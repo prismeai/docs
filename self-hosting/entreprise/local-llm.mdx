@@ -1,5 +1,442 @@
 ---
-title: 'New file'
-description: 'Description of your new file.'
+title: 'Local LLM'
+description: 'Deploy and configure local language models in your Prisme.ai environment with the prismeai-llm microservice'
 ---
 
+The `prismeai-llm` microservice enables you to integrate open-source language models into your Prisme.ai environment. This service supports both LocalAI and Ollama as runtime engines, giving you flexibility in how you deploy and manage your models.
+
+
+## Overview
+
+The `prismeai-llm` microservice allows you to:
+
+<CardGroup cols={2}>
+  <Card title="Run Local Models" icon="microchip">
+    Deploy and run open-source language models directly within your infrastructure
+  </Card>
+  <Card title="Text Generation" icon="message">
+    Generate text completions and chat responses using various models
+  </Card>
+  <Card title="Embeddings" icon="vector-square">
+    Create vector embeddings for semantic search and content understanding
+  </Card>
+  <Card title="OpenAI-Compatible API" icon="plug">
+    Interface with models using the familiar OpenAI API format
+  </Card>
+</CardGroup>
+
+By default, the service uses [LocalAI](https://github.com/go-skynet/LocalAI) with the pre-built image available at `quay.io/go-skynet/local-ai`. You can also configure it to use [Ollama](https://github.com/ollama/ollama) as an alternative runtime.
+
+## Installation Prerequisites
+
+Before deploying the `prismeai-llm` microservice, ensure you have:
+
+<CardGroup cols={2}>
+  <Card title="Storage Volume" icon="hard-drive">
+    A persistent volume to store model files, which can be substantial in size
+  </Card>
+  <Card title="Sufficient Resources" icon="server">
+    Adequate CPU, RAM, and potentially GPU resources depending on model size
+  </Card>
+</CardGroup>
+
+<Warning>
+  Language models can be resource-intensive. We recommend starting with a 16 vCPU machine for initial deployment. For production use with larger models, consider dedicated resources and possibly GPU acceleration.
+</Warning>
+
+## Deployment Options
+
+### vLLM 
+
+When using vLLM, you only need to add your endpoints in the AI Knowledge configuration.
+Please refer to the AI Knowledge configuration documentation  for instructions on how to add these endpoints and the corresponding credentials.
+
+### LocalAI (Default)
+
+When using LocalAI, you'll need to provide specific files for each model in the `./models` directory:
+
+<CardGroup cols={3}>
+  <Card title="YAML File" icon="file-code">
+    Configuration file describing the model
+  </Card>
+  <Card title="Template File" icon="file-lines">
+    .tmpl file defining the prompt format (not needed for embedding models)
+  </Card>
+  <Card title="Model File" icon="file-binary">
+    GGUF (CPU-compatible) file containing the actual model weights
+  </Card>
+</CardGroup>
+
+
+
+### Ollama Configuration
+
+To use Ollama instead of LocalAI, modify your `prismeai-apps/values.yaml` configuration:
+
+```yaml
+prismeai-llm:
+  image:
+    repository: ollama/ollama
+    tag: latest
+    pullPolicy: Always
+
+  env:
+     - name: OLLAMA_HOST
+       value: 0.0.0.0:5000
+     - name: OLLAMA_MODELS
+       value: /models/models/ollama  
+```
+
+## Model Installation
+
+<Tabs>
+  <Tab title="LocalAI">
+    <Steps>
+      <Step title="Create Model Directory">
+        Ensure you have a `/models` directory in your specified storage volume.
+      </Step>
+      
+      <Step title="Download Model Files">
+        For each model, you'll need to download the GGUF model file. For example, for Mistral:
+        
+        ```bash
+        curl -L "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_0.gguf?download=true" -o ./models/mistral-7b-instruct-v0.2.Q4_0.gguf
+        ```
+        
+        <Note>
+          The file size can be several gigabytes. Q4 models are more compressed (smaller, faster, less accurate) while Q8 models are less compressed (larger, slower, more accurate).
+        </Note>
+      </Step>
+      
+      <Step title="Add Configuration Files">
+        Create or copy the required YAML and template files for your model.
+        
+        **Example YAML (mistral.yaml):**
+        ```yaml
+        name: mistral-7b-instruct
+        parameters:
+          model: /models/mistral-7b-instruct-v0.2.Q4_0.gguf
+          temperature: 0.7
+          top_k: 40
+          top_p: 0.5
+          context_size: 4096
+        template: mistral-instruct
+        ```
+        
+        **Example Template (mistral-instruct.tmpl):**
+        ```
+        {{- if .System }}
+        <s>{{ .System }}</s>
+        {{- end }}
+        
+        {{- range $i, $message := .Messages }}
+        {{- if eq $message.Role "user" }}
+        [INST] {{ $message.Content }} [/INST]
+        {{- else if eq $message.Role "assistant" }}
+        {{ $message.Content }}
+        {{- end }}
+        {{- end }}
+        ```
+      </Step>
+      
+      <Step title="Special Configuration for Embedding Models">
+        For embedding models like MPNET:
+        
+        ```bash
+        # Clone the model repository
+        git clone https://huggingface.co/sentence-transformers/multi-qa-mpnet-base-dot-v1 ./models/multi-qa-mpnet-base-dot-v1
+        
+        # Create configuration file (mpnet.yaml)
+        cat > ./models/mpnet.yaml << EOL
+        name: mpnet
+        parameters:
+          model: /models/multi-qa-mpnet-base-dot-v1
+          embedding_model_type: sentence_transformers
+        EOL
+        ```
+      </Step>
+      
+      <Step title="Restart the Service">
+        After adding new models, restart the service to make them available:
+        
+        ```bash
+        kubectl rollout restart deployment prismeai-llm -n apps
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  
+  <Tab title="Ollama">
+    <Steps>
+      <Step title="Access the Ollama Container">
+        Connect to your Ollama container:
+        
+        ```bash
+        kubectl exec -it deployment/prismeai-llm -n apps -- bash
+        ```
+      </Step>
+      
+      <Step title="Download Models">
+        Download models from the Ollama library:
+        
+        ```bash
+        # Download Phi model
+        ollama run phi
+        
+        # Download Mistral model
+        ollama run mistral
+        
+        # Download Llama model
+        ollama run llama2
+        ```
+        
+        Models will be automatically downloaded to the directory specified by `OLLAMA_MODELS` environment variable.
+      </Step>
+      
+      <Step title="Verify Model Installation">
+        Check that models were correctly downloaded:
+        
+        ```bash
+        ollama list
+        ```
+        
+        This should show all available models.
+      </Step>
+    </Steps>
+    
+    <Note>
+      For offline installation, you can run Ollama on an internet-connected machine, then copy the model files (typically from `~/.ollama/models` on macOS, `/usr/share/ollama/.ollama/models` on Linux, or `C:\Users\<username>\.ollama\models` on Windows) to your target environment.
+    </Note>
+  </Tab>
+</Tabs>
+
+## Microservice Testing
+
+After deployment, test the service with these commands:
+
+<Accordion title="Test Text Generation">
+  To test text generation capabilities, use this curl command:
+  
+  ```bash
+  curl http://localhost:5000/v1/chat/completions -X POST \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "phi-2",
+      "messages": [{
+        "role": "user",
+        "content": "Give me a random number."
+      }],
+      "temperature": 0.7,
+      "max_token": 10,
+      "stream": true
+    }'
+  ```
+  
+  Replace `phi-2` with your installed model name (e.g., `mistral-7b-instruct`, `orca`, or `airoboros`).
+  
+  You should receive a streamed response containing the generated text.
+</Accordion>
+
+<Accordion title="Test Embedding Generation">
+  To test embedding generation, use this curl command:
+  
+  ```bash
+  curl http://localhost:5000/v1/embeddings \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "bert",
+      "input": "A long time ago in a galaxy far, far away"
+    }'
+  ```
+  
+  Replace `bert` with your installed embedding model name (e.g., `mpnet`).
+  
+  You should receive a response containing a vector of floating-point numbers representing the text embedding.
+</Accordion>
+
+<Note>
+  The first inference request may take several minutes as the model is loaded into memory. Subsequent requests will be faster.
+</Note>
+
+## Performance Considerations
+
+<CardGroup cols={2}>
+  <Card title="CPU Requirements" icon="microchip">
+    **Resource Impact**
+    
+    - Larger models require more CPU cores
+    - 16+ vCPUs recommended for production use
+    - Mistral 7B is more demanding than Phi-2
+    
+    **Expected Performance (16 CPU)**
+    
+    - Phi-2: ~3 minutes for large context
+    - Mistral 7B: ~10 minutes for large context
+  </Card>
+  
+  <Card title="Memory Requirements" icon="memory">
+    **Resource Impact**
+    
+    - Model size directly affects memory usage
+    - Q4 models use less RAM than Q8 models
+    - Context window size impacts memory usage
+    
+    **Recommendations**
+    
+    - Minimum 8GB RAM for smaller models
+    - 16-32GB RAM for 7B parameter models
+    - Consider swap space configuration
+  </Card>
+  
+  <Card title="Storage Requirements" icon="hard-drive">
+    **Resource Impact**
+    
+    - Model files can be several gigabytes each
+    - Multiple models multiply storage needs
+    
+    **Recommendations**
+    
+    - 10GB minimum storage
+    - 50GB+ recommended for multiple models
+    - Use high-performance storage when possible
+  </Card>
+  
+  <Card title="Optimization Options" icon="gauge-high">
+    **Strategies**
+    
+    - Use quantized models (Q4_0, Q4_K_M) for better performance
+    - Consider GPU acceleration for production
+    - Adjust context size based on needs
+    - Use streaming for better user experience
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+<Accordion title="Slow Response Times">
+  **Symptom**: Extremely slow response times (10+ minutes)
+  
+  **Possible Causes**:
+  - First inference requires loading the model into memory
+  - Insufficient CPU resources
+  - Large model with small resource allocation
+  
+  **Resolution Steps**:
+  1. Wait for the first inference to complete (can take 10+ minutes)
+  2. Enable debug mode by setting `DEBUG: true` in your environment
+  3. Check logs for memory or resource constraints
+  4. Consider using smaller models or increasing resources
+  
+  **Note**: On resource-constrained environments like a MacBook M2, you might get as slow as 1 token every 7 seconds.
+</Accordion>
+
+<Accordion title="Model Loading Errors">
+  **Symptom**: Service fails to start or responds with model not found errors
+  
+  **Possible Causes**:
+  - Incorrect file paths in YAML configuration
+  - Missing model files
+  - Incomplete model download
+  - Permission issues with model files
+  
+  **Resolution Steps**:
+  1. Verify model files exist in the correct location
+  2. Check YAML configuration for correct paths
+  3. Ensure file permissions allow the service to read files
+  4. Try downloading the model files again
+</Accordion>
+
+<Accordion title="Out of Memory Errors">
+  **Symptom**: Service crashes with OOM (Out of Memory) errors
+  
+  **Possible Causes**:
+  - Model too large for allocated memory
+  - Multiple models loaded simultaneously
+  - Large context windows in requests
+  
+  **Resolution Steps**:
+  1. Increase memory allocation
+  2. Use more quantized models (Q4 instead of Q8)
+  3. Reduce context size in model configuration
+  4. Consider container-level memory limits
+</Accordion>
+
+## Integration with AI Knowledge
+
+To use your local models with Prisme.ai's AI Knowledge:
+
+<Steps>
+  <Step title="Access Project Settings">
+    Navigate to your AI Knowledge project and open the settings panel.
+  </Step>
+  
+  <Step title="Configure Model Settings">
+    Update the model settings to use your local models:
+    
+    - **Text Generation Model**: Enter the model name (e.g., "orca", "airoboros", "phi-2")
+    - **Embedding Model**: Enter the embedding model name (e.g., "bert", "mpnet")
+    
+    <Warning>
+      If you change the embedding model of an existing project, you'll need to create a new project instead. This is because different embedding models produce vectors of different dimensions, which affects the Redis indexing structure.
+    </Warning>
+  </Step>
+  
+  <Step title="Save and Test">
+    Save your settings and test with a few queries to ensure proper integration.
+  </Step>
+</Steps>
+
+## Advanced Configuration
+
+<Accordion title="Adding New Models">
+  To add new models to LocalAI:
+  
+  1. Find a model on Hugging Face (prefer models with GGUF versions)
+  2. Download the model file to your `/models` directory:
+     ```bash
+     curl -L "URL_TO_MODEL" -o ./models/MODEL_NAME.gguf
+     ```
+  3. Find or create an appropriate template from the [model gallery](https://github.com/go-skynet/model-gallery)
+  4. Create a YAML configuration file
+  5. Restart the service
+  
+  For detailed instructions, refer to the [LocalAI documentation](https://localai.io/advanced/).
+</Accordion>
+
+<Accordion title="GPU Acceleration">
+  For production environments, GPU acceleration can dramatically improve performance:
+  
+  1. Use a GPU-enabled container image
+  2. Configure the appropriate GPU drivers and runtime
+  3. Update the model configuration to use GPU resources
+  4. Adjust container resource allocation to include GPU access
+  
+  With proper GPU acceleration, models like Mistral 7B can achieve near real-time performance similar to cloud services.
+</Accordion>
+
+<Accordion title="Custom Model Templates">
+  To customize how prompts are formatted for specific models:
+  
+  1. Create a new template file (e.g., `custom-format.tmpl`)
+  2. Define the prompt format, using variables like `.System`, `.Messages`, etc.
+  3. Reference the template in your model's YAML configuration
+  
+  This allows you to optimize prompt formats for different model architectures and fine-tunings.
+</Accordion>
+
+## Next Steps
+
+Now that you have the LLM Open Source microservice running, consider these next steps:
+
+<CardGroup cols={2}>
+  <Card title="Create RAG Agents" icon="brain" href="/create-agents/rag-agents/overview">
+    Build knowledge-powered agents that use your local models
+  </Card>
+
+  <Card title="Integrate with Workflows" icon="diagram-project" href="/products/ai-builder/automations">
+    Incorporate local models into your automation workflows
+  </Card>
+  <Card title="Monitor Performance" icon="chart-line" href="/products/ai-insights/overview">
+    Track usage and performance of your language models
+  </Card>
+</CardGroup>
