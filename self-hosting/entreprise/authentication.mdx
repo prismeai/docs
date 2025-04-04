@@ -1,0 +1,541 @@
+---
+title: 'Authentication & SSO Integration'
+description: 'Configure secure enterprise authentication for Prisme.ai with SSO options including OIDC, SAML, and Microsoft Entra ID'
+---
+
+Prisme.ai provides robust support for enterprise authentication requirements, allowing you to integrate with your existing identity providers through industry-standard protocols. This guide covers the configuration options for Single Sign-On (SSO) integration using OIDC, SAML, and Microsoft Entra ID (formerly Azure AD).
+
+<Frame>
+  <img src="/images/sso-overview.png" alt="SSO Integration Overview" />
+</Frame>
+
+## Authentication Overview
+
+Integrating your identity provider with Prisme.ai offers several benefits:
+
+<CardGroup cols={2}>
+  <Card title="Centralized Identity Management" icon="user-shield">
+    Manage access through your existing identity provider
+  </Card>
+  <Card title="Enhanced Security" icon="shield-check">
+    Enforce your organization's security policies and MFA requirements
+  </Card>
+  <Card title="Simplified User Experience" icon="hand-point-right">
+    Provide one-click access without separate credentials
+  </Card>
+  <Card title="Automated Provisioning" icon="user-plus">
+    Streamline user onboarding and offboarding
+  </Card>
+</CardGroup>
+
+## Supported Authentication Methods
+
+Prisme.ai supports the following authentication protocols:
+
+<Tabs>
+  <Tab title="OIDC">
+    **OpenID Connect** is a modern authentication protocol built on top of OAuth 2.0.
+    
+    <Frame>
+      <img src="/images/oidc-flow.png" alt="OIDC Authentication Flow" />
+    </Frame>
+    
+    **Compatible with**:
+    - Google Workspace
+    - Okta
+    - Auth0
+    - Keycloak
+    - Any standards-compliant OIDC provider
+  </Tab>
+  
+  <Tab title="SAML">
+    **Security Assertion Markup Language** is an XML-based authentication protocol.
+    
+    <Frame>
+      <img src="/images/saml-flow.png" alt="SAML Authentication Flow" />
+    </Frame>
+    
+    **Compatible with**:
+    - ADFS
+    - Okta
+    - OneLogin
+    - PingIdentity
+    - Any standards-compliant SAML 2.0 provider
+    
+    **Current limitations**:
+    - Only supports HTTP-POST binding for receiving authentication assertions
+    - No support for IdP-initiated login
+  </Tab>
+  
+  <Tab title="Microsoft Entra ID">
+    **Microsoft Entra ID** (formerly Azure AD) provides specialized integration for Microsoft environments.
+    
+    <Frame>
+      <img src="/images/microsoft-sso-flow.png" alt="Microsoft SSO Flow" />
+    </Frame>
+    
+    **Compatible with**:
+    - Microsoft Entra ID
+    - Azure Active Directory
+    - Microsoft 365 tenants
+  </Tab>
+</Tabs>
+
+## Configuring OIDC Authentication
+
+<Steps>
+  <Step title="Register an Application">
+    Create an OAuth 2.0 client in your OIDC provider.
+    
+    <Frame>
+      <img src="/images/oidc-registration.png" alt="OIDC App Registration" />
+    </Frame>
+    
+    **Key configuration:**
+    1. Register a **Web** OAuth2 client/app
+    2. Configure the authorized redirect URI:
+       ```
+       https://API_URL/v2/login/callback
+       ```
+    3. Request the following scopes (minimum):
+       ```
+       openid email
+       ```
+    4. Add `profile` scope if you need first name and last name
+    
+    **Note the following credentials:**
+    - Client ID
+    - Client Secret
+    - Auth URL (authorization_endpoint)
+    - Token URL (token_endpoint)
+    - Certificate URL (jwks_uri)
+    
+    <Note>
+      The JWKS URI might not be shown with client details as it is generally global to the IdP or tenant. This URL can return either a standard JWKS or an object mapping `kid`s to PEM certificate strings.
+      
+      Currently, only the **RS256** algorithm is supported.
+    </Note>
+  </Step>
+  
+  <Step title="Create Configuration File">
+    Create an `authProviders.config.yml` file with your OIDC provider details.
+    
+    ```yaml
+    providers:
+      <ProviderName>:
+        type: oidc
+        config:
+          client_id: "your client id"
+          client_secret: "your client secret"
+          authorization_endpoint: "idp authorization_endpoint"
+          token_endpoint: "idp token_endpoint"
+          jwks_uri: "idp public certificates endpoint"
+          scopes: "openid email profile"
+        attributesMapping:
+          firstName: 'given_name'
+          lastName: 'family_name'
+          email: 'email'
+    ```
+    
+    <Warning>
+      Choose your `<ProviderName>` carefully, as this name will be used in front-end services and injected into user authData, making it potentially difficult to change later.
+    </Warning>
+    
+    - The `scopes` field is optional and defaults to `openid email`
+    - The minimum required scopes are `openid` and `email`
+    - Add `profile` scope to retrieve additional user attributes like name
+  </Step>
+  
+  <Step title="Mount Configuration File">
+    Add the configuration file to the `prismeai-api-gateway` container.
+    
+    ```bash
+    # In your deployment configuration, add a volume mount:
+    volumes:
+      - /path/to/authProviders.config.yml:/www/services/api-gateway/authProviders.config.yml
+    ```
+    
+    You can customize the file location with the `AUTH_PROVIDERS_CONFIG` environment variable.
+  </Step>
+  
+  <Step title="Enable the Provider in UI">
+    Configure the sign-in buttons by setting environment variables.
+    
+    For both `prismeai-console` and `prismeai-pages` microservices, add:
+    
+    ```
+    ENABLED_AUTH_PROVIDERS='[{"name": "local"}, {"name": "<ProviderName>", "label": "Sign in with Provider", "icon": "https://path/to/provider-icon.png"}]'
+    ```
+    
+    - `name` must match the `<ProviderName>` in your config file
+    - `label` is the text displayed on the sign-in button
+    - `icon` is the URL to the provider's logo image
+    - Include `{"name": "local"}` to keep the username/password login option
+  </Step>
+  
+  <Step title="Configure Workspace Access">
+    Update workspaces to allow SSO authentication.
+    
+    <Frame>
+      <img src="/images/workspace-sso-config.png" alt="Workspace SSO Configuration" />
+    </Frame>
+    
+    When a new user authenticates with SSO, they won't automatically have access to existing products and workspaces. You need to:
+    
+    1. Configure whitelist settings in the product configuration
+    2. Set access permissions for the SSO users
+    
+    <Note>
+      Whenever you change your `PAGES_HOST` environment variable, make sure to trigger a workspace update (e.g., by changing its description) to register the new redirect URI with your identity provider.
+    </Note>
+  </Step>
+</Steps>
+
+## Configuring SAML Authentication
+
+<Steps>
+  <Step title="Register Service Provider">
+    Register Prisme.ai as a Service Provider (SP) in your Identity Provider.
+    
+    <Frame>
+      <img src="/images/saml-registration.png" alt="SAML Service Provider Registration" />
+    </Frame>
+    
+    **Key configuration:**
+    1. Configure the **ACS Endpoint**:
+       ```
+       https://API_URL/v2/login/callback
+       ```
+    2. Set the **SP EntityID** (defaults to `https://studio.prisme.ai/sp`)
+    3. Set **Name ID format** to `unspecified` (all formats are supported)
+    
+    **Export the IdP metadata XML file** containing the signing certificate and entity information.
+  </Step>
+  
+  <Step title="Create Configuration File">
+    Create an `authProviders.config.yml` file with your SAML provider details.
+    
+    ```yaml
+    providers:
+      <ProviderName>:
+        type: saml
+        config:
+          idp_metadata_filepath: "/path/towards/idp-saml-metadata.xml"
+          issuer: "Service Provider entity id"  
+        attributesMapping:
+          firstName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname'
+          lastName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname'
+          email: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress'
+    ```
+    
+    <Warning>
+      Choose your `<ProviderName>` carefully, as this name will be used in front-end services and injected into user authData, making it potentially difficult to change later.
+    </Warning>
+    
+    If no XML file is available, you can configure individual parameters:
+    
+    ```yaml
+    providers:
+      <ProviderName>:
+        type: saml
+        config:
+          entryPoint: "https://idp.example.org/SAML2/SSO/Redirect"
+          idpCert: "-----BEGIN CERTIFICATE-----\nMIID...\n-----END CERTIFICATE-----"
+          issuer: "Service Provider entity id"
+    ```
+    
+    See [node-saml documentation](https://github.com/node-saml/node-saml) for complete configuration options.
+  </Step>
+  
+  <Step title="Mount Configuration File">
+    Add the configuration file to the `prismeai-api-gateway` container.
+    
+    ```bash
+    # In your deployment configuration, add a volume mount:
+    volumes:
+      - /path/to/authProviders.config.yml:/www/services/api-gateway/authProviders.config.yml
+    ```
+    
+    You can customize the file location with the `AUTH_PROVIDERS_CONFIG` environment variable.
+  </Step>
+  
+  <Step title="Enable the Provider in UI">
+    Configure the sign-in buttons by setting environment variables.
+    
+    For both `prismeai-console` and `prismeai-pages` microservices, add:
+    
+    ```
+    ENABLED_AUTH_PROVIDERS='[{"name": "local"}, {"name": "<ProviderName>", "label": "Sign in with Provider", "icon": "https://path/to/provider-icon.png"}]'
+    ```
+    
+    - `name` must match the `<ProviderName>` in your config file
+    - `label` is the text displayed on the sign-in button
+    - `icon` is the URL to the provider's logo image
+    - Include `{"name": "local"}` to keep the username/password login option
+  </Step>
+  
+  <Step title="Configure Workspace Access">
+    Update workspaces to allow SSO authentication.
+    
+    <Frame>
+      <img src="/images/workspace-sso-config.png" alt="Workspace SSO Configuration" />
+    </Frame>
+    
+    When a new user authenticates with SSO, they won't automatically have access to existing products and workspaces. You need to:
+    
+    1. Configure whitelist settings in the product configuration
+    2. Set access permissions for the SSO users
+    
+    <Note>
+      Whenever you change your `PAGES_HOST` environment variable, make sure to trigger a workspace update (e.g., by changing its description) to register the new redirect URI with your identity provider.
+    </Note>
+  </Step>
+</Steps>
+
+## Configuring Microsoft Entra ID (Azure AD)
+
+<Steps>
+  <Step title="Register an Application">
+    Register a new application in your Microsoft Entra ID tenant.
+    
+    <Frame>
+      <img src="/images/microsoft-app-registration.png" alt="Microsoft App Registration" />
+    </Frame>
+    
+    1. Navigate to **Azure Portal** > **App registrations**
+    2. Click **New registration**
+    3. Name the application (e.g., "Prisme.ai")
+    4. Select the appropriate **Supported account types**:
+       - Accounts in this organizational directory only
+       - Accounts in any organizational directory
+       - Accounts in any organizational directory and personal Microsoft accounts
+       - Personal Microsoft accounts only
+    5. Set the **Redirect URI** platform to **Web** with the value:
+       ```
+       https://API_URL/v2/login/azure/callback
+       ```
+    6. Click **Register**
+    
+    **Note the Application (client) ID** displayed on the overview page.
+  </Step>
+  
+  <Step title="Generate a Client Secret">
+    Create a secret for authentication.
+    
+    <Frame>
+      <img src="/images/microsoft-client-secret.png" alt="Microsoft Client Secret" />
+    </Frame>
+    
+    1. Navigate to **Certificates & secrets** in the left menu
+    2. Click **New client secret**
+    3. Add a description and select an expiry period
+    4. Click **Add**
+    
+    **Immediately copy and store the client secret value**, as it won't be visible again.
+  </Step>
+  
+  <Step title="Configure Environment Variables">
+    Set the required environment variables in the `prismeai-api-gateway` service.
+    
+    ```bash
+    # Microsoft Entra ID Configuration
+    AZURE_AD_CLOUD_INSTANCE_ID=https://login.microsoftonline.com/
+    AZURE_AD_TENANT=YourCompany.onmicrosoft.com
+    AZURE_AD_APP_ID=your-application-id
+    AZURE_AD_CLIENT_SECRET=your-client-secret
+    ```
+    
+    For the `AZURE_AD_TENANT` value:
+    - Use your tenant domain (e.g., `YourCompany.onmicrosoft.com`) for single-tenant apps
+    - Use `organizations` for multi-tenant organizational accounts
+    - Use `common` for both organizational and personal accounts
+    - Use `consumers` for Microsoft accounts only
+    
+    <Note>
+      The `AZURE_AD_TENANT` value should match the **Supported account types** option you selected when registering the app.
+    </Note>
+  </Step>
+  
+  <Step title="Enable the Provider in UI">
+    Configure the sign-in buttons by setting the environment variable.
+    
+    For both `prismeai-console` and `prismeai-pages` microservices, add:
+    
+    ```bash
+    # Simple configuration
+    ENABLED_AUTH_PROVIDERS=azure
+    
+    # OR custom configuration
+    ENABLED_AUTH_PROVIDERS='[{"name":"local"},{"name":"custom","extends":"azure","label":{"fr":"Connexion avec Microsoft","en":"Sign in with Microsoft"},"icon":"https://path/to/microsoft-logo.png"}]'
+    ```
+    
+    The custom configuration allows you to:
+    - Customize the button label (with multi-language support)
+    - Use a custom icon
+    - Keep the standard username/password option (`local`)
+  </Step>
+  
+  <Step title="Configure Workspace Access">
+    Update workspaces to allow SSO authentication.
+    
+    <Frame>
+      <img src="/images/workspace-sso-config.png" alt="Workspace SSO Configuration" />
+    </Frame>
+    
+    When a new user authenticates with SSO, they won't automatically have access to existing products and workspaces. You need to:
+    
+    1. Configure whitelist settings in the product configuration
+    2. Set access permissions for the SSO users
+  </Step>
+</Steps>
+
+## Custom Attribute Mapping
+
+All authentication methods support mapping identity provider attributes to Prisme.ai user properties:
+
+<Accordion title="Attribute Mapping Configuration">
+  The `attributesMapping` section in your provider configuration maps provider-specific attributes to standard Prisme.ai fields.
+  
+  ```yaml
+  providers:
+    <ProviderName>:
+      type: oidc  # or saml
+      # ... other config ...
+      attributesMapping:
+        firstName: 'provider_first_name_field'
+        lastName: 'provider_last_name_field'
+        email: 'provider_email_field'
+  ```
+  
+  Only `firstName`, `lastName`, and `email` are supported as native fields.
+  
+  **Common OIDC Mappings:**
+  ```yaml
+  attributesMapping:
+    firstName: 'given_name'
+    lastName: 'family_name'
+    email: 'email'
+  ```
+  
+  **Common SAML Mappings:**
+  ```yaml
+  attributesMapping:
+    firstName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname'
+    lastName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname'
+    email: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress'
+  ```
+  
+  You can inspect available attributes by examining `gateway.login.succeeded` events or by reading the `{{user}}` variable from a test automation.
+</Accordion>
+
+## Troubleshooting
+
+<Accordion title="Common Issues and Solutions">
+  **1. Redirect URI Mismatch**
+  
+  **Symptom:** Error message about redirect URI not matching during authentication
+  
+  **Solution:** 
+  - Ensure the redirect URI in your IdP exactly matches `https://API_URL/v2/login/callback` for OIDC/SAML or `https://API_URL/v2/login/azure/callback` for Microsoft
+  - Check for trailing slashes or HTTP vs HTTPS mismatches
+  
+  **2. JWKS Retrieval Failed**
+  
+  **Symptom:** Authentication fails with JWKS errors
+  
+  **Solution:**
+  - Verify the `jwks_uri` endpoint is accessible from the Prisme.ai server
+  - Check for correct formatting of the JWKS endpoint URL
+  - Ensure the signing algorithm is RS256
+  
+  **3. SAML Response Validation Failed**
+  
+  **Symptom:** SAML authentication fails after IdP redirect
+  
+  **Solution:**
+  - Confirm the IdP certificate in the configuration is correct and not expired
+  - Verify the IdP is sending responses via HTTP-POST binding
+  - Check that the `issuer` value matches the EntityID expected by the IdP
+  
+  **4. Missing User Attributes**
+  
+  **Symptom:** User logs in successfully but name fields are empty
+  
+  **Solution:**
+  - Check that the `attributesMapping` configuration matches the actual attribute names provided by your IdP
+  - For OIDC, ensure the `profile` scope is requested if you need name attributes
+  - Examine the authentication events to see what claims are actually being received
+</Accordion>
+
+<Accordion title="Diagnostic Tools">
+  **Event Logs**
+  
+  Authentication issues can be diagnosed by examining events in the Activity view:
+  
+  - Look for `gateway.login.started` events to see authentication attempts
+  - Check `gateway.login.succeeded` events to examine the received user claims
+  - Investigate `gateway.login.failed` events for error details
+  
+  **Configuration Testing**
+  
+  You can validate your SSO configuration by:
+  
+  1. Creating a test user in your IdP
+  2. Attempting authentication with detailed logs enabled
+  3. Examining the request/response data in the Activity logs
+  
+  **Common Error Codes**
+  
+  - `invalid_request`: Malformed authentication request
+  - `unauthorized_client`: The client is not authorized for the requested authentication flow
+  - `access_denied`: The resource owner denied the request
+  - `invalid_token`: JWT validation failed
+  - `invalid_grant`: The provided authorization grant is invalid
+</Accordion>
+
+## Security Considerations
+
+<CardGroup cols={2}>
+  <Card title="Token Validation" icon="shield-check">
+    - Always validate JWT signatures using the IdP's public keys
+    - Verify token expiration and issuance times
+    - Confirm the audience and issuer claims match your application
+  </Card>
+  
+  <Card title="Secure Storage" icon="key">
+    - Store client secrets securely using environment variables or secrets management
+    - Never hardcode secrets in configuration files or source code
+    - Rotate secrets periodically according to your security policy
+  </Card>
+  
+  <Card title="TLS Encryption" icon="lock">
+    - Ensure all authentication traffic uses HTTPS
+    - Configure proper TLS versions and cipher suites
+    - Validate certificates in production environments
+  </Card>
+  
+  <Card title="Access Controls" icon="user-lock">
+    - Implement proper RBAC after authentication
+    - Don't assume authenticated users should have access to all resources
+    - Regularly audit user access and permissions
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+After configuring SSO authentication, consider implementing these additional features:
+
+<CardGroup cols={2}>
+  <Card title="Role-Based Access Control" icon="user-shield" href="/resources/security/authentication">
+    Configure fine-grained permissions based on user roles and attributes
+  </Card>
+  <Card title="User Provisioning" icon="users" href="/resources/security/sso">
+    Automate user creation and access management
+  </Card>
+  <Card title="Multi-Factor Authentication" icon="shield-halved" href="/resources/security/authentication">
+    Enhance security with additional authentication factors
+  </Card>
+  <Card title="Audit Logging" icon="clipboard-list" href="/resources/security/audit">
+    Track authentication events and user activities
+  </Card>
+</CardGroup>
