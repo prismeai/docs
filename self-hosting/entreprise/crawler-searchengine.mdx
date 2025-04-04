@@ -1,0 +1,419 @@
+---
+title: 'Crawler & SearchEngine Microservices'
+description: 'Deploy and configure the Prisme.ai web crawling and search engine capabilities for knowledge base creation and content discovery'
+---
+
+# Crawler & SearchEngine Microservices
+
+The Crawler and SearchEngine microservices work together to provide powerful web content indexing and search capabilities for your Prisme.ai platform. These services enable the creation of knowledge bases from web content, support external data integration, and power the search functionality across your applications.
+
+<Frame>
+  <img src="/images/crawler-searchengine-architecture.png" alt="Crawler and SearchEngine Architecture" />
+</Frame>
+
+## Overview
+
+The Crawler and SearchEngine microservices function as a pair to deliver comprehensive web content processing:
+
+<CardGroup cols={2}>
+  <Card title="prismeai-crawler" icon="spider">
+    Discovers, fetches, and processes web content from specified sources, managing crawl schedules and content extraction
+  </Card>
+  <Card title="prismeai-searchengine" icon="magnifying-glass">
+    Indexes processed content and provides search capabilities with relevance ranking and content highlighting
+  </Card>
+</CardGroup>
+
+<Note>
+  These services must be deployed together - you cannot use one without the other as they form a complete indexing and search solution.
+</Note>
+
+## Installation Prerequisites
+
+Before deploying these microservices, ensure you have access to the following dependencies:
+
+<CardGroup cols={2}>
+  <Card title="ElasticSearch" icon="database">
+    Required for document storage and search functionality
+    
+    - Can use the same ElasticSearch instance as the core deployment
+    - Stores indexed content and search metadata
+    - Provides the search functionality backend
+  </Card>
+  <Card title="Redis" icon="server">
+    Required for inter-service communication
+    
+    - Can use the same Redis instance as the core deployment
+    - Manages crawl queues and job scheduling
+    - Facilitates communication between services
+    - Stores temporary processing data
+  </Card>
+</CardGroup>
+
+## Configuration
+
+### Environment Variables
+
+Configure the Crawler and SearchEngine microservices with the following environment variables:
+
+<Accordion title="Common Environment Variables">
+  | Variable Name | Description | Default Value | Affected Services |
+  |---------------|-------------|---------------|-------------------|
+  | `REDIS_URL` | Redis connection URL for communication between services | `redis://localhost:6379` | Both |
+  | `ELASTIC_SEARCH_URL` | ElasticSearch connection URL for document storage | `localhost` | Both |
+</Accordion>
+
+<Accordion title="Crawler-Specific Environment Variables">
+  | Variable Name | Description | Default Value | Affected Services |
+  |---------------|-------------|---------------|-------------------|
+  | `MAX_CONTENT_LEN` | Maximum length (in characters) of documents crawled | `150000` | prismeai-crawler |
+</Accordion>
+
+<Note>
+  `ELASTIC_SEARCH_URL` can be set to an empty string (''), which will prevent webpage content from being saved, effectively deactivating the search functionality while still allowing crawling.
+</Note>
+
+### Resource Considerations
+
+When planning your deployment, consider these resource recommendations:
+
+<CardGroup cols={2}>
+  <Card title="Memory Requirements" icon="memory">
+    - **Crawler**: Min 1GB, recommended 2GB+
+    - **SearchEngine**: Min 1GB, recommended 2GB+
+    - Scale based on crawl volume and index size
+  </Card>
+  <Card title="CPU Allocation" icon="microchip">
+    - **Crawler**: Min 0.5 vCPU, recommended 1+ vCPU
+    - **SearchEngine**: Min 0.5 vCPU, recommended 1+ vCPU
+    - Consider additional resources for high request volumes
+  </Card>
+  <Card title="Storage Needs" icon="hard-drive">
+    - **ElasticSearch**: Plan for index growth based on content volume
+    - **Redis**: Minimal requirements for queue management
+    - Consider storage class with good I/O performance
+  </Card>
+  <Card title="Network Configuration" icon="network-wired">
+    - Internet access for the Crawler service
+    - Internal network access between services
+    - Consider bandwidth requirements for crawl activities
+  </Card>
+</CardGroup>
+
+## Deployment Process
+
+Follow these steps to deploy the Crawler and SearchEngine microservices:
+
+<Steps>
+  <Step title="Configure Dependencies">
+    Ensure ElasticSearch and Redis are accessible:
+    
+    1. Verify ElasticSearch connection with:
+       ```bash
+       curl -X GET "[ELASTIC_SEARCH_URL]:9200"
+       ```
+       You should receive a response with version and cluster information
+    
+    2. Verify Redis connection with:
+       ```bash
+       redis-cli -u [REDIS_URL] ping
+       ```
+       The response should be "PONG"
+  </Step>
+  
+  <Step title="Deploy Microservices">
+    Deploy both services using Helm as described in the [Self-Hosting Apps Microservices](/self-hosting/apps) guide.
+    
+    Ensure both services are included in your `values.yaml` configuration:
+    
+    ```yaml
+    prismeai-crawler:
+      enabled: true
+      config:
+        redis:
+          url: "redis://redis-service:6379"
+        elasticsearch:
+          url: "elasticsearch-service:9200"
+        
+    prismeai-searchengine:
+      enabled: true
+      config:
+        redis:
+          url: "redis://redis-service:6379"
+        elasticsearch:
+          url: "elasticsearch-service:9200"
+    ```
+  </Step>
+  
+  <Step title="Verify Deployment">
+    Check that both services are running correctly:
+    
+    ```bash
+    kubectl get pods -n apps | grep 'crawler\|searchengine'
+    ```
+    
+    Both services should show `Running` status and be ready (e.g., `1/1`).
+  </Step>
+  
+  <Step title="Configure Network Access">
+    Ensure the services can access:
+    
+    1. ElasticSearch and Redis internally
+    2. Internet access for the Crawler service
+    3. Access from other Prisme.ai services that will use search functionality
+  </Step>
+</Steps>
+
+## Microservice Testing
+
+After deploying the Crawler and SearchEngine microservices, verify their operation with these steps:
+
+<Steps>
+  <Step title="Create a Test SearchEngine">
+    Create a searchengine instance to crawl a test website:
+    
+    ```bash
+    curl --location 'http://localhost:8000/monitor/searchengine/test/test' \
+    --header 'Content-Type: application/json' \
+    --data '{
+        "websites": [
+            "https://docs.eda.prisme.ai/en/workspaces/"
+        ]
+    }'
+    ```
+    
+    If successful, you should receive a complete searchengine object that includes an `id` field.
+  </Step>
+  
+  <Step title="Check Crawl Progress">
+    After a few seconds, check the crawl history and statistics:
+    
+    ```bash
+    curl --location --request GET 'http://localhost:8000/monitor/searchengine/test/test/stats' \
+    --header 'Content-Type: application/json' \
+    --data '{
+        "urls": ["https://docs.eda.prisme.ai/en/workspaces/"]
+    }'
+    ```
+    
+    Verify that:
+    - The `metrics.indexed_pages` field is greater than 0
+    - The `metrics.pending_requests` field indicates active crawling
+    - The `crawl_history` section shows pages that have been processed
+  </Step>
+  
+  <Step title="Test Search Functionality">
+    Perform a test search query to verify indexing and search:
+    
+    ```bash
+    curl --location 'http://localhost:8000/search/test/test' \
+    --header 'Content-Type: application/json' \
+    --data '{
+        "query": "workspace"
+    }'
+    ```
+    
+    The response should include a `results` array containing pages from the crawled website that match your search term. Each result should include relevance information and content snippets.
+  </Step>
+</Steps>
+
+If all tests pass, congratulations! Your Crawler and SearchEngine microservices are up and running correctly.
+
+## Features and Capabilities
+
+<Accordion title="Web Crawling">
+  The Crawler service provides advanced web content discovery and extraction:
+  
+  - **Configurable crawl depth**: Control how many links deep the crawler will explore
+  - **URL filtering**: Include or exclude specific URL patterns
+  - **Rate limiting**: Respect website terms of service with configurable crawl rates
+  - **Content extraction**: Parse and clean HTML to extract meaningful content
+  - **Metadata extraction**: Capture titles, descriptions, and other metadata
+  - **Scheduled crawls**: Set up periodic recrawling to keep content fresh
+  - **Robots.txt compliance**: Respect website crawling policies
+</Accordion>
+
+<Accordion title="Search Capabilities">
+  The SearchEngine service delivers powerful search functionality:
+  
+  - **Full-text search**: Find content across all indexed documents
+  - **Relevance ranking**: Surface the most relevant content first
+  - **Content highlighting**: Highlight matching terms in search results
+  - **Faceted search**: Filter results by metadata fields
+  - **Synonym handling**: Find content using related terms
+  - **Language support**: Index and search content in multiple languages
+  - **Query suggestions**: Support for "did you mean" functionality
+  - **Result snippets**: Show context around matching terms
+</Accordion>
+
+## Integration with Prisme.ai
+
+The Crawler and SearchEngine microservices integrate with other Prisme.ai components:
+
+<CardGroup cols={2}>
+  <Card title="AI Knowledge" icon="brain">
+    - Create knowledge bases from crawled web content
+    - Enrich existing knowledge bases with web information
+    - Use search capabilities for better information retrieval
+  </Card>
+  <Card title="AI Builder" icon="toolbox">
+    - Build custom search interfaces using search API
+    - Integrate search results into workflows
+    - Trigger crawls programmatically in automations
+  </Card>
+  <Card title="AI Store" icon="store">
+    - Power research agents with web crawling capabilities
+    - Create domain-specific search tools
+    - Develop content discovery applications
+  </Card>
+  <Card title="Custom Code" icon="code">
+    - Extend crawling behavior with custom functions
+    - Process search results with specialized logic
+    - Create advanced search and discovery experiences
+  </Card>
+</CardGroup>
+
+## Advanced Configuration
+
+<Accordion title="Crawl Configuration Options">
+  When creating a searchengine, you can specify advanced crawl options:
+  
+  ```json
+  {
+    "websites": ["https://example.com"],
+    "options": {
+      "maxDepth": 3,
+      "includePatterns": ["*/blog/*", "*/products/*"],
+      "excludePatterns": ["*/admin/*", "*/login/*"],
+      "respectRobotsTxt": true,
+      "crawlDelay": 1000,
+      "userAgent": "Prisme.ai Crawler",
+      "maxPagesPerSite": 1000
+    }
+  }
+  ```
+  
+  These options allow you to fine-tune crawling behavior for different use cases.
+</Accordion>
+
+<Accordion title="ElasticSearch Index Management">
+  The services automatically create and manage ElasticSearch indices. For advanced use cases, you can:
+  
+  - Configure index settings like sharding and replication
+  - Set up index lifecycle policies for managing index growth
+  - Implement custom analyzers for specialized search needs
+  - Configure cross-cluster search for large-scale deployments
+  
+  Consult the ElasticSearch documentation for more information on these advanced configurations.
+</Accordion>
+
+<Accordion title="Performance Tuning">
+  To optimize performance for your specific needs:
+  
+  - Adjust `MAX_CONTENT_LEN` to balance comprehensiveness with resource usage
+  - Configure crawler concurrency settings for faster crawling
+  - Implement ElasticSearch performance optimizations
+  - Consider Redis caching strategies for frequent searches
+  - Use horizontal scaling for high-volume crawling and search scenarios
+</Accordion>
+
+## Troubleshooting
+
+<Accordion title="Crawling Issues">
+  **Symptom**: Web pages are not being crawled or indexed
+  
+  **Possible causes**:
+  - Network connectivity issues
+  - Website robots.txt restrictions
+  - Rate limiting by target websites
+  - URL pattern configuration excluding relevant pages
+  
+  **Resolution steps**:
+  1. Check crawler logs for specific error messages
+  2. Verify network connectivity to target websites
+  3. Review website robots.txt for restrictions
+  4. Adjust crawl rate settings to avoid being blocked
+  5. Check URL pattern configurations
+</Accordion>
+
+<Accordion title="Search Problems">
+  **Symptom**: Search results are missing or irrelevant
+  
+  **Possible causes**:
+  - Content not properly indexed
+  - ElasticSearch configuration issues
+  - Query formatting problems
+  - Content exceeding maximum length limits
+  
+  **Resolution steps**:
+  1. Verify content was successfully crawled and indexed
+  2. Check ElasticSearch connectivity and health
+  3. Review search query format and parameters
+  4. Check if content exceeds `MAX_CONTENT_LEN` setting
+  5. Test simple queries to validate basic functionality
+</Accordion>
+
+<Accordion title="Performance Issues">
+  **Symptom**: Slow crawling or search response times
+  
+  **Possible causes**:
+  - Insufficient resources allocated
+  - ElasticSearch performance problems
+  - Redis bottlenecks
+  - Large crawl queues or index sizes
+  
+  **Resolution steps**:
+  1. Monitor resource usage during operations
+  2. Check ElasticSearch performance metrics
+  3. Verify Redis isn't running out of memory
+  4. Consider scaling resources horizontally or vertically
+  5. Implement more targeted crawling strategies
+</Accordion>
+
+## Security Considerations
+
+When deploying and using the Crawler and SearchEngine microservices, keep these security considerations in mind:
+
+<CardGroup cols={2}>
+  <Card title="Network Security" icon="shield-halved">
+    - Implement appropriate network policies
+    - Consider using a dedicated proxy for outbound crawling
+    - Monitor for unusual traffic patterns
+  </Card>
+  <Card title="Content Security" icon="file-shield">
+    - Be mindful of crawling and indexing sensitive content
+    - Implement URL patterns to exclude sensitive areas
+    - Consider content filtering before indexing
+  </Card>
+  <Card title="Authentication" icon="key">
+    - Secure ElasticSearch and Redis with strong authentication
+    - Implement API access controls for search endpoints
+    - Use TLS for all service communications
+  </Card>
+  <Card title="Compliance" icon="gavel">
+    - Respect website terms of service when crawling
+    - Consider data retention policies for crawled content
+    - Be aware of copyright implications of content indexing
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+Now that you have the Crawler and SearchEngine microservices deployed, consider these next steps:
+
+<CardGroup cols={2}>
+  <Card title="Create Knowledge Bases" icon="brain" href="/products/ai-knowledge/knowledge-bases">
+    Use crawled content to build comprehensive knowledge bases for your AI agents
+  </Card>
+  <Card title="Build Search Interfaces" icon="magnifying-glass" href="/products/ai-builder/blocks">
+    Develop custom search experiences using the search API
+  </Card>
+  <Card title="Configure Scheduled Crawls" icon="calendar" href="/connect-data/marketplace/crawler">
+    Set up regular crawling to keep your knowledge bases current
+  </Card>
+  <Card title="Integrate with AI Agents" icon="robot" href="/create-agents/tool-agents/tool-integration">
+    Enable AI agents to use search capabilities for enhanced responses
+  </Card>
+</CardGroup>
+
+For any issues or questions during the deployment process, contact [support@prisme.ai](mailto:support@prisme.ai) for assistance.

@@ -1,0 +1,386 @@
+---
+title: 'Functions Microservice'
+description: 'How to deploy, configure, and use the Prisme.ai Functions Microservice for running custom NodeJS and Python code in your applications'
+---
+
+The Functions Microservice enables you to execute custom code (NodeJS or Python) within your Prisme.ai applications. This powerful capability allows you to extend the platform with custom logic, integrate with external systems, and implement complex business processes.
+
+<Frame>
+  <img src="/images/functions-microservice-overview.png" alt="Functions Microservice Architecture" />
+</Frame>
+
+## Overview
+
+The Functions Microservice provides a secure, isolated environment for running custom code within the Prisme.ai platform. It supports:
+
+- **NodeJS Functions**: JavaScript code execution with access to selected built-in modules
+- **Python Functions**: Python code execution with standard library access
+- **Shared Execution Context**: Functions within the same workspace can call each other
+- **Memory Management**: Configurable resource limits and garbage collection
+- **Dependency Management**: Automatic installation of required packages
+
+<Note>
+  The Functions Microservice is designed with security in mind, running code in isolated environments with configurable resource limits to prevent abuse or resource exhaustion.
+</Note>
+
+## Installation Prerequisites
+
+Before deploying the Functions Microservice, ensure you have:
+
+<CardGroup cols={2}>
+  <Card title="NPM Registry Access" icon="npm">
+    The service must have access to a npm registry for installing JavaScript dependencies. You can use the `NPM_CONFIG_REGISTRY` environment variable to specify your own registry.
+  </Card>
+  <Card title="Storage Volume" icon="hard-drive">
+    The service requires a volume for storing code, dependencies, and execution data. We recommend using volumes with high I/O performance as they may experience heavy usage when installing dependencies.
+  </Card>
+</CardGroup>
+
+## Configuration
+
+### Environment Variables
+
+Configure the Functions Microservice with the following environment variables:
+
+<Accordion title="Python Configuration">
+  | Variable Name | Description | Default Value |
+  |---------------|-------------|---------------|
+  | `PYTHON_FUNCTIONS_RUN_TIMEOUT` | Python functions execution timeout in milliseconds | `20000` |
+  | `PYTHON_API_URL` | Python API URL | `http://localhost:8000` |
+</Accordion>
+
+<Accordion title="NodeJS Configuration">
+  | Variable Name | Description | Default Value |
+  |---------------|-------------|---------------|
+  | `PORT` | HTTP port for the service | `4000` |
+  | `FUNCTIONS_STORAGE_FILESYSTEM_DIRPATH` | Directory path for function storage | `data/functions/` |
+  | `FUNCTIONS_RUN_TIMEOUT` | Functions execution timeout in milliseconds | `20000` |
+  | `FUNCTIONS_WORKERS_MAX_LRU` | Maximum number of function workers kept in memory | `500` |
+  | `NODE_BUILTIN_MODULES` | Allowed Node.js built-in modules | `http, https, url, util, zlib, dns, stream, buffer, crypto` |
+  | `NPM_CONFIG_REGISTRY` | NPM registry URL | `https://registry.npmjs.org/` |
+  | `NODE_WORKER_MAX_OLD_GENERATION_SIZE_MB` | NodeJS function worker [maxOldGenerationSizeMb](https://nodejs.org/api/worker_threads.html#workerresourcelimits) | `100` |
+  | `INACTIVE_NODE_WORKER_DELETION_TIMEOUT` | Inactive period in seconds after which node workers are automatically terminated | `3600` |
+  | `UPDATE_SCRIPTS_ON_STARTUP` | If set to "yes" or "true", ensures function scripts are in-sync with corresponding workspace.yaml files on startup | `no` |
+  | `REQUEST_MAX_SIZE` | Maximum request body size (format from bodyParser.json) | `1mb` |
+</Accordion>
+
+### Resource Considerations
+
+When deploying the Functions Microservice, consider the following resource recommendations:
+
+<CardGroup cols={2}>
+  <Card title="Memory Allocation" icon="memory">
+    Allocate sufficient memory based on your expected workload:
+    - Minimum: 1GB
+    - Recommended: 2GB or more for production environments
+    - Consider additional memory if functions will process large datasets
+  </Card>
+  <Card title="CPU Resources" icon="microchip">
+    Ensure adequate CPU resources:
+    - Minimum: 0.5 vCPU
+    - Recommended: 1 vCPU or more for production environments
+    - Functions with complex calculations may benefit from additional CPU
+  </Card>
+  <Card title="Disk Space" icon="hard-drive">
+    Plan for storage requirements:
+    - Minimum: 1GB
+    - Recommended: 5GB or more for environments with many dependencies
+    - Consider storage needs for dependency caching and function code
+  </Card>
+  <Card title="Network Configuration" icon="network-wired">
+    Ensure proper network setup:
+    - Accessible by other microservices (especially API Gateway)
+    - Access to required external resources (NPM registry, etc.)
+    - Consider network policies for security
+  </Card>
+</CardGroup>
+
+## Microservice Testing
+
+After deploying the Functions Microservice, verify its operation with these simple tests:
+
+<Steps>
+  <Step title="Create a Test Function">
+    Create a function workspace named `test` containing a `hello` function:
+    
+    ```bash
+    curl --location 'http://localhost:4000/v2/functions/test' \
+    --header 'Content-Type: application/json' \
+    --data '{
+        "functions": {
+            "hello": {
+                "code": "return \"Hello \" + name;",
+                "parameters": {
+                    "name": {
+                        "type": "string"
+                    }
+                }
+            }
+        }
+    }'
+    ```
+    
+    If successful, the same body should be returned in the response.
+  </Step>
+  
+  <Step title="Execute the Function">
+    Run the function with a test parameter:
+    
+    ```bash
+    curl --location 'http://localhost:4000/v2/functions/test/run/hello' \
+    --header 'Content-Type: application/json' \
+    --data '{
+        "parameters": {
+            "name": "world"
+        }
+    }'
+    ```
+    
+    If successful, you should receive a response like:
+    
+    ```json
+    {
+        "result": "Hello world",
+        "logs": [],
+        "duration": 38
+    }
+    ```
+  </Step>
+  
+  <Step title="Verify Resource Limits">
+    Test that resource limits are enforced by creating a function that attempts to use excessive resources:
+    
+    ```bash
+    curl --location 'http://localhost:4000/v2/functions/test' \
+    --header 'Content-Type: application/json' \
+    --data '{
+        "functions": {
+            "resourceTest": {
+                "code": "const array = []; while(true) { array.push(new Array(1000000).fill(\"test\")); }",
+                "parameters": {}
+            }
+        }
+    }'
+    ```
+    
+    When executing this function, it should terminate due to resource limits or timeout:
+    
+    ```bash
+    curl --location 'http://localhost:4000/v2/functions/test/run/resourceTest' \
+    --header 'Content-Type: application/json' \
+    --data '{
+        "parameters": {}
+    }'
+    ```
+  </Step>
+</Steps>
+
+If all tests pass, congratulations! Your Functions Microservice is up and running correctly.
+
+## Advanced Features
+
+The Functions Microservice includes several advanced capabilities that enhance its flexibility and power:
+
+<Accordion title="Asynchronous Functions">
+  All functions are executed as asynchronous operations, even if they don't explicitly use async calls. This means:
+  
+  - Every function is treated as if it had the `async` keyword
+  - When calling functions from the same workspace, you must use the `await` keyword
+  - Results are always returned as promises
+  
+  **Example:**
+  ```javascript
+  // This simple function is still executed asynchronously
+  function simpleCalc() {
+    return 42;
+  }
+  
+  // When calling from another function, use await
+  async function useCalc() {
+    const result = await simpleCalc();
+    return `The answer is ${result}`;
+  }
+  ```
+</Accordion>
+
+<Accordion title="Shared Execution Context">
+  Functions within the same workspace are executed within a generated JavaScript file that combines all functions. This allows:
+  
+  - Functions to call each other directly
+  - Shared utility functions across the workspace
+  - Code reuse and modularization
+  
+  **Example:**
+  
+  **funcA:**
+  ```javascript
+  return "world";
+  ```
+  
+  **funcB:**
+  ```javascript
+  return "hello " + (await funcA());
+  ```
+  
+  When `funcB` is called, it will internally call `funcA` and return "hello world".
+</Accordion>
+
+<Accordion title="Shared Memory Cache">
+  Functions from the same workspace are executed within the same worker NodeJS and VM2 instance. This enables memory sharing using a special `cache` variable:
+  
+  - The `cache` object persists between function executions
+  - Use it to store and retrieve values across multiple calls
+  - Useful for maintaining state or caching expensive operations
+  
+  **Example:**
+  
+  **funcA:**
+  ```javascript
+  let counter = cache['counter']
+  
+  counter = (counter || 0) + 1
+  
+  cache['counter'] = counter;
+  
+  return counter;
+  ```
+  
+  **funcB:**
+  ```javascript
+  let counter = cache['counter'];
+  return "Counter: " + counter;
+  ```
+  
+  Each call to `funcA` will increment the counter, and `funcB` can access the current value.
+</Accordion>
+
+<Accordion title="Dependency Management">
+  Functions can use external dependencies by specifying them in the function definition:
+  
+  - NodeJS functions can use NPM packages
+  - Python functions can use PyPI packages
+  - Dependencies are automatically installed when the function is created or updated
+  
+  **Example NodeJS function with dependencies:**
+  ```json
+  {
+    "functions": {
+      "processData": {
+        "code": "const _ = require('lodash'); return _.groupBy(data, 'category');",
+        "parameters": {
+          "data": {
+            "type": "array"
+          }
+        },
+        "dependencies": {
+          "lodash": "^4.17.21"
+        }
+      }
+    }
+  }
+  ```
+</Accordion>
+
+## Integration with Prisme.ai
+
+The Functions Microservice integrates with other Prisme.ai components:
+
+<CardGroup cols={2}>
+  <Card title="AI Builder" icon="toolbox">
+    Within AI Builder, you can create custom automations that execute functions, allowing you to extend workflows with custom logic.
+  </Card>
+  <Card title="AI Knowledge" icon="brain">
+    Custom functions can be used as tools in AI Knowledge agents, enabling them to perform specialized operations like data transformation or external API calls.
+  </Card>
+  <Card title="AI Store" icon="store">
+    Functions can power features in agents published to the AI Store, adding custom capabilities to shared agents.
+  </Card>
+  <Card title="Custom Code App" icon="code">
+    The Custom Code app provides a user-friendly interface for managing, testing, and monitoring functions.
+  </Card>
+</CardGroup>
+
+## Security Considerations
+
+When deploying and using the Functions Microservice, keep these security considerations in mind:
+
+<CardGroup cols={2}>
+  <Card title="Code Isolation" icon="shield">
+    Functions run in isolated environments to prevent interference between different workspaces and functions.
+  </Card>
+  <Card title="Resource Limits" icon="gauge">
+    Configure appropriate resource limits to prevent denial-of-service attacks or resource exhaustion.
+  </Card>
+  <Card title="Access Control" icon="lock">
+    Implement proper authentication and authorization to control who can create and execute functions.
+  </Card>
+  <Card title="Dependency Scanning" icon="magnifying-glass">
+    Consider scanning dependencies for vulnerabilities before allowing their installation.
+  </Card>
+</CardGroup>
+
+<Warning>
+  Function code is executed in a restricted environment, but it still has access to specified Node.js built-in modules and network resources. Be careful when allowing users to create functions, and consider implementing additional security controls for sensitive environments.
+</Warning>
+
+## Troubleshooting
+
+<Accordion title="Function Creation Fails">
+  **Possible causes:**
+  - Invalid function code syntax
+  - Unavailable or incompatible dependencies
+  - Insufficient disk space for dependencies
+  - Network issues preventing access to the NPM registry
+  
+  **Resolution steps:**
+  1. Check the service logs for specific error messages
+  2. Verify NPM registry access from within the container
+  3. Ensure sufficient disk space in the function storage volume
+  4. Validate function syntax before submission
+</Accordion>
+
+<Accordion title="Function Execution Timeouts">
+  **Possible causes:**
+  - Function code contains infinite loops or excessive processing
+  - Timeout setting is too low for the operation
+  - External service calls that take too long
+  
+  **Resolution steps:**
+  1. Review function code for inefficiencies or infinite loops
+  2. Adjust the `FUNCTIONS_RUN_TIMEOUT` or `PYTHON_FUNCTIONS_RUN_TIMEOUT` setting
+  3. Implement better error handling for external service calls
+  4. Consider breaking complex operations into smaller, chainable functions
+</Accordion>
+
+<Accordion title="Memory-Related Errors">
+  **Possible causes:**
+  - Functions attempting to use more memory than allowed
+  - Memory leaks in long-running functions
+  - Too many function workers in memory
+  
+  **Resolution steps:**
+  1. Adjust `NODE_WORKER_MAX_OLD_GENERATION_SIZE_MB` for larger memory requirements
+  2. Reduce `FUNCTIONS_WORKERS_MAX_LRU` if overall memory usage is too high
+  3. Optimize function code to use less memory
+  4. Check for and fix memory leaks in function code
+</Accordion>
+
+## Next Steps
+
+Now that you have the Functions Microservice up and running, here are some next steps to consider:
+
+<CardGroup cols={2}>
+  <Card title="Set Up Web Crawling" icon="spider-web" href="elf-hosting/entreprise/crawler-searchengine">
+    Configure crawling & search services
+  </Card>
+  <Card title="Configure LLM Access" icon="microchip-ai" href="self-hosting/entreprise/local-llm">
+    Set up access to various local language models
+  </Card>
+    <Card title="Build Workflow Automations" icon="diagram-project" href="/products/ai-builder/automations">
+    Incorporate functions into complex workflow automations
+  </Card>
+    <Card title="Integrate with Agent" icon="robot" href="/products/ai-knowledge/tools-integration">
+    Use functions as custom tools in your agents
+  </Card>
+  
+</CardGroup>
