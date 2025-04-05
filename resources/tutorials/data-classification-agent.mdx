@@ -1,0 +1,339 @@
+---
+title: 'Building a Data Classification Agent'
+description: 'Learn how to create an AI-powered document classification system with Prisme.ai'
+---
+
+
+This tutorial guides you through building an intelligent document classification system using Prisme.ai. You'll create a solution that automatically categorizes uploaded documents into types such as invoices, CVs, quotes, contracts, and more using the power of generative AI.
+
+## What You'll Build
+
+A complete document management system with:
+- A user-friendly document upload interface
+- Automatic AI-based document classification
+- A searchable and filterable document repository
+- Document management capabilities (view, categorize, delete)
+
+<Note>
+This solution integrates AI Knowledge for classification with Collection for document storage, creating a powerful yet simple document management system.
+</Note>
+
+## Prerequisites
+
+Before starting this tutorial, make sure you have:
+
+- An active Prisme.ai account
+- The Knowledge Client app installed in your workspace
+- The Collection app installed in your workspace
+- Basic familiarity with Prisme.ai Builder
+
+## Step 1: Creating Your Document Management Workspace
+
+Let's start by setting up a dedicated workspace for our document management system:
+
+<Steps>
+  <Step title="Access AI Builder">
+    Log in to your Prisme.ai account and navigate to the AI Builder product
+  </Step>
+  <Step title="Create a New Workspace">
+    Click the "Create Workspace" button to start a new project
+  </Step>
+  <Step title="Configure Workspace Settings">
+    Name your workspace "Document Management System" (or a name of your choice) and configure any additional settings as needed
+    
+    <Frame>
+      <img src="/images/document-classification-workspace.png" alt="Creating a Document Management Workspace" />
+    </Frame>
+  </Step>
+</Steps>
+
+## Step 2: Building the Document Upload Interface
+
+Now, let's create a user-friendly interface for document uploads and management:
+
+<Steps>
+  <Step title="Create a New Page">
+    In your workspace, navigate to the Pages section and click "Create Page"
+  </Step>
+  <Step title="Configure Page Properties">
+    - Name your page "Document Upload Form"
+    - Set the slug to "upload-docs" (this will be used in the URL)
+  </Step>
+  <Step title="Add a Form Block">
+    Add a Form block to your page for document uploads with the following configuration:
+    
+    ```yaml
+    slug: upload-docs
+    name: Document Upload Form
+    blocks:
+      - slug: Form
+        schema:
+          type: object
+          properties:
+            attachment:
+              type: string
+              ui:widget: upload
+              title: Document Upload
+              description: Attach your document here.
+              ui:options:
+                upload:
+                  accept: .pdf
+            description:
+              type: textarea
+              title: Document Description
+              placeholder: Describe the document here.
+        onSubmit: save
+    ```
+    
+    <Frame>
+      <img src="/images/form-configuration.png" alt="Configuring the Document Upload Form" />
+    </Frame>
+  </Step>
+  <Step title="Add a Data Table Block">
+    Add a DataTable block to display uploaded documents and their classifications:
+    
+    ```yaml
+    - slug: DataTable
+      columns:
+        - label: ID
+          key: id
+          type: string
+        - label: Description
+          key: description
+          type: string
+        - label: Category
+          key: category
+          type: string
+        - label: Actions
+          actions:
+            - label: Delete
+              action:
+                type: event
+                value: deleteData
+                payload:
+                  id: ${_id}
+      config:
+        customProps:
+          loading: true
+        title:
+          fr: Uploaded Documents
+          en: Uploaded Documents
+      updateOn: updateData
+      onInit: initData
+      data:
+        - {}
+    ```
+  </Step>
+  <Step title="Save Your Page">
+    Save your page configuration. You should now have a form for uploads and a table to display documents
+    
+    <Frame>
+      <img src="/images/document-management-interface.png" alt="Document Management Interface" />
+    </Frame>
+  </Step>
+</Steps>
+
+## Step 3: Creating the Document Classification Automation
+
+Next, let's set up the automation that will classify documents when they're uploaded:
+
+<Steps>
+  <Step title="Navigate to Automations">
+    In your workspace, go to the Automations section
+  </Step>
+  <Step title="Create Document Classification Automation">
+    Create a new automation named "Manage Form" with the following configuration:
+    
+    ```yaml
+    slug: manage-form
+    name: Manage Form
+    do:
+      - Knowledge Client.chat-completion:
+          messages:
+            - role: system
+              content: 'Classify the document within these categories: invoice, CV, quote, contract, others. Provide your categorization based on the content.'
+            - role: user
+              content: '{{payload.description}}'
+          output: data
+      - conditions:
+          '{{data.response}}':
+            - set:
+                name: payload.category
+                value: '{{data.response}}'
+                type: merge
+          default:
+            - emit:
+                target:
+                  currentSocket: true
+                options:
+                  persist: true
+                event: error
+                payload: '{{data}}'
+            - set:
+                name: payload.error
+                value: '{{data.error.message}}'
+                type: merge
+      - Collection.insert:
+          data: '{{payload}}'
+      - emit:
+          target:
+            currentSocket: true
+          options:
+            persist: false
+          event: initData
+    when:
+      events:
+        - save
+    output: '{{payload}}'
+    ```
+    
+    <Frame>
+      <img src="/images/classification-automation.png" alt="Document Classification Automation" />
+    </Frame>
+  </Step>
+  <Step title="Create Data Retrieval Automation">
+    Create another automation named "Get Data" to fetch and display documents:
+    
+    ```yaml
+    slug: get-data
+    name: Get Data
+    do:
+      - Collection.find:
+          query: {}
+          output: data      
+          sort:
+            createdAt: -1        
+      - emit:
+          event: updateData
+          payload:
+            data: '{{data}}'
+            customProps:
+              loading: false  
+    when:
+      events:
+        - initData   
+    output: ''
+    ```
+  </Step>
+  <Step title="Create Document Deletion Automation">
+    Create a final automation named "Delete Data" to handle document removal:
+    
+    ```yaml
+    slug: delete-data
+    name: Delete Data
+    do:
+      - conditions:
+          '!{{payload.data._id}}':
+            - break: {}            
+          default: []
+      - Collection.deleteOne:
+          query:
+            _id: '{{payload.data._id}}'
+      - emit:
+          target:
+            currentSocket: true
+          options:
+            persist: true
+          event: initData   
+    when:
+      events:
+        - deleteData
+    output: ''
+    ```
+  </Step>
+  <Step title="Deploy Your Automations">
+    Save all automations and make sure they're properly configured to work together
+  </Step>
+</Steps>
+
+## Step 4: Testing and Using Your Document Classification System
+
+Now it's time to test your document management system:
+
+<Steps>
+  <Step title="Access Your Document Upload Page">
+    Navigate to your document upload page using the URL format: `workspace-slug.pages.host/lang/upload-docs`
+  </Step>
+  <Step title="Upload a Test Document">
+    - Upload a sample document (PDF) through the form
+    - Add a description that gives context about the document's content
+    - Submit the form
+  </Step>
+  <Step title="Verify Classification">
+    After a moment, the document should appear in the data table with its AI-determined classification
+    
+    <Frame>
+      <img src="/images/document-classification-result.png" alt="Document Classification Result" />
+    </Frame>
+  </Step>
+  <Step title="Test Document Management">
+    Try deleting a document to ensure the delete functionality works correctly
+  </Step>
+</Steps>
+
+## Step 5: Version Control and Deployment
+
+To finalize your document classification system:
+
+<Steps>
+  <Step title="Push Your Changes">
+    Use the "Push" button in your workspace to save the current state of your project
+    
+    <Frame>
+      <img src="/images/push-changes.png" alt="Push Changes" />
+    </Frame>
+  </Step>
+  <Step title="Create a Version">
+    Create a version of your workspace for easy rollback if needed in the future
+  </Step>
+  <Step title="Configure Access Controls">
+    Set up appropriate Role-Based Access Control (RBAC) to determine who can use your document management system
+  </Step>
+</Steps>
+
+## Monitoring and Improving Your System
+
+After deployment, regularly check the system's performance:
+
+<Steps>
+  <Step title="Monitor Activity Logs">
+    Review the activity logs to track document uploads and classifications
+    
+    <Frame>
+      <img src="/images/activity-monitoring.png" alt="Activity Monitoring" />
+    </Frame>
+  </Step>
+  <Step title="Review Classification Accuracy">
+    Periodically check if documents are being classified correctly and refine your system as needed
+  </Step>
+  <Step title="Optimize for Performance">
+    Make adjustments to improve speed and accuracy as your document volume grows
+  </Step>
+</Steps>
+
+## Extending Your Document Classification System
+
+Your base system is powerful, but consider these enhancements:
+
+- **Advanced Classification**: Train a more specialized model for your specific document types
+- **Content Extraction**: Extract key information from documents based on their category
+- **Automated Workflows**: Trigger specific actions based on document type (e.g., route invoices to accounting)
+- **Search Functionality**: Add search capabilities to find documents by content or metadata
+- **Integration**: Connect with other systems like CRM or ERP platforms
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Build a Webhook Handler" icon="webhook" href="/resources/tutorials/webhook-builder">
+    Learn how to create webhook integrations for your document management system
+  </Card>
+  <Card title="Explore AI Contact Routing" icon="phone" href="/resources/tutorials/ai-contact-routing">
+    Discover how to route documents to the right department automatically
+  </Card>
+  <Card title="Create a RAG Agent" icon="database" href="/resources/tutorials/no-code-rag-agent">
+    Build an agent that can answer questions about your document repository
+  </Card>
+  <Card title="Integrate with Websites" icon="globe" href="/resources/tutorials/website-to-rag-agent">
+    Connect your document system to web content for enhanced capabilities
+  </Card>
+</CardGroup>
