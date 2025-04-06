@@ -1,0 +1,447 @@
+---
+title: 'Rate Limits'
+description: 'Understanding and working with Prisme.ai API rate limits'
+---
+
+<Frame>
+  <img src="/images/api-rate-limits.png" alt="Prisme.ai API Rate Limits" />
+</Frame>
+
+Prisme.ai implements rate limiting to ensure platform stability and fair usage across all users. This page explains the rate limits in place, how to monitor your usage, and best practices for working within these limits.
+
+## Rate Limit Overview
+
+<Tabs>
+  <Tab title="API Endpoints">
+    Most API endpoints have rate limits applied based on:
+    
+    - **User or API Key**: Limits are tracked per authenticated user or API key
+    - **Endpoint Category**: Different endpoint categories have different limits
+    - **Workspace**: Some limits are applied per workspace
+    
+    <CardGroup cols={3}>
+      <Card title="Standard APIs" icon="code">
+        Most API endpoints: 100 requests per minute
+      </Card>
+      <Card title="Write Operations" icon="pen-to-square">
+        Create/update operations: 60 requests per minute
+      </Card>
+      <Card title="Search/List" icon="magnifying-glass">
+        Search and list operations: 30 requests per minute
+      </Card>
+    </CardGroup>
+    
+    <Info>
+      These are general guidelines. Specific endpoints may have custom rate limits based on their resource intensity.
+    </Info>
+  </Tab>
+  
+  <Tab title="Runtime Automations">
+    While executing workspace automations, the Runtime enforces four distinct rate limits:
+    
+    <CardGroup cols={2}>
+      <Card title="Automations Execution" icon="play">
+        - Default: 100 automations per second
+        - Burst: 400 automations
+        - Environment Variable: `RATE_LIMIT_AUTOMATIONS`
+        - Workspace Secret: `prismeai_ratelimit_automations`
+      </Card>
+      <Card title="Event Emits" icon="bell">
+        - Default: 30 emits per second
+        - Burst: 100 emits
+        - Environment Variable: `RATE_LIMIT_EMITS`
+        - Workspace Secret: `prismeai_ratelimit_emits`
+      </Card>
+      <Card title="HTTP Fetches" icon="globe">
+        - Default: 50 fetches per second
+        - Burst: 200 fetches
+        - Environment Variable: `RATE_LIMIT_FETCHS`
+        - Workspace Secret: `prismeai_ratelimit_fetchs`
+      </Card>
+      <Card title="Repeat Loops" icon="repeat">
+        - Default: 1000 iterations per second
+        - Burst: 4000 iterations
+        - Environment Variable: `RATE_LIMIT_REPEATS`
+        - Workspace Secret: `prismeai_ratelimit_repeats`
+      </Card>
+    </CardGroup>
+    
+    <Warning>
+      These rate limits are applied per workspace and per Runtime instance. They are not shared across instances in a cluster deployment.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Understanding Runtime Rate Limits
+
+<Accordion title="Rate Limit Scoping">
+  Each workspace has its own rate limits for automations, emits, fetches, and repeat loops. These rate limits are local to each Runtime instance and not shared between multiple Runtime instances.
+  
+  For example, with 2 Runtime instances and a workspace that has a 100 automation executions/second rate limit, the workspace might reach 200 automations/second across both instances. To fully utilize this capacity, automations should distribute workload using events.
+</Accordion>
+
+<Accordion title="Burst Rate">
+  The burst rate represents the number of operations that can be executed during a momentary peak before being throttled to the normal rate.
+  
+  For example, an automation with a rate limit of 100/second and burst of 400 can execute 400 operations in a burst, after which it will be throttled to 100 operations per second.
+</Accordion>
+
+<Accordion title="Rate Limit Distribution">
+  Rate limits are applied at different scopes:
+  
+  ```
+  Sequential execution on a single instance:
+  ```
+  
+  ```yaml
+  slug: thisWillBeThrottled
+  do:
+    - repeat:
+        on: 2000
+        do:
+          - callSomeOtherAutomation: {}
+  ```
+  
+  This automation will be throttled to the single-instance limit because all operations run on the same instance.
+  
+  ```
+  Distributed execution across instances:
+  ```
+  
+  ```yaml
+  do:
+    - repeat:
+        on: 2000
+        do:
+          - emit:
+              event: triggerSomeOtherAutomation
+              payload: {}
+  
+  ---
+  # The second automation:  
+  
+  slug: callSomeOtherAutomation
+  when:
+    events:
+      - triggerSomeOtherAutomation
+  do: []
+  ```
+  
+  This approach can leverage multiple instances since events can be processed by any available instance in the cluster.
+</Accordion>
+
+## Rate Limit Headers
+
+When making API requests, rate limit information is returned in the response headers:
+
+<CardGroup cols={2}>
+  <Card title="X-RateLimit-Limit" icon="gauge">
+    The maximum number of requests allowed in the current time window
+  </Card>
+  <Card title="X-RateLimit-Remaining" icon="calculator">
+    The number of requests remaining in the current time window
+  </Card>
+  <Card title="X-RateLimit-Reset" icon="clock">
+    The time when the current rate limit window resets, in Unix epoch seconds
+  </Card>
+  <Card title="Retry-After" icon="hourglass">
+    Present only when rate limited, indicates seconds to wait before retrying
+  </Card>
+</CardGroup>
+
+## Rate Limit Response
+
+When you exceed a rate limit, the API returns a 429 "Too Many Requests" response with details about the limit:
+
+```json
+{
+  "error": {
+    "code": "rate_limit_exceeded",
+    "message": "Rate limit exceeded. Please retry after 30 seconds.",
+    "details": {
+      "limit": 100,
+      "period": "60s",
+      "retryAfter": 30
+    },
+    "requestId": "req-1234567890abcdef"
+  }
+}
+```
+
+For Runtime automations, a `payload.throttled` field in the `runtime.automations.executed` event indicates the throttling duration.
+
+## Configuration Options
+
+<Tabs>
+  <Tab title="Global Configuration">
+    Rate limits can be configured globally using environment variables:
+    
+    | Environment Variable | Description | Default Value |
+    |----------------------|-------------|---------------|
+    | `RATE_LIMIT_AUTOMATIONS` | Automations per second | 100 |
+    | `RATE_LIMIT_EMITS` | Event emits per second | 30 |
+    | `RATE_LIMIT_FETCHS` | HTTP fetches per second | 50 |
+    | `RATE_LIMIT_REPEATS` | Repeat iterations per second | 1000 |
+    | `RATE_LIMIT_AUTOMATIONS_BURST` | Automations burst limit | 400 |
+    | `RATE_LIMIT_EMITS_BURST` | Event emits burst limit | 100 |
+    | `RATE_LIMIT_FETCHS_BURST` | HTTP fetches burst limit | 200 |
+    | `RATE_LIMIT_REPEATS_BURST` | Repeat iterations burst limit | 4000 |
+    | `RATE_LIMIT_DISABLED` | Disable all rate limits | false |
+    
+    <Warning>
+      Setting any of these environment variables to 0 disables the corresponding rate limit for all workspaces.
+    </Warning>
+  </Tab>
+  
+  <Tab title="Workspace Configuration">
+    Rate limits can be configured per workspace using workspace secrets:
+    
+    | Workspace Secret | Description | Default Value |
+    |------------------|-------------|---------------|
+    | `prismeai_ratelimit_automations` | Automations per second | 100 |
+    | `prismeai_ratelimit_emits` | Event emits per second | 30 |
+    | `prismeai_ratelimit_fetchs` | HTTP fetches per second | 50 |
+    | `prismeai_ratelimit_repeats` | Repeat iterations per second | 1000 |
+    | `prismeai_ratelimit_automations_burst` | Automations burst limit | 400 |
+    | `prismeai_ratelimit_emits_burst` | Event emits burst limit | 100 |
+    | `prismeai_ratelimit_fetchs_burst` | HTTP fetches burst limit | 200 |
+    | `prismeai_ratelimit_repeats_burst` | Repeat iterations burst limit | 4000 |
+    | `prismeai_ratelimit_disabled` | Disable rate limits for this workspace | false |
+    
+    <Info>
+      These workspace secrets are restricted to super admins. Regular workspace admins cannot modify these values.
+    </Info>
+  </Tab>
+</Tabs>
+
+## Best Practices
+
+<Steps>
+  <Step title="Monitor Your Usage">
+    Track your API usage and rate limit headers to understand your consumption patterns:
+    
+    ```javascript
+    function checkRateLimits(response) {
+      const limit = response.headers.get('X-RateLimit-Limit');
+      const remaining = response.headers.get('X-RateLimit-Remaining');
+      const reset = response.headers.get('X-RateLimit-Reset');
+      
+      console.log(`Rate limits: ${remaining}/${limit} remaining, reset at ${new Date(reset * 1000).toLocaleTimeString()}`);
+      
+      // Alert if approaching limit
+      if (remaining && parseInt(remaining, 10) < parseInt(limit, 10) * 0.1) {
+        console.warn('Approaching rate limit!');
+      }
+    }
+    ```
+  </Step>
+  
+  <Step title="Implement Backoff and Retry">
+    When rate limited, implement exponential backoff with jitter:
+    
+    ```javascript
+    async function apiCallWithRetry(url, options, maxRetries = 5) {
+      let retries = 0;
+      
+      while (retries < maxRetries) {
+        try {
+          const response = await fetch(url, options);
+          checkRateLimits(response);
+          
+          if (response.status === 429) {
+            // Get retry after header or default to exponential backoff
+            const retryAfter = response.headers.get('Retry-After');
+            let delay;
+            
+            if (retryAfter) {
+              delay = parseInt(retryAfter, 10) * 1000;
+            } else {
+              // Exponential backoff with jitter
+              delay = Math.pow(2, retries) * 1000 + Math.random() * 1000;
+            }
+            
+            console.log(`Rate limited. Retrying after ${delay}ms`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            retries++;
+            continue;
+          }
+          
+          return response;
+        } catch (error) {
+          retries++;
+          if (retries >= maxRetries) throw error;
+          
+          // Exponential backoff for network errors
+          const delay = Math.pow(2, retries) * 1000 + Math.random() * 1000;
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+    ```
+  </Step>
+  
+  <Step title="Optimize Automation Distribution">
+    Design automations to distribute work effectively:
+    
+    1. Use events to distribute processing across multiple Runtime instances
+    2. Batch operations where possible instead of making multiple single calls
+    3. Implement queuing for high-volume operations
+    4. Use parallel processing for independent operations
+    
+    ```yaml
+    # Example of batched processing
+    do:
+      - var: users
+        value: ${getUsers()}
+      - callAPI:
+          method: POST
+          url: /api/batch-update
+          body:
+            users: ${users}
+    
+    # Rather than:
+    do:
+      - var: users
+        value: ${getUsers()}
+      - repeat:
+          on: ${users}
+          do:
+            - callAPI:
+                method: POST
+                url: /api/update/${item.id}
+                body: ${item}
+    ```
+  </Step>
+  
+  <Step title="Cache Responses">
+    Implement caching for frequently accessed data:
+    
+    ```javascript
+    // Simple in-memory cache
+    const cache = new Map();
+    
+    async function fetchWithCache(url, options, ttlMs = 60000) {
+      const cacheKey = `${url}:${JSON.stringify(options)}`;
+      
+      if (cache.has(cacheKey)) {
+        const { data, expiry } = cache.get(cacheKey);
+        if (expiry > Date.now()) {
+          return data;
+        }
+        cache.delete(cacheKey);
+      }
+      
+      const response = await fetch(url, options);
+      const data = await response.json();
+      
+      cache.set(cacheKey, {
+        data,
+        expiry: Date.now() + ttlMs
+      });
+      
+      return data;
+    }
+    ```
+  </Step>
+</Steps>
+
+## Monitoring Throttling
+
+You can monitor throttling in Runtime automations through the following methods:
+
+<Tabs>
+  <Tab title="Automation Events">
+    Each automation execution generates a `runtime.automations.executed` event that includes throttling information:
+    
+    ```json
+    {
+      "event": "runtime.automations.executed",
+      "payload": {
+        "automation": "my-automation",
+        "workspace": "my-workspace",
+        "duration": 1250, // Total duration in milliseconds
+        "throttled": 1000, // Time spent being throttled in milliseconds
+        "status": "success"
+      }
+    }
+    ```
+    
+    If `throttled` is greater than zero, the automation was rate limited.
+  </Tab>
+  
+  <Tab title="Metrics Dashboard">
+    The Prisme.ai dashboard provides metrics on automation execution, including:
+    
+    - Execution counts
+    - Average duration
+    - Throttling rates
+    - Error rates
+    
+    <Frame>
+      <img src="/images/automation-metrics.png" alt="Automation Metrics Dashboard" />
+    </Frame>
+  </Tab>
+</Tabs>
+
+## Common Rate Limit Scenarios
+
+<CardGroup cols={2}>
+  <Card title="High-Volume Data Processing" icon="database">
+    When processing large datasets, use batching and distributed processing:
+    
+    - Split large datasets into manageable chunks
+    - Process chunks in parallel using events
+    - Implement checkpointing to resume interrupted processing
+    - Consider scheduled automations for very large datasets
+  </Card>
+  <Card title="User-Generated Events" icon="users">
+    For systems handling many user-triggered events:
+    
+    - Implement client-side throttling for UI interactions
+    - Queue events server-side for processing
+    - Consider debouncing or deduplicating similar events
+    - Prioritize critical user actions in your processing queue
+  </Card>
+  <Card title="Integration Synchronization" icon="rotate">
+    When synchronizing with external systems:
+    
+    - Use webhooks where possible instead of polling
+    - Implement incremental synchronization (only changed data)
+    - Schedule large synchronization jobs during off-peak hours
+    - Prioritize critical data for real-time sync
+  </Card>
+  <Card title="Scheduled Reports" icon="chart-line">
+    For generating scheduled reports or analytics:
+    
+    - Pre-compute and cache common metrics
+    - Generate reports during off-peak hours
+    - Split large reports into smaller segments
+    - Implement progressive loading for user interfaces
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card
+    title="Security"
+    icon="shield"
+    href="/api-reference/security"
+  >
+    Learn about API security best practices
+  </Card>
+  <Card
+    title="Authentication"
+    icon="key"
+    href="/api-reference/authentication"
+  >
+    Understand authentication methods
+  </Card>
+  <Card
+    title="Error Handling"
+    icon="triangle-exclamation"
+    href="/api-reference/errors"
+  >
+    Learn how to handle API errors
+  </Card>
+</CardGroup>
