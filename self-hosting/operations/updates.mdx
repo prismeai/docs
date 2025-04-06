@@ -1,0 +1,446 @@
+---
+title: 'Updates'
+description: 'Learn how to safely update your self-hosted Prisme.ai platform'
+---
+
+<Frame>
+  <img src="/images/platform-updates.png" alt="Prisme.ai Platform Updates" />
+</Frame>
+
+Keeping your Prisme.ai platform up to date ensures you have access to the latest features, security patches, and performance improvements. This guide covers the process for updating your self-hosted Prisme.ai installation safely and efficiently.
+
+## Update Strategy
+
+<Tabs>
+  <Tab title="Standard Updates">
+    Standard updates include minor version changes and patches that don't require significant infrastructure modifications.
+    
+    <Frame>
+      <img src="/images/standard-update-flow.png" alt="Standard Update Process" />
+    </Frame>
+    
+    These updates typically include:
+    - Bug fixes
+    - Security patches
+    - Minor feature enhancements
+    - Performance optimizations
+  </Tab>
+  
+  <Tab title="Major Updates">
+    Major updates involve significant version changes that may require database migrations, infrastructure changes, or configuration updates.
+    
+    <Frame>
+      <img src="/images/major-update-flow.png" alt="Major Update Process" />
+    </Frame>
+    
+    These updates often include:
+    - Architectural changes
+    - New product capabilities
+    - Database schema modifications
+    - Configuration structure changes
+  </Tab>
+</Tabs>
+
+## Pre-Update Checklist
+
+Before proceeding with any update, complete the following checklist:
+
+<Steps>
+  <Step title="Backup Your Environment">
+    Create complete backups of your client-managed databases and configurations.
+    
+    ```bash
+    # Back up MongoDB data
+    mongodump --uri="mongodb://username:password@hostname:port/database" --out=/path/to/backup/mongo
+    
+    # Back up Elasticsearch/OpenSearch
+    elasticdump --input=http://elasticsearch:9200/index --output=/path/to/backup/elasticsearch.json
+    
+    # Back up Redis
+    redis-cli -h redis-host -a password --rdb /path/to/backup/redis.rdb
+    
+    # Back up S3 storage
+    aws s3 sync s3://your-prisme-bucket /path/to/backup/s3-data
+    ```
+    
+    See the [Backup & Restore](/self-hosting/operations/backup) page for detailed instructions.
+  </Step>
+  
+  <Step title="Review Release Notes">
+    Carefully review the release notes for the target version to understand:
+    - Changes to Helm charts
+    - Terraform module updates
+    - Database schema changes
+    - Required infrastructure modifications
+    
+    Release notes are available in the Prisme.ai customer portal and within the release artifacts.
+  </Step>
+  
+  <Step title="Check System Requirements">
+    Verify your infrastructure meets the requirements for the new version.
+    
+    <Accordion title="System Requirements Check">
+      ```bash
+      # Run the Prisme.ai compatibility check
+      kubectl apply -f https://raw.githubusercontent.com/prisme-ai/compatibility-check/main/verify-environment.yaml
+      
+      # Check results
+      kubectl logs job/prisme-compatibility-check
+      ```
+      
+      Pay special attention to:
+      - Kubernetes version compatibility
+      - Node resource availability
+      - Database version requirements
+      - Storage capacity
+    </Accordion>
+  </Step>
+  
+  <Step title="Update Terraform Modules">
+    If you're using Terraform for infrastructure management, update your modules to the versions compatible with the new Prisme.ai release.
+    
+    ```bash
+    # Update Terraform module versions in your .tf files
+    
+    module "prisme_platform" {
+      source  = "prisme-ai/platform/aws"
+      version = "x.y.z"  # Update to match your Prisme.ai target version
+      
+      # Your existing configuration...
+    }
+    
+    # Run terraform plan to validate changes
+    terraform plan
+    ```
+  </Step>
+  
+  <Step title="Prepare Rollback Plan">
+    Document a detailed rollback plan in case issues occur during the update.
+    
+    Your rollback plan should include:
+    - Specific commands to restore databases from backup
+    - Helm rollback commands
+    - Terraform destroy/apply commands for affected resources
+    - Recovery time objectives
+    - Verification steps after rollback
+  </Step>
+</Steps>
+
+## Update Process
+
+<Tabs>
+  <Tab title="Helm Chart Updates">
+    <Steps>
+      <Step title="Update Helm Repository">
+        Refresh your Helm repository to get the latest charts.
+        
+        ```bash
+        helm repo update prisme
+        ```
+      </Step>
+      
+      <Step title="Review Chart Values">
+        Compare your current values with the new chart's default values to identify changes.
+        
+        ```bash
+        # Get current values
+        helm get values prisme-core -n prisme-system > current-values.yaml
+        
+        # Compare with new chart defaults
+        helm show values prisme/prisme-core --version X.Y.Z > new-defaults.yaml
+        
+        # Use a diff tool to compare
+        diff current-values.yaml new-defaults.yaml
+        ```
+      </Step>
+      
+      <Step title="Upgrade Core Components">
+        Update the core Prisme.ai components first.
+        
+        ```bash
+        helm upgrade prisme-core prisme/prisme-core --version X.Y.Z \
+          -f values.yaml \
+          --namespace prisme-system
+        ```
+        
+        <Warning>
+          The core components handle compute operations and must be updated before product modules.
+        </Warning>
+      </Step>
+      
+      <Step title="Update Product Modules">
+        After the core is updated, upgrade each product module.
+        
+        ```bash
+        # Update AI SecureChat
+        helm upgrade prisme-securechat prisme/prisme-securechat --version X.Y.Z \
+          -f securechat-values.yaml \
+          --namespace prisme-system
+          
+        # Update AI Knowledge
+        helm upgrade prisme-knowledge prisme/prisme-knowledge --version X.Y.Z \
+          -f knowledge-values.yaml \
+          --namespace prisme-system
+          
+        # Repeat for other product modules: AI Store, AI Builder, AI Governance, etc.
+        ```
+      </Step>
+      
+      <Step title="Monitor Update Progress">
+        Watch the deployment progress to ensure all pods are successfully updated.
+        
+        ```bash
+        kubectl get pods -n prisme-system -w
+        ```
+      </Step>
+      
+      <Step title="Verify Connectivity to External Databases">
+        Ensure all services can connect to your managed databases.
+        
+        ```bash
+        # Check MongoDB connectivity
+        kubectl exec -it -n prisme-system deploy/prisme-api -- mongosh --eval "db.adminCommand('ping')"
+        
+        # Check Elasticsearch/OpenSearch connectivity
+        kubectl exec -it -n prisme-system deploy/prisme-api -- curl -s elasticsearch:9200
+        
+        # Check Redis connectivity
+        kubectl exec -it -n prisme-system deploy/prisme-api -- redis-cli -h redis-host ping
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  
+  <Tab title="Terraform Updates">
+    <Steps>
+      <Step title="Update Terraform Provider Versions">
+        Ensure your Terraform providers are compatible with the new Prisme.ai version.
+        
+        ```hcl
+        terraform {
+          required_providers {
+            aws = {
+              source  = "hashicorp/aws"
+              version = ">= 4.0.0"
+            }
+            kubernetes = {
+              source  = "hashicorp/kubernetes"
+              version = ">= 2.10.0"
+            }
+            helm = {
+              source  = "hashicorp/helm"
+              version = ">= 2.5.0"
+            }
+          }
+        }
+        ```
+      </Step>
+      
+      <Step title="Update Prisme.ai Terraform Modules">
+        Modify your Terraform configuration to use the updated Prisme.ai modules.
+        
+        ```hcl
+        module "prisme_platform" {
+          source  = "prisme-ai/platform/aws"
+          version = "X.Y.Z"  # Match your target Prisme.ai version
+          
+          # Your configuration...
+        }
+        
+        module "prisme_databases" {
+          source  = "prisme-ai/databases/aws"
+          version = "X.Y.Z"  # Match your target Prisme.ai version
+          
+          # Your database configuration...
+        }
+        ```
+      </Step>
+      
+      <Step title="Apply Infrastructure Changes">
+        Run Terraform plan and apply to update your infrastructure.
+        
+        ```bash
+        terraform init -upgrade
+        terraform plan
+        terraform apply
+        ```
+        
+        <Warning>
+          Review the plan output carefully to understand what resources will be modified, created, or destroyed.
+        </Warning>
+      </Step>
+      
+      <Step title="Update Helm Charts Through Terraform">
+        If you're managing Helm releases via Terraform, update those resources as well.
+        
+        ```hcl
+        resource "helm_release" "prisme_core" {
+          name       = "prisme-core"
+          repository = "https://charts.prisme.ai"
+          chart      = "prisme-core"
+          version    = "X.Y.Z"  # Match your target Prisme.ai version
+          namespace  = "prisme-system"
+          
+          # Your values...
+        }
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Database Compatibility Considerations
+
+<CardGroup cols={2}>
+  <Card title="MongoDB / Compatible" icon="database">
+    - Recommended version: 4.4+
+    - Required indexes will be created automatically
+    - Schema migrations happen on startup
+    - Connection string format: `mongodb://username:password@host:port/database`
+  </Card>
+  <Card title="Elasticsearch / OpenSearch" icon="magnifying-glass">
+    - Elasticsearch 7.10+ or OpenSearch 1.3+
+    - Check index mappings compatibility
+    - Some updates require reindexing
+    - Set `elasticsearch.existingUrl` in values.yaml
+  </Card>
+  <Card title="Redis" icon="server">
+    - Redis 6.0+ recommended
+    - Used for caching and message queuing
+    - Persistence configuration recommended
+    - Cluster mode supported in Prisme.ai v3.2+
+  </Card>
+  <Card title="Object Storage (S3)" icon="hard-drive">
+    - S3-compatible storage required
+    - Used for document storage
+    - Configure using `storage.s3.*` parameters
+    - Verify bucket permissions after updates
+  </Card>
+</CardGroup>
+
+## Post-Update Tasks
+
+After completing the update, perform these essential post-update tasks:
+
+<Steps>
+  <Step title="Verify Database Connectivity">
+    Ensure all services can connect to your managed databases.
+    
+    ```bash
+    # Check from a pod within the cluster
+    kubectl exec -it -n prisme-system deploy/prisme-api -- curl -s <internal-elasticsearch-url>:9200
+    kubectl exec -it -n prisme-system deploy/prisme-api -- mongosh --eval "db.adminCommand('ping')"
+    ```
+  </Step>
+  
+  <Step title="Run Database Optimization Tasks">
+    Optimize database performance after the update.
+    
+    ```bash
+    # Run MongoDB index optimization
+    kubectl exec -it -n prisme-system deploy/prisme-api -- node /app/scripts/optimize-indexes.js
+    
+    # Run Elasticsearch optimization
+    kubectl exec -it -n prisme-system deploy/prisme-api -- node /app/scripts/optimize-indices.js
+    ```
+  </Step>
+  
+  <Step title="Verify Product Functionality">
+    Test each Prisme.ai product to ensure they work as expected:
+    - AI SecureChat
+    - AI Store
+    - AI Knowledge
+    - AI Builder
+    - AI Governance
+    - AI Insights
+  </Step>
+  
+  <Step title="Check Resource Utilization">
+    Monitor resource usage to ensure the system is functioning efficiently.
+    
+    ```bash
+    # Check pod resource usage
+    kubectl top pods -n prisme-system
+    
+    # Check node resource usage
+    kubectl top nodes
+    ```
+  </Step>
+</Steps>
+
+## Rollback Procedure
+
+If you encounter critical issues after an update:
+
+<Steps>
+  <Step title="Roll Back Helm Releases">
+    Use Helm rollback to return to the previous version.
+    
+    ```bash
+    # List Helm release history
+    helm history prisme-core -n prisme-system
+    
+    # Rollback to previous revision
+    helm rollback prisme-core [REVISION] -n prisme-system
+    
+    # Repeat for other releases
+    helm rollback prisme-securechat [REVISION] -n prisme-system
+    ```
+  </Step>
+  
+  <Step title="Restore Databases">
+    If necessary, restore databases from your pre-update backups.
+    
+    ```bash
+    # Restore MongoDB
+    mongorestore --uri="mongodb://username:password@hostname:port/database" /path/to/backup/mongo
+    
+    # Restore Elasticsearch/OpenSearch
+    elasticdump --input=/path/to/backup/elasticsearch.json --output=http://elasticsearch:9200/index
+    
+    # Restore Redis
+    redis-cli -h redis-host -a password SHUTDOWN SAVE
+    # Copy backup RDB file to Redis data directory
+    
+    # Restore S3 data if needed
+    aws s3 sync /path/to/backup/s3-data s3://your-prisme-bucket
+    ```
+  </Step>
+  
+  <Step title="Revert Terraform Changes">
+    If you used Terraform for the update, revert to the previous state.
+    
+    ```bash
+    # Revert to previous Terraform state
+    git checkout [previous-commit] terraform/
+    terraform plan
+    terraform apply
+    ```
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card
+    title="Backup & Restore"
+    icon="database"
+    href="/self-hosting/operations/backup"
+  >
+    Learn how to create and manage backups for your Prisme.ai platform
+  </Card>
+  <Card
+    title="Scaling"
+    icon="arrows-up-down-left-right"
+    href="/self-hosting/operations/scaling"
+  >
+    Scale your platform to meet growing demands
+  </Card>
+  <Card
+    title="Troubleshooting"
+    icon="wrench"
+    href="/self-hosting/operations/troubleshooting"
+  >
+    Resolve common issues and challenges
+  </Card>
+</CardGroup>

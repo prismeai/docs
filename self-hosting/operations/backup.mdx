@@ -1,0 +1,828 @@
+---
+title: 'Backup & Restore'
+description: 'Protect your Prisme.ai platform data with comprehensive backup and restore procedures'
+---
+
+<Frame>
+  <img src="/images/backup-restore.png" alt="Backup and Restore" />
+</Frame>
+
+A robust backup and restore strategy is essential for protecting your Prisme.ai platform data and ensuring business continuity. This guide provides detailed instructions for backing up and restoring all components of your self-hosted Prisme.ai environment.
+
+## Backup Strategy
+
+<Tabs>
+  <Tab title="What to Back Up">
+    Your Prisme.ai platform requires backing up several components:
+    
+    <CardGroup cols={2}>
+      <Card title="Client-Managed Databases" icon="database">
+        - MongoDB/compatible database
+        - Elasticsearch/OpenSearch
+        - Redis
+      </Card>
+      <Card title="Object Storage" icon="hard-drive">
+        - S3 or compatible object storage
+        - Document files and attachments
+      </Card>
+      <Card title="Configuration" icon="gear">
+        - Kubernetes manifests
+        - Helm values
+        - Terraform state files
+      </Card>
+      <Card title="Secrets" icon="key">
+        - Kubernetes secrets
+        - Certificate files
+        - API keys and credentials
+      </Card>
+    </CardGroup>
+  </Tab>
+  
+  <Tab title="Backup Frequency">
+    Recommended backup frequencies based on data criticality:
+    
+    <table>
+      <thead>
+        <tr>
+          <th>Component</th>
+          <th>Frequency</th>
+          <th>Retention</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>MongoDB</td>
+          <td>Daily</td>
+          <td>30 days</td>
+        </tr>
+        <tr>
+          <td>Elasticsearch/OpenSearch</td>
+          <td>Daily</td>
+          <td>14 days</td>
+        </tr>
+        <tr>
+          <td>Redis</td>
+          <td>Daily</td>
+          <td>7 days</td>
+        </tr>
+        <tr>
+          <td>S3 Storage</td>
+          <td>Weekly (incremental)</td>
+          <td>90 days</td>
+        </tr>
+        <tr>
+          <td>Configuration</td>
+          <td>After changes</td>
+          <td>Last 10 versions</td>
+        </tr>
+      </tbody>
+    </table>
+    
+    <Warning>
+      Adjust backup frequency based on your organization's Recovery Point Objective (RPO) requirements.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Database Backup Procedures
+
+<Tabs>
+  <Tab title="MongoDB">
+    <Steps>
+      <Step title="Create MongoDB Backup">
+        Use mongodump to create a full backup of your MongoDB database:
+        
+        ```bash
+        # For standalone MongoDB
+        mongodump --uri="mongodb://username:password@hostname:port/database" \
+          --out=/path/to/backup/mongo/$(date +%Y-%m-%d)
+        
+        # For MongoDB Atlas
+        mongodump --uri="mongodb+srv://username:password@cluster.mongodb.net/database" \
+          --out=/path/to/backup/mongo/$(date +%Y-%m-%d)
+        ```
+        
+        <Accordion title="MongoDB Backup Options">
+          Additional options to consider:
+          
+          ```bash
+          # Compressed backup (reduces storage requirements)
+          mongodump --uri="mongodb://username:password@hostname:port/database" \
+            --out=/path/to/backup/mongo/$(date +%Y-%m-%d) \
+            --gzip
+          
+          # Backup specific collections
+          mongodump --uri="mongodb://username:password@hostname:port/database" \
+            --collection=users --collection=agents \
+            --out=/path/to/backup/mongo/$(date +%Y-%m-%d)
+          ```
+        </Accordion>
+      </Step>
+      
+      <Step title="Verify MongoDB Backup">
+        Ensure the backup contains all expected data:
+        
+        ```bash
+        # List databases in the backup
+        find /path/to/backup/mongo/$(date +%Y-%m-%d) -type d -depth 1
+        
+        # Count documents in a specific collection
+        mongorestore --uri="mongodb://username:password@hostname:port/database" \
+          --nsInclude="database.collection" \
+          --dryRun /path/to/backup/mongo/$(date +%Y-%m-%d) | grep "documents to restore"
+        ```
+      </Step>
+      
+      <Step title="Schedule Regular Backups">
+        Create a cron job to automate daily backups:
+        
+        ```bash
+        # Add to crontab
+        0 1 * * * /path/to/mongodb-backup-script.sh > /path/to/logs/mongodb-backup-$(date +\%Y-\%m-\%d).log 2>&1
+        ```
+        
+        Example backup script (`mongodb-backup-script.sh`):
+        
+        ```bash
+        #!/bin/bash
+        
+        BACKUP_DIR="/path/to/backup/mongo"
+        DATE=$(date +%Y-%m-%d)
+        RETENTION_DAYS=30
+        
+        # Create backup
+        mongodump --uri="mongodb://username:password@hostname:port/database" \
+          --out=${BACKUP_DIR}/${DATE} --gzip
+        
+        # Clean up old backups
+        find ${BACKUP_DIR} -type d -mtime +${RETENTION_DAYS} -exec rm -rf {} \;
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  
+  <Tab title="Elasticsearch/OpenSearch">
+    <Steps>
+      <Step title="Create Elasticsearch/OpenSearch Backup">
+        Use Elasticsearch snapshot API or elasticdump for backups:
+        
+        <Accordion title="Using Snapshot API (recommended)">
+          ```bash
+          # 1. Register a snapshot repository (S3)
+          curl -X PUT "localhost:9200/_snapshot/backup_repository" -H "Content-Type: application/json" -d'
+          {
+            "type": "s3",
+            "settings": {
+              "bucket": "your-backup-bucket",
+              "region": "your-region",
+              "role_arn": "arn:aws:iam::account-id:role/role-name"
+            }
+          }'
+          
+          # 2. Create a snapshot
+          curl -X PUT "localhost:9200/_snapshot/backup_repository/snapshot_$(date +%Y%m%d)" -H "Content-Type: application/json" -d'
+          {
+            "indices": "*",
+            "ignore_unavailable": true,
+            "include_global_state": true
+          }'
+          
+          # 3. Check snapshot status
+          curl -X GET "localhost:9200/_snapshot/backup_repository/snapshot_$(date +%Y%m%d)/_status"
+          ```
+        </Accordion>
+        
+        <Accordion title="Using elasticdump">
+          ```bash
+          # Install elasticdump
+          npm install -g elasticdump
+          
+          # Backup all indices data
+          elasticdump \
+            --input=http://elasticsearch:9200/ \
+            --output=/path/to/backup/elasticsearch/data_$(date +%Y%m%d).json \
+            --type=data
+          
+          # Backup index mappings
+          elasticdump \
+            --input=http://elasticsearch:9200/ \
+            --output=/path/to/backup/elasticsearch/mapping_$(date +%Y%m%d).json \
+            --type=mapping
+          ```
+        </Accordion>
+      </Step>
+      
+      <Step title="Verify Elasticsearch/OpenSearch Backup">
+        Ensure the backup contains all expected indices and data:
+        
+        ```bash
+        # For snapshot API
+        curl -X GET "localhost:9200/_snapshot/backup_repository/snapshot_$(date +%Y%m%d)"
+        
+        # For elasticdump
+        jq 'keys' /path/to/backup/elasticsearch/mapping_$(date +%Y%m%d).json
+        ```
+      </Step>
+      
+      <Step title="Schedule Regular Backups">
+        Create a cron job to automate daily backups:
+        
+        ```bash
+        # Add to crontab (for elasticdump method)
+        0 2 * * * /path/to/elasticsearch-backup-script.sh > /path/to/logs/elasticsearch-backup-$(date +\%Y-\%m-\%d).log 2>&1
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  
+  <Tab title="Redis">
+    <Steps>
+      <Step title="Configure Redis Persistence">
+        Ensure Redis is configured for persistence:
+        
+        ```conf
+        # In redis.conf
+        
+        # RDB persistence
+        save 900 1
+        save 300 10
+        save 60 10000
+        
+        # AOF persistence
+        appendonly yes
+        appendfsync everysec
+        ```
+      </Step>
+      
+      <Step title="Create Redis Backup">
+        Use the SAVE command or copy the RDB file:
+        
+        ```bash
+        # Trigger a SAVE operation
+        redis-cli -h redis-host -a password SAVE
+        
+        # Copy the dump.rdb file
+        cp /path/to/redis/data/dump.rdb /path/to/backup/redis/dump_$(date +%Y%m%d).rdb
+        ```
+      </Step>
+      
+      <Step title="Schedule Regular Backups">
+        Create a cron job to automate daily backups:
+        
+        ```bash
+        # Add to crontab
+        0 3 * * * /path/to/redis-backup-script.sh > /path/to/logs/redis-backup-$(date +\%Y-\%m-\%d).log 2>&1
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  
+  <Tab title="S3 Storage">
+    <Steps>
+      <Step title="Back Up S3 Data">
+        Use AWS CLI or compatible tools to back up your S3 storage:
+        
+        ```bash
+        # Sync to another bucket (cross-region for disaster recovery)
+        aws s3 sync s3://your-prisme-bucket s3://your-backup-bucket
+        
+        # Or sync to local storage
+        aws s3 sync s3://your-prisme-bucket /path/to/backup/s3-data
+        ```
+      </Step>
+      
+      <Step title="Enable Versioning">
+        Enable versioning on your S3 bucket for built-in backup protection:
+        
+        ```bash
+        aws s3api put-bucket-versioning \
+          --bucket your-prisme-bucket \
+          --versioning-configuration Status=Enabled
+        ```
+      </Step>
+      
+      <Step title="Set Up Lifecycle Policies">
+        Configure lifecycle policies to manage backup retention:
+        
+        ```bash
+        aws s3api put-bucket-lifecycle-configuration \
+          --bucket your-backup-bucket \
+          --lifecycle-configuration file://lifecycle-config.json
+        ```
+        
+        Example `lifecycle-config.json`:
+        
+        ```json
+        {
+          "Rules": [
+            {
+              "ID": "Delete old backups",
+              "Status": "Enabled",
+              "Prefix": "",
+              "Expiration": {
+                "Days": 90
+              }
+            }
+          ]
+        }
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Configuration Backup
+
+<Steps>
+  <Step title="Back Up Kubernetes Resources">
+    Save your Kubernetes configuration resources:
+    
+    ```bash
+    # Back up all resources in the Prisme namespace
+    mkdir -p /path/to/backup/kubernetes/$(date +%Y-%m-%d)
+    
+    # Export deployments, services, configmaps, secrets, etc.
+    kubectl get all,pvc,cm,secret -n prisme-system -o yaml > \
+      /path/to/backup/kubernetes/$(date +%Y-%m-%d)/prisme-resources.yaml
+    ```
+  </Step>
+  
+  <Step title="Back Up Helm Values">
+    Save your Helm chart values for each release:
+    
+    ```bash
+    # Get values for each Helm release
+    helm get values prisme-core -n prisme-system -o yaml > \
+      /path/to/backup/helm/$(date +%Y-%m-%d)/prisme-core-values.yaml
+    
+    helm get values prisme-securechat -n prisme-system -o yaml > \
+      /path/to/backup/helm/$(date +%Y-%m-%d)/prisme-securechat-values.yaml
+    
+    # Repeat for each product module
+    ```
+  </Step>
+  
+  <Step title="Back Up Terraform State">
+    If using Terraform, back up your state files:
+    
+    ```bash
+    # If using local state
+    cp terraform.tfstate terraform.tfstate.backup
+    cp -r terraform.tfstate.d /path/to/backup/terraform/$(date +%Y-%m-%d)
+    
+    # If using remote state (recommended), ensure your remote backend has proper backup
+    ```
+    
+    <Info>
+      Using remote state in Terraform (like S3 with versioning or Terraform Cloud) provides built-in backup capabilities.
+    </Info>
+  </Step>
+</Steps>
+
+## Restore Procedures
+
+<Tabs>
+  <Tab title="MongoDB Restore">
+    <Steps>
+      <Step title="Prepare for Restore">
+        Before restoring, stop services that interact with the database:
+        
+        ```bash
+        # Scale down Prisme.ai deployments
+        kubectl scale deployment -n prisme-system --replicas=0 \
+          prisme-api prisme-worker prisme-securechat prisme-knowledge
+        ```
+      </Step>
+      
+      <Step title="Restore MongoDB Data">
+        Use mongorestore to restore from your backup:
+        
+        ```bash
+        # Full restore
+        mongorestore --uri="mongodb://username:password@hostname:port/database" \
+          --nsFrom="database.*" --nsTo="database.*" \
+          /path/to/backup/mongo/YYYY-MM-DD
+        
+        # Or restore specific collections
+        mongorestore --uri="mongodb://username:password@hostname:port/database" \
+          --nsInclude="database.users" --nsInclude="database.agents" \
+          /path/to/backup/mongo/YYYY-MM-DD
+        ```
+        
+        <Warning>
+          Restoring will overwrite existing data. Be sure to validate your backup before proceeding.
+        </Warning>
+      </Step>
+      
+      <Step title="Restart Services">
+        After restore is complete, scale the services back up:
+        
+        ```bash
+        # Scale up Prisme.ai deployments
+        kubectl scale deployment -n prisme-system --replicas=1 \
+          prisme-api prisme-worker prisme-securechat prisme-knowledge
+        
+        # Verify pods are running
+        kubectl get pods -n prisme-system
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  
+  <Tab title="Elasticsearch/OpenSearch Restore">
+    <Steps>
+      <Step title="Prepare for Restore">
+        Stop services that interact with Elasticsearch:
+        
+        ```bash
+        kubectl scale deployment -n prisme-system --replicas=0 \
+          prisme-api prisme-worker
+        ```
+      </Step>
+      
+      <Step title="Restore Data">
+        <Accordion title="Using Snapshot API">
+          ```bash
+          # List available snapshots
+          curl -X GET "localhost:9200/_snapshot/backup_repository/_all"
+          
+          # Restore from snapshot
+          curl -X POST "localhost:9200/_snapshot/backup_repository/snapshot_YYYYMMDD/_restore" -H "Content-Type: application/json" -d'
+          {
+            "indices": "*",
+            "ignore_unavailable": true,
+            "include_global_state": true
+          }'
+          
+          # Check restore status
+          curl -X GET "localhost:9200/_recovery?human"
+          ```
+        </Accordion>
+        
+        <Accordion title="Using elasticdump">
+          ```bash
+          # Restore mappings first
+          elasticdump \
+            --input=/path/to/backup/elasticsearch/mapping_YYYYMMDD.json \
+            --output=http://elasticsearch:9200/ \
+            --type=mapping
+          
+          # Then restore data
+          elasticdump \
+            --input=/path/to/backup/elasticsearch/data_YYYYMMDD.json \
+            --output=http://elasticsearch:9200/ \
+            --type=data
+          ```
+        </Accordion>
+      </Step>
+      
+      <Step title="Restart Services">
+        After restore is complete, restart the services:
+        
+        ```bash
+        kubectl scale deployment -n prisme-system --replicas=1 \
+          prisme-api prisme-worker
+        
+        # Verify pods are running
+        kubectl get pods -n prisme-system
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  
+  <Tab title="Redis Restore">
+    <Steps>
+      <Step title="Stop Redis Server">
+        If possible, gracefully shut down Redis:
+        
+        ```bash
+        redis-cli -h redis-host -a password SHUTDOWN SAVE
+        ```
+        
+        If using Redis in Kubernetes:
+        
+        ```bash
+        # Scale down Redis deployment
+        kubectl scale statefulset -n prisme-system redis --replicas=0
+        ```
+      </Step>
+      
+      <Step title="Replace RDB File">
+        Copy the backup RDB file to Redis data directory:
+        
+        ```bash
+        # If using persistent volume in Kubernetes
+        kubectl cp /path/to/backup/redis/dump_YYYYMMDD.rdb \
+          prisme-system/redis-0:/data/dump.rdb
+        
+        # For standalone Redis
+        cp /path/to/backup/redis/dump_YYYYMMDD.rdb /path/to/redis/data/dump.rdb
+        ```
+      </Step>
+      
+      <Step title="Restart Redis">
+        Start Redis service with the restored data:
+        
+        ```bash
+        # For Kubernetes
+        kubectl scale statefulset -n prisme-system redis --replicas=1
+        
+        # For standalone Redis
+        systemctl start redis
+        
+        # Verify Redis is running with restored data
+        redis-cli -h redis-host -a password info keyspace
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  
+  <Tab title="S3 Storage Restore">
+    <Steps>
+      <Step title="Prepare for Restore">
+        Consider the impact of restoration on your application:
+        
+        ```bash
+        # Scale down services that interact with object storage
+        kubectl scale deployment -n prisme-system --replicas=0 \
+          prisme-document-processor prisme-file-handler
+        ```
+      </Step>
+      
+      <Step title="Restore S3 Data">
+        Sync data from your backup location:
+        
+        ```bash
+        # From backup bucket
+        aws s3 sync s3://your-backup-bucket s3://your-prisme-bucket
+        
+        # Or from local backup
+        aws s3 sync /path/to/backup/s3-data s3://your-prisme-bucket
+        ```
+        
+        <Info>
+          If using versioning, you can restore specific versions of objects:
+          
+          ```bash
+          # List versions of a specific object
+          aws s3api list-object-versions --bucket your-prisme-bucket --prefix path/to/object
+          
+          # Restore specific version
+          aws s3api copy-object --copy-source your-prisme-bucket/path/to/object?versionId=VERSION_ID \
+            --bucket your-prisme-bucket --key path/to/object
+          ```
+        </Info>
+      </Step>
+      
+      <Step title="Verify Restoration">
+        Check that files have been properly restored:
+        
+        ```bash
+        # List objects in bucket
+        aws s3 ls s3://your-prisme-bucket --recursive | head
+        
+        # Count objects
+        aws s3 ls s3://your-prisme-bucket --recursive | wc -l
+        ```
+      </Step>
+      
+      <Step title="Restart Services">
+        Resume normal operations:
+        
+        ```bash
+        kubectl scale deployment -n prisme-system --replicas=1 \
+          prisme-document-processor prisme-file-handler
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Configuration Restore
+
+<Steps>
+  <Step title="Restore Kubernetes Resources">
+    Apply your backed-up Kubernetes configurations:
+    
+    ```bash
+    # First, clean up the namespace if necessary
+    # WARNING: This will delete all resources! Use with caution.
+    # kubectl delete namespace prisme-system
+    # kubectl create namespace prisme-system
+    
+    # Apply backed-up resources
+    kubectl apply -f /path/to/backup/kubernetes/YYYY-MM-DD/prisme-resources.yaml
+    ```
+    
+    <Warning>
+      Be cautious when restoring resources. Consider restoring specific resource types instead of everything at once:
+      
+      ```bash
+      # Restore only ConfigMaps and Secrets first
+      kubectl apply -f /path/to/backup/kubernetes/YYYY-MM-DD/configmaps.yaml
+      kubectl apply -f /path/to/backup/kubernetes/YYYY-MM-DD/secrets.yaml
+      
+      # Then restore other resources
+      kubectl apply -f /path/to/backup/kubernetes/YYYY-MM-DD/deployments.yaml
+      ```
+    </Warning>
+  </Step>
+  
+  <Step title="Restore Helm Releases">
+    Use your backed-up values to reinstall or upgrade Helm releases:
+    
+    ```bash
+    # Reinstall core
+    helm upgrade --install prisme-core prisme/prisme-core \
+      -f /path/to/backup/helm/YYYY-MM-DD/prisme-core-values.yaml \
+      --namespace prisme-system
+    
+    # Reinstall product modules
+    helm upgrade --install prisme-securechat prisme/prisme-securechat \
+      -f /path/to/backup/helm/YYYY-MM-DD/prisme-securechat-values.yaml \
+      --namespace prisme-system
+    
+    # Repeat for other product modules
+    ```
+  </Step>
+  
+  <Step title="Restore Terraform State">
+    If you need to restore Terraform state:
+    
+    ```bash
+    # For local state
+    cp /path/to/backup/terraform/YYYY-MM-DD/terraform.tfstate .
+    cp -r /path/to/backup/terraform/YYYY-MM-DD/terraform.tfstate.d .
+    
+    # Verify state
+    terraform state list
+    ```
+    
+    For remote state, follow your backend provider's restoration process.
+  </Step>
+</Steps>
+
+## Disaster Recovery Planning
+
+<Tabs>
+  <Tab title="Recovery Objectives">
+    Define your recovery objectives to guide your backup strategy:
+    
+    <CardGroup cols={2}>
+      <Card title="RPO (Recovery Point Objective)" icon="clock-rotate-left">
+        Maximum acceptable data loss in time:
+        - Critical data: RPO < 1 hour
+        - Important data: RPO < 24 hours
+        - Regular data: RPO < 1 week
+      </Card>
+      <Card title="RTO (Recovery Time Objective)" icon="stopwatch">
+        Maximum acceptable time to restore service:
+        - Critical services: RTO < 4 hours
+        - Important services: RTO < 24 hours
+        - Regular services: RTO < 3 days
+      </Card>
+    </CardGroup>
+  </Tab>
+  
+  <Tab title="DR Scenarios">
+    Plan for different disaster recovery scenarios:
+    
+    <Accordion title="Single Component Failure">
+      **Example:** MongoDB database corruption
+      
+      **Recovery Plan:**
+      1. Scale down dependent services
+      2. Restore MongoDB from most recent backup
+      3. Verify data integrity
+      4. Scale up services
+      5. Monitor application functionality
+    </Accordion>
+    
+    <Accordion title="Entire Platform Failure">
+      **Example:** Kubernetes cluster compromise
+      
+      **Recovery Plan:**
+      1. Deploy new Kubernetes cluster
+      2. Restore configuration (secrets, configmaps)
+      3. Reconnect to database services (if intact)
+      4. Restore databases if necessary
+      5. Deploy Helm charts with backed-up values
+      6. Verify connectivity and functionality
+    </Accordion>
+    
+    <Accordion title="Datacenter/Region Failure">
+      **Example:** Cloud provider region outage
+      
+      **Recovery Plan:**
+      1. Activate secondary region (if configured)
+      2. Restore from cross-region backups
+      3. Update DNS/load balancing to point to new region
+      4. Verify application functionality
+      5. Communicate status to users
+    </Accordion>
+  </Tab>
+  
+  <Tab title="DR Testing">
+    Regularly test your disaster recovery procedures:
+    
+    <Steps>
+      <Step title="Scheduled Testing">
+        Conduct regular DR tests:
+        - Quarterly: Component-level recovery
+        - Bi-annually: Full platform recovery
+        - Annually: Regional failover (if applicable)
+      </Step>
+      
+      <Step title="Test Documentation">
+        Document each test with:
+        - Date and scope
+        - Procedures followed
+        - Time to recover
+        - Issues encountered
+        - Improvements identified
+      </Step>
+      
+      <Step title="Continuous Improvement">
+        Update procedures based on test results:
+        - Optimize recovery scripts
+        - Improve automation
+        - Address gaps or failures
+        - Update documentation
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Testing and Validation
+
+<Steps>
+  <Step title="Verify Backup Integrity">
+    Regularly test your backups to ensure they can be restored:
+    
+    ```bash
+    # For MongoDB
+    mongorestore --uri="mongodb://username:password@hostname:port/test_db" \
+      --nsFrom="database.*" --nsTo="test_db.*" \
+      --dryRun /path/to/backup/mongo/YYYY-MM-DD
+    
+    # For S3
+    aws s3 cp s3://your-backup-bucket/sample-file.pdf /tmp/test-restore.pdf
+    ```
+  </Step>
+  
+  <Step title="Validation Checkpoints">
+    Establish validation points for successful restoration:
+    
+    <CardGroup cols={2}>
+      <Card title="Data Validation" icon="database">
+        - Record counts match pre-backup state
+        - Sample record content is intact
+        - Relationships between data are preserved
+        - Application-specific data tests pass
+      </Card>
+      <Card title="Functionality Validation" icon="check-circle">
+        - Core services start successfully
+        - API endpoints respond correctly
+        - Authentication and authorization work
+        - Data processing functions operate properly
+        - UI elements display and function as expected
+      </Card>
+    </CardGroup>
+  </Step>
+  
+  <Step title="Document Restoration Procedures">
+    Maintain detailed, tested restoration runbooks:
+    
+    - Step-by-step instructions
+    - Required credentials and access
+    - Validation checkpoints
+    - Troubleshooting guidance
+    - Contact information for support
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card
+    title="Updates"
+    icon="arrow-up-right-dots"
+    href="/self-hosting/operations/updates"
+  >
+    Keep your platform current with the latest updates
+  </Card>
+  <Card
+    title="Scaling"
+    icon="arrows-up-down-left-right"
+    href="/self-hosting/operations/scaling"
+  >
+    Scale your platform to meet growing demands
+  </Card>
+  <Card
+    title="Troubleshooting"
+    icon="wrench"
+    href="/self-hosting/operations/troubleshooting"
+  >
+    Resolve common issues and challenges
+  </Card>
+</CardGroup>
