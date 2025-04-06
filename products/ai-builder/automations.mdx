@@ -103,6 +103,8 @@ Automations can be activated through different types of triggers, configured at 
       value:
         sseKeepAlive: 5000 # Keep-alive interval in milliseconds (minimum 5000ms)
   ```
+  
+  After this instruction, a `data: {"keepAlive": true}` chunk will be regularly emitted until the connection ends.
 </Accordion>
 
 <Accordion title="Events">
@@ -166,6 +168,10 @@ Automations can use and modify data across different memory scopes:
     - `run.depth`: Current automation depth in the stacktrace
     - `run.trigger.type`: Trigger type (event, endpoint, automation)
     - `run.trigger.value`: Trigger value (event name, endpoint path, etc.)
+    - `run.socketId`: Current socket ID if connected by websocket
+    - `run.appSlug`: Current app slug if running from an appInstance
+    - `run.appInstanceSlug`: Current appInstance slug if applicable
+    - `run.parentAppSlug`: Parent app slug if parent is also an appInstance
     
     The run context is automatically removed 60 seconds after the last automation run.
   </Property>
@@ -206,6 +212,7 @@ Automations can use and modify data across different memory scopes:
     - `global.apiUrl`: Current API instance public URL
     - `global.studioUrl`: Current studio instance public URL
     - `global.pagesUrl`: Current workspace pages public URL
+    - `global.pagesHost`: Current pages instance base domain
     - `global.endpoints`: Map of available endpoint slugs to URLs
     - `global.workspacesRegistry`: Map of public workspaces
     - Custom workspace-wide variables
@@ -258,7 +265,7 @@ If `session.myObjectVariable` equals `{"mickey": "house"}` and `item.field` equa
 
 ## Instructions
 
-Once triggered, automations execute a sequence of instructions in order. Here are some of the core instructions available:
+Once triggered, automations execute a sequence of instructions in order. Here are the available instructions:
 
 ### Logic Instructions
 
@@ -282,7 +289,7 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
               value: unknown
     ```
     
-    [More details on condition syntax](/conditions)
+    [More details on condition syntax](#condition-syntax)
   </Card>
   
   <Card title="Repeat" icon="arrows-rotate">
@@ -335,6 +342,8 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
         payload:
           reason: "Operation cancelled"
     ```
+    
+    When `break` is meant to be handled from a parent automation's try/catch, `scope` must be set to `all`.
   </Card>
   
   <Card title="All" icon="layer-group">
@@ -365,6 +374,8 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
               payload:
                 error: "{{$error}}"
     ```
+    
+    The `$error` variable is accessible both inside and outside the `catch` block.
   </Card>
 </CardGroup>
 
@@ -399,6 +410,14 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
         value:
           theme: "dark"
     ```
+    
+    You can also use expressions in the value parameter:
+    
+    ```yaml
+    - set:
+        name: counter
+        value: '{% {{counter}} + 1 %}'
+    ```
   </Card>
   
   <Card title="Delete Instruction" icon="trash">
@@ -418,6 +437,7 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
     Make HTTP requests to external APIs.
     
     ```yaml
+    # Basic GET request
     - fetch:
         url: https://api.example.com/users
         method: GET
@@ -457,6 +477,35 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
             value: "{{fileMetadata}}"
         output: uploadResult
     ```
+    
+    For AWS services, you can use AWS Signature V4 authentication:
+    
+    ```yaml
+    - fetch:
+        url: https://bedrock-runtime.eu-west-3.amazonaws.com/model/{{model}}/invoke
+        auth:
+          awsv4:
+            accessKeyId: ''
+            secretAccessKey: ''
+            service: bedrock
+            region: 'eu-west-3'
+        method: POST
+        body:
+          inputText: Hello
+        output: output
+    ```
+    
+    For handling streaming SSE responses:
+    
+    ```yaml
+    - fetch:
+        url: "https://api.openai.com/v1/chat/completions"
+        stream:
+          event: chunk
+          payload:
+            foo: bar
+        output: output
+    ```
   </Card>
   
   <Card title="Emit Instruction" icon="bolt">
@@ -476,7 +525,20 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
           userId: "{{targetUserId}}"
         payload:
           message: "You've received a new message"
+    
+    # Autocomplete for events
+    - emit:
+        event: 'event.{{var}}'
+        autocomplete:
+          var:
+            from: config
+            path: things~
+        private: false
+        options:
+          persist: true
     ```
+    
+    Events size must not exceed 100KB.
   </Card>
   
   <Card title="Wait Instruction" icon="clock">
@@ -558,6 +620,17 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
           Authorization: Bearer {{jwt.jwt}}
         output: apiResponse
     ```
+    
+    You can also forward source workspace authentication:
+    
+    ```yaml
+    - fetch:
+        url: https://api.studio.prisme.ai/v2/workspaces/123/webhooks/someAutomation
+        auth:
+          prismeai:
+            forwardWorkspaceAuth: true
+        output: apiResponse
+    ```
   </Card>
   
   <Card title="User Topic Instructions" icon="users">
@@ -577,8 +650,256 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
         userIds:
           - "{{newUserId}}"
     ```
+    
+    User topics allow sending events to multiple users without knowing who they are in advance.
   </Card>
 </CardGroup>
+
+## Condition Syntax {#condition-syntax}
+
+Conditions allow you to execute different instructions based on contextual information. You can use a powerful expression syntax in conditions and anywhere with `{% ... %}` delimiters.
+
+### Basic Operators
+
+```yaml
+# Comparison operators
+{{someAge}} > 18
+{{someAge}} >= 18
+{{someAge}} < 18
+{{someAge}} <= 18
+{{someAge}} == 18
+{{someAge}} = 18
+{{cityName}} = "Toulouse"
+
+# Inequality
+{{someAge}} !== 18
+{{someAge}} != 18
+
+# String matching
+"hello" matches "hel"
+"hello" matches {{someArray}}
+
+# Variable checking
+{{testedVariable}}      # Is this variable defined?
+!{{testedVariable}}     # Is this variable empty?
+
+# Membership testing
+{{someValue}} in {{someList}}
+{{someKey}} in {{someObject}}
+{{someKey}} not in {{someObject}}
+{{someKey}} not in "my,string,list"
+
+# Type checking
+isArray({{someVariable}})
+isObject({{someVariable}})
+isString({{someVariable}})
+isNumber({{someVariable}})
+```
+
+### Logical Operators
+
+```yaml
+# AND operators
+{{someAge}} >= 18 and {{cityName}} == "Toulouse"
+{{someAge}} >= 18 && {{cityName}} == "Toulouse"
+
+# OR operators
+{{someAge}} >= 18 or {{cityName}} == "Toulouse"
+{{someAge}} >= 18 || {{cityName}} == "Toulouse"
+
+# Grouping with parentheses
+{{someCity}} == "Paris" || ({{someAge}} >= 18 && {{cityName}} == "Toulouse")
+
+# Negation
+{{someCity}} == "Paris" || ! ({{someAge}} >= 18 && {{cityName}} == "Toulouse")
+{{someCity}} == "Paris" || not ({{someAge}} >= 18 && {{cityName}} == "Toulouse")
+```
+
+### Regular Expressions
+
+```yaml
+"luke.skywalker@gmail.com" matches regex(luke)
+```
+
+### MongoDB-like Conditional Matches
+
+```yaml
+jsonmatch({{object}}, {{condition}})
+```
+
+Example condition:
+```json
+{
+  "$or": [
+    {
+      "test": "unknown"
+    },
+    {
+      "one": {
+        "$eq": "three"
+      }
+    }
+  ]
+}
+```
+
+### Date Functions
+
+#### Parsing and Access
+
+```yaml
+date("2022-04-13T08:00:05.493Z").hour == 8
+date({{mydate}}).minute > 34 && date({{mydate}}).minute < 37
+date({{mydate}}).second >= 5
+date({{mydate}}).date == 23
+date({{mydate}}).month >= 6 && date({{mydate}}).month < 10
+date({{mydate}}).year == 2022
+date({{mydate}}).day == 3
+date({{mydate}}).day in {{allowedDays}}
+date({{mydate}}).ts == 1649836805493
+date({{mydate}}).iso == '2022-04-13T08:00:05.493Z'
+```
+
+Note: Tested values are UTC based, and day starts on 0 for Sunday (so 3 is Wednesday).
+
+#### Formatting
+
+```yaml
+date("2023-03-31T17:07:23.975Z", "l") == "3/31/2023"
+date("2023-03-31T17:07:23.975Z", "DD/MM/YYYY") == "3/31/2023"
+date("2023-03-31T17:07:23.975Z", "LT") == "7:07 PM"
+date("2023-03-31T17:07:23.975Z", "LT", "fr") == "19:07"
+date("2023-03-31T17:07:23.975Z", "lll", "fr") == "31 mars 2023 19:07"
+date("2023-03-31T17:07:23.975Z", "l LT") == "3/31/2023 7:07 PM"
+date("2023-03-31T17:07:23.975Z", "LT", "fr", "America/New_York") == "13:07"
+```
+
+See all formatting options on [Day.js documentation](https://day.js.org/docs/en/display/format).
+
+### Math Functions
+
+#### Operators
+
+```yaml
+1+1
+1+{{someVariable}}
+{{firstVar}} * {{secondVar}}
+({{firstVar}} * {{secondVar}} + 10) / 2
+```
+
+#### Functions
+
+```yaml
+rand(50, 150)  # Random number between 50 and 150
+rand()  # Random float between 0 and 1
+
+round(10.2)  # 10
+round(10.2, 1)  # 10.2
+round(10.26, 1)  # 10.3
+
+ceil(10.1)  # 11
+ceil(10.9)  # 11
+```
+
+### String Functions
+
+```yaml
+# JSON parsing/stringifying
+json('{"foo": "bar"}')  # Object { foo: "bar" }
+json({"foo": "bar"})  # String '{"foo":"bar"}'
+
+# String manipulation
+split('one,two,three', ',')  # Array ["one", "two", "three"]
+join(['one', 'two', 'three'], ',')  # String "one,two,three"
+replace('hello world', 'world', 'there')  # String "hello there"
+
+# Query string
+URLSearchParams("key1=value1&key2=value2").asJSON  # Object
+URLSearchParams({foo: "bar", abc: "xyz"}).asString  # String "foo=bar&abc=xyz"
+```
+
+## Arguments
+
+When calling a native instruction or another automation, different arguments can be transmitted. These graphical inputs are not reserved to native instructions, but can also be configured for your own custom automations by specifying expected arguments and their types.
+
+```yaml
+testArguments:
+  name: testArguments
+  arguments:
+    someString:
+      type: string
+    someNumber:
+      type: number
+    someObject:
+      type: object
+      properties:
+        someStringField:
+          type: string
+    someOtherObject:
+      type: object
+      properties:
+        nestedObject:
+          type: object
+          properties:
+            someField:
+              type: number
+    someStringArray:
+      type: array
+      items:
+        type: string
+    someObjectArray:
+      type: array
+      items:
+        type: object
+        properties:
+          fieldA:
+            type: string
+    someRawJSON:
+      type: object
+      additionalProperties: true          
+    someToken:
+      type: string        
+      secret: true
+  do:
+    # Automation instructions
+```
+
+The `someToken` argument defined with `secret: true` is automatically redacted from native runtime events to avoid accidental leaks of sensitive information.
+
+### Arguments Validation
+
+Automation arguments can be validated during execution by enabling `validateArguments: true`:
+
+```yaml
+slug: test
+name: test
+do: []
+when:
+  endpoint: true
+output: '{{body}}'
+arguments:
+  body:
+    type: object
+    required:
+      - str
+    properties:
+      str:
+        type: string
+      uri:
+        type: string
+        format: uri
+      obj:
+        type: object
+        required:
+          - un
+        properties:
+          un:
+            type: string
+            pattern: '^[a-z]+$'
+validateArguments: true
+```
+
+Arguments support various validation formats including date, url, time, password, etc. Validation errors immediately stop current and parent automations.
 
 ## Advanced Automation Patterns
 
@@ -681,7 +1002,7 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
     do:
       # Categorize feedback
       - fetch:
-          url: "{{config.llmApiUrl}}/completions"
+          url: "{{config.llmApiUrl}}/chat-completions"
           method: POST
           body:
             model: "gpt-3.5-turbo"
@@ -694,10 +1015,10 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
       
       # Extract sentiment and key points
       - fetch:
-          url: "{{config.llmApiUrl}}/completions"
+          url: "{{config.llmApiUrl}}/chat-completions"
           method: POST
           body:
-            model: "gpt-4"
+            model: "mistral"
             messages:
               - role: system
                 content: "Analyze this product feedback and extract: 1) Sentiment (positive/negative/neutral), 2) Key points as bullet points, 3) Actionability score (1-10)"
@@ -793,6 +1114,37 @@ Workspaces can listen to a specific subset of native events:
           "createdAt": "iso date",
           "description": "version description"
         }
+      }
+      ```
+    </Property>
+    
+    <Property name="workspaces.pages.permissions.shared" type="event">
+      Emitted when some page has been shared with someone
+      
+      Payload:
+      ```json
+      {
+        "subjectId": "<pageId>",
+        "permissions": {
+          "email": "<user email>",
+          "policies": {
+            "read": true
+          },
+          "id": "<user id>"
+        }
+      }
+      ```
+    </Property>
+    
+    <Property name="workspaces.pages.permissions.deleted" type="event">
+      Emitted when someone's access to the page has been removed
+      
+      Payload:
+      ```json
+      {
+        "subjectId": "<pageId>",
+        "userId": "<user id>",
+        "email": "<user email>"
       }
       ```
     </Property>
@@ -1054,13 +1406,13 @@ Workspaces can listen to a specific subset of native events:
     icon="file-code"
     href="/products/ai-builder/pages"
   >
-    Discover how to create interfaces that
+    Discover how to create interfaces for your applications
   </Card>
-    <Card
-    title="Blocks"
-    icon="puzzle-piece"
+  <Card
+    title="Deployment"
+    icon="rocket"
     href="/products/ai-builder/deployment"
   >
-    Learn more about deployment strategies.
+    Learn more about deployment strategies
   </Card>
 </CardGroup>
