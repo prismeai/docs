@@ -1,10 +1,13 @@
 ---
-title: "Tool Selection"
-description: "Prisme.ai natively supports hybrid tool selection capabilities. This functionality is transparently integrated into agent creation processes within both AI Knowledge and AI Builder products.
-The platform allows developers to completely customize their tool selection system, giving you the control over how your AI agents operate. Learn how to implement custom tool selection logic so your AI agents can intelligently choose the right tools at precisely the right time, maximizing efficiency and performance."
+title: "Custom Tool Selection"
+description: "Prisme.ai natively supports hybrid tool selection capabilities. This functionality is transparently integrated into agent creation processes within both AI Knowledge and AI Builder products. The platform allows developers to completely customize their tool selection system, giving you the control over how your AI agents operate. Learn how to implement custom tool selection logic so your AI agents can intelligently choose the right tools at precisely the right time, maximizing efficiency and performance."
 ---
 
-Effective tool selection is critical for tool-using agents. It ensures that agents choose the right tool for each task, leading to accurate, efficient, and purposeful interactions. This guide explores strategies and techniques for implementing robust tool selection in Prisme.ai.
+Effective tool selection is critical for tool-using agents. It ensures that agents choose the right tool for each task, leading to accurate, efficient, and purposeful interactions. This guide explores strategies and techniques for implementing your own tool selection in Prisme.ai.
+
+<Note>
+  These guides provide example YAML files for educational purposes, showcasing the range of possibilities. It is up to the technical teams to implement them according to your internal tools and APIs.
+</Note>
 
 ## Understanding Tool Selection
 
@@ -177,6 +180,57 @@ For many applications, LLM-based selection provides the best balance of flexibil
   </Step>
 </Steps>
 
+## Example: LLM-Based Tool Selection
+
+Here's a complete example of custom implementation of LLM-based tool selection:
+
+```yaml
+slug: llm-tool-selection
+name: "LLM-Based Tool Selection"
+description: "Uses the LLM to select appropriate tools based on user input"
+do:
+  - AgentAnalyzer.chat-completion:
+      prompt: |
+        Select the most appropriate tool for this user request:
+        User request: "{{input.text}}"
+
+        Available tools:
+        1. WeatherTool - Gets current weather information for a location
+        2. CalendarTool - Manages calendar events and appointments
+        3. StockTool - Retrieves current stock prices and market information
+        
+        Respond with a JSON object containing:
+        - selectedTool: name of the selected tool
+        - reasoning: why this tool was selected
+        - parameters: parameters to pass to the tool
+      output: toolSelection
+  
+  - conditions:
+      '{{toolSelection.selectedTool}} == "WeatherTool"':
+        - WeatherTool.execute:
+            location: "{{toolSelection.parameters.location}}"
+            output: result
+      '{{toolSelection.selectedTool}} == "CalendarTool"':
+        - CalendarTool.execute:
+            action: "{{toolSelection.parameters.action}}"
+            date: "{{toolSelection.parameters.date}}"
+            output: result
+      '{{toolSelection.selectedTool}} == "StockTool"':
+        - StockTool.execute:
+            symbol: "{{toolSelection.parameters.symbol}}"
+            output: result
+      default:
+        - set:
+            name: result
+            value:
+              error: "No appropriate tool selected"
+
+output: "{{result}}"
+when:
+  events:
+    - user-request
+```
+
 ## Implementing Rule-Based Selection
 
 For more controlled environments, rule-based selection provides predictability and reliability:
@@ -187,48 +241,79 @@ For more controlled environments, rule-based selection provides predictability a
   **Example implementation**:
 
   ```yaml
+  slug: rule-based-tool-selection
+  name: "Rule-Based Tool Selection"
+  description: "Uses explicit rules to determine which tool to use"
   do:
+    - EntityExtractor.extract:
+        text: "{{input.text}}"
+        output: entities
     - set:
-        name: requestType
-        value: 'unknown'
+        name: selectedTool
+        value: "None"
+   
     - conditions:
-        '{{input.text}} matches "customer.*info|find.*customer|customer.*details"':
+        '{{input.text}} matches "weather" && {{entities.locations.length}} > 0':
           - set:
-              name: requestType
-              value: 'customer_lookup'
-        '{{input.text}} matches "product.*price|how.*much.*cost|price.*of"':
+              name: selectedTool
+              value: "WeatherTool"
           - set:
-              name: requestType
-              value: 'product_pricing'
-        '{{input.text}} matches "order.*status|track.*order|where.*order"':
-          - set:
-              name: requestType
-              value: 'order_tracking'
+              name: toolParameters
+              value:
+                location: "{{entities.locations[0]}}"
+  
     - conditions:
-        '{{requestType}} == "customer_lookup"':
-          - CustomerLookup.execute:
-              input: '{{input.text}}'
-              output: toolResult
-        '{{requestType}} == "product_pricing"':
-          - ProductPricing.execute:
-              input: '{{input.text}}'
-              output: toolResult
-        '{{requestType}} == "order_tracking"':
-          - OrderTracking.execute:
-              input: '{{input.text}}'
-              output: toolResult
-        'else':
-          - LLM.generate:
-              prompt: 'I cannot determine which tool to use for: {{input.text}}'
-              output: toolResult
+        '{{input.text}} matches "schedule" && {{entities.dates.length}} > 0':
+          - set:
+              name: selectedTool
+              value: "CalendarTool"
+          - set:
+              name: toolParameters
+              value:
+                action: "{{entities.action}}"
+  			  date: "{{entities.dates[0]}}"
+    
+    - conditions:
+        '{{input.text}} matches "stock" && {{entities.companies.length}} > 0':
+          - set:
+              name: selectedTool
+              value: "StockTool"
+          - set:
+              name: toolParameters
+              value:
+                symbol: "{{entities.companies[0].symbol}}"  
+    - conditions:
+        '{{selectedTool}} == "WeatherTool"':
+          - WeatherTool.execute:
+              location: "{{toolParameters.location}}"
+              output: result
+        '{{selectedTool}} == "CalendarTool"':
+          - CalendarTool.execute:
+              action: "{{toolParameters.action}}"
+              date: "{{toolParameters.date}}"
+              output: result
+        '{{selectedTool}} == "StockTool"':
+          - StockTool.execute:
+              symbol: "{{toolParameters.symbol}}"
+              output: result
+        default:
+          - set:
+              name: result
+              value:
+                message: "I couldn't determine which tool would help with your request."
+  
+  output: "{{result}}"
+  when:
+    events:
+      - user-request
   ```
 
   This approach:
 
-  - Uses regex-like pattern matching
-  - Maps patterns to specific request types
-  - Routes each request type to the appropriate tool
-  - Provides fallback for unrecognized patterns
+  - Uses pattern matching on user input text
+  - Extracts and validates required entities
+  - Maps patterns to specific tool selections
+  - Provides a clear fallback for unrecognized patterns
 </Accordion>
 
 <Accordion title="Intent-Based Routing">
@@ -238,11 +323,9 @@ For more controlled environments, rule-based selection provides predictability a
 
   ```yaml
   do:
-    # Classify the user intent
     - IntentClassifier.classify:
         input: '{{input.text}}'
         output: intent
-    # Route based on intent
     - conditions:
         '{{intent.primary}} == "get_account_balance"':
           - AccountBalance.execute:
@@ -256,14 +339,14 @@ For more controlled environments, rule-based selection provides predictability a
           - FraudReport.execute:
               input: '{{input.text}}'
               output: toolResult
-        'else':
+        default:
           - conditions:
               '{{intent.confidence}} < 0.7':
                 - IntentClarification.execute:
                     input: '{{input.text}}'
                     intent: '{{intent}}'
                     output: toolResult
-              'else':
+              default:
                 - GeneralAssistant.execute:
                     input: '{{input.text}}'
                     output: toolResult
@@ -277,156 +360,164 @@ For more controlled environments, rule-based selection provides predictability a
   - Includes clarification flows for low-confidence cases
 </Accordion>
 
-## Hybrid Selection Techniques
+## Example: Hybrid Selection Approach
 
 Most enterprise applications benefit from hybrid approaches that combine LLM flexibility with rule-based governance:
 
-<Steps>
-  <Step title="LLM Pre-Selection with Rule Validation">
-    Let the LLM suggest tools but validate selections against rules.
+```yaml
+slug: hybrid-tool-selection
+name: "Hybrid Tool Selection"
+description: "Combines rule-based filtering with LLM ranking for optimal tool selection"
+do:
+  - EntityExtractor.extract:
+      text: "{{input.text}}"
+      output: entities
+  - set:
+      name: eligibleTools
+      value: []
+  
+  - conditions:
+      '{{input.text}} matches "weather" && {{entities.locations.length}} > 0':
+        - set:
+            name: eligibleTools[]
+            value:
+              name: "WeatherTool"
+              parameters:
+                location: "{{entities.locations[0]}}"
+  
+  - conditions:
+      '{{input.text}} matches "schedule" && {{entities.dates.length}} > 0':
+        - set:
+            name: eligibleTools[]
+            value:
+              name: "CalendarTool"
+              parameters:
+                action: "{{entities.action}}"
+                date: "{{entities.dates[0]}}"
+  
+  - conditions:
+      '{{input.text}} matches "stock" && {{entities.companies.length}} > 0':
+        - set:
+            name: eligibleTools[]
+            value:
+              name: "StockTool"
+              parameters:
+                symbol: "{{entities.companies[0].symbol}}"
+  
+  - conditions:
+      '{{eligibleTools.length}} > 1':
+        - Knowledge Client.chat-completion:
+            prompt: |
+              Rank these tools for the user request: "{{input.text}}"
+              
+              Available tools:
+              {{eligibleTools}}
+              - {{tool.name}}              
+                Respond with a JSON array of tool names, ranked from most to least appropriate.
+            output: rankedTools
+        - set:
+            name: selectedTool
+            value: "{{rankedTools[0]}}"
+      '{{eligibleTools.length}} == 1':
+        - set:
+            name: selectedTool
+            value: "{{eligibleTools[0].name}}"
+        - set:
+            name: toolParameters
+            value: "{{eligibleTools[0].parameters}}"
+      default:
+        - Knowledge Client.chat-completion:
+            prompt: |
+              Select the most appropriate tool for this user request:
+              User request: "{{input.text}}"
+              
+              Available tools:
+              1. WeatherTool - Gets current weather information for a location
+              2. CalendarTool - Manages calendar events and appointments
+              3. StockTool - Retrieves current stock prices and market information
+              
+              Respond with a JSON object containing:
+              - selectedTool: name of the selected tool
+              - parameters: parameters to pass to the tool
+            output: llmSelection
+        - set:
+            name: selectedTool
+            value: "{{llmSelection.selectedTool}}"
+        - set:
+            name: toolParameters
+            value: "{{llmSelection.parameters}}"
+ 
+  - conditions:
+      '{{selectedTool}} == "WeatherTool"':
+        - WeatherTool.execute:
+            location: "{{toolParameters.location}}"
+            output: result
+      '{{selectedTool}} == "CalendarTool"':
+        - CalendarTool.execute:
+            action: "{{toolParameters.action}}"
+            date: "{{toolParameters.date}}"
+            output: result
+      '{{selectedTool}} == "StockTool"':
+        - StockTool.execute:
+            symbol: "{{toolParameters.symbol}}"
+            output: result
+      default:
+        - set:
+            name: result
+            value:
+              message: "I couldn't determine which tool would help with your request."
 
-    **Implementation approach**:
+output: "{{result}}"
+when:
+  events:
+    - user-request
+```
 
-    ```yaml
-    do:
-      # Let LLM select a tool
-      - LLM.selectTool:
-          input: '{{input.text}}'
-          availableTools: ['CustomerLookup', 'OrderStatus', 'ProductSearch']
-          output: toolSelection
-      # Validate against rules
-      - conditions:
-          # If customer tool selected but no customer identifier provided
-          '{{toolSelection.tool}} == "CustomerLookup" && !{{input.hasEntity("customer_id")}} && !{{input.hasEntity("email")}}':
-            - set:
-                name: toolSelection.valid
-                value: false
-                name: toolSelection.invalidReason
-                value: "Customer identifier required"
-          # Other validation rules...
-          'else':
-            - set:
-                name: toolSelection.valid
-                value: true
-      # Execute or correct
-      - conditions:
-          '{{toolSelection.valid}}':
-            - ToolExecutor.execute:
-                tool: '{{toolSelection.tool}}'
-                parameters: '{{toolSelection.parameters}}'
-                output: toolResult
-          'else':
-            - UserClarification.request:
-                reason: '{{toolSelection.invalidReason}}'
-                input: '{{input.text}}'
-                output: toolResult
-    ```
+## Example: Tool Definition
 
-    This approach:
+Here's an example of how to define a weather tool in AI Builder:
 
-    - Uses LLM judgment for initial selection
-    - Applies explicit validation rules
-    - Prevents invalid tool usage
-    - Requests clarification when needed
-  </Step>
-  <Step title="Rule-Based Filtering with LLM Ranking">
-    Use rules to create a shortlist, then let the LLM rank options.
+```yaml
+slug: get-weather
+name: "Get Weather Information"
+description: "Returns current weather information for a specified location"
+do:
+  - fetch:
+      url: "https://api.weatherservice.com/v1/current"
+      method: GET
+      headers:
+        Authorization: "Bearer {{secret.weatherApiKey}}"
+      query:
+        location: "{{location}}"
+      output: weatherData
+  - set:
+      name: output
+      value:
+        temperature: "{{weatherData.current.temperature}}"
+        condition: "{{weatherData.current.condition.text}}"
+        humidity: "{{weatherData.current.humidity}}"
+        location: "{{weatherData.location.name}}, {{weatherData.location.country}}"
+        updated: "{{weatherData.current.last_updated}}"
 
-    **Implementation approach**:
-
-    ```yaml
-    do:
-      # Apply rules to create eligible tool list
-      - ToolFilter.apply:
-          input: '{{input.text}}'
-          allTools: ['CustomerLookup', 'OrderStatus', 'ProductSearch', 'PaymentProcess']
-          output: eligibleTools
-      # If multiple tools are eligible, let LLM rank them
-      - conditions:
-          '{{eligibleTools.count}} > 1':
-            - LLM.rankTools:
-                input: '{{input.text}}'
-                tools: '{{eligibleTools.list}}'
-                output: rankedTools
-            - set:
-                name: selectedTool
-                value: '{{rankedTools[0]}}'
-          '{{eligibleTools.count}} == 1':
-            - set:
-                name: selectedTool
-                value: '{{eligibleTools.list[0]}}'
-          'else':
-            - set:
-                name: selectedTool
-                value: 'GeneralAssistant'
-      # Execute selected tool
-      - ToolExecutor.execute:
-          tool: '{{selectedTool}}'
-          input: '{{input.text}}'
-          output: toolResult
-    ```
-
-    This approach:
-
-    - Uses rules to enforce hard constraints
-    - Leverages LLM judgment for nuanced decisions
-    - Reduces the decision space for the LLM
-    - Provides controlled fallbacks
-  </Step>
-  <Step title="Context-Aware Selection Logic">
-    Incorporate conversation history and user context in selection decisions.
-
-    **Implementation approach**:
-
-    ```yaml
-    do:
-      # Analyze conversation context
-      - ContextAnalyzer.analyze:
-          currentInput: '{{input.text}}'
-          conversationHistory: '{{conversation.history}}'
-          userProfile: '{{user.profile}}'
-          output: context
-      # Apply contextual selection logic
-      - conditions:
-          # Follow-up on previous tool usage
-          '{{context.isFollowUpTo}} == "ProductSearch"':
-            - conditions:
-                '{{input.hasIntent("purchase")}}':
-                  - OrderCreation.execute:
-                      input: '{{input.text}}'
-                      productContext: '{{context.previousToolResult}}'
-                      output: toolResult
-                '{{input.hasIntent("compare")}}':
-                  - ProductComparison.execute:
-                      input: '{{input.text}}'
-                      productContext: '{{context.previousToolResult}}'
-                      output: toolResult
-                'else':
-                  - ProductDetails.execute:
-                      input: '{{input.text}}'
-                      productContext: '{{context.previousToolResult}}'
-                      output: toolResult
-          # User preference based selection
-          '{{context.userPrefers}} == "Self-Service"':
-            - SelfServiceTools.select:
-                input: '{{input.text}}'
-                output: toolResult
-          # Default path
-          'else':
-            - LLM.selectTool:
-                input: '{{input.text}}'
-                context: '{{context}}'
-                output: toolResult
-    ```
-
-    This approach:
-
-    - Considers conversation history
-    - Accounts for user preferences
-    - Provides continuity across interactions
-    - Adapts to changing context
-  </Step>
-</Steps>
+validateArguments: true
+arguments:
+  location:
+    type: string
+    description: "The city or location to get weather for"
+  format:
+    type: string
+    enum: 
+     - detailed
+     - simple
+    default: simple
+    description: "Level of detail to return"
+output: "{{output}}"
+when:
+  endpoint: true
+labels:
+  - weather
+  - tools
+```
 
 ## Best Practices for Tool Selection
 
@@ -608,8 +699,7 @@ For advanced tool selection logic in AI Builder, implement these patterns:
   ```yaml
   slug: intent-based-tool-selection
   do:
-    # Classify user intent
-    - LLM.classify:
+    - MyApp.classify:
         input: '{{event.data.text}}'
         classes:
           - product_inquiry
@@ -618,13 +708,11 @@ For advanced tool selection logic in AI Builder, implement these patterns:
           - technical_support
           - general_inquiry
         output: classification
-    # Log the classification
     - emit:
         event: intent.classified
         data:
           originalText: '{{event.data.text}}'
           classification: '{{classification}}'
-    # Route based on intent
     - conditions:
         '{{classification.class}} == "product_inquiry" && {{classification.confidence}} > 0.7':
           - ProductTool.execute:
@@ -634,14 +722,11 @@ For advanced tool selection logic in AI Builder, implement these patterns:
           - OrderTool.execute:
               input: '{{event.data.text}}'
               output: toolResult
-        # Additional routing conditions...
-        'else':
-          # Fallback for low confidence or unhandled intents
-          - LLM.generateResponse:
+        default:
+          - MyApp.generateResponse:
               input: '{{event.data.text}}'
               context: 'The user intent was classified as {{classification.class}} with confidence {{classification.confidence}}.'
               output: toolResult
-    # Return the result
     - emit:
         event: tool.result
         data:
@@ -657,16 +742,13 @@ For advanced tool selection logic in AI Builder, implement these patterns:
   ```yaml
   slug: multi-stage-tool-selection
   do:
-    # Stage 1: Extract entities and intents
     - TextAnalysis.extract:
         text: '{{event.data.text}}'
         output: analysis
-    # Stage 2: Filter eligible tools
     - ToolFilter.apply:
         analysis: '{{analysis}}'
         tools: ['CustomerTool', 'ProductTool', 'OrderTool', 'SupportTool']
         output: eligibleTools
-    # Stage 3: Rank tools by relevance
     - conditions:
         '{{eligibleTools.count}} > 0':
           - ToolRanker.rank:
@@ -676,11 +758,10 @@ For advanced tool selection logic in AI Builder, implement these patterns:
           - set:
               name: selectedTool
               value: '{{rankedTools[0].name}}'
-        'else':
+        default:
           - set:
               name: selectedTool
               value: 'GeneralAssistant'
-    # Stage 4: Execute selected tool
     - conditions:
         '{{selectedTool}} == "CustomerTool"':
           - CustomerTool.execute:
@@ -688,7 +769,6 @@ For advanced tool selection logic in AI Builder, implement these patterns:
               analysis: '{{analysis}}'
               output: result
         # Other tool conditions...
-    # Log and return result
     - emit:
         event: tool.selected
         data:
@@ -710,36 +790,29 @@ For advanced tool selection logic in AI Builder, implement these patterns:
   ```yaml
   slug: context-aware-selection
   do:
-    # Retrieve conversation context
+  
     - ConversationManager.getContext:
         conversationId: '{{event.data.conversationId}}'
         output: context
-    # Analyze for context-specific routing
     - ContextAnalyzer.analyze:
         currentInput: '{{event.data.text}}'
         context: '{{context}}'
         output: analysis
-    # Apply contextual routing
     - conditions:
-        # Follow-up on previous tool
         '{{analysis.isFollowUp}} && {{context.lastTool}} == "ProductTool"':
           - ProductFollowup.execute:
               input: '{{event.data.text}}'
               previousResult: '{{context.lastToolResult}}'
               output: result
-        # Continuation of multi-turn workflow
         '{{context.activeWorkflow}} == "ordering"':
           - OrderWorkflow.continueFlow:
               input: '{{event.data.text}}'
               currentState: '{{context.workflowState}}'
               output: result
-        # New request
-        'else':
-          # Standard tool selection for new requests
+        default:
           - StandardSelection.select:
               input: '{{event.data.text}}'
               output: result
-    # Update context and return result
     - ConversationManager.updateContext:
         conversationId: '{{event.data.conversationId}}'
         updates:
