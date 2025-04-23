@@ -127,46 +127,6 @@ Prisme.ai supports the following authentication protocols:
     - The minimum required scopes are `openid` and `email`
     - Add `profile` scope to retrieve additional user attributes like name
   </Step>
-  
-  <Step title="Mount Configuration File">
-    Add the configuration file to the `prismeai-api-gateway` container.
-    
-    ```bash
-    # In your deployment configuration, add a volume mount:
-    volumes:
-      - /path/to/authProviders.config.yml:/www/services/api-gateway/authProviders.config.yml
-    ```
-    
-    You can customize the file location with the `AUTH_PROVIDERS_CONFIG` environment variable.
-  </Step>
-  
-  <Step title="Enable the Provider in UI">
-    Configure the sign-in buttons by setting environment variables.
-    
-    For both `prismeai-console` and `prismeai-pages` microservices, add:
-    
-    ```
-    ENABLED_AUTH_PROVIDERS='[{"name": "local"}, {"name": "<ProviderName>", "label": "Sign in with Provider", "icon": "https://path/to/provider-icon.png"}]'
-    ```
-    
-    - `name` must match the `<ProviderName>` in your config file
-    - `label` is the text displayed on the sign-in button
-    - `icon` is the URL to the provider's logo image
-    - Include `{"name": "local"}` to keep the username/password login option
-  </Step>
-  
-  <Step title="Configure Workspace Access">
-    Update workspaces to allow SSO authentication.
-    
-    When a new user authenticates with SSO, they won't automatically have access to existing products and workspaces. You need to:
-    
-    1. Configure whitelist settings in the product configuration
-    2. Set access permissions for the SSO users
-    
-    <Note>
-      Whenever you change your `PAGES_HOST` environment variable, make sure to trigger a workspace update (e.g., by changing its description) to register the new redirect URI with your identity provider.
-    </Note>
-  </Step>
 </Steps>
 
 ## Configuring SAML Authentication
@@ -181,7 +141,7 @@ Prisme.ai supports the following authentication protocols:
        ```
        https://API_URL/v2/login/callback
        ```
-    2. Set the **SP EntityID** (defaults to `https://studio.prisme.ai/sp`)
+    2. Set the **SP EntityID** : must match the `audience` configured below
     3. Set **Name ID format** to `unspecified` (all formats are supported)
     
     **Export the IdP metadata XML file** containing the signing certificate and entity information.
@@ -196,7 +156,8 @@ Prisme.ai supports the following authentication protocols:
         type: saml
         config:
           idp_metadata_filepath: "/path/towards/idp-saml-metadata.xml"
-          issuer: "Service Provider entity id"  
+          audience: "Service Provider entity id"  
+          issuer: "Issuer entity id, can be set to audience value"  
         attributesMapping:
           firstName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname'
           lastName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname'
@@ -216,52 +177,45 @@ Prisme.ai supports the following authentication protocols:
         config:
           entryPoint: "https://idp.example.org/SAML2/SSO/Redirect"
           idpCert: "-----BEGIN CERTIFICATE-----\nMIID...\n-----END CERTIFICATE-----"
+          audience: "Service Provider entity id"
           issuer: "Service Provider entity id"
     ```
     
     See [node-saml documentation](https://github.com/node-saml/node-saml) for complete configuration options.
   </Step>
-  
-  <Step title="Mount Configuration File">
-    Add the configuration file to the `prismeai-api-gateway` container.
-    
-    ```bash
-    # In your deployment configuration, add a volume mount:
-    volumes:
-      - /path/to/authProviders.config.yml:/www/services/api-gateway/authProviders.config.yml
-    ```
-    
-    You can customize the file location with the `AUTH_PROVIDERS_CONFIG` environment variable.
-  </Step>
-  
-  <Step title="Enable the Provider in UI">
-    Configure the sign-in buttons by setting environment variables.
-    
-    For both `prismeai-console` and `prismeai-pages` microservices, add:
-    
-    ```
-    ENABLED_AUTH_PROVIDERS='[{"name": "local"}, {"name": "<ProviderName>", "label": "Sign in with Provider", "icon": "https://path/to/provider-icon.png"}]'
-    ```
-    
-    - `name` must match the `<ProviderName>` in your config file
-    - `label` is the text displayed on the sign-in button
-    - `icon` is the URL to the provider's logo image
-    - Include `{"name": "local"}` to keep the username/password login option
-  </Step>
-  
-  <Step title="Configure Workspace Access">
-    Update workspaces to allow SSO authentication.
-    
-    When a new user authenticates with SSO, they won't automatically have access to existing products and workspaces. You need to:
-    
-    1. Configure whitelist settings in the product configuration
-    2. Set access permissions for the SSO users
-    
-    <Note>
-      Whenever you change your `PAGES_HOST` environment variable, make sure to trigger a workspace update (e.g., by changing its description) to register the new redirect URI with your identity provider.
-    </Note>
-  </Step>
 </Steps>
+
+## Mount Configuration File  
+
+Whether you configured an OIDC or SAML provider, you can now mount the configuration file inside the `prismeai-api-gateway` container at `/www/services/api-gateway/authProviders.config.yml`.  
+You can customize the file location with the `AUTH_PROVIDERS_CONFIG` environment variable.  
+
+For **Kubernetes**, store the configuration file in a configmap :  
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prismeai-api-gateway-authproviders
+  namespace: core
+data:
+  authProviders.config.yml: |-
+    providers:
+      providerName:
+        ...
+```
+    
+Add the following `volume` and `volumeMount` to `prismeai-api-gateway` deployment :  
+```yaml
+volumes:
+  - name: gateway-authproviders
+    configMap:
+      name: prismeai-api-gateway-authproviders
+
+volumeMounts:
+  - name: gateway-authproviders
+    mountPath: /www/services/api-gateway/authProviders.config.yml
+    subPath: authProviders.config.yml
+```
 
 ## Configuring Microsoft Entra ID (Azure AD)
 
@@ -319,35 +273,44 @@ Prisme.ai supports the following authentication protocols:
       The `AZURE_AD_TENANT` value should match the **Supported account types** option you selected when registering the app.
     </Note>
   </Step>
-  
-  <Step title="Enable the Provider in UI">
-    Configure the sign-in buttons by setting the environment variable.
-    
-    For both `prismeai-console` and `prismeai-pages` microservices, add:
-    
-    ```bash
-    # Simple configuration
-    ENABLED_AUTH_PROVIDERS=azure
-    
-    # OR custom configuration
-    ENABLED_AUTH_PROVIDERS='[{"name":"local"},{"name":"custom","extends":"azure","label":{"fr":"Connexion avec Microsoft","en":"Sign in with Microsoft"},"icon":"https://path/to/microsoft-logo.png"}]'
-    ```
-    
-    The custom configuration allows you to:
-    - Customize the button label (with multi-language support)
-    - Use a custom icon
-    - Keep the standard username/password option (`local`)
-  </Step>
-  
-  <Step title="Configure Workspace Access">
-    Update workspaces to allow SSO authentication.
-    
-    When a new user authenticates with SSO, they won't automatically have access to existing products and workspaces. You need to:
-    
-    1. Configure whitelist settings in the product configuration
-    2. Set access permissions for the SSO users
-  </Step>
 </Steps>
+
+## Enable the Provider in UI
+Configure the sign-in buttons by setting environment variables.
+
+For both `prismeai-console` and `prismeai-pages` microservices, add this environment variable :  
+
+```
+ENABLED_AUTH_PROVIDERS='[{"name": "local"}, {"name": "<ProviderName>", "label": "Sign in with Provider", "icon": "https://path/to/provider-icon.png"}]'
+```
+
+- `name` must match the `<ProviderName>` in your config file
+- `label` is the text displayed on the sign-in button
+- `icon` is the URL to the provider's logo image
+- Include `{"name": "local"}` to keep the username/password login option
+
+For **Azure AD**, add a `"extends":"azure"` option  :  
+```
+ENABLED_AUTH_PROVIDERS='[{"name":"local"},{"name":"custom","extends":"azure","label":{"fr":"Connexion avec Microsoft","en":"Sign in with Microsoft"},"icon":"https://path/to/microsoft-logo.png"}]'
+```
+
+## Disable local signup
+
+Disable local signup with the following environment variable in prismeai-console, prismeai-pages and prismeai-api-gateway :  
+````
+DISABLE_LOCAL_SIGNUP='true'
+```
+
+## Configure products SSO access
+
+Update workspaces to automatically grant access to certain products to [SSO-authenticated users](/self-hosting/entreprise/permissions#sso-access) :  
+
+- [**AI Knowledge**](self-hosting/configuration/ai-knowledge#sso-access)
+- [**AI Insights**](self-hosting/configuration/ai-insights#sso-access)
+
+<Note>
+  Whenever you change your `PAGES_HOST` environment variable, make sure to trigger a workspace update (e.g., by changing its description) to register the new redirect URI with your identity provider.
+</Note>
 
 ## Custom Attribute Mapping
 
@@ -416,6 +379,7 @@ All authentication methods support mapping identity provider attributes to Prism
   - Confirm the IdP certificate in the configuration is correct and not expired
   - Verify the IdP is sending responses via HTTP-POST binding
   - Check that the `issuer` value matches the EntityID expected by the IdP
+  - Try adding `skipRequestCompression: true` and `wantAuthnResponseSigned: false` SAML options  
   
   **4. Missing User Attributes**
   
