@@ -136,26 +136,25 @@ Optimize database indexes for common queries, including user email lookups, docu
 
 When formatting the Elasticsearch/Opensearch filesystem volume, it is important to first shutdown the prismeai-events microservice in core namespace. This can be easily done from Kubernetes by editing the deployment and setting `replicas: 0`.  
 
-Index mappings are initialized when prismeai-events starts up. If indexes and index mappings are deleted (such as when formatting a volume) without first stopping prismeai-events, the next event persistence request sent to the cluster would cause it to automatically infer an incorrect index mapping, which would cause most other persistence requests to fail and result in data loss.  
-When Prisme.ai events mapping are not initialized before first events write requests, ES/OS automatically infer mappings for `payload.*` nested fields, making it incompatible with the needed `flattened` (ES) / `flat_object` (OS) mapping on the entire `payload` field.  
+Index mappings are initialized when prismeai-events starts up. If indexes and index mappings are deleted (such as when formatting a volume) without first stopping prismeai-events, the next event persistence request sent to the cluster would cause it to automatically infer an incorrect index mapping, which would cause most other persistence requests to fail and result in data loss.  This is because when Prisme.ai events mapping are not initialized before first events write requests, ES/OS automatically infer mappings for `payload.*` nested fields, making it incompatible with the needed `flattened` (ES) / `flat_object` (OS) mapping on the entire `payload` field.  
 
 This situation causes errors like `Limit of total fields [1000] has been exceeded` as ES/OS tries to map every single `payload.*` nested field until reaching the 1000 fields maximum limit.  
-**If it is possible** to delete the events data** (includes workspaces debug events and AIK usage metrics), this can be easily solved by :  
+**If it is possible to delete the events data** (includes workspaces debug events and AIK usage metrics), this can be easily solved by :  
 
-1. Shutting down prismeai-events by editing the deployment and setting `replicas: 0`. **If a HorizontalPodAutoscaler exists for prismeai-events, first delete it or set its min/max replicas to 0.**.   
+1. Shutting down prismeai-events by editing the deployment and setting `replicas: 0`. **If a HorizontalPodAutoscaler exists for prismeai-events, first delete it or set its min/max replicas to 0**.   
 2. Removing every failed index/datastream either from Kibana or curl :  
 ```
-DELETE /events-<id1>
-DELETE /events-<id2>
+DELETE /_data_stream/events-<id1>
+DELETE /_data_stream/events-<id2>
 ...
 ```
 
 Failed index names can be found in `_index` field of prismeai-events error logs.  
 Names starting with `.ds-events-` are datastreams underlying indexes and can be renamed like this to delete all underlying indexes at once :  `.ds-events-<id>-000001` -> `events-<id>`
 
-3. Starting prismeai-events by editing the deployment and setting `replicas: 1` 
+3. Restarting prismeai-events by editing the deployment and setting `replicas: 1` 
 
-**If events data cannot be lost**, the [existing indexes must me manually reindexed with the appropriate mapping](#reindexing-with-default-mapping).    
+**If events data cannot be lost**, the [existing indexes must me manually reindexed with the appropriate mapping](#reindexing-events-with-default-mapping).    
 
 #### Reindexing events with default mapping
 
@@ -177,13 +176,13 @@ Example :
   "index_templates": [
     ...
     {
-      "name": "index-template-events-<id1>",
+      "name": "index-template-events",
       "index_template": {
         "index_patterns": [
-          "events-<id1>"
+          "events-*"
         ],
         "composed_of": [
-          "template-events-<id1>"
+          "template-events"
         ],
         "priority": 1,
         "data_stream": {
@@ -196,6 +195,10 @@ Example :
   ]
 }
 ```
+
+<Warning>
+Some workspaces like AI Knowledge have a custom specific index template tuned for their needs, with the workspace id included in their index & component template name.
+</Warning>
 
 This index template automatically applies its configuration and **component templates** (`composed_of`) to all indices matching `index_patterns`.  
 The **component template** is where Prisme.ai custom index settings & mappings are configured.  
