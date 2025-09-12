@@ -299,49 +299,42 @@ DELETE /_data_stream/events-<id1>-tmp
 
 #### Index Lifecycle Management (ILM) Policies
 
-We recommend implementing ILM policies to automate index rollover, deletion, and transition between storage tiers based on criteria such as index age, size, or activity. This helps:
+Prismeai automatically configures ILM policies to automate index rollover + segments merging when their primary shard reach **40GB**, as recommended by Elasticsearch/Opensearch.  
+Our Elasticsearch driver also configures an ILM policy to automate the events deletion **30 days** (default, configurable with `EVENTS_SCHEDULED_DELETION_DAYS`) after workspace deletion.  
+This is not yet supported by Opensearch driver, which deletes events as soon as the workspace is deleted.  
 
-* Automatically remove outdated indices (e.g., logs older than 30 days),
-* Reduce disk usage and IOPS pressure,
-* Limit memory usage by keeping only active shards in RAM,
-* Maintain fast query response times in production environments.
+Events expiration is not configured from ILM as they do not offer the precision needed to tune different expiration periods depending on the different kind of data.  
+Instead, events expiration is enforced by prismeai-events `/sys/cleanup/*` APIs which are automatically called from a Kubernetes CronJob as described below.  
 
-Example of a basic ILM policy for daily logs:
 
-```json
-{
-  "policy": {
-    "phases": {
-      "hot": {
-        "actions": {
-          "rollover": {
-            "max_age": "1d",
-            "max_size": "20gb"
-          }
-        }
-      },
-      "delete": {
-        "min_age": "30d",
-        "actions": {
-          "delete": {}
-        }
-      }
-    }
-  }
-}
-```
-
-#### Kubernetes Cleaner Service Deployment
+#### Events automated cleanup 
 
 In addition to ILM, we provide a lightweight Kubernetes-native cleaner service that automatically:
 
-* Detects inactive or closed indices,
-* Removes old indices not yet covered by ILM,
-* Unloads stale shards from RAM to reduce heap pressure.
+1. Deletes expires events to enforce local data retention regulation (i.e RGPD). 
+2. Deletes datastreams from small & inactive workspaces to reduce shards usage and avoid reaching the ***1000 shards** per node limit.  
+3. Removes `payload` and `output` fields from `runtime.automations.executed` technical events to save disk space without compromising audit/debug capabilities in short term
 
-The service can be deployed as a CronJob or long-running sidecar. It connects to your cluster via API and applies retention or cleanup rules defined in a config file or environment variables. This is especially useful in high-ingestion environments where ILM alone is not sufficient to manage short-lived or redundant indices.
+These 3 tasks are configurable from helm values :  
 
-For deployment instructions, configuration examples, and security considerations, refer to the `elastic-cleaner` section of the deployment guide.
+```yaml
+prismeai-events:
+  ...
+  events:
+    cleanupjob: true # Create a cronjob to call /cleanup API in order to regularly apply retention, clean unused & inactive workspaces (see EVENTS_CLEANUP_* vars)...
+
+    # 1. Delete events older than 3 years
+    retention: 1080       
+
+    # 2. delete all events from small AND inactive workspaces :
+    workspaceMaxEvents: 50 # with max N events
+    workspaceInactivityDays: 30 # & inactive for N days
+
+    # 3. Delete payload & output fields from all runtime.automations.executed events older than :
+    automationExecutedExpiration: '14d' 
+```
+
+Step 1 and 2 are executed from a `cleanup-es-indices` Kubernetes CronJob scheduled every sunday at 0AM, while step 3 is executed from a `cleanup-exec-events` CronJob every night at 3:30AM.  
 
 
 #### Optimize index settings
