@@ -225,6 +225,36 @@ POST _reindex
 }
 ```
 
+You can optionally add a query filter to the source, very useful if you want to drop all error & execution events (which can take lot of disk space & are only useful for debugging last few days activities) :  
+```
+POST _reindex
+{
+  "source": {
+    "index": "events-<id1>",
+    "query": {
+      "bool": {
+        "must_not": [
+          {
+            "terms": {
+              "type": [
+                "runtime.automations.executed",
+                "error"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "dest": {
+    "index": "events-<id1>-tmp",
+    "op_type":"create"
+  }
+}
+```
+
+When retrying this request multiple times (for example with different source query to drop documents incompatible with the new mapping), you can add an `"conflicts": "proceed"` option to the body in order to ignore documents already created in destination index.  
+
 A response with `{"failures": []}` indicates all data have been reindexed & match the destination mapping.  
 In case of a mismatch between source data and destination mapping, you can receive error response like this :  
 ```json
@@ -264,6 +294,8 @@ In case of a mismatch between source data and destination mapping, you can recei
 }
 ```
 
+Either adapt the destination mapping or filter out these documents using the source query.  
+
 4. Delete the current datastream :  
 ```
 DELETE /_data_stream/events-<id1>
@@ -288,6 +320,67 @@ POST _reindex
 <Warning>
 Make sure the response `failures` is an empty `[]` and `total` is the same as the first _reindex `total`
 </Warning>
+
+Optionally, check that some specific type of event has been recovered :  
+
+```
+GET /events-<workspaceId>/_search 
+{
+  "track_total_hits": true, 
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "type": "usage"
+          }
+        }
+      ]
+    }
+  },
+  "aggs": {
+    "latestDate": {
+      "max": {
+        "field": "createdAt"
+      }
+    },
+    "oldestDate": {
+      "min": {
+        "field": "createdAt"
+      }
+    }    
+  }
+} 
+```
+
+Example response :  
+```json
+{
+  "hits": {
+    "total": {
+      "value": 668177, 
+      "relation": "eq"
+    },
+    "max_score": null,
+    "hits": []
+  },
+  "aggregations": {
+    "latestDate": {
+      "value": 1758017828520,
+      "value_as_string": "2025-09-16T10:17:08.520Z"
+    },
+    "oldestDate": {
+      "value": 1725905374947,
+      "value_as_string": "2024-09-09T18:09:34.947Z"
+    }
+  }
+}
+```
+
+* hits.total.value: the number of matching documents
+* aggregations.latestDate.value_as_string : The latest matching document date
+* aggregations.oldestDate.value_as_string : The oldest matching document date
 
 6. Check from your bowser that the target workspace events feed is not empty and contain old data, and that events previously failing to persist are now persisted.  
 If everything is fine, you can delete the temporary datastream :   
