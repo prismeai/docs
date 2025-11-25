@@ -1,5 +1,6 @@
 # Prisme.ai documentation
 
+*Works best with node 22*
 
 ### Development
 
