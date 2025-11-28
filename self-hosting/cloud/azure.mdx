@@ -46,6 +46,7 @@ Set up Prisme.ai using the following Azure-managed resources:
     - **Best Practices**:
       - Enable Geo-replication for disaster recovery
       - Regularly monitor and scale throughput dynamically
+      - Use [Microsoft Entra ID](#passwordless-authentication) authentication with PostgreSQL
   </Accordion>
   <Accordion title="Search Engine (ElasticSearch / OpenSearch)">
     - **Service**: Elasticsearch on Elastic Cloud or ES/OS deployed via AKS-managed containers
@@ -63,6 +64,7 @@ Set up Prisme.ai using the following Azure-managed resources:
     - **Best Practices**:
       - Regularly perform maintenance and updates
       - Integrate with Azure Monitor for metrics
+      - Use [Microsoft Entra ID](#passwordless-authentication) authentication with Redis
   </Accordion>
   <Accordion title="Object Storage (Azure Blob Storage)">
     - **Service**: Azure Blob Storage
@@ -138,6 +140,77 @@ Set up Prisme.ai using the following Azure-managed resources:
 
 ---
 
+## Passwordless authentication
+
+Microsoft Entra ID authentication enable passwordless authentication using [system-assigned or user-assigned managed identities](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/overview).  
+
+For both Redis and PostgreSQL, start following these common steps :  
+
+1. Create a managed identity :
+```bash
+az identity create --name PrismeaiIdentity --resource-group <RESOURCE_GROUP>
+```
+
+2. Allow our future Kubernetes deployments to endorse this manage identity using one of these 2 methods :  
+
+2a. Bind this identity with your Azure Kubernetes Cluster :  
+```bash
+az aks update  --resource-group <RESOURCE_GROUP>  --name <CLUSTER_NAME>  --enable-managed-identity  --assign-identity <IDENTITY_ID>  --assign-kubelet-identity <IDENTITY_ID>
+```
+
+With this method, managed identity authentication can be enabled from prismeai Helm value files by defining all `azureSystemIdentity` values to `true`.  
+
+2b. **Alternatively,** you can also create a federated identity to bind the managed identity with the Kubernetes service account which will be used by the deployments needing access to these databases :  
+```bash
+az identity federated-credential create    --name aks-fic  --identity-name PrismeaiIdentity    --resource-group <RESOURCE_GROUP>    --issuer <aks_oidc_issuer>    --subject system:serviceaccount:<CORE_NAMESPACE>:prismeai-backends-sa    --audiences api://AzureADTokenExchange
+az identity federated-credential create    --name aks-fic  --identity-name PrismeaiIdentity    --resource-group <RESOURCE_GROUP>    --issuer <aks_oidc_issuer>    --subject system:serviceaccount:<APPS_NAMESPACE>:prismeai-backends-sa    --audiences api://AzureADTokenExchange
+```
+Here, all Prismeai backends services (everything except prismeai-console and prismeai-pages) will need a `serviceAccount.name: prismeai-backends-sa` value in Helm value files.   
+<CORE_NAMESPACE> and <APPS_NAMESPACE> must be replaced with the expected **core** and **apps** namespace names.  
+
+From there, managed identity authentication can be enabled from prismeai Helm value files by defining all `azureManagedIdentityClientId` values to the managed identity **clientId**.  
+
+### Redis
+
+1. Open your Azure Managed Redis or Azure Cache For Redis
+2. Open Settings > Authentication in left menu
+3. Enable Microsoft Entra ID authentication and select your created managed identity
+
+This is all ! 
+
+### PostgreSQL
+
+1. Connect to the Postgres cluster with your Entra admin user : 
+```bash
+export AZ_DATABASE_SERVER_NAME=prismeai
+export CURRENT_USERNAME=$(az ad signed-in-user show --query userPrincipalName --output tsv)
+export AZ_DATABASE_NAME=<DB SERVER NAME>
+psql "host=$AZ_DATABASE_SERVER_NAME.postgres.database.azure.com user=$CURRENT_USERNAME dbname=$AZ_DATABASE_NAME port=5432 password=$(az account get-access-token --resource-type oss-rdbms --output tsv --query accessToken) sslmode=require"
+```
+
+2. Create a postgres user attached to our managed identity (by using the same name) :
+```sql
+select * from pgaadauth_create_principal('PrismeaiIdentity', false, false);
+```
+3. Assign permissions :
+```sql
+GRANT CREATE ON SCHEMA public TO "PrismeaiIdentity";
+GRANT USAGE ON SCHEMA public TO "PrismeaiIdentity";
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "PrismeaiIdentity";
+# Give default permissions for future tables
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "PrismeaiIdentity";
+```
+
+**PrismeaiIdentity** must match the managed identity name you created in first step.  
+
+4. In addition to the `azureManagedIdentityClientId` or `azureSystemIdentity` value you configured in your Helm value files, Postgres authentication will also need the managed identity username (_PrismeaiIdentity_) to be configured for all PostgreSQL clients :  
+
+* `global.permissions.user` 
+* `prismeai-api-gateway.storage.users.user`
+* `prismeai-runtime.storage.collections.user`
+
+
+--- 
 ## Security Best Practices
 
 <CardGroup cols="2">
