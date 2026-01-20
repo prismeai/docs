@@ -65,12 +65,56 @@ Configure the Crawler and SearchEngine microservices with the following environm
   |---------------|-------------|---------------|-------------------|
   | `MAX_CONTENT_LEN`                 | Maximum length (in characters) of documents crawled | `150000` | prismeai-crawler |
   | `CONCURRENT_REQUESTS`             | [The maximum number of concurrent (i.e. simultaneous) requests that will be performed by the Scrapy downloader](https://docs.scrapy.org/en/latest/topics/settings.html#concurrent-requests)          | `16` | prismeai-crawler |
-  | `CONCURRENT_REQUESTS_PER_DOMAIN`  | The maximum number of concurrent (i.e. simultaneous) requests that will be performed to any single domain.          | `16` | prismeai-crawler | 
+  | `CONCURRENT_REQUESTS_PER_DOMAIN`  | The maximum number of concurrent (i.e. simultaneous) requests that will be performed to any single domain.          | `16` | prismeai-crawler |
   | `DOWNLOAD_DELAY`                  | [Minimum seconds to wait between 2 consecutive requests to the same domain.](https://docs.scrapy.org/en/latest/topics/settings.html#download-delay)          | `0` | prismeai-crawler |
-  | `REQUEST_QUEUES_POLLING_INTERVAL` | Interval in seconds between each time we pull new requests from the queue          | `5` | prismeai-crawler |
-  | `REQUEST_QUEUES_POLLING_SIZE`     | Number of requests to start from the queue in a single poll          | `1` | prismeai-crawler | 
+  | `REQUEST_QUEUES_POLLING_INTERVAL` | Interval in seconds between each poll of the Redis queue for new requests to process. Lower values increase responsiveness but also Redis load.          | `2` | prismeai-crawler |
+  | `REQUEST_QUEUES_POLLING_SIZE`     | Number of requests to start from the queue in a single poll          | `1` | prismeai-crawler |
   | `USER_AGENT`                      | Crawler HTTP user agent | `Prisme.ai (https://prisme.ai)` | prismeai-crawler
   | `ROBOTSTXT_OBEY`                  | Whether the crawler should respect the site's `robots.txt`. <br/><br/>- Recommended: **`True`** for all public websites. <br/>- For **internal portals (e.g. SharePoint, intranet)**, you may set **`False`** if robots.txt prevents access to content you are authorized to crawl. <br/><br/>⚠️ Disabling this option should only be done in controlled/internal environments. | `True` | prismeai-crawler |
+
+</Accordion>
+
+<Accordion title="ACK & Reliability Environment Variables">
+  These settings control the acknowledgment mechanism that ensures zero data loss when the crawler crashes during request processing.
+
+  | Variable Name | Description | Default Value | Affected Services |
+  |---------------|-------------|---------------|-------------------|
+  | `ACK_ENABLED` | Enable/disable the request acknowledgment mechanism. When enabled, requests are tracked atomically in Redis and automatically reclaimed if the crawler crashes during processing. Disabling this reverts to the original behavior where crashed requests are lost. | `True` | prismeai-crawler |
+  | `PENDING_VISIBILITY_TIMEOUT` | Time in seconds before a pending request is considered stale and eligible for reclaim. Set this to 2-3x your longest document processing time (e.g., large PDFs). If a request takes longer than this timeout, it will be retried. | `900` (15 minutes) | prismeai-crawler |
+  | `PENDING_RECLAIM_INTERVAL` | Interval in seconds between checks for stale pending requests. The reclaim loop runs at this frequency to find and re-queue abandoned tasks. | `60` | prismeai-crawler |
+
+</Accordion>
+
+<Accordion title="Resource Throttling Environment Variables">
+  These settings control adaptive resource monitoring to prevent OOM (Out of Memory) crashes through CPU and memory monitoring. The crawler will pause polling when resources are constrained and resume when they recover.
+
+  <Note>
+    **Thresholds are percentages of container limits**, not system resources. Limits are auto-detected from cgroup files (cgroup v1/v2). For restricted Kubernetes clusters where cgroup detection fails, you can set `CONTAINER_CPU_LIMIT_MILLICORES` and `CONTAINER_MEMORY_LIMIT_BYTES` as fallbacks.
+  </Note>
+
+  | Variable Name | Description | Default Value | Affected Services |
+  |---------------|-------------|---------------|-------------------|
+  | `RESOURCE_THROTTLING_ENABLED` | Enable/disable resource-based throttling. When enabled, the crawler monitors memory and CPU usage and pauses polling when thresholds are exceeded to prevent OOM crashes. | `True` | prismeai-crawler |
+  | `RESOURCE_THROTTLING_MODE` | What resources to monitor. Options: `memory_only` (recommended - Kubernetes handles CPU throttling effectively), `cpu_only`, `both`, `none`. Memory monitoring is critical as memory exhaustion leads to OOMKilled. | `memory_only` | prismeai-crawler |
+  | `MEMORY_WARNING_THRESHOLD` | Memory usage percentage (of container limit) above which the crawler pauses polling for new requests. Existing requests continue processing. | `80` | prismeai-crawler |
+  | `MEMORY_CRITICAL_THRESHOLD` | Memory usage percentage (of container limit) above which the crawler stops all processing. This is a last-resort protection against OOM. | `95` | prismeai-crawler |
+  | `CPU_WARNING_THRESHOLD` | CPU usage percentage (of container limit) above which the crawler pauses polling. Only applies when `RESOURCE_THROTTLING_MODE` includes CPU monitoring. | `85` | prismeai-crawler |
+  | `CPU_CRITICAL_THRESHOLD` | CPU usage percentage (of container limit) above which the crawler stops all processing. Only applies when `RESOURCE_THROTTLING_MODE` includes CPU monitoring. | `95` | prismeai-crawler |
+  | `RESOURCE_CHECK_INTERVAL` | Interval in seconds between resource usage checks. Lower values provide faster response to resource pressure but increase overhead. | `1.0` | prismeai-crawler |
+  | `RESOURCE_CIRCUIT_BREAKER_THRESHOLD` | Number of consecutive resource check failures before escalating to a CRITICAL alert. This helps identify persistent resource issues vs. temporary spikes. | `10` | prismeai-crawler |
+  | `RESOURCE_CIRCUIT_BREAKER_SHUTDOWN_TIMEOUT` | Seconds the crawler can remain stuck in critical state before initiating automatic pod shutdown. The pod exits gracefully, allowing Kubernetes to restart it with fresh state. Set to `0` to disable auto-shutdown. | `900` (15 minutes) | prismeai-crawler |
+  | `RESOURCE_CIRCUIT_BREAKER_FORCE_EXIT_TIMEOUT` | Hard timeout in seconds for graceful reactor shutdown during circuit breaker auto-shutdown. If the reactor doesn't stop within this time, `os._exit(1)` is called to force termination. | `60` | prismeai-crawler |
+
+</Accordion>
+
+<Accordion title="Document Processing Environment Variables">
+  These settings control how documents (PDFs, DOCX, etc.) are parsed and processed by the crawler.
+
+  | Variable Name | Description | Default Value | Affected Services |
+  |---------------|-------------|---------------|-------------------|
+  | `DOCUMENTS_DEFAULT_PARSER` | Default parser for document processing. Options: `unstructured` (recommended, uses the Unstructured library), `tika` (Apache Tika - requires TIKA_PATH to be configured), `docling` (IBM Docling - requires HUGGINGFACE_MODEL_PATH). Can be overridden per-searchengine via parser configuration. | `unstructured` | prismeai-crawler |
+  | `UNSTRUCTURED_DEFAULT_STRATEGY` | Default parsing strategy for the Unstructured library. Options: `fast` (no OCR, fastest), `auto` (automatic detection), `hi_res` (full OCR processing, slowest but most accurate for scanned documents), `ocr_only` (OCR only). Can be overridden per-searchengine. | `fast` | prismeai-crawler |
+  | `TIKA_OCR_SKIP` | Skip OCR (Tesseract) processing when using Apache Tika parser. Set to `True` for faster parsing at the cost of not extracting text from images within documents. Similar to Unstructured's `fast` strategy. Can be overridden per-searchengine using parser config: `{"type": "tika", "skip_ocr": true}`. | `True` | prismeai-crawler |
 
 </Accordion>
 
