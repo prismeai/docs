@@ -392,18 +392,19 @@ AI Knowledge can process documents, images, and audio files using Language Model
     |-----------|----------|-----------|
     | **Images** | Always uses LLM (automatic) | Scene descriptions, chart/diagram data extraction, infographic analysis |
     | **Audio** | Always uses LLM (automatic) | Speech transcription from MP3/WAV files |
-    | **Documents** | LLM when `parser=llm` | Complex layouts, scanned PDFs with OCR, preserving document structure |
+    | **Documents** | LLM when `parser=llm` | Complex layouts, preserving document structure, OCR on embedded images |
 
-    For images and audio, LLM processing is automatic when a capable model is configured. For documents, you must explicitly request LLM parsing.
+    Images and audio bypass the project parser setting and always use LLM analysis (auto-detected by mimetype). The `parser` configuration only affects document files (PDF, DOCX, etc.): documents are still parsed with `tika` / `unstructured` when selected, but only `parser=llm` uses an LLM.
   </Tab>
 
   <Tab title="Processing Pipeline">
-    The LLM analysis follows a three-phase flow:
+    The LLM analysis follows a three-phase flow (parse → embed → query):
 
     **1. Parsing Phase**
-    - File is sent to the configured LLM with vision/audio capabilities
-    - LLM extracts and describes content as text
-    - Result is stored as `document.text`
+    - Images: LLM generates a text description → stored as `document.text` (original URL in `source.url`)
+    - Audio: LLM generates a text transcript → stored as `document.text` (original URL in `source.url`)
+    - Documents (`parser: llm`): LLM extracts text (Markdown) → stored as `document.text` (original URL in `source.url`)
+    - Documents (`parser: tika` / `unstructured`): the selected parser extracts text (OCR variants are available in the UI) → stored as `document.text` (original URL in `source.url`)
 
     **2. Embedding Phase**
     - Extracted text is chunked according to project settings
@@ -412,41 +413,55 @@ AI Knowledge can process documents, images, and audio files using Language Model
 
     **3. Query Phase**
     - User queries retrieve relevant chunks via vector search
-    - For capable models, original files can be injected alongside text context
-    - LLM generates response using both text chunks and file content
+    - For capable models, original files can be injected alongside text context (`retrieveSourceDocumentsBase64`)
+    - If the model lacks the required capability, only text is sent (no file injection)
   </Tab>
 
   <Tab title="Configuration">
-    Configure LLM parsing in your workspace:
+    Configure fallback models and capabilities:
 
-    **Workspace Configuration**
+    **Workspace Config (`config` in `index.yml`)**
     ```yaml
-    # In workspace config
-    defaultModels:
-      parsing: "your-vision-capable-model"
+    config:
+      defaultModels:
+        parsing:
+          image: gpt-5    # Model for image analysis
+          audio: gpt-5    # Model for audio transcription
+          file: gpt-5     # Model for document extraction
     ```
 
-    **Model Capabilities**
-
-    Ensure your parsing model has the required capabilities:
-    - `vision`: For image analysis
-    - `audio`: For audio transcription
-    - `file`: For document processing
+    **Model Specifications (`modelsSpecifications`)**
+    ```yaml
+    modelsSpecifications:
+      gpt-5:
+        capabilities:
+          vision:
+            enabled: true
+          audio:
+            enabled: true
+          file:
+            enabled: true
+            maxSize: 20000000  # Max file size in bytes
+    ```
 
     **UI Configuration**
 
-    Navigate to: **AI Knowledge > Project Settings > Processing > Parser Model**
+    - Project default: **AI Knowledge > Project > Advanced > Tools > Documents parsing**
+    - Per-document override: **AI Knowledge > Project > AI > Text Splitter > Enable override by document**
   </Tab>
 
   <Tab title="API Usage">
     Specify the parser when uploading documents via API:
 
     ```bash
-    curl -X POST "https://api.prisme.ai/v2/knowledge/{projectId}/documents" \
-      -H "Authorization: Bearer {apiKey}" \
-      -H "Content-Type: multipart/form-data" \
-      -F "file=@document.pdf" \
-      -F "parser=llm"
+    curl -X POST 'https://{env}.prisme.ai/api/workspaces/{workspaceId}/webhooks/document?projectId={projectId}' \
+      -H 'Content-Type: application/json' \
+      -H 'knowledge-project-apikey: YOUR_API_KEY' \
+      -d '{
+        "name": "Complex Report.pdf",
+        "content": { "url": "https://example.com/file.pdf" },
+        "parser": "llm"
+      }'
     ```
 
     **Parser Values**
@@ -454,9 +469,11 @@ AI Knowledge can process documents, images, and audio files using Language Model
     | Value | Description |
     |-------|-------------|
     | `project` | Use project default settings |
-    | `tika` | Apache Tika extraction (fast, free) |
-    | `unstructured` | Unstructured.io extraction (structured output) |
-    | `llm` | LLM-based extraction (intelligent, handles complex layouts) |
+    | `tika` | Background analysis (fast, text-focused) |
+    | `unstructured` | Structure analysis (preserves layout) |
+    | `llm` | AI-based analysis (uses LLM) |
+
+    `parser: "llm"` only applies when uploading via URL or file. If you provide `content.text` directly, no parsing occurs (text is already extracted).
   </Tab>
 </Tabs>
 
@@ -474,10 +491,10 @@ AI Knowledge can process documents, images, and audio files using Language Model
 ### Limitations
 
 - **Audio formats**: Only MP3 and WAV are supported
-- **File size**: Subject to model context limits
+- **File size**: Limited by the model’s `capabilities.file.maxSize` (default ~20MB)
 - **Token costs**: Large documents consume significant tokens
 - **Processing time**: Slower than traditional parsers
-- **Model availability**: Requires a configured vision/audio-capable model
+- **Model availability**: Requires a configured model with the required capability (`vision`, `audio`, or `file`)
 
 ## Document Maintenance
 
