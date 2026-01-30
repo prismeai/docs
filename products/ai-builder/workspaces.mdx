@@ -195,6 +195,8 @@ Secrets beginning with `prismeai_*` are reserved for super admins to configure s
 
 ## Version Control
 
+Prisme.ai workspaces can be synchronized with external Git repositories, enabling collaborative workflows between the platform and standard Git tooling. Changes made on either side are merged transparently using Git's built-in merge capabilities.
+
 ### Repository Configuration
 
 Configure version control in your workspace source code:
@@ -217,7 +219,7 @@ Different authentication methods are supported:
 
 - **Username/Password**: For basic authentication
 - **Personal Access Tokens**: For services like GitHub which forbid user password usage from CLI, instead they let you generate a Personal Access Token you will use exactly like a password
-- **SSH Keys**: For secure key-based authentication, see below example. 
+- **SSH Keys**: For secure key-based authentication, see below example.
 
 You can configure multiple repositories with different access modes:
 
@@ -225,15 +227,59 @@ You can configure multiple repositories with different access modes:
 - **read-only**: Only pull operations
 - **write-only**: Only push operations
 
+#### Sub-directory (`dirpath`)
+
+By default, workspace files are stored at the root of the Git repository. Use the `dirpath` option to store them in a sub-directory instead:
+
+```yaml
+repositories:
+  github:
+    name: My GitHub Repository
+    type: git
+    mode: read-write
+    config:
+      url: https://github.com/YourUser/your-repository.git
+      branch: main
+      dirpath: "workspaces/myapp"
+      auth:
+        user: 'your git user'
+        password: '{{secret.gitPassword}}'
+```
+
+This is useful when a single Git repository hosts multiple workspaces or includes non-workspace files alongside workspace content.
+
+#### Platform-wide Repositories
+
+Administrators can configure shared repositories available to all workspaces through environment variables, without requiring each workspace to configure its own credentials. Each workspace's files are stored in a sub-directory named after its slug.
+
+See the [self-hosting environment variables documentation](/self-hosting/kubernetes/environment-variables#platform-git-repositories) for configuration details.
+
 ### Using Secrets in Version Control
 
-You can also use secrets inside repositories config section:  
+You can use secrets inside the repository config section:
 
 ```yaml
 config:
   auth:
     password: '{{secret.gitPassword}}'
 ```
+
+### Typical Collaboration Workflow
+
+When working with an external Git repository, the platform uses an **intermediate branch** (named `prismeai/{workspaceSlug}/{targetBranch}`) to manage synchronization. This branch acts as a buffer zone where merges happen before affecting either side.
+
+A typical workflow looks like this:
+
+1. **Developers A work on the platform** — editing automations, pages, and configuration through the UI
+2. **Other team members work in Git** — editing YAML files directly in their IDE, committing to the target branch
+3. **Pull** — imports remote Git changes into the workspace. The platform first saves its own state (edited by developers A) to the intermediate branch, then merges the target branch in. If there are no conflicts, the merge result is imported transparently
+4. **Push** — exports the workspace state to Git. The platform commits to the intermediate branch, then merges it into the target branch
+
+Because both sides' changes are saved to Git before merging, Git can detect conflicts and perform automatic merges when changes don't overlap.
+
+<Warning>
+The intermediate branch (`prismeai/{workspaceSlug}/{branch}`) is managed automatically by the platform. **Never modify it manually** unless you are resolving a merge conflict (see below).
+</Warning>
 
 ### Push and Pull Operations
 
@@ -247,6 +293,58 @@ A native repository named "Prismeai" is always available for saving versions to 
 </Info>
 
 Versioning saves the workspace's static configuration, including security roles, automations, pages, blocks, and apps, but not dynamic data like events, collections, or uploaded files.
+
+#### Automatic Platform State Save on Pull
+
+When you pull, the platform **automatically saves the current workspace state** to the intermediate Git branch before merging remote changes. This ensures that any local modifications made through the UI are preserved in Git history and can be detected as conflicts if they overlap with remote changes.
+
+This automatic save is **skipped** in two cases:
+- **Discard local changes**: when you explicitly choose to discard local changes (available as a UI option), the pull overwrites the workspace entirely with the remote content
+- **After a merge conflict resolution**: when a previous pull resulted in a merge conflict (which is resolved manually in Git), the next pull skips saving to avoid overwriting the resolution
+
+#### Push Requires an Up-to-date Workspace
+
+Before pushing, the platform checks whether the workspace is synchronized with the remote branch. If there are remote commits that haven't been pulled yet, the push is **rejected** with a message asking you to pull first. This prevents accidentally overwriting remote changes that haven't been reviewed.
+
+### Merge Conflicts
+
+When a pull detects conflicting changes between the platform state and the remote branch, the operation stops and the workspace is **locked with a `merge_conflict` reason**. This lock does not expire and prevents any further versioning operations until the conflict is resolved.
+
+To resolve a merge conflict:
+
+1. **In your Git client**, checkout the intermediate branch, merge the target branch, and resolve the conflicts:
+   ```bash
+   git checkout main
+   git pull
+   git checkout prismeai/myapp/main
+   git pull
+   git merge --no-ff main
+   # Resolve conflicts in your editor
+   git commit
+   git push
+   ```
+2. **Back on the platform**, pull again. The platform detects that a merge conflict was previously active, skips saving local state (to not overwrite your resolution), and imports the resolved content.
+
+Alternatively, if you want to discard the conflicting state entirely, you can clear the lock via the API (see [Write Lock](#write-lock) below) and pull with "discard local changes" enabled.
+
+### Write Lock
+
+Versioning operations (pull, push, import) acquire an **exclusive write lock** on the workspace to prevent concurrent operations from corrupting data. The lock is automatically released when the operation completes.
+
+If an operation fails or takes too long, the lock expires after 30 minutes (configurable via `WORKSPACE_WRITE_LOCK_TIMEOUT_MINUTES`). **Exception**: merge conflict locks never expire and require explicit resolution through API or pull.
+
+You can manage the lock manually through the API:
+
+- **Set a lock**: `POST /v2/workspaces/{workspaceId}/writeLock` with an optional `reason` field
+- **Clear a lock**: `DELETE /v2/workspaces/{workspaceId}/writeLock`
+
+Both endpoints require the `ManageSecurity` permission on the workspace. Clearing a lock is useful to recover from stuck operations or to dismiss a merge conflict without resolving it in Git.
+
+### Progress Notifications
+
+During pull and push operations, the platform emits real-time progress events (`workspaces.versions.progress`) that are displayed as notifications in the UI. These notifications show the current step of the operation (checkout, pull, write, merge, push, import) along with a live timer for long-running steps.
+
+If an operation fails, an error notification is displayed. Progress events are also available in the workspace event stream for programmatic monitoring.
 
 ### Excluding Files from Import
 
@@ -279,8 +377,7 @@ After each archive import or repository pull, a `workspaces.imported` event is e
  "files": [
   "index",
   "security",
-  "pages/test.yml",
-   ...
+  "pages/test.yml"
  ],
  "deleted": [
   "automations/removedAutomation.yml"
@@ -305,12 +402,12 @@ This event provides a complete record of what changed during the import.
 
 ### Self-Signed TLS
 
-When trying to authenticate using user/password method against a repository with a self-signed HTTPS certificate, you can receive the following error:  
+When trying to authenticate using user/password method against a repository with a self-signed HTTPS certificate, you can receive the following error:
 ```
   SSL certificate problem: self-signed certificate in certificate chain
 ```
 
-This is an infrastructure issue which needs to be solved within `prismeai-workspaces` deployment, by mounting a copy of the `/etc/ssl/certs/ca-certificates.crt` file at the same address and adding the git server certificate to it.  
+This is an infrastructure issue which needs to be solved within `prismeai-workspaces` deployment, by mounting a copy of the `/etc/ssl/certs/ca-certificates.crt` file at the same address and adding the git server certificate to it.
 
 ## Workspace Events
 
