@@ -5,6 +5,104 @@ description: 'Verify that your Prisme.ai platform is ready for use'
 
 Once you have deployed your own version of the core platform, use this checklist to confirm that all essential components are running smoothly.
 
+## Platform Readiness API
+
+The `GET /v2/readiness` endpoint provides an automated way to verify that all services and their dependencies (databases, Redis, brokers, etc.) are properly configured and reachable. It is the recommended first step after deploying or updating the platform.
+
+### Access
+
+This endpoint is restricted to:
+- **Super admins** (authenticated users with the `superAdmin` role)
+- **Internal API key** (via the `INTERNAL_API_KEY` header, used for service-to-service calls)
+
+### Usage
+
+```bash
+# As a super admin (with a valid session cookie or JWT)
+curl https://api.your-domain.com/v2/readiness
+
+# With the internal API key
+curl -H "x-prismeai-api-key: <INTERNAL_API_KEY>" https://api.your-domain.com/v2/readiness
+
+# Filter specific services
+curl https://api.your-domain.com/v2/readiness?services=api-gateway,runtime
+```
+
+The `services` query parameter accepts a comma-separated list to check only specific services. Valid values: `api-gateway`, `runtime`, `events`, `workspaces`.
+
+### Response
+
+The endpoint returns a JSON response with an overall `status` (`ready` or `error`) and per-service details:
+
+```json
+{
+  "status": "ready",
+  "services": {
+    "api-gateway": {
+      "status": "ready",
+      "modulesReady": [
+        { "module": "database", "driver": "mongodb" },
+        { "module": "sessionsRedis", "driver": "redis" },
+        { "module": "rateLimitsRedis", "driver": "redis" },
+        { "module": "broker", "driver": "redis" },
+        { "module": "jwks", "driver": "http" }
+      ]
+    },
+    "runtime": {
+      "status": "ready",
+      "url": "http://runtime:3003",
+      "response": { "status": "ready", "modulesReady": [...] }
+    },
+    "events": {
+      "status": "ready",
+      "url": "http://events:3004",
+      "response": { "status": "ready", "modulesReady": [...] }
+    },
+    "workspaces": {
+      "status": "ready",
+      "url": "http://workspaces:3002",
+      "response": { "status": "ready", "modulesReady": [...] }
+    }
+  }
+}
+```
+
+When errors are detected, the HTTP status code is **400** and each failing service includes an `errors` array with details:
+
+```json
+{
+  "status": "error",
+  "services": {
+    "api-gateway": {
+      "status": "error",
+      "errors": [
+        {
+          "error": "DatabaseError",
+          "module": "database",
+          "driver": "mongodb",
+          "message": "Database tables are not initialized. Please check logs for more information"
+        }
+      ]
+    }
+  }
+}
+```
+
+### What is tested
+
+| Service | Modules tested |
+|---------|---------------|
+| **api-gateway** | Can reach runtime, events and workspaces services. Redis cache, databases, broker, JWKS URI reachability |
+| **runtime** | Redis cache, broker, permissions database, collections database, DSUL storage, searchengine reachable, custom code service reachable, gateway reachable |
+| **events** | Redis cache, broker, permissions database, Elasticsearch (write & delete), gateway reachable |
+| **workspaces** | Broker, permissions database, DSUL storage, gateway reachable |
+| **searchengine** | Elasticsearch, Redis. Verifies it can create and delete an index |
+| **crawler** | Elasticsearch, Redis, `NO_PROXY=localhost` check, gateway reachable. Verifies it can create and delete an index |
+
+<Note>
+Results are cached for 30 seconds to avoid overloading services with repeated checks. You can configure the cache TTL with the `READINESS_CACHE_TTL_MS` environment variable.
+</Note>
+
 ## Account Management
 
 ### Create an Account
