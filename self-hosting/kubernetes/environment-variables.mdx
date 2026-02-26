@@ -348,11 +348,11 @@ To avoid public buckets / CDN, you can force all file download requests to go th
 | UPLOADS_MAX_SIZE            | workspaces, api-gateway, runtime | Maximum upload size in bytes                                       | 10000000 (10MB)                               |
 | IMPORT_BATCH_SIZE           | workspaces                       | Maximum parallel save requests during imports                      | 50                                            |
 
-#### Platform Git Repositories
+#### Platform Repositories
 
-Platform git repositories are shared repositories automatically available to **all workspaces** for versioning (push/pull). They are configured entirely through environment variables and require no per-workspace setup.
+Platform repositories are shared repositories automatically available to **all workspaces** for versioning (push/pull). They are configured entirely through environment variables and require no per-workspace setup.
 
-Each workspace's files are stored in a subdirectory named after the workspace slug within the git repository. This allows a single repository to serve as a centralized versioning backend for every workspace on the platform.
+Each workspace's files are stored in a subdirectory named after the workspace slug within the repository. This allows a single repository to serve as a centralized versioning backend for every workspace on the platform.
 
 Multiple platform repositories can be configured by using the following naming convention:
 
@@ -364,16 +364,21 @@ Where `{repoId}` is a unique identifier for the repository (e.g., `prismeai`, `b
 
 | Field suffix    | Description                                                       | Default Value |
 | --------------- | ----------------------------------------------------------------- | ------------- |
-| `URL`          | Git repository URL (**required** — the repository is only enabled if this is set) |               |
+| `TYPE`         | Repository type: `git` (remote Git repository) or `filesystem` (local directory) | `git`         |
+| `URL`          | Git repository URL (**required for `git` type** — the repository is only enabled if this is set) |               |
 | `NAME`         | Display name shown in the UI                                      | `{repoId}`    |
-| `BRANCH`       | Git branch to use                                                 | `main`        |
-| `MODE`         | Access mode: `read-write` or `read-only`                          | `read-write`  |
-| `DIRPATH`      | Base directory path inside the repository. Each workspace's files are stored under `{dirpath}/{workspaceSlug}`. If omitted, workspace files are stored directly under `{workspaceSlug}` at the repository root. |               |
-| `AUTH_USER`    | Username for HTTPS authentication                                 |               |
-| `AUTH_PASSWORD` | Password or personal access token (PAT) for HTTPS authentication |               |
-| `AUTH_SSHKEY`  | SSH private key content for SSH authentication                    |               |
+| `BRANCH`       | Git branch to use (only for `git` type)                           | `main`        |
+| `MODE`         | Access mode: `read-write` or `read-only`                          | `read-write` |
+| `DIRPATH`      | For `git` type: base directory path inside the repository. Each workspace's files are stored under `{dirpath}/{workspaceSlug}`. If omitted, workspace files are stored directly under `{workspaceSlug}` at the repository root. For `filesystem` type: **required** absolute path to the local directory containing workspace subdirectories. |               |
+| `AUTH_USER`    | Username for HTTPS authentication (only for `git` type)           |               |
+| `AUTH_PASSWORD` | Password or personal access token (PAT) for HTTPS authentication (only for `git` type) |               |
+| `AUTH_SSHKEY`  | SSH private key content for SSH authentication (only for `git` type) |               |
 
-**Example — single platform repository:**
+<Warning>
+The `filesystem` type is reserved for platform repositories and cannot be used in workspace-level repository configurations.  
+</Warning>
+
+**Example — single platform Git repository:**
 
 ```dotenv
 WORKSPACES_STORAGE_GIT_PLATFORM_prismeai_URL=https://github.com/myorg/workspaces.git
@@ -383,7 +388,18 @@ WORKSPACES_STORAGE_GIT_PLATFORM_prismeai_AUTH_USER=your-user
 WORKSPACES_STORAGE_GIT_PLATFORM_prismeai_AUTH_PASSWORD=github_pat_xxxxxxx
 ```
 
-**Example — with a custom directory path:**
+**Example — filesystem platform repository (like the one embedded in prismeai-workspaces Docker image):**
+
+```dotenv
+WORKSPACES_STORAGE_GIT_PLATFORM_builtin_TYPE=filesystem
+WORKSPACES_STORAGE_GIT_PLATFORM_builtin_NAME=Built-in Workspaces
+WORKSPACES_STORAGE_GIT_PLATFORM_builtin_DIRPATH=/www/platform-workspaces
+WORKSPACES_STORAGE_GIT_PLATFORM_builtin_MODE=read-only
+```
+
+With this configuration, the platform expects workspace directories directly inside `/www/platform-workspaces/` (e.g., `/www/platform-workspaces/ai-knowledge/`, etc.).
+
+**Example — with a custom directory path (Git):**
 
 ```dotenv
 WORKSPACES_STORAGE_GIT_PLATFORM_prismeai_URL=https://github.com/myorg/monorepo.git
@@ -393,28 +409,90 @@ WORKSPACES_STORAGE_GIT_PLATFORM_prismeai_AUTH_USER=your-user
 WORKSPACES_STORAGE_GIT_PLATFORM_prismeai_AUTH_PASSWORD=github_pat_xxxxxxx
 ```
 
-With this configuration, a workspace with slug `myapp` would be stored under `prisme/workspaces/myapp/` in the repository.
+With this configuration, a workspace with slug `myapp` would be stored under `workspaces/myapp/` in the repository.
 
 **Example — multiple platform repositories:**
 
 ```dotenv
-# Primary read-write repository
+# Primary read-write Git repository
 WORKSPACES_STORAGE_GIT_PLATFORM_primary_URL=https://github.com/myorg/workspaces.git
 WORKSPACES_STORAGE_GIT_PLATFORM_primary_NAME=Main Repository
 WORKSPACES_STORAGE_GIT_PLATFORM_primary_AUTH_USER=x-access-token
 WORKSPACES_STORAGE_GIT_PLATFORM_primary_AUTH_PASSWORD=ghp_xxxxxxxxxxxx
 
-# Read-only backup repository
+# Read-only backup Git repository
 WORKSPACES_STORAGE_GIT_PLATFORM_backup_URL=git@github.com:myorg/workspaces-backup.git
 WORKSPACES_STORAGE_GIT_PLATFORM_backup_NAME=Backup (read-only)
 WORKSPACES_STORAGE_GIT_PLATFORM_backup_MODE=read-only
 WORKSPACES_STORAGE_GIT_PLATFORM_backup_AUTH_SSHKEY="-----BEGIN OPENSSH PRIVATE KEY-----\n..."
+
+# Built-in filesystem repository (Docker image)
+WORKSPACES_STORAGE_GIT_PLATFORM_builtin_TYPE=filesystem
+WORKSPACES_STORAGE_GIT_PLATFORM_builtin_NAME=Built-in Workspaces
+WORKSPACES_STORAGE_GIT_PLATFORM_builtin_DIRPATH=/www/platform-workspaces
 ```
 
 **Notes:**
 - Platform repositories are returned in the `platformRepositories` field of the workspace API response — they do not include auth details, and are never persisted into the workspace configuration.
 - Authentication credentials are never exposed in API responses.
 - For GitHub HTTPS authentication, use your username as `AUTH_USER` and a personal access token (PAT) with read-write permissions on **Contents** as `AUTH_PASSWORD`.
+
+#### Workspace Groups
+
+Workspace groups define logical sets of workspaces that can be imported together via bulk import. Groups are configured through environment variables:
+
+```
+WORKSPACES_GROUP_{groupName}_LABELS="label1,label2,..."
+```
+
+A workspace belongs to a group if at least one of its labels matches one of the group's labels. When a workspace is pushed to a platform repository, the groups it belongs to are recorded in its `.import.yml` file.
+
+| Name | Service | Description | Default Value |
+| --- | --- | --- | --- |
+| `WORKSPACES_GROUP_{groupName}_LABELS` | workspaces | Comma-separated list of labels for the group. A workspace with any matching label is included in this group. | |
+
+**Example:**
+
+```dotenv
+# Core dependencies
+WORKSPACES_GROUP_base1_LABELS=production:app:base1
+WORKSPACES_GROUP_base2_LABELS=production:app:base2
+
+# Core products
+WORKSPACES_GROUP_extended_LABELS=production:app,production:product
+```
+
+These group names are then used in:
+- The **bulk import** API (`groups` body parameter): `POST /v2/workspaces/platform/versions/latest/pull`
+- The **bulk push** API (`groups` body parameter): `POST /v2/workspaces/platform/versions`
+- `STARTUP_IMPORT_GROUPS` to select which workspaces to import automatically on startup
+
+#### Automatic Import at Startup
+
+The workspaces service can automatically trigger a bulk import when it starts. This is useful for initial deployments and platform upgrades, ensuring that reference workspaces from a platform repository are always up to date.
+
+| Name | Service | Description | Default Value |
+| --- | --- | --- | --- |
+| `STARTUP_IMPORT_GROUPS` | workspaces | Comma-separated list of group names to import at startup. Each group is imported sequentially. If any group encounters errors, remaining groups are skipped. If empty, no auto-import is performed. | |
+| `STARTUP_IMPORT_REPOSITORY` | workspaces | Repository ID (matching a configured platform repository) to import from at startup. | |
+
+**Example:**
+
+```dotenv
+# Import core workspaces from the built-in filesystem repository at startup
+STARTUP_IMPORT_GROUPS=base1,base2,extended
+STARTUP_IMPORT_REPOSITORY=builtin
+```
+
+At startup, the service:
+1. Ensures the `platform` workspace exists (creates it if needed)
+2. Waits for the platform to be ready (checks the `/v2/readiness` endpoint, with a 5-minute timeout)
+3. Imports each group sequentially using the bulk import mechanism, with a 30s pause between each group  
+4. Skips workspaces already at the correct version (based on `.import.yml` version matching)
+
+<Info>
+When multiple replicas start simultaneously (e.g., during a rollout), only one replica acquires the write lock on the Platform workspace and performs the import. Other replicas skip the import entirely.
+</Info>
 
 ## Performance & Limits
 

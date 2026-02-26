@@ -252,9 +252,17 @@ This is useful when a single Git repository hosts multiple workspaces or include
 
 Administrators can configure shared repositories available to all workspaces through environment variables, without requiring each workspace to configure its own credentials. Each workspace's files are stored in a sub-directory named after its slug.
 
+Platform repositories support two types:
+- **git** (default): a remote Git repository accessed via HTTPS or SSH
+- **filesystem**: a local directory on disk, typically embedded in the Docker image. Filesystem repositories are **read-only** — workspaces can be pulled from them but cannot push back.
+
+<Warning>
+The `filesystem` type is reserved for platform repositories configured by administrators. Workspaces cannot configure filesystem-type repositories through the API or workspace settings.
+</Warning>
+
 Platform repositories can also configure a custom `DIRPATH` to store workspace directories under a specific base path within the repository. In that case, each workspace's files are stored under `{dirpath}/{workspaceSlug}`.
 
-See the [self-hosting environment variables documentation](/self-hosting/kubernetes/environment-variables#platform-git-repositories) for configuration details.
+See the [self-hosting environment variables documentation](/self-hosting/kubernetes/environment-variables#platform-repositories) for configuration details.
 
 ### Using Secrets in Version Control
 
@@ -425,6 +433,200 @@ When trying to authenticate using user/password method against a repository with
 ```
 
 This is an infrastructure issue which needs to be solved within `prismeai-workspaces` deployment, by mounting a copy of the `/etc/ssl/certs/ca-certificates.crt` file at the same address and adding the git server certificate to it.
+
+## Platform Workspace, Bulk Import and Bulk Push
+
+### The Platform Workspace
+
+Prisme.ai automatically creates a special workspace with the ID `platform`. This workspace is used for platform-wide operations such as bulk imports and bulk pushes, and serves as a central place to monitor platform-level events.
+
+By default, only **super admins** have access to the Platform workspace. Super admins can share access with other users if needed.
+
+The Platform workspace also holds the **write lock** during bulk import and bulk push operations, ensuring that only one bulk operation can run at a time across the entire cluster.
+
+The Platform workspace can also use the standard individual push/pull APIs (`POST /workspaces/platform/versions` and `POST /workspaces/platform/versions/latest/pull`) with its own workspace-level repositories. When no platform repository ID is specified (or an unrecognized one is given), these endpoints fall back to the Platform workspace's own repository configuration, behaving like a regular workspace push/pull.
+
+### Bulk Import
+
+Bulk import allows importing (or updating) groups of workspaces from a platform repository in a single operation. This is useful for initial deployments, platform upgrades, or keeping a fleet of workspaces synchronized with a reference repository.
+
+#### Triggering a Bulk Import
+
+A bulk import can be triggered in two ways:
+
+1. **Via API**: send a `POST` request to `/v2/workspaces/platform/versions/latest/pull` with the repository and optional group filter:
+
+```json
+{
+  "repository": { "id": "yourRepoId" },
+  "groups": ["core"],
+  "forceReimport": false
+}
+```
+
+By default, workspaces already up to date with the repository are skipped. `forceReimport: true` disable this by forcing all target workspaces reimport.  
+
+2. **Automatically at startup**: configure the environment variables `STARTUP_IMPORT_GROUPS` and `STARTUP_IMPORT_REPOSITORY` to trigger a bulk import each time the workspaces service starts. See the [environment variables documentation](/self-hosting/kubernetes/environment-variables#automatic-import-at-startup) for details.
+
+<Info>
+The API endpoint requires access to the `platform` workspace.  
+Non super admins still need access to all corresponding workspaces in order to trigger a bulk import from the Platform workspace.  
+</Info>
+
+#### How It Works
+
+When a bulk import is triggered:
+
+1. **Repository clone** (git repos only): the repository is cloned or pulled once. For git repositories, the local clone is then used as a filesystem source for each workspace import, avoiding redundant clones.
+2. **Workspace discovery**: all top-level directories in the repository are listed. Each directory represents a workspace identified by its slug.
+3. **Filtering by group**: if a `group` parameter is provided, only workspaces whose `.import.yml` includes that group are imported (see [Workspace Groups](#workspace-groups) below).
+4. **Topological ordering**: workspaces are sorted by their dependencies (declared via `dependsOn` in `.import.yml`) so that a workspace is always imported after its dependencies.
+5. **Skip optimization**: for each workspace, the platform checks whether it is already up to date by comparing the `version.name` from the repository's `.import.yml` with the workspace's `lastPull.version` in the database. If they match, the workspace is skipped. Can be disabled with `forceReimport: true`  
+6. **Import**: each workspace is imported sequentially using the standard pull mechanism with `discardLocalChanges: true` (local changes are always overwritten during bulk imports).
+
+#### Monitoring Progress
+
+All bulk import events are emitted to the **Platform workspace** and can be monitored from its Activity view:
+
+| Event | Description |
+| --- | --- |
+| `workspaces.bulkImport.started` | Emitted at the beginning with the list of workspaces to import |
+| `workspaces.bulkImport.progress` | Emitted after each workspace with its status (`imported`, `skipped`, or `error`), file counts, and percentage |
+| `workspaces.bulkImport.completed` | Emitted at the end with the full summary: created, updated, skipped, errors, and total duration |
+
+Individual workspace events (`workspaces.imported`, `workspaces.versions.progress`) are still emitted as usual for each workspace.
+
+If the HTTP request times out (configurable via the `timeout` query parameter), the response returns `{ "processing": true }` and the final result is available through the `workspaces.bulkImport.completed` event.
+
+### Bulk Push
+
+Bulk push allows pushing all dirty workspaces belonging to specific groups to a platform repository in a single operation. This is the counterpart of bulk import: while bulk import pulls workspaces **from** a repository, bulk push pushes workspaces **to** a repository.
+
+#### Triggering a Bulk Push
+
+A bulk push can be triggered in two ways:
+
+1. **Via API**: send a `POST` request to `/v2/workspaces/platform/versions` with the groups and repository:
+
+```json
+{
+  "groups": ["core", "extended"],
+  "repository": { "id": "yourRepoId" },
+  "name": "v2.5.0",
+  "description": "February release"
+}
+```
+
+2. **Via the UI**: from the Platform workspace's Versions panel, select the groups to push and click "Push". This triggers the same bulk push API under the hood.
+
+<Info>
+The API endpoint requires access to the `platform` workspace.
+A write lock is acquired on the Platform workspace during the operation to prevent concurrent bulk pushes.
+</Info>
+
+#### How It Works
+
+When a bulk push is triggered:
+
+1. **Group resolution**: the requested groups are resolved to workspace labels via the `WORKSPACE_GROUPS` configuration (same groups used for bulk import).
+2. **Workspace discovery**: all workspaces matching the resolved labels are fetched and categorized:
+   - **Dirty** workspaces (with local changes since last push) are candidates for push
+   - **Already pushed** workspaces (no local changes) are skipped by default
+   - Workspaces with an active **merge conflict** lock are excluded
+   - Workspaces with a **push already in progress** are skipped
+3. **Sequential push**: each candidate workspace is pushed sequentially using the standard push mechanism.
+
+#### Options
+
+| Parameter | Description |
+| --- | --- |
+| `groups` | Group names to push (must exist in `WORKSPACE_GROUPS` config) |
+| `repository.id` | Platform repository ID (defaults to the first available platform repository) |
+| `name` | Version name applied to each pushed workspace. Auto-generated if omitted |
+| `description` | Version description |
+| `dryRun` | When `true`, returns workspace categorization without actually pushing |
+| `force` | When `true`, also pushes workspaces that are already up to date |
+
+#### Monitoring Progress
+
+All bulk push events are emitted to the **Platform workspace** and can be monitored from its Activity view:
+
+| Event | Description |
+| --- | --- |
+| `workspaces.bulkPush.started` | Emitted at the beginning with the list of workspaces and their initial status (`candidate`, `mergeConflict`, `inProgress`, `alreadyPushed`) |
+| `workspaces.bulkPush.progress` | Emitted after each workspace with its status (`pushed` or `error`), current/total counts, and percentage |
+| `workspaces.bulkPush.completed` | Emitted at the end with the full summary: pushed, merge conflicts, already pushed, errors, and total duration |
+
+Individual workspace push events (`workspaces.versions.progress`) are still emitted as usual for each workspace.
+
+#### SSE Streaming
+
+The bulk push API supports **Server-Sent Events** for real-time progress tracking. Add `?sse=true` to the query string to receive a stream of progress events instead of a single JSON response:
+
+```bash
+curl -X POST "https://api.studio.prisme.ai/v2/workspaces/platform/versions?sse=true" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"groups": ["core"], "repository": {"id": "yourRepoId"}}'
+```
+
+Each SSE event contains the current workspace status, progress percentage, and duration. The final event contains the full completion summary.
+
+If SSE is not enabled and the HTTP request times out (configurable via the `timeout` query parameter, default 15s), the response returns `{ "processing": true }` and the final result is available through the `workspaces.bulkPush.completed` event.
+
+### The `.import.yml` File
+
+Each workspace in a platform repository contains a `.import.yml` file at its root. This file is **automatically generated** when a workspace is pushed to a platform repository and contains metadata used during imports.
+
+```yaml
+# Example .import.yml
+workspaceId: "abc123"
+version:
+  type: export
+  name: "v2.4.0"
+  exportedAt: "2026-02-15T10:30:00.000Z"
+groups:
+  - core
+  - enterprise
+dependsOn:
+  - app/securechat
+  - app/knowledge
+app:
+  slug: builder
+  name: Builder
+checksums:
+  automations:
+    myAutomation: "sha256:..."
+  pages:
+    dashboard: "sha256:..."
+  imports:
+    securechat: "sha256:..."
+```
+
+Key fields:
+- **version.name**: the version label set at push time, used to detect whether a workspace is already up to date
+- **groups**: list of group names this workspace belongs to, used for filtering during bulk imports and bulk pushes
+- **dependsOn**: list of dependencies (referenced as `app/{appSlug}`), used to determine import order
+- **app**: if the workspace publishes an app, its slug and name
+- **checksums**: SHA checksums of individual files, generated at export time
+
+<Warning>
+Any manual changes to this file will be overwritten by the next platform push.
+</Warning>
+
+### Workspace Groups
+
+Workspace groups allow organizing workspaces into logical sets for selective bulk imports and bulk pushes. Groups are defined via environment variables:
+
+```
+WORKSPACES_GROUP_{groupName}_LABELS="label1,label2,..."
+```
+
+A workspace belongs to a group if at least one of its labels matches one of the group's labels. When a workspace is pushed to a platform repository, the groups it belongs to are written to its `.import.yml` file.
+
+During a bulk import, the `groups` parameter filters which workspaces are imported. Only workspaces whose `.import.yml` lists at least one of the requested groups will be included. Similarly, during a bulk push, the `groups` parameter determines which workspaces are pushed based on their labels.
+
+See the [environment variables documentation](/self-hosting/kubernetes/environment-variables#workspace-groups) for configuration examples.
 
 ## Workspace Events
 
