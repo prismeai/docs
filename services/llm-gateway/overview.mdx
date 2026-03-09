@@ -1,0 +1,93 @@
+---
+title: "LLM Gateway"
+description: "Multi-provider LLM abstraction — routing, failover, governance, and carbon tracking"
+---
+
+LLM Gateway is the centralized entry point for all LLM operations across the platform. It abstracts multiple providers (OpenAI, Azure OpenAI, Anthropic, Google Vertex, AWS Bedrock) behind a unified API, adds governance controls, and tracks usage and carbon footprint.
+
+**Workspace:** `llm-gateway` (33 automations)
+
+## Key Features
+
+- **Multi-provider routing** — Route requests to the best provider based on rules, cost, capabilities, or LLM classification
+- **Automatic failover** — Fall back to alternative models when the primary fails
+- **Governance** — Enforce model access, quotas, and rate limits per API key
+- **Usage tracking** — Token consumption, cost, and latency per request
+- **Carbon footprint** — Estimate energy and CO2 per LLM call
+- **Streaming** — SSE streaming for chat completions
+
+## Architecture
+
+```
+                    ┌──────────────────────────────────────┐
+                    │            LLM Gateway                │
+Caller ────────────►│                                      │
+(workspace JWT      │  ┌─────────────┐  ┌──────────────┐  │
+ or iak_* key)      │  │ Auth +      │  │ Resolve      │  │
+                    │  │ Governance  │  │ Provider     │  │
+                    │  └──────┬──────┘  └──────┬───────┘  │
+                    │         │                │          │
+                    │         ▼                ▼          │
+                    │  ┌─────────────┐  ┌──────────────┐  │
+                    │  │ Model       │  │ Failover     │  │
+                    │  │ Routing     │  │ Call         │  │
+                    │  └─────────────┘  └──────┬───────┘  │
+                    │                          │          │
+                    │    ┌──────────┬──────────┤          │
+                    │    ▼          ▼          ▼          │
+                    │ OpenAI    Azure    Anthropic  ...   │
+                    └──────────────────────────────────────┘
+```
+
+## API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST v1/chat/completions` | Chat completion (sync + streaming) |
+| `POST v1/embeddings` | Text embeddings |
+| `GET/POST v1/models` | Model catalog CRUD |
+| `GET/PUT/DELETE v1/models/:model_id` | Individual model management |
+
+## Supported Providers
+
+| Provider | Models | Notes |
+|----------|--------|-------|
+| OpenAI | GPT-4o, GPT-4o-mini, GPT-3.5-turbo, etc. | Direct API |
+| Azure OpenAI | Same models via Azure endpoints | Multiple credential sets supported |
+| OpenAI-compatible | Gemini, local models, any OpenAI-compatible API | Via `openai_like` provider type |
+| Anthropic | Claude family | Native SDK |
+| Google Vertex AI | Gemini, PaLM | Via model aliases |
+| AWS Bedrock | Claude, Titan, Mistral | Multiple region/credential sets |
+
+## Dependencies
+
+| Service | Purpose | Auth Method |
+|---------|---------|-------------|
+| [AI Governance](/products/ai-governance/overview) | API key validation, governance rules | Workspace JWT |
+
+LLM Gateway is a dependency **sink** for most workspaces — it's called by Agent Factory, Storage, Guardrails, Memories, Evaluations, and Insights.
+
+## Configuration
+
+Provider credentials and model aliases are configured in `index.yml`:
+
+```yaml
+config:
+  value:
+    providers:
+      openai:
+        api_key: '{{secret.OPENAI_API_KEY}}'
+      azure_openai:
+        endpoint: 'https://...'
+        api_key: '{{secret.AZURE_OPENAI_KEY}}'
+      anthropic:
+        api_key: '{{secret.ANTHROPIC_API_KEY}}'
+    model_aliases:
+      gemini-pro: 'projects/.../publishers/google/models/gemini-pro'
+    defaults:
+      chat_model: gpt-4o
+      embedding_model: text-embedding-3-small
+    exclude_params:
+      anthropic:
+        - top_p
+```

@@ -1,0 +1,246 @@
+---
+title: "Tools System"
+description: "System tools, custom tools, MCP integration, guardrails, and tool dispatch"
+---
+
+Agent Factory supports a rich tool ecosystem. Tools extend an agent's capabilities beyond pure text generation — allowing it to search knowledge bases, store data, call external APIs, and more.
+
+## Tool Types
+
+| Type | Description | Registration |
+|------|-------------|-------------|
+| `system` | Built-in tools provided by the platform | Automatic, based on agent profile |
+| `knowledge` | Knowledge base search (RAG) | Configured per agent via Storage |
+| `custom` | External MCP servers or custom functions | Added via the Agent Tools API |
+| `guardrail` | Input/output safety checks | Configured per agent |
+
+## System Tools
+
+System tools are built into Agent Factory and available based on the agent's [profile](/products/agent-factory/overview#agent-profiles).
+
+### Memory Tools
+
+| Tool | Description | Profiles |
+|------|-------------|----------|
+| `memory` (working) | In-context scratchpad, compacted when full | All |
+| `memory` (session) | Persists across turns within a conversation | Workflow+ |
+| `memory` (long-term) | Cross-conversation memory via [Memories workspace](/tools/memories) | Agent Full+ |
+
+Working memory configuration:
+```json
+{
+  "type": "system",
+  "name": "memory",
+  "parameters": {
+    "session_memory": false,
+    "types": [
+      {
+        "id": "working_memory",
+        "enabled": true,
+        "config": {
+          "max_tokens": 4000,
+          "compaction_strategy": "summarize"
+        }
+      },
+      {
+        "id": "long_term",
+        "enabled": true,
+        "config": {
+          "max_memories": 50
+        }
+      }
+    ]
+  }
+}
+```
+
+### Planning & Reflection
+
+| Tool | Input Schema | Profiles |
+|------|-------------|----------|
+| `planning_create_plan` | `{ goal: string, steps: [{ description, expected_output }] }` | Agent Full+ |
+| `reflection_evaluate` | `{ progress: string, quality: string, next_steps: string }` | Agent Full+ |
+
+### Human Interaction
+
+| Tool | Input Schema | Profiles |
+|------|-------------|----------|
+| `human_request_approval` | `{ action: string, reason: string, details: object }` | Agent Full+ |
+| `human_ask_clarification` | `{ question: string, options: string[] }` | Agent Full+ |
+
+### Task Management
+
+| Tool | Input Schema | Profiles |
+|------|-------------|----------|
+| `todo_write` | `{ items: [{ task: string, status: string }] }` | Agent Light+ |
+
+### Knowledge
+
+| Tool | Input Schema | Profiles |
+|------|-------------|----------|
+| `knowledge_search` | `{ query: string, sources: string[] }` | All |
+
+### Multi-Agent (Orchestrator only)
+
+| Tool | Input Schema | Profiles |
+|------|-------------|----------|
+| `agent_delegate` | `{ agent_id: string, task: string, context: object }` | Orchestrator |
+| `agent_list_available` | `{}` | Orchestrator |
+
+### Budget
+
+| Tool | Input Schema | Profiles |
+|------|-------------|----------|
+| `budget_get_remaining` | `{}` | Agent Full+ |
+
+## Custom Tools
+
+Custom tools are external capabilities registered per agent. They can be:
+
+### MCP Server Tools
+
+Tools exposed by a remote [MCP server](https://modelcontextprotocol.io/). The server URL is registered, and its `tools/list` is called to discover available tools.
+
+```json
+{
+  "type": "mcp",
+  "name": "bing_search",
+  "config": {
+    "server_url": "https://api.prisme.ai/v2/workspaces/slug:tools-search-bing/webhooks/bing-search/mcp",
+    "auth": { "type": "apikey", "key": "..." }
+  }
+}
+```
+
+### Custom Functions
+
+Webhook-based tools that call an external URL:
+
+```json
+{
+  "type": "function",
+  "name": "get_weather",
+  "description": "Get current weather for a location",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "location": { "type": "string" }
+    },
+    "required": ["location"]
+  },
+  "config": {
+    "url": "https://api.weather.com/v1/current",
+    "method": "GET"
+  }
+}
+```
+
+### Custom Automations (Skills)
+
+Tools backed by Prisme.ai automations in other workspaces:
+
+```json
+{
+  "type": "skill",
+  "name": "process_document",
+  "config": {
+    "workspace_slug": "my-workspace",
+    "automation": "process-document"
+  }
+}
+```
+
+### File Search (Knowledge Base)
+
+Knowledge base search tools backed by [Storage](/services/storage/overview):
+
+```json
+{
+  "type": "file_search",
+  "name": "knowledge_base",
+  "config": {
+    "vector_store_id": "vs_abc123",
+    "top_k": 5,
+    "min_score": 0.7
+  }
+}
+```
+
+## Tool Registry (Capabilities)
+
+The [Capabilities workspace](/services/capabilities/overview) maintains a centralized catalog of available tools. It provides:
+
+- Built-in tool templates with `config_schema` for UI rendering
+- Custom tool registration per organization
+- Tool discovery for the Agent Factory frontend
+
+When a user configures an agent, the frontend fetches available tools from Capabilities and renders configuration forms based on the `config_schema`.
+
+## Tool Dispatch
+
+When the LLM requests a tool call during the [agentic loop](/products/agent-factory/agentic-loop), Agent Factory dispatches it through `_route-tool`:
+
+```
+LLM requests tool_call(name, arguments)
+    │
+    ├─► System tool? ──► _execute-system-tool
+    │                      ├─► memory → _session-memory / _load-long-term-memories
+    │                      ├─► planning → create plan in context
+    │                      ├─► reflection → evaluate and store
+    │                      ├─► knowledge → _execute-rag-tool
+    │                      └─► todo/human/agent/budget → direct execution
+    │
+    ├─► RAG tool? ──────► _execute-rag-tool
+    │                      └─► Storage workspace search
+    │
+    └─► Custom tool? ───► Execute via MCP/webhook/automation
+```
+
+Each tool execution returns a result that is fed back into the LLM context for the next iteration of the agentic loop.
+
+## Guardrails
+
+Guardrails are a special type of tool that runs **automatically** (not by LLM choice) on input and/or output:
+
+```json
+{
+  "guardrails": [
+    {
+      "type": "input",
+      "name": "prompt_injection_detection",
+      "config": { "sensitivity": "high" }
+    },
+    {
+      "type": "output",
+      "name": "toxicity_check",
+      "config": { "threshold": 0.7, "action": "regenerate" }
+    },
+    {
+      "type": "output",
+      "name": "pii_detection",
+      "config": { "mode": "mask", "types": ["email", "phone"] }
+    }
+  ]
+}
+```
+
+Guardrails are executed via the `_guardrails` automation, which calls the [Guardrails workspace](/tools/guardrails) for each configured check.
+
+**Input guardrails** run before the LLM call. If triggered, they can block the message entirely.
+
+**Output guardrails** run after the LLM response. Depending on configuration, they can:
+- `block` — Replace the response with a safety message
+- `regenerate` — Request a new LLM response (sets `needs_regeneration: true`)
+- `flag` — Allow but log for review
+- `mask` — Redact sensitive content in the response
+
+See [Guardrails](/tools/guardrails) for the full list of available guardrail types.
+
+## Tool Permission Checking
+
+Before executing any custom tool, Agent Factory runs `_check-tool-permission` to verify:
+
+1. The tool is registered in the agent's configuration
+2. The user has permission to use the tool
+3. The tool's rate limits haven't been exceeded
+4. For `action_approval` guardrails: the user has approved the action

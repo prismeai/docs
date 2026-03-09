@@ -1,0 +1,221 @@
+---
+title: "Conversations"
+description: "Chat with agents — message sending, SSE streaming, conversation management, and the A2A protocol"
+---
+
+## Conversation Lifecycle
+
+1. **Create** — Start a new conversation with an agent
+2. **Send messages** — Send user messages, receive agent responses
+3. **Stream** — Real-time token-by-token streaming via SSE
+4. **List/Get** — Retrieve conversation history
+5. **Delete** — Remove individual conversations or all conversations for an agent
+
+## Endpoints
+
+### List Conversations
+
+```
+GET v1/agents/:agent_id/conversations
+```
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `limit` | integer | Results per page |
+| `offset` | integer | Pagination offset |
+
+Returns conversations for the authenticated user with the specified agent.
+
+### Create Conversation
+
+```
+POST v1/agents/:agent_id/conversations
+```
+
+```json
+{
+  "title": "Research session"
+}
+```
+
+Creates a new conversation context. Returns the conversation ID (`context_id`).
+
+### Get Conversation
+
+```
+GET v1/agents/:agent_id/conversations/:context_id
+```
+
+Returns conversation metadata and message history.
+
+### Delete Conversation
+
+```
+DELETE v1/agents/:agent_id/conversations/:context_id
+```
+
+Emits `conversations.deleted` for cache invalidation and cleanup.
+
+## Sending Messages
+
+### Synchronous
+
+```
+POST v1/agents/:agent_id/messages/send
+```
+
+```json
+{
+  "message": "What are the key findings from the Q3 report?",
+  "context_id": "conv_abc123",
+  "attachments": [
+    {
+      "file_id": "file_xyz",
+      "name": "Q3-report.pdf"
+    }
+  ]
+}
+```
+
+Waits for the full agent response before returning. Used by API integrations and the A2A protocol.
+
+**Response:**
+```json
+{
+  "message": "Based on the Q3 report, the key findings are...",
+  "context_id": "conv_abc123",
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 450,
+    "total_tokens": 1650
+  }
+}
+```
+
+### Streaming (SSE)
+
+```
+POST v1/agents/:agent_id/messages/stream
+```
+
+Same request body as `/send`, but returns a Server-Sent Events stream. This is the primary method used by the SecureChat frontend.
+
+**SSE event types:**
+
+| Event | Data | Description |
+|-------|------|-------------|
+| `token` | `{ text: "..." }` | Individual token from the LLM |
+| `tool_call` | `{ name: "...", arguments: {...} }` | Agent is calling a tool |
+| `tool_result` | `{ name: "...", result: {...} }` | Tool execution result |
+| `thinking` | `{ text: "..." }` | Agent's reasoning (visible in agent_light+) |
+| `artifact` | `{ id: "...", type: "...", content: "..." }` | Generated artifact |
+| `done` | `{ usage: {...} }` | Stream complete |
+| `error` | `{ message: "..." }` | Error occurred |
+
+The stream also emits events for:
+- Planning steps (`plan`)
+- Reflection results (`reflection`)
+- Memory operations (`memory_save`, `memory_recall`)
+- Guardrail checks (`guardrail_input`, `guardrail_output`)
+
+### Event-Driven Streaming
+
+Streaming can also be triggered via workspace events:
+
+```yaml
+when:
+  events:
+    - agents.messages.stream
+```
+
+This allows other workspaces to initiate streaming conversations programmatically.
+
+## Async Operations
+
+During a conversation, several operations happen asynchronously after the response is sent:
+
+| Operation | Event | Purpose |
+|-----------|-------|---------|
+| Title generation | `async.conversation.title` | Auto-generate conversation title from first exchange |
+| Stats update | `async.conversation.stats` | Update conversation statistics |
+| Session summary | `async.session.summary` | Summarize session for context compaction |
+| Conversations count | `async.conversations.count` | Update agent's conversation count |
+
+These are fire-and-forget — they don't block the user response.
+
+## Message Flow
+
+For agentic profiles (agent_light and above), a single user message can trigger multiple LLM calls:
+
+```
+User Message
+    │
+    ▼
+┌──────────────┐
+│ Input        │──► Blocked? Return safety message
+│ Guardrails   │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│ Build Context│ ◄── Working memory + session memory
+│              │ ◄── Long-term memory recall
+│              │ ◄── System prompt + tools
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐     ┌──────────────┐
+│ LLM Call     │────►│ Tool Call?   │──► Execute tool ──► Loop back
+│ (ReAct Loop) │     │              │
+└──────┬───────┘     └──────────────┘
+       │ (final answer)
+       ▼
+┌──────────────┐
+│ Output       │──► Toxic? Regenerate
+│ Guardrails   │
+└──────┬───────┘
+       │
+       ▼
+   Response to User
+```
+
+See [Agentic Loop](/products/agent-factory/agentic-loop) for the full ReAct implementation.
+
+## Frontend Integration
+
+The SecureChat frontend connects to Agent Factory via:
+
+1. **REST API** for conversation CRUD
+2. **SSE streaming** for real-time responses
+3. **WebSocket** (`sdk.streamEvents`) for workspace-level events (typing indicators, presence)
+
+```tsx
+// Simplified SecureChat pattern
+const events = await sdk.streamEvents(workspace.id)
+
+// Listen for streaming tokens
+events.on('agent.token', (data) => {
+  appendToken(data.payload.text)
+})
+
+// Send a message
+const response = await fetch(
+  `${apiUrl}/workspaces/slug:agent-factory/webhooks/v1/agents/${agentId}/messages/stream`,
+  {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ message, context_id })
+  }
+)
+```
+
+## Rate Limiting
+
+| Operation | Window | Limit |
+|-----------|--------|-------|
+| `messages/send` | 60s | 30 |
+| `messages/stream` | 60s | 30 |
+| `agents` (list) | 60s | 100 |
+| `agents` (create) | 3600s | 10 |
+
+Rate limits are configurable via `config.rateLimits` in the workspace config. They can be disabled entirely with `rateLimits.enabled: false`.

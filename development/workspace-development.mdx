@@ -1,0 +1,335 @@
+---
+title: "Workspace Development"
+description: "Write backend automations — REST endpoints, events, scheduled jobs, and data access"
+---
+
+Backend workspaces are written in DSUL (Declarative Structured Universal Language) — Prisme.ai's YAML-based automation language. Each workspace is a self-contained microservice with its own API, data, and security.
+
+## Workspace Structure
+
+```
+workspaces/my-workspace/
+├── index.yml           # Configuration
+├── security.yml        # RBAC rules
+├── automations/
+│   ├── _auth.yml       # Private: auth helper
+│   ├── _llm.yml        # Private: LLM client
+│   ├── v1/
+│   │   ├── items.yml              # GET/POST /v1/items
+│   │   └── items/
+│   │       └── item_id.yml        # GET/PUT/DELETE /v1/items/:item_id
+│   ├── events/
+│   │   └── item-updated.yml       # React to events
+│   └── jobs/
+│       └── nightly-cleanup.yml    # Scheduled tasks
+└── imports/
+    └── items.yml       # Data collection
+```
+
+## REST Endpoints
+
+Create an endpoint automation with `when: endpoint:`:
+
+```yaml
+# automations/v1/items.yml
+slug: v1-items
+name: Items Endpoint
+when:
+  endpoint: v1/items
+do:
+  - _auth:
+  - conditions:
+      '{{req.method}}':
+        GET:
+          - items.find:
+              query:
+                orgSlug: '{{auth.orgSlug}}'
+              options:
+                limit: '{{query.limit || 20}}'
+                sort:
+                  createdAt: -1
+              output: results
+          - output: '{{results}}'
+        POST:
+          - items.insert:
+              document:
+                name: '{{body.name}}'
+                orgSlug: '{{auth.orgSlug}}'
+                createdBy: '{{auth.userId}}'
+              output: created
+          - set:
+              __statusCode: 201
+          - output: '{{created}}'
+```
+
+### Path Parameters
+
+```yaml
+# automations/v1/items/item_id.yml
+when:
+  endpoint: v1/items/:item_id
+do:
+  - _auth:
+  - conditions:
+      '{{req.method}}':
+        GET:
+          - items.findOne:
+              query:
+                id: '{{params.item_id}}'
+                orgSlug: '{{auth.orgSlug}}'
+              output: item
+          - conditions:
+              '{{item}}':
+                __empty__:
+                  - set:
+                      __statusCode: 404
+                  - output:
+                      error: Not found
+                __default__:
+                  - output: '{{item}}'
+        DELETE:
+          - items.delete:
+              query:
+                id: '{{params.item_id}}'
+                orgSlug: '{{auth.orgSlug}}'
+          - set:
+              __statusCode: 204
+```
+
+### Request Data
+
+| Variable | Description |
+|----------|-------------|
+| `{{req.method}}` | HTTP method (GET, POST, PUT, DELETE) |
+| `{{body.field}}` | Request body field |
+| `{{query.field}}` | Query parameter |
+| `{{params.field}}` | URL path parameter |
+| `{{req.headers.field}}` | Request header |
+
+### Response
+
+| Technique | Usage |
+|-----------|-------|
+| `output: value` | Set response body |
+| `set: { __statusCode: 404 }` | Set HTTP status code |
+| `set: { __headers: { X-Custom: value } }` | Set response headers |
+
+## Private Helpers
+
+Use underscore-prefixed automations for shared logic:
+
+```yaml
+# automations/_auth.yml
+slug: _auth
+private: true
+do:
+  - conditions:
+      '{{user.id}}':
+        __empty__:
+          - set:
+              __statusCode: 401
+          - output:
+              error: Authentication required
+          - break:
+        __default__:
+          - set:
+              auth:
+                userId: '{{user.id}}'
+                orgSlug: '{{user.meta.currentOrg}}'
+```
+
+Call private helpers like any automation:
+
+```yaml
+- _auth:
+    # arguments if needed
+```
+
+## Data Access (Collection App)
+
+### Define a Collection
+
+```yaml
+# imports/items.yml
+appSlug: Collection
+config:
+  COLLECTION_NAME: my_items
+  slug: items
+  properties:
+    name: { type: text }
+    description: { type: text }
+    metadata: { type: json }
+    count: { type: integer }
+    active: { type: boolean }
+    orgSlug: { type: text }
+    createdBy: { type: text }
+  indexes:
+    - orgSlug
+    - createdBy
+    - active
+  uniques:
+    - name
+```
+
+### Available Types
+
+`text`, `json`, `integer`, `float`, `boolean`, `date`, `datetime`, `localized_text`
+
+### CRUD Operations
+
+```yaml
+# Find (list with filter)
+- items.find:
+    query: { orgSlug: '{{auth.orgSlug}}' }
+    options:
+      limit: 20
+      offset: 0
+      sort: { createdAt: -1 }
+      fields: { name: 1, description: 1 }
+    output: results
+
+# Find one
+- items.findOne:
+    query: { id: '{{params.item_id}}' }
+    output: item
+
+# Insert
+- items.insert:
+    document: { name: '{{body.name}}', orgSlug: '{{auth.orgSlug}}' }
+    output: created
+
+# Update
+- items.update:
+    query: { id: '{{params.item_id}}' }
+    update:
+      $set: { name: '{{body.name}}' }
+    output: updated
+
+# Delete
+- items.delete:
+    query: { id: '{{params.item_id}}' }
+
+# Count
+- items.count:
+    query: { orgSlug: '{{auth.orgSlug}}' }
+    output: total
+
+# Distinct
+- items.distinct:
+    field: category
+    query: { orgSlug: '{{auth.orgSlug}}' }
+    output: categories
+
+# Aggregate
+- items.aggregate:
+    pipeline:
+      - $match: { orgSlug: '{{auth.orgSlug}}' }
+      - $group: { _id: '$category', count: { $sum: 1 } }
+    output: stats
+```
+
+## Event-Driven Automations
+
+React to events:
+
+```yaml
+# automations/events/item-updated.yml
+slug: on-item-updated
+when:
+  events:
+    - items.updated
+do:
+  - # Handle the event
+  - set:
+      itemId: '{{event.payload.item_id}}'
+```
+
+Emit events:
+
+```yaml
+- emit:
+    event: items.updated
+    payload:
+      item_id: '{{item.id}}'
+```
+
+## Scheduled Jobs
+
+```yaml
+# automations/jobs/nightly-cleanup.yml
+slug: nightly-cleanup
+when:
+  schedules:
+    - cron: '0 3 * * *'  # 3 AM daily
+do:
+  - items.delete:
+      query:
+        active: false
+        updatedAt:
+          $lt: '{{date_subtract(now(), 30, "days")}}'
+```
+
+## Cross-Workspace Calls
+
+Call another workspace's API via workspace JWT:
+
+```yaml
+# automations/_llm.yml
+slug: _llm
+private: true
+arguments:
+  endpoint:
+    type: string
+  body:
+    type: object
+do:
+  - auth:
+      workspace: true
+      output: _wsJwt
+  - fetch:
+      url: '{{global.apiUrl}}/workspaces/slug:llm-gateway/webhooks/{{endpoint}}'
+      method: POST
+      headers:
+        Authorization: 'Bearer {{_wsJwt.jwt}}'
+        Content-Type: application/json
+      body: '{{body}}'
+      output: __output
+```
+
+## Security
+
+```yaml
+# security.yml
+authorizations:
+  roles:
+    editor: {}
+    viewer: {}
+    workspace:
+      auth:
+        apiKey: {}
+  rules:
+    - role: editor
+      action: [read, update]
+      subject: workspaces
+    - role: viewer
+      action: read
+      subject: [workspaces, pages]
+    - role: workspace
+      action: [create, update, read, delete]
+      subject: files
+    - action: create
+      subject: events
+      conditions:
+        source.serviceTopic: topic:runtime:emit
+```
+
+## Deployment
+
+Push your workspace to an environment:
+
+```bash
+# Using the Prisme Builder MCP
+# Or via the Builder UI at /builder
+```
+
+See [Workspace Deployment](/self-hosting/workspace-deployment) for details.

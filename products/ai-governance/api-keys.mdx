@@ -1,0 +1,174 @@
+---
+title: "API Keys"
+description: "API key lifecycle — creation, permissions, scoping, rotation, and revocation"
+---
+
+API keys (`iak_*`) enable programmatic access to the Prisme.ai platform from external systems. They are scoped to an organization and carry specific permissions and resource scopes.
+
+## Key Format
+
+All API keys use the `iak_` prefix followed by a random string:
+
+```
+iak_a1b2c3d4e5f6g7h8i9j0...
+```
+
+Keys are stored **hashed** in the `iam_apikeys` collection. The plaintext key is returned only once at creation time.
+
+## Endpoints
+
+### List API Keys
+
+```
+GET v1/orgs/:org_slug/apikeys
+```
+
+Returns all API keys for the organization (without the secret values).
+
+### Create API Key
+
+```
+POST v1/orgs/:org_slug/apikeys
+```
+
+```json
+{
+  "name": "Production Integration",
+  "permissions": [
+    "llm:completions:use",
+    "agents:read",
+    "agents:use",
+    "memories:read",
+    "memories:write"
+  ],
+  "scopes": {
+    "models": ["gpt-4o", "gpt-4o-mini"],
+    "agents": ["agent_abc123"]
+  },
+  "expires_at": "2026-12-31T23:59:59Z"
+}
+```
+
+**Response** (key is only shown once):
+```json
+{
+  "id": "key_xyz",
+  "key": "iak_a1b2c3d4e5f6g7h8i9j0...",
+  "name": "Production Integration",
+  "permissions": [...],
+  "scopes": {...},
+  "created_at": "2026-01-15T10:00:00Z"
+}
+```
+
+### Get / Update API Key
+
+```
+GET v1/orgs/:org_slug/apikeys/:key_id
+PUT v1/orgs/:org_slug/apikeys/:key_id
+```
+
+Update allows changing name, permissions, scopes, and expiration. The key value itself cannot be changed (use rotation instead).
+
+### Delete API Key
+
+```
+DELETE v1/orgs/:org_slug/apikeys/:key_id
+```
+
+### Revoke API Key
+
+```
+POST v1/orgs/:org_slug/apikeys/:key_id/revoke
+```
+
+Immediately invalidates the key. Revoked keys cannot be un-revoked.
+
+### Rotate API Key
+
+```
+POST v1/orgs/:org_slug/apikeys/:key_id/rotate
+```
+
+Generates a new key value while preserving the key's permissions and scopes. The old key is immediately invalidated. Returns the new plaintext key.
+
+## Permissions
+
+API key permissions follow a `resource:action` pattern:
+
+| Permission | Description |
+|-----------|-------------|
+| `llm:completions:use` | Access LLM Gateway chat completions |
+| `llm:embeddings:use` | Access LLM Gateway embeddings |
+| `agents:read` | Read agent configurations |
+| `agents:use` | Send messages to agents |
+| `agents:write` | Create and modify agents |
+| `memories:read` | Read agent memories |
+| `memories:write` | Create and update memories |
+| `memories:query` | Run analytics queries on memories |
+| `collections:read` | Read collection data |
+| `collections:write` | Write collection data |
+| `insights:read` | Read analytics data |
+| `iam:*` | Full IAM access (admin) |
+
+Wildcard permissions are supported: `memories:*` grants all memory permissions.
+
+## Scopes
+
+Scopes restrict **which resources** a key can access, even if the permission allows the action:
+
+```json
+{
+  "scopes": {
+    "models": ["gpt-4o", "gpt-4o-mini"],
+    "agents": ["agent_abc123", "agent_def456"]
+  }
+}
+```
+
+- **`models`** — Restricts which LLM models the key can use via the LLM Gateway
+- **`agents`** — Restricts which agents the key can interact with
+
+If scopes are empty or omitted, the key has access to all resources within its permissions.
+
+## Cross-Workspace Validation
+
+When other workspaces receive a request with an `iak_*` token, they validate it against AI Governance:
+
+```
+POST v1/auth/apikey
+```
+
+This internal endpoint (called via workspace JWT) returns the full API key context:
+
+```json
+{
+  "valid": true,
+  "orgSlug": "acme-corp",
+  "permissions": ["llm:completions:use", "agents:read"],
+  "scopes": {
+    "models": ["gpt-4o"]
+  },
+  "subscriptionLimits": {
+    "llm_requests_per_minute": 100,
+    "max_tokens_per_request": 8000
+  },
+  "llm": {
+    "allowed_providers": ["openai", "azure"],
+    "default_model": "gpt-4o"
+  }
+}
+```
+
+The validation result is cached for **60 seconds** by the calling workspace to minimize cross-workspace calls.
+
+## Usage Tracking
+
+API key usage is tracked through the `v1/usage` endpoints and recorded via `on-apikey-used` events. Each key has an associated usage counter that can be checked against quota limits defined in the organization's subscription.
+
+## Security
+
+- Keys are stored as **SHA-256 hashes** — plaintext values are never persisted
+- Key events (`apikeys.*`) are **excluded from event streaming** via inverted RBAC rules — even editors cannot read key operation events
+- Rotation provides **zero-downtime key renewal** — the new key is active immediately
+- Expired keys are automatically rejected during validation

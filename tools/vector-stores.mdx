@@ -1,0 +1,138 @@
+---
+title: "Vector Stores"
+description: "Interchangeable vector storage providers — OpenSearch, Elasticsearch, and Mock"
+---
+
+Three vector provider workspaces implement the same interface, making them interchangeable backends for the [Storage](/services/storage/overview) service's RAG pipeline.
+
+## Providers
+
+| Provider | Workspace | App Slug | Engine |
+|----------|-----------|----------|--------|
+| **OpenSearch** | `vector-opensearch` | `VectorOpensearch` | k-NN plugin (HNSW via Lucene) |
+| **Elasticsearch** | `vector-elasticsearch` | `VectorElasticsearch` | Native `dense_vector` + `knn` queries |
+| **Mock** | `vector-mock` | `VectorMock` | In-memory fake results (testing only) |
+
+## Shared Interface
+
+All providers implement these 5 operations:
+
+### create-index
+
+Creates a vector index for storing embeddings.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `index` | string | Index name |
+| `dimensions` | integer | Vector dimensions (e.g., 1536) |
+| `similarity` | string | Similarity metric (`cosine`, `dot_product`, `l2`) |
+
+Returns: `{ success: true, index: "..." }`
+
+### upsert
+
+Inserts or updates vectors.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `index` | string | Index name |
+| `vectors` | array | `[{ id, vector, metadata }]` |
+
+Returns: `{ success: true, count: N, errors: [] }`
+
+### search
+
+Performs similarity search.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `index` | string | Index name |
+| `vector` | array | Query embedding |
+| `limit` | integer | Max results |
+| `filter` / `filter_json` | object/string | Metadata filter |
+| `min_score` | float | Minimum similarity score |
+
+Returns: `{ results: [{ id, score, metadata }], total: N }`
+
+### delete-vectors
+
+Deletes vectors by ID or filter.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `index` | string | Index name |
+| `ids` | array | Vector IDs to delete |
+| `filter` | object | Metadata filter for bulk delete |
+
+Returns: `{ success: true, deleted_count: N }`
+
+### delete-index
+
+Deletes an entire vector index.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `index` | string | Index name |
+
+Returns: `{ success: true }`
+
+## Vector Metadata Schema
+
+All providers store vectors with this metadata:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file_id` | string | Source file identifier |
+| `vector_store_id` | string | Parent vector store |
+| `chunk_index` | integer | Position in source document |
+| `text` | string | Original text chunk |
+| `page` | integer | Source page number |
+| `start_char` | integer | Character offset start |
+| `end_char` | integer | Character offset end |
+| `scope` | string | Access scope (e.g., `org:acme-corp`) |
+| `conversation_id` | string | For conversation-scoped data |
+| `expires_at` | datetime | Expiration timestamp |
+
+## Provider Differences
+
+### OpenSearch
+
+- Uses the **k-NN plugin** with `knn_vector` field type and HNSW algorithm (Lucene engine)
+- Filters passed as raw JSON string (`filter_json`) because Prisme.ai's template engine interprets dotted keys (e.g., `metadata.scope`) as nested objects. The JSON string workaround preserves flat keys.
+- Auth via `Basic` HTTP header from `config.auth_header`
+
+### Elasticsearch
+
+- Uses native **`dense_vector`** field type with `knn` query
+- Filters constructed as standard Prisme objects (ES handles dotted keys natively)
+- Supports `$or` operators via Elasticsearch's `should` clauses
+- Same `Basic` auth pattern
+
+### Mock
+
+- **No external calls** — returns hardcoded fake results
+- 5 pre-defined mock texts with random scores between 0.5–1.0
+- Configurable `mock_latency_ms` and `mock_error_rate` for testing error paths
+- All operations return `mock: true` in output
+- Emits `vector-mock.*` events for observability
+
+Use Mock for development and integration testing without a real vector engine.
+
+## How Storage Routes to Providers
+
+The Storage workspace's `_vector-router` dispatches to the correct provider based on the vector store's `provider` field:
+
+```yaml
+- conditions:
+    '{{provider}}':
+      opensearch:
+        - VectorOpensearch.search: ...
+      elasticsearch:
+        - VectorElasticsearch.search: ...
+      mock:
+        - VectorMock.search: ...
+```
+
+Changing provider requires:
+1. Update the vector store's `provider` field
+2. Re-index all files (embeddings are reusable, but the index structure differs)

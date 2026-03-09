@@ -1,0 +1,156 @@
+---
+title: "Authentication & SSO"
+description: "Configure OIDC, SAML, and Microsoft Entra ID for enterprise single sign-on"
+---
+
+Prisme.ai supports enterprise SSO through OIDC, SAML, and Microsoft Entra ID.
+
+## Supported Providers
+
+<Tabs>
+  <Tab title="OIDC">
+    Compatible with Google Workspace, Okta, Auth0, Keycloak, and any OIDC-compliant provider.
+  </Tab>
+  <Tab title="SAML">
+    Compatible with ADFS, Okta, OneLogin, PingIdentity. Supports HTTP-POST binding.
+  </Tab>
+  <Tab title="Microsoft Entra ID">
+    Specialized integration for Microsoft environments (formerly Azure AD).
+  </Tab>
+</Tabs>
+
+## OIDC Configuration
+
+<Steps>
+  <Step title="Register Application">
+    In your OIDC provider:
+    1. Register a **Web** OAuth2 client
+    2. Set redirect URI: `https://API_URL/v2/login/callback`
+    3. Request scopes: `openid email` (add `profile` for name)
+    4. Note: Client ID, Client Secret, Auth URL, Token URL, JWKS URI
+
+    <Note>
+      Only the **RS256** algorithm is currently supported.
+    </Note>
+  </Step>
+  <Step title="Create Configuration File">
+    ```yaml
+    providers:
+      MyProvider:
+        type: oidc
+        config:
+          client_id: "your-client-id"
+          client_secret: "your-client-secret"
+          authorization_endpoint: "https://idp.example.com/authorize"
+          token_endpoint: "https://idp.example.com/token"
+          jwks_uri: "https://idp.example.com/.well-known/jwks.json"
+          scopes: "openid email profile"
+        attributesMapping:
+          firstName: 'given_name'
+          lastName: 'family_name'
+          email: 'email'
+    ```
+
+    <Warning>
+      Choose your provider name carefully — it's stored in user auth data and difficult to change later.
+    </Warning>
+  </Step>
+</Steps>
+
+## SAML Configuration
+
+<Steps>
+  <Step title="Register Service Provider">
+    In your IdP:
+    1. Set ACS endpoint: `https://API_URL/v2/login/callback`
+    2. Set SP EntityID to match the `audience` below
+    3. Export the IdP metadata XML
+  </Step>
+  <Step title="Create Configuration File">
+    ```yaml
+    providers:
+      MySAML:
+        type: saml
+        config:
+          idp_metadata_filepath: "/path/to/idp-metadata.xml"
+          audience: "https://api.yourdomain.com"
+          issuer: "https://api.yourdomain.com"
+        attributesMapping:
+          firstName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname'
+          lastName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname'
+          email: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress'
+    ```
+
+    Without XML, use individual parameters:
+
+    ```yaml
+    providers:
+      MySAML:
+        type: saml
+        config:
+          entryPoint: "https://idp.example.com/SAML2/SSO/Redirect"
+          idpCert: "-----BEGIN CERTIFICATE-----\nMIID...\n-----END CERTIFICATE-----"
+          audience: "https://api.yourdomain.com"
+          issuer: "https://api.yourdomain.com"
+    ```
+  </Step>
+</Steps>
+
+## Mount Configuration
+
+Mount the config file in the `prismeai-api-gateway` container at `/www/services/api-gateway/authProviders.config.yml` (customizable via `AUTH_PROVIDERS_CONFIG` env var).
+
+For Kubernetes:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prismeai-api-gateway-authproviders
+data:
+  authProviders.config.yml: |
+    providers:
+      MyProvider:
+        type: oidc
+        config:
+          client_id: "..."
+          # ...
+---
+# In the Deployment spec:
+volumes:
+  - name: auth-config
+    configMap:
+      name: prismeai-api-gateway-authproviders
+volumeMounts:
+  - name: auth-config
+    mountPath: /www/services/api-gateway/authProviders.config.yml
+    subPath: authProviders.config.yml
+```
+
+## Frontend Configuration
+
+Enable the SSO button in the platform UI:
+
+```bash
+ENABLED_AUTH_PROVIDERS='[{"name":"MyProvider","label":"Sign in with SSO"}]'
+```
+
+To disable local account creation:
+
+```bash
+DISABLE_LOCAL_SIGNUP=true
+```
+
+## Troubleshooting
+
+<Accordion title="Redirect URI Mismatch">
+  Ensure the redirect URI in your IdP exactly matches `https://API_URL/v2/login/callback`.
+</Accordion>
+
+<Accordion title="SAML Signature Validation Failed">
+  Verify the IdP certificate is current and correctly formatted in the metadata XML.
+</Accordion>
+
+<Accordion title="Missing User Attributes">
+  Check `attributesMapping` matches your IdP's claim names. Monitor `gateway.login.succeeded` events for the raw attributes returned.
+</Accordion>

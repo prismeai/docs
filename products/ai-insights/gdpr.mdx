@@ -1,0 +1,131 @@
+---
+title: "GDPR Compliance"
+description: "Data deletion requests, user data export, and text anonymization"
+---
+
+AI Insights includes GDPR compliance tools for handling user data rights — the right to erasure, the right to data portability, and data anonymization.
+
+## Data Deletion
+
+### Request Deletion
+
+```
+POST v1/gdpr/users/:user_id/deletion
+```
+
+```json
+{
+  "reason": "User requested account deletion",
+  "scope": "all",
+  "requested_by": "admin_user_id"
+}
+```
+
+Creates a deletion request record in `gdpr_requests` with status `pending`.
+
+**Scope options:**
+- `all` — Delete all user data across the platform
+- `conversations` — Delete only conversation data
+- `memories` — Delete only memory data
+- `analytics` — Delete only analytics/insights data
+
+### Deletion Processing
+
+Pending deletion requests are processed nightly (`0 3 * * *`) by `gdpr/process-pending-requests`:
+
+1. Fetch all `pending` requests
+2. For each request, call `gdpr/process-deletion`:
+   - Delete conversations from Agent Factory
+   - Delete memories from Memories workspace
+   - Delete insights records
+   - Delete feedback records
+   - Anonymize any retained analytics data
+3. Update request status to `completed`
+4. Log the deletion for audit
+
+### Deletion Status
+
+Deletion requests can be tracked through the `gdpr_requests` collection. Statuses:
+
+| Status | Description |
+|--------|-------------|
+| `pending` | Request created, waiting for nightly processing |
+| `processing` | Currently being executed |
+| `completed` | All data successfully deleted |
+| `partial` | Some deletions succeeded, others failed (retried next night) |
+| `failed` | Deletion failed (requires manual intervention) |
+
+## Data Export
+
+```
+GET v1/gdpr/users/:user_id/export
+```
+
+Exports all user data in a structured format:
+
+```json
+{
+  "user_id": "user_abc",
+  "exported_at": "2026-03-01T10:00:00Z",
+  "data": {
+    "conversations": [...],
+    "memories": [...],
+    "feedback": [...],
+    "insights": [...],
+    "ratings": [...]
+  }
+}
+```
+
+The export includes all data associated with the user across all workspaces accessible to AI Insights.
+
+## Text Anonymization
+
+The `_anonymize-text` automation provides PII removal from text data:
+
+- Email addresses → `[EMAIL]`
+- Phone numbers → `[PHONE]`
+- Names → `[NAME]`
+- Addresses → `[ADDRESS]`
+- Other PII patterns → `[PII]`
+
+Anonymization is used:
+- During data export (optional, configurable)
+- When retaining analytics data after a deletion request
+- For creating anonymized datasets for analysis
+
+## Retention Policies
+
+Retention policies define how long data is kept before automatic purging:
+
+```json
+{
+  "conversations": {
+    "ttl_days": 365,
+    "anonymize_after_days": 90
+  },
+  "memories": {
+    "ttl_days": 730
+  },
+  "insights": {
+    "ttl_days": 365
+  },
+  "feedbacks": {
+    "ttl_days": 365
+  }
+}
+```
+
+Policies are stored in the `retention_policies` collection and enforced by the nightly purge job (`0 4 * * *`).
+
+The `_resolve-retention-policy` automation determines the applicable policy for each data type, considering organization-level overrides.
+
+## Data Expiry
+
+The nightly purge job (`gdpr/purge-expired-data`) at `0 4 * * *`:
+
+1. Reads retention policies for the organization
+2. Identifies records past their TTL
+3. Anonymizes records past the `anonymize_after_days` threshold
+4. Deletes records past the `ttl_days` threshold
+5. Logs all operations for audit

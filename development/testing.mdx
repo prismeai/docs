@@ -1,0 +1,163 @@
+---
+title: "Testing"
+description: "Test patterns for workspace automations and builtin apps"
+---
+
+## Workspace Integration Tests
+
+Each workspace includes integration test suites as private endpoint automations. They exercise the full API stack — authentication, data access, and cross-workspace calls.
+
+### Convention
+
+Test files follow the `tests-*.yml` pattern and are private endpoints:
+
+```yaml
+# automations/tests-items-crud.yml
+slug: tests-items-crud
+name: Tests - Items CRUD
+when:
+  endpoint: tests/items-crud
+private: true
+do:
+  - comment: Create item
+  - fetch:
+      url: '{{global.apiUrl}}/workspaces/slug:my-workspace/webhooks/v1/items'
+      method: POST
+      headers:
+        Authorization: 'Bearer {{_wsJwt.jwt}}'
+      body:
+        name: 'Test Item {{timestamp}}'
+      output: createResult
+
+  - comment: Verify creation
+  - conditions:
+      '{{createResult.id}}':
+        __empty__:
+          - output:
+              status: FAIL
+              test: create
+              error: No ID returned
+          - break:
+
+  - comment: Get item
+  - fetch:
+      url: '{{global.apiUrl}}/workspaces/slug:my-workspace/webhooks/v1/items/{{createResult.id}}'
+      method: GET
+      headers:
+        Authorization: 'Bearer {{_wsJwt.jwt}}'
+      output: getResult
+
+  - comment: Verify get
+  - conditions:
+      '{{getResult.name}}':
+        'Test Item {{timestamp}}':
+          - set:
+              testsPassed: '{{testsPassed + 1}}'
+        __default__:
+          - output:
+              status: FAIL
+              test: get
+              error: 'Name mismatch: {{getResult.name}}'
+          - break:
+
+  - comment: Cleanup - delete item
+  - fetch:
+      url: '{{global.apiUrl}}/workspaces/slug:my-workspace/webhooks/v1/items/{{createResult.id}}'
+      method: DELETE
+      headers:
+        Authorization: 'Bearer {{_wsJwt.jwt}}'
+
+  - output:
+      status: PASS
+      tests_passed: '{{testsPassed}}'
+```
+
+### Running Tests
+
+Tests are triggered via HTTP:
+
+```bash
+curl -X POST \
+  https://api.prisme.ai/v2/workspaces/slug:my-workspace/webhooks/tests/items-crud \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Test Suites by Workspace
+
+Most workspaces include comprehensive test suites:
+
+| Workspace | Test Files | Coverage |
+|-----------|-----------|----------|
+| Agent Factory | `tests-agents-crud`, `tests-conversations`, `tests-tools` | Agent lifecycle, chat, tools |
+| AI Governance | `tests-audit`, `tests-invites`, `tests-sso`, `tests-join-rules`, `tests-branding`, `tests-has-any-permission` | All IAM features |
+| AI Collection | `tests-collections-crud`, `tests-collections-data`, `tests-data-crud` | Collection + data lifecycle |
+| LLM Gateway | `tests-chat-completion`, `tests-embeddings`, `tests-governance`, `tests-routing`, `tests-models-crud`, `tests-carbon-footprint`, `tests-stream-usage` | All LLM operations |
+| Storage | `tests-run-all`, `tests-rag-scopes`, `tests-skills`, `tests-vector-stores-files`, `tests-vector-stores-search` | Files, vectors, RAG |
+| Guardrails | `tests-all`, `tests-injection-detect`, `tests-pii-detect`, `tests-topic-guard`, `tests-hallucination-check`, `tests-toxicity-check`, `tests-action-approval` | Each guardrail type |
+| Memories | `tests-all`, `tests-recall`, `tests-remember`, `tests-forget`, `tests-get-user-memories` | Memory lifecycle |
+| Evaluations | `tests-all` | Eval lifecycle |
+| Prompt Library | `tests-run-all`, `tests-mcp` | MCP protocol |
+| Bing Search | `tests-run-all`, `tests-web-search`, `tests-mcp` | Search + MCP |
+| Vector Stores | `tests-all` (in each provider) | Provider operations |
+
+### Aggregate Test Runner
+
+Some workspaces have a `tests-run-all` or `tests-all` automation that runs all test suites sequentially and returns an aggregate result:
+
+```yaml
+slug: tests-run-all
+when:
+  endpoint: tests/run-all
+private: true
+do:
+  - tests-items-crud:
+      output: test1
+  - tests-items-search:
+      output: test2
+  - output:
+      results:
+        items_crud: '{{test1.status}}'
+        items_search: '{{test2.status}}'
+      all_passed: '{{test1.status == "PASS" && test2.status == "PASS"}}'
+```
+
+## Frontend Tests
+
+The platform uses **Vitest** for frontend unit and component tests:
+
+```bash
+# Run tests
+npm run test --prefix services/platform
+
+# Watch mode
+npm run test:watch --prefix services/platform
+```
+
+Test files follow the `*.test.ts` / `*.test.tsx` convention and live alongside their source files.
+
+## Type Checking
+
+```bash
+npm run typecheck --prefix services/platform
+```
+
+Runs `tsc --noEmit` to check TypeScript types without generating output files.
+
+## Linting
+
+```bash
+npm run lint --prefix services/platform
+```
+
+Runs ESLint across the codebase.
+
+## CI Validation
+
+For a full validation pass:
+
+```bash
+npm run typecheck --prefix services/platform && \
+npm run test --prefix services/platform && \
+npm run lint --prefix services/platform && \
+npm run build --prefix services/platform
+```

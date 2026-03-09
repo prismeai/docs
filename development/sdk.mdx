@@ -1,0 +1,236 @@
+---
+title: "SDK Reference"
+description: "Using @prisme.ai/sdk — authentication, API calls, WebSocket events, and real-time streaming"
+---
+
+The `@prisme.ai/sdk` package is the TypeScript SDK for interacting with the Prisme.ai platform. It's used by both the platform shell and builtin apps.
+
+## Installation
+
+The SDK is included in the platform's `packages/sdk` and available as `@prisme.ai/sdk`. Builtin apps get it automatically via the shared module registry.
+
+## Initialization
+
+```tsx
+import PrismeSDK from '@prisme.ai/sdk'
+
+const sdk = new PrismeSDK({
+  apiUrl: 'https://api.prisme.ai/v2',
+  token: 'your-access-token'
+})
+```
+
+In builtin apps, the SDK instance is provided as a prop:
+
+```tsx
+export default function App({ sdk, workspace }: AppProps) {
+  // sdk is already initialized and authenticated
+}
+```
+
+## Authentication
+
+### OIDC Flow
+
+```tsx
+// Get authorization URL
+const authUrl = sdk.getAuthorizationURL({
+  clientId: 'your-client-id',
+  redirectUri: 'http://localhost:3000/callback',
+  scope: 'openid profile email'
+})
+
+// Exchange code for token
+const token = await sdk.getToken({
+  code: authorizationCode,
+  redirectUri: 'http://localhost:3000/callback'
+})
+```
+
+### Token Management
+
+```tsx
+// Set token
+sdk.setToken('access-token-value')
+
+// Get current token
+const token = sdk.token
+
+// CSRF token (included automatically on mutating requests)
+const csrf = sdk._csrfToken
+```
+
+## REST API Calls
+
+### Direct Fetch
+
+```tsx
+const response = await fetch(
+  `${sdk.apiUrl}/workspaces/slug:agent-factory/webhooks/v1/agents`,
+  {
+    headers: {
+      Authorization: `Bearer ${sdk.token}`,
+      'Content-Type': 'application/json'
+    }
+  }
+)
+const agents = await response.json()
+```
+
+### Using createApiFetch
+
+```tsx
+import { createApiFetch } from '@/socle/lib/ApiClient'
+
+const api = createApiFetch(sdk, 'agent-factory')
+
+// GET
+const agents = await api('v1/agents')
+
+// POST
+const agent = await api('v1/agents', {
+  method: 'POST',
+  body: JSON.stringify({
+    name: 'My Agent',
+    profile: 'simple'
+  })
+})
+
+// PUT
+await api('v1/agents/agent_abc', {
+  method: 'PUT',
+  body: JSON.stringify({ name: 'Updated Name' })
+})
+
+// DELETE
+await api('v1/agents/agent_abc', { method: 'DELETE' })
+```
+
+### Using BaseApiClient
+
+For workspaces with full CRUD APIs, extend `BaseApiClient`:
+
+```tsx
+import { BaseApiClient } from '@/socle/lib/ApiClient'
+
+class AgentClient extends BaseApiClient {
+  constructor(sdk: SDK) {
+    super(sdk, 'agent-factory', 'v1/agents')
+  }
+
+  async publish(agentId: string) {
+    return this.post(`${agentId}/publish`)
+  }
+}
+
+const client = new AgentClient(sdk)
+const agents = await client.list()
+const agent = await client.get('agent_abc')
+const created = await client.create({ name: 'New Agent' })
+await client.update('agent_abc', { name: 'Updated' })
+await client.delete('agent_abc')
+await client.publish('agent_abc')
+```
+
+## WebSocket Events
+
+### Connect to Workspace Events
+
+```tsx
+const events = await sdk.streamEvents(workspace.id)
+
+// Listen for events
+const unsubscribe = events.on('my-event', (data) => {
+  console.log('Event received:', data.type, data.payload)
+})
+
+// Emit events
+events.emit('my-event', { key: 'value' })
+
+// Clean up
+events.close()
+```
+
+### React Hook Pattern
+
+```tsx
+import { useWorkspaceEvents } from '@/socle/hooks/useWorkspaceEvents'
+
+function MyComponent({ sdk, workspace }) {
+  const { events, connected } = useWorkspaceEvents(sdk, workspace.id)
+
+  useEffect(() => {
+    if (!events) return
+    return events.on('data-updated', (data) => {
+      // Handle event
+    })
+  }, [events])
+
+  return <div>Status: {connected ? 'Connected' : 'Connecting...'}</div>
+}
+```
+
+### SSE Streaming
+
+For streaming LLM responses:
+
+```tsx
+const response = await fetch(
+  `${sdk.apiUrl}/workspaces/slug:agent-factory/webhooks/v1/agents/${agentId}/messages/stream`,
+  {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sdk.token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ message: userMessage, context_id: conversationId })
+  }
+)
+
+const reader = response.body.getReader()
+const decoder = new TextDecoder()
+
+while (true) {
+  const { done, value } = await reader.read()
+  if (done) break
+
+  const text = decoder.decode(value)
+  // Parse SSE events from text
+  const events = text.split('\n\n').filter(Boolean)
+  for (const event of events) {
+    if (event.startsWith('data: ')) {
+      const data = JSON.parse(event.slice(6))
+      // Handle token, tool_call, done, etc.
+    }
+  }
+}
+```
+
+## Workspace Operations
+
+```tsx
+// List workspaces
+const workspaces = await sdk.getWorkspaces()
+
+// Get workspace by slug
+const workspace = await sdk.getWorkspace('agent-factory')
+
+// Get workspace config
+const config = await sdk.getWorkspaceConfig(workspaceId)
+```
+
+## Platform Hooks
+
+These hooks are available in builtin apps via the socle:
+
+| Hook | Purpose |
+|------|---------|
+| `useAuth()` | Authentication state, login/logout |
+| `useWorkspace(slug)` | Workspace CRUD |
+| `usePlatform()` | Platform shell state (sidebar, menu, branding) |
+| `useIAMContext()` | IAM context (org, permissions, navigation) |
+| `useAppRouter()` | In-app routing utilities |
+| `useWorkspaceEvents(sdk, workspaceId)` | WebSocket event connection |
+| `useDemoMode()` | Demo mode state |
+| `usePresence()` | User presence tracking |
+| `useNavigationFeatures()` | Navigation feature flags |

@@ -1,0 +1,155 @@
+---
+title: "Platform Service"
+description: "Build and deploy the services/platform Docker image — nginx, runtime config, and caching"
+---
+
+The platform frontend is deployed as a static site served by nginx. The Docker image is built from `services/platform/Dockerfile`.
+
+## Building the Image
+
+```bash
+# From the repo root
+docker build -f services/platform/Dockerfile -t prisme-platform .
+```
+
+The multi-stage build:
+
+1. **Build stage** (Node.js)
+   - Installs dependencies
+   - Builds the Vite shell (`npm run build`)
+   - Builds all builtin apps (`npm run build:builtin`)
+   - Outputs everything to `dist/`
+
+2. **Runtime stage** (nginx:alpine)
+   - Copies `dist/` to `/usr/share/nginx/html`
+   - Installs the `docker-entrypoint.sh` script
+   - Configures nginx for SPA routing
+
+## Runtime Configuration
+
+The `docker-entrypoint.sh` script generates `/usr/share/nginx/html/env-config.js` at container start:
+
+```js
+window.__ENV__ = {
+  API_URL: "https://api.your-domain.com/v2",
+  CONSOLE_URL: "https://console.your-domain.com",
+  OIDC_STUDIO_CLIENT_ID: "your-client-id",
+  PAGES_HOST: ".pages.your-domain.com",
+  BUNDLE_BASE_URL: "/builtin-bundles",
+  ENABLED_AUTH_PROVIDERS: '[{"name":"local"},{"name":"azure","label":"Sign in with Azure"}]',
+  DISABLE_LOCAL_SIGNUP: "false"
+};
+```
+
+This allows **runtime configuration without rebuilding the image**.
+
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `API_URL` | Yes | `https://api.prisme.ai/v2` | Backend API base URL |
+| `CONSOLE_URL` | No | `https://console.prisme.ai` | Console URL |
+| `OIDC_STUDIO_CLIENT_ID` | Yes | `local-client-id` | OIDC client ID for auth |
+| `OIDC_PROVIDER_URL` | No | (derived from API_URL) | OIDC discovery URL |
+| `PAGES_HOST` | No | `.pages.prisme.ai` | Pages hostname pattern |
+| `BUNDLE_BASE_URL` | No | `/builtin-bundles` | Builtin bundles path |
+| `ENABLED_AUTH_PROVIDERS` | No | (empty) | JSON array of auth providers |
+| `DISABLE_LOCAL_SIGNUP` | No | `false` | Disable local account creation |
+
+### Auth Providers
+
+`ENABLED_AUTH_PROVIDERS` accepts a JSON array:
+
+```json
+[
+  { "name": "local" },
+  { "name": "azure", "label": "Sign in with Microsoft" },
+  { "name": "google", "label": "Sign in with Google" }
+]
+```
+
+If empty, only local authentication is shown.
+
+## Nginx Configuration
+
+The built-in nginx config handles:
+
+| Path | Caching | Description |
+|------|---------|-------------|
+| `/assets/` | Immutable (1 year) | Vite-generated hashed assets |
+| `/builtin-bundles/*.js` | Immutable (1 year) | Hashed bundle files |
+| `/builtin-bundles/routes-manifest.json` | No cache | Dynamic route mapping |
+| `/builtin-bundles/bundle-map.json` | No cache | Dynamic bundle mapping |
+| `/env-config.js` | No cache | Runtime environment |
+| `/index.html` | No cache | SPA entry point |
+| `/*` | Fallback to index.html | SPA client-side routing |
+
+## Docker Run
+
+```bash
+docker run -d \
+  -p 3000:80 \
+  -e API_URL=https://api.your-domain.com/v2 \
+  -e OIDC_STUDIO_CLIENT_ID=your-client-id \
+  -e ENABLED_AUTH_PROVIDERS='[{"name":"local"}]' \
+  prisme-platform
+```
+
+## Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: platform
+          image: prisme-platform:latest
+          ports:
+            - containerPort: 80
+          env:
+            - name: API_URL
+              value: "https://api.your-domain.com/v2"
+            - name: OIDC_STUDIO_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: oidc-client-id
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform
+spec:
+  ports:
+    - port: 80
+      targetPort: 80
+  selector:
+    app: platform
+```
+
+The platform frontend is **stateless** — it can be horizontally scaled with no coordination between replicas.
+
+## Health Check
+
+nginx responds to any valid path, so a simple HTTP check works:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /env-config.js
+    port: 80
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```

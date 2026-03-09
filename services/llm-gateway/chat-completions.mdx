@@ -1,0 +1,135 @@
+---
+title: "Chat Completions"
+description: "Chat completion endpoint — request format, streaming, and failover behavior"
+---
+
+## Endpoint
+
+```
+POST v1/chat/completions
+```
+
+Base URL: `{API_URL}/workspaces/slug:llm-gateway/webhooks/v1/chat/completions`
+
+## Authentication
+
+This endpoint supports **dual authentication**:
+
+| Mode | How | Flow |
+|------|-----|------|
+| API key (`iak_*`) | `Authorization: Bearer iak_...` | Validates against AI Governance → checks `llm:completions:use` permission → checks model access via scopes |
+| Workspace JWT | `Authorization: Bearer {jwt}` | Trusted directly (no governance checks) |
+
+## Request
+
+```json
+{
+  "model": "gpt-4o",
+  "messages": [
+    { "role": "system", "content": "You are a helpful assistant." },
+    { "role": "user", "content": "What is the capital of France?" }
+  ],
+  "temperature": 0.7,
+  "max_tokens": 1000,
+  "stream": false
+}
+```
+
+### Parameters
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | (required) | Model identifier |
+| `messages` | array | (required) | Conversation messages |
+| `temperature` | float | 1.0 | Randomness (0-2) |
+| `max_tokens` | integer | — | Maximum response tokens |
+| `stream` | boolean | false | Enable SSE streaming |
+| `top_p` | float | 1.0 | Nucleus sampling |
+| `stop` | string/array | — | Stop sequences |
+| `tools` | array | — | Tool/function definitions |
+| `tool_choice` | string/object | — | Tool selection strategy |
+| `response_format` | object | — | Response format (e.g., JSON mode) |
+
+Some parameters are excluded per provider (e.g., `top_p` is excluded for Anthropic).
+
+## Response (Non-Streaming)
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "model": "gpt-4o",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "The capital of France is Paris."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 25,
+    "completion_tokens": 12,
+    "total_tokens": 37
+  }
+}
+```
+
+## Streaming (SSE)
+
+When `stream: true`, the response is a Server-Sent Events stream:
+
+```
+data: {"id":"chatcmpl-abc","choices":[{"delta":{"role":"assistant"},"index":0}]}
+
+data: {"id":"chatcmpl-abc","choices":[{"delta":{"content":"The"},"index":0}]}
+
+data: {"id":"chatcmpl-abc","choices":[{"delta":{"content":" capital"},"index":0}]}
+
+...
+
+data: {"id":"chatcmpl-abc","choices":[{"delta":{},"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"completion_tokens":12,"total_tokens":37}}
+
+data: [DONE]
+```
+
+Stream chunks are processed by `_process-stream-chunk` which handles usage accumulation and event emission.
+
+## Failover
+
+If the primary model call fails, LLM Gateway automatically tries the **failover model** defined in the model catalog:
+
+```
+Primary: gpt-4o
+    │
+    ├─── Success ──► Return response
+    │
+    └─── Failure ──► Failover: gpt-4o-mini
+                          │
+                          ├─── Success ──► Return response
+                          │
+                          └─── Failure ──► Return error
+```
+
+The `_failover-call` automation handles this logic. The failover model is configured per model in the [model catalog](/services/llm-gateway/models).
+
+## Analytics Event
+
+Every completion emits an `analytics.llm.completion` event:
+
+```json
+{
+  "model": "gpt-4o",
+  "provider": "openai",
+  "tokens": { "input": 25, "output": 12, "total": 37 },
+  "cost_usd": 0.000185,
+  "carbon_g": 0.012,
+  "duration_ms": 850,
+  "stream": false,
+  "failover_used": false
+}
+```
+
+This powers the [observability](/products/ai-governance/observability) dashboards.

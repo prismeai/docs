@@ -1,0 +1,131 @@
+---
+title: "Tasks"
+description: "Async task execution, status tracking, cancellation, and archival"
+---
+
+Tasks allow agents to execute long-running operations asynchronously. Instead of waiting for a synchronous response, the client receives a task ID and can poll for status or subscribe to updates.
+
+## Endpoints
+
+### List Tasks
+
+```
+GET v1/agents/:agent_id/tasks
+```
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `status` | string | Filter by status (`pending`, `running`, `completed`, `failed`, `cancelled`) |
+| `limit` | integer | Results per page |
+| `offset` | integer | Pagination offset |
+
+### Create Task
+
+```
+POST v1/agents/:agent_id/tasks
+```
+
+```json
+{
+  "message": "Generate a comprehensive market analysis report for Q3 2025",
+  "attachments": [
+    { "file_id": "file_xyz", "name": "data.csv" }
+  ]
+}
+```
+
+Returns:
+```json
+{
+  "task_id": "task_abc123",
+  "status": "pending",
+  "created_at": "2026-03-01T10:00:00Z"
+}
+```
+
+### Get Task Status
+
+```
+GET v1/agents/:agent_id/tasks/:task_id
+```
+
+Returns the current status, progress, and result (if completed):
+
+```json
+{
+  "task_id": "task_abc123",
+  "status": "running",
+  "progress": {
+    "steps_completed": 3,
+    "steps_total": 5,
+    "current_step": "Analyzing competitor data"
+  },
+  "created_at": "2026-03-01T10:00:00Z",
+  "started_at": "2026-03-01T10:00:01Z"
+}
+```
+
+### Cancel Task
+
+```
+POST v1/agents/:agent_id/tasks/:task_id/cancel
+```
+
+Cancels a running or pending task. The agent's current operation is interrupted, and the task status is set to `cancelled`.
+
+### Subscribe to Task Updates
+
+```
+GET v1/agents/:agent_id/tasks/:task_id/subscribe
+```
+
+Returns a Server-Sent Events stream with real-time task updates:
+
+| Event | Data | Description |
+|-------|------|-------------|
+| `status` | `{ status: "running" }` | Status changed |
+| `progress` | `{ step: "...", percent: 60 }` | Progress update |
+| `result` | `{ output: "..." }` | Task completed with result |
+| `error` | `{ message: "..." }` | Task failed |
+
+## Task Lifecycle
+
+```
+pending ──► running ──► completed
+                   ├──► failed
+                   └──► cancelled
+```
+
+1. **Pending** — Task created, waiting for execution
+2. **Running** — Agent is actively processing the task
+3. **Completed** — Task finished successfully, result available
+4. **Failed** — Task encountered an unrecoverable error
+5. **Cancelled** — Task was cancelled by the user
+
+## Async Finalization
+
+When a task completes, the `_async-task-finalize` automation handles post-processing:
+- Stores the final result
+- Updates task metadata (duration, token usage)
+- Emits completion events
+- Triggers any follow-up actions
+
+## Archival
+
+A nightly scheduled job (`0 3 * * *`) archives completed tasks:
+
+1. Completed tasks older than the retention period are moved from `tasks` to `tasks_archive`
+2. The archive retains task metadata and results
+3. The `tasks` collection stays lean for active task queries
+
+Archived tasks remain accessible for audit and analytics purposes but are stored separately to maintain query performance on active tasks.
+
+## Rate Limits
+
+Task creation follows the same rate limits as agent operations:
+
+| Operation | Window | Limit |
+|-----------|--------|-------|
+| Task creation | 3600s | 10 per agent |
+
+This prevents runaway task creation that could overwhelm the system.

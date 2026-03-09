@@ -1,0 +1,302 @@
+---
+title: "Workspace APIs"
+description: "How workspaces expose REST, event-driven, and MCP APIs through Prisme.ai automations"
+---
+
+Every backend workspace exposes its functionality through Prisme.ai automations. There are three API patterns: REST endpoints, event-driven handlers, and MCP (Model Context Protocol) servers.
+
+## REST Endpoints
+
+Automations with `when: endpoint:` become HTTP webhooks accessible at:
+
+```
+{API_URL}/workspaces/slug:{workspace-slug}/webhooks/{endpoint}
+```
+
+### Convention
+
+All public REST endpoints follow the `v1/` versioned path convention:
+
+```yaml
+# automations/v1/agents.yml
+slug: v1-agents
+name: Agents Endpoint
+when:
+  endpoint: v1/agents
+do:
+  - _auth:
+  - conditions:
+      '{{req.method}}':
+        GET:
+          - # List agents
+        POST:
+          - # Create agent
+```
+
+### Path Parameters
+
+Path parameters use `:param` syntax and are available as `{{params.param}}`:
+
+```yaml
+# automations/v1/agents/agent_id.yml
+when:
+  endpoint: v1/agents/:agent_id
+do:
+  - _auth:
+  - conditions:
+      '{{req.method}}':
+        GET:
+          - # Get agent by {{params.agent_id}}
+        PUT:
+          - # Update agent
+        DELETE:
+          - # Delete agent
+```
+
+### Request / Response
+
+| Field | Access Pattern |
+|-------|---------------|
+| HTTP method | `{{req.method}}` |
+| Request body | `{{body.field}}` |
+| Query params | `{{query.field}}` |
+| Path params | `{{params.field}}` |
+| Headers | `{{req.headers.field}}` |
+
+Responses are returned via the `output:` field or by setting `{{output}}` directly. HTTP status codes are set via `set: { __statusCode: 404 }`.
+
+### File Structure
+
+The file path mirrors the URL structure:
+
+```
+automations/
+├── v1/
+│   ├── agents.yml                          → v1/agents
+│   └── agents/
+│       ├── agent_id.yml                    → v1/agents/:agent_id
+│       └── agent_id/
+│           ├── conversations.yml           → v1/agents/:agent_id/conversations
+│           └── conversations/
+│               └── context_id.yml          → v1/agents/:agent_id/conversations/:context_id
+```
+
+## Event-Driven APIs
+
+Automations can listen for events emitted within the workspace:
+
+```yaml
+# automations/events/agent-updated.yml
+when:
+  events:
+    - agents.updated
+do:
+  - # Invalidate cache, update search index, etc.
+```
+
+Events are emitted from automations using:
+
+```yaml
+- emit:
+    event: agents.updated
+    payload:
+      agent_id: '{{agent.id}}'
+```
+
+Event-driven automations are used for:
+- **Cache invalidation** — React to data changes
+- **Async processing** — Background tasks triggered by user actions
+- **Cross-workspace communication** — Workspaces can subscribe to events from other workspaces
+
+## Scheduled Jobs
+
+Automations with `when: schedules:` run on cron schedules:
+
+```yaml
+# automations/jobs/aggregate-metrics.yml
+when:
+  schedules:
+    - cron: '5 * * * *'   # Every hour at :05
+do:
+  - # Aggregate hourly metrics
+```
+
+Common patterns:
+- `*/5 * * * *` — Process analysis queues (AI Insights)
+- `0 * * * *` — Hourly aggregations
+- `0 3 * * *` — Nightly cleanup and archival
+- `0 2 * * *` — Nightly evaluation batches
+
+## MCP Servers
+
+Some workspaces implement the **Model Context Protocol** (MCP) JSON-RPC 2.0 standard, making them callable as tool providers by AI agents:
+
+```yaml
+# automations/mcp.yml
+when:
+  endpoint: ai-collection/mcp
+do:
+  - conditions:
+      '{{body.method}}':
+        initialize:
+          - output:
+              jsonrpc: '2.0'
+              id: '{{body.id}}'
+              result:
+                protocolVersion: '2025-06-18'
+                capabilities:
+                  tools: {}
+        tools/list:
+          - output:
+              jsonrpc: '2.0'
+              id: '{{body.id}}'
+              result:
+                tools: '{{config.mcpTools}}'
+        tools/call:
+          - # Route to appropriate data automation
+```
+
+Workspaces implementing MCP:
+- **AI Collection** — Structured data CRUD (10 tools)
+- **Prompt Library** — Prompt retrieval and search
+- **Bing Web Search** — Web search via Azure AI Foundry
+
+## Data Access (Collection App)
+
+Workspaces use the **Collection app** as their ORM. Each import defines a collection:
+
+```yaml
+# imports/agents.yml
+appSlug: Collection
+config:
+  COLLECTION_NAME: agents2
+  slug: agents
+  properties:
+    name: { type: text }
+    profile: { type: text }
+    tools: { type: json }
+    created_by: { type: text }
+  indexes:
+    - created_by
+  uniques:
+    - slug
+```
+
+### Available Types
+
+`text`, `json`, `integer`, `float`, `boolean`, `date`, `datetime`, `localized_text`
+
+### Operations
+
+Collections are accessed via module calls in automations:
+
+```yaml
+# Find documents
+- agents.find:
+    query:
+      created_by: '{{auth.userId}}'
+    options:
+      limit: 20
+      offset: '{{query.offset}}'
+      sort:
+        updatedAt: -1
+    output: results
+
+# Insert
+- agents.insert:
+    document:
+      name: '{{body.name}}'
+      created_by: '{{auth.userId}}'
+    output: created
+
+# Update
+- agents.update:
+    query:
+      id: '{{params.agent_id}}'
+    update:
+      $set:
+        name: '{{body.name}}'
+    output: updated
+
+# Delete
+- agents.delete:
+    query:
+      id: '{{params.agent_id}}'
+```
+
+### Advanced Operations
+
+```yaml
+# Aggregation
+- agents.aggregate:
+    pipeline:
+      - $match:
+          orgSlug: '{{auth.orgSlug}}'
+      - $group:
+          _id: '$profile'
+          count: { $sum: 1 }
+    output: stats
+
+# Distinct values
+- agents.distinct:
+    field: profile
+    query:
+      orgSlug: '{{auth.orgSlug}}'
+    output: profiles
+
+# Count
+- agents.count:
+    query:
+      created_by: '{{auth.userId}}'
+    output: total
+```
+
+## Private Helpers
+
+Internal automations use the underscore prefix convention and `private: true`:
+
+```yaml
+# automations/_auth.yml
+slug: _auth
+private: true
+do:
+  - # Authentication logic
+```
+
+Private automations:
+- Are **not** accessible via HTTP
+- Can only be called from within the same workspace
+- Serve as shared utility functions
+
+Common private helpers across workspaces:
+
+| Helper | Purpose | Found In |
+|--------|---------|----------|
+| `_auth` | Authentication and authorization | All workspaces |
+| `_llm` | LLM Gateway client (workspace JWT) | Agent Factory, Storage, Guardrails, Memories, Evaluations, Insights |
+| `_error` | Error response formatting | Governance, Evaluations |
+| `_check-permission` | Permission verification | Governance, Memories, Insights |
+| `_call-storage` | Storage workspace client | Agent Factory |
+| `_call-agent-factory` | Agent Factory client | Insights, Evaluations |
+
+## Testing Automations
+
+Each workspace includes integration test suites as private endpoint automations:
+
+```yaml
+# automations/tests-agents-crud.yml
+slug: tests-agents-crud
+name: Tests - Agents CRUD
+when:
+  endpoint: tests/agents-crud
+private: true
+do:
+  - # Create agent
+  - # Verify creation
+  - # Update agent
+  - # Verify update
+  - # Delete agent
+  - # Verify deletion
+```
+
+Tests are triggered via HTTP and return pass/fail results. They exercise the full API stack including authentication, data access, and cross-workspace calls.

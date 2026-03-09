@@ -1,194 +1,85 @@
 ---
-title: 'Testing a deployment'
-description: 'Verify that your Prisme.ai platform is ready for use'
+title: "Platform Testing"
+description: "Readiness checks, health verification, and integration testing for self-hosted deployments"
 ---
 
-Once you have deployed your own version of the core platform, use this checklist to confirm that all essential components are running smoothly.
+## Readiness Endpoint
 
-## Platform Readiness API
-
-The `GET /v2/readiness` endpoint provides an automated way to verify that all services and their dependencies (databases, Redis, brokers, etc.) are properly configured and reachable. It is the recommended first step after deploying or updating the platform.
-
-### Access
-
-This endpoint is restricted to:
-- **Super admins** (authenticated users with the `superAdmin` role)
-- **Internal API key** (via the `INTERNAL_API_KEY` header, used for service-to-service calls)
-
-### Usage
+The API Gateway provides a readiness endpoint that checks all services:
 
 ```bash
-# As a super admin (with a JWT or access token)
-curl -H "Authorization: Bearer YOUR_JWT" https://api.your-domain.com/v2/readiness
-
-# With the internal API key
-curl -H "x-prismeai-api-key: <INTERNAL_API_KEY>" https://api.your-domain.com/v2/readiness
-
-# Filter specific services
-curl https://api.your-domain.com/v2/readiness?services=api-gateway,runtime
+curl https://api.yourdomain.com/v2/readiness \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-The `services` query parameter accepts a comma-separated list to check only specific services. Valid values: `api-gateway`, `runtime`, `events`, `workspaces`.
+<Info>
+  Restricted to super admins and internal API keys. Results are cached for 30 seconds (configurable via `READINESS_CACHE_TTL_MS`).
+</Info>
 
-### Response
-
-The endpoint returns a JSON response with an overall `status` (`ready` or `error`) and per-service details:
+Response:
 
 ```json
 {
   "status": "ready",
   "services": {
-    "api-gateway": {
-      "status": "ready",
-      "modulesReady": [
-        { "module": "database", "driver": "mongodb" },
-        { "module": "sessionsRedis", "driver": "redis" },
-        { "module": "rateLimitsRedis", "driver": "redis" },
-        { "module": "broker", "driver": "redis" },
-        { "module": "jwks", "driver": "http" }
-      ]
-    },
-    "runtime": {
-      "status": "ready",
-      "url": "http://runtime:3003",
-      "response": { "status": "ready", "modulesReady": [...] }
-    },
-    "events": {
-      "status": "ready",
-      "url": "http://events:3004",
-      "response": { "status": "ready", "modulesReady": [...] }
-    },
-    "workspaces": {
-      "status": "ready",
-      "url": "http://workspaces:3002",
-      "response": { "status": "ready", "modulesReady": [...] }
-    }
+    "api-gateway": { "status": "ready", "modulesReady": ["broker", "permissions", "users"] },
+    "runtime": { "status": "ready", "modulesReady": ["broker", "permissions", "collections"] },
+    "events": { "status": "ready", "modulesReady": ["broker", "elasticsearch"] },
+    "workspaces": { "status": "ready", "modulesReady": ["broker", "permissions", "storage"] }
   }
 }
 ```
 
-When errors are detected, the HTTP status code is **400** and each failing service includes an `errors` array with details:
+## Workspace Integration Tests
 
-```json
-{
-  "status": "error",
-  "services": {
-    "api-gateway": {
-      "status": "error",
-      "errors": [
-        {
-          "error": "DatabaseError",
-          "module": "database",
-          "driver": "mongodb",
-          "message": "Database tables are not initialized. Please check logs for more information"
-        }
-      ]
-    }
-  }
-}
+Each backend workspace includes test suites. Run them after deployment:
+
+```bash
+# LLM Gateway tests
+curl -X POST https://api.yourdomain.com/v2/workspaces/slug:llm-gateway/webhooks/tests/run-all \
+  -H "Authorization: Bearer $TOKEN"
+
+# Storage tests
+curl -X POST https://api.yourdomain.com/v2/workspaces/slug:storage/webhooks/tests/run-all \
+  -H "Authorization: Bearer $TOKEN"
+
+# Agent Factory tests
+curl -X POST https://api.yourdomain.com/v2/workspaces/slug:agent-factory/webhooks/tests/run-all \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
-### What is tested
+See [Development — Testing](/development/testing) for the complete list of test suites by workspace.
 
-| Service | Modules tested |
-|---------|---------------|
-| **api-gateway** | Can reach runtime, events and workspaces services. Redis cache, databases, broker, JWKS URI reachability |
-| **runtime** | Redis cache, broker, permissions database, collections database, DSUL storage, searchengine reachable, custom code service reachable, gateway reachable |
-| **events** | Redis cache, broker, permissions database, Elasticsearch (write & delete), gateway reachable |
-| **workspaces** | Broker, permissions database, DSUL storage, gateway reachable |
-| **searchengine** | Elasticsearch, Redis. Verifies it can create and delete an index |
-| **crawler** | Elasticsearch, Redis, `NO_PROXY=localhost` check, gateway reachable. Verifies it can create and delete an index |
+## Manual Verification Checklist
 
-<Note>
-Results are cached for 30 seconds to avoid overloading services with repeated checks. You can configure the cache TTL with the `READINESS_CACHE_TTL_MS` environment variable.
-</Note>
+After a new deployment or update, verify:
 
-## Account Management
+- [ ] User login and logout
+- [ ] Anonymous login
+- [ ] Workspace creation
+- [ ] Agent creation and conversation
+- [ ] File upload and retrieval
+- [ ] Event streaming (WebSocket)
+- [ ] Page rendering
+- [ ] SSO login (if configured)
+- [ ] API key creation and usage
+- [ ] Workspace publishing and versioning
 
-### Create an Account
-1. Navigate to the Prisme.ai registration page.
-2. Complete the required fields (name, email, password, etc.).
-3. Confirm that the new account is created successfully.
+## Platform Frontend Health
 
-### Login
-1. Go to the Prisme.ai login page.
-2. Sign in with the credentials of the newly created account.
-3. Verify you can access the main platform dashboard.
+The platform frontend (nginx) responds to any valid path:
 
-### Logout
-1. Ensure you can successfully log out of your account.
+```bash
+curl https://platform.yourdomain.com/env-config.js
+```
 
-## Pages
-1. Open the studio builder & create a workspace
-2. From the left menu, create a new page
-    * The technical slug will appear inside the page URL
-3. Add a simple text block to the page
-4. Save
-5. Verify that the text block is displayed correctly.
-6. Click the share button & open the page URL
-7. Verify that the same text block appears
+For Kubernetes probes:
 
-
-## Automations
-
-1. Open the created workspace
-2. From the left menu, create a new automation
-3. Open the green output block
-4. Type "Hello world" & save
-5. Execute the automation from the top right corner
-6. Verify you get the expected output
-7. Now open the blue trigger block
-8. Enable API trigger and save
-9. Copy the trigger URL which appeared inside the blue trigger block
-10. Open this URL inside a new tab & verify the output
-11. Return to the automation builder tab & click on "See code"
-12. Your automation manifest should appear in yaml format : try updating the output from here !  
-
-## Apps
-
-### Publish an application
-1. Open the created workspace
-2. From the left menu open the 3 dots action list
-3. Publish as an app
-
-### Install an Application
-1. Come back to the studio builder in order to create a new workspace
-2. From the left menu, add a new app
-3. Install the previously published app
-4. Create a new automation
-5. Add an instruction & select the "Hello world" app automation you created before
-6. Type `output` in its output parameter
-7. Open the green output block and type `{{output}}`
-8. Run the automation
-9. Verify you receive "Hello world" 
-
-## Workspace Management
-
-### Workspace Share
-1. Try sharing the workspace you have created with another user.
-
-## Page share
-1. Create a new workspace.
-2. Try sharing the page you have created with another user.
-3. Verify that the other user can access the page but not the entire workspace.
-
-## Workspace settings
-1. Go to the workspace settings.
-2. Modify the name, description, and add a logo to your workspace.
-
-## Activity feed
-
-1. Open the activity feed
-2. Verify that all the operations you have performed are logged with associated data.
-3. Try filter suggestions
-
-## Workspace versioning
-1. Go to the workspace settings and add a version.
-2. Open the activity feed : a versioning event should have appeared, including a rollback action
-3. Create a new empty automation
-3. On the activity feed, rollback to the created version
-4. Verify the created automation has disappeared
-
-Please make sure to follow the steps of each task and note the results obtained as well as any issues encountered during the tests. This information will be useful for improving and addressing any potential problems on the Prisme.ai platform. 
-
-Good luck with your tests!
+```yaml
+livenessProbe:
+  httpGet:
+    path: /env-config.js
+    port: 80
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```

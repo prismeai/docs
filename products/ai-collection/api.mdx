@@ -1,0 +1,270 @@
+---
+title: "AI Collection API"
+description: "REST API and MCP protocol reference for AI Collection"
+---
+
+AI Collection exposes both a REST API (for frontend/admin use) and an MCP endpoint (for agent tool use).
+
+## REST API
+
+Base URL: `{API_URL}/workspaces/slug:ai-collection-v3/webhooks`
+
+### Collections
+
+#### List Collections
+
+```
+GET v1/collections
+```
+
+Returns all collections the authenticated user has access to.
+
+#### Create Collection
+
+```
+POST v1/collections
+```
+
+```json
+{
+  "name": "Products",
+  "description": "Product catalog",
+  "schema": {
+    "name": { "type": "text", "required": true },
+    "price": { "type": "float" },
+    "category": { "type": "text" },
+    "metadata": { "type": "json" }
+  },
+  "agent_ids": ["agent_abc", "agent_def"],
+  "ttl_days": 0,
+  "max_records": 10000
+}
+```
+
+#### Get Collection
+
+```
+GET v1/collections/:collection_id
+```
+
+#### Update Collection
+
+```
+PUT v1/collections/:collection_id
+```
+
+#### Delete Collection
+
+```
+DELETE v1/collections/:collection_id
+```
+
+### Data Operations
+
+#### Insert Records
+
+```
+POST v1/collections/:collection_id/data
+```
+
+```json
+{
+  "records": [
+    { "name": "Widget A", "price": 29.99, "category": "electronics" },
+    { "name": "Widget B", "price": 49.99, "category": "electronics" }
+  ]
+}
+```
+
+#### Query Records
+
+```
+GET v1/collections/:collection_id/data
+```
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `filter` | JSON | MongoDB-style filter |
+| `sort` | JSON | Sort specification |
+| `limit` | integer | Results per page |
+| `offset` | integer | Pagination offset |
+| `fields` | string | Comma-separated field names to return |
+
+Example with filter:
+```
+GET v1/collections/:collection_id/data?filter={"category":"electronics"}&sort={"price":-1}&limit=10
+```
+
+#### Get Record
+
+```
+GET v1/collections/:collection_id/data/:record_id
+```
+
+#### Update Record
+
+```
+PUT v1/collections/:collection_id/data/:record_id
+```
+
+```json
+{
+  "price": 34.99,
+  "category": "electronics-updated"
+}
+```
+
+#### Delete Record
+
+```
+DELETE v1/collections/:collection_id/data/:record_id
+```
+
+### Aggregation Operations
+
+#### Count
+
+```
+POST v1/collections/:collection_id/data/count
+```
+
+```json
+{
+  "filter": { "category": "electronics" }
+}
+```
+
+#### Distinct
+
+```
+POST v1/collections/:collection_id/data/distinct
+```
+
+```json
+{
+  "field": "category",
+  "filter": {}
+}
+```
+
+#### Aggregate
+
+```
+POST v1/collections/:collection_id/data/aggregate
+```
+
+```json
+{
+  "pipeline": [
+    { "$match": { "category": "electronics" } },
+    { "$group": { "_id": "$category", "avg_price": { "$avg": "$price" }, "count": { "$sum": 1 } } }
+  ]
+}
+```
+
+## MCP Protocol
+
+Endpoint: `POST {API_URL}/workspaces/slug:ai-collection-v3/webhooks/ai-collection/mcp`
+
+### Initialize
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2025-06-18",
+    "clientInfo": { "name": "agent-factory", "version": "1.0.0" }
+  }
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocolVersion": "2025-06-18",
+    "serverInfo": { "name": "ai-collection", "version": "1.0.0" },
+    "capabilities": { "tools": {} }
+  }
+}
+```
+
+### List Tools
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/list"
+}
+```
+
+Returns the 10 tool definitions with their input schemas.
+
+### Call Tool
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "data_query",
+    "arguments": {
+      "collection_id": "products",
+      "filter": { "category": "electronics" },
+      "sort": { "price": -1 },
+      "limit": 5
+    }
+  }
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "[{\"name\": \"Widget B\", \"price\": 49.99, ...}]"
+      }
+    ]
+  }
+}
+```
+
+### MCP Context
+
+When Agent Factory calls AI Collection via MCP, it passes context in the arguments:
+
+```json
+{
+  "params": {
+    "name": "data_insert",
+    "arguments": {
+      "agent_id": "agent_abc123",
+      "tool_id": "default",
+      "owner_id": "user_xyz",
+      "records": [...]
+    }
+  }
+}
+```
+
+The `agent_id`, `tool_id`, and `owner_id` are set by the calling Agent Factory automation, not by the user. This ensures proper data isolation.
+
+## Collection Resolution (`_resolve-collection`)
+
+When a data operation is received, AI Collection resolves the target storage:
+
+1. **`collection_id` provided** — Look up in `collections` metadata, verify ownership (`owner_id` match or `agent_ids` membership), use the collection's dedicated storage
+2. **No `collection_id`** — Use the default `mcp_data_v2` collection, scope by `agent_id` + `tool_id`
+
+This dual-mode approach allows both simple per-agent data isolation and explicit shared collections.

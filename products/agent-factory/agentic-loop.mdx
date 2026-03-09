@@ -1,0 +1,227 @@
+---
+title: "Agentic Loop"
+description: "ReAct loop implementation — reasoning, tool execution, context management, and memory"
+---
+
+For agents with profiles `agent_light` and above, Agent Factory implements a **ReAct (Reasoning + Acting) loop** — the agent reasons about the task, selects tools, executes them, observes results, and iterates until the task is complete or a budget limit is reached.
+
+## Loop Architecture
+
+```
+                    ┌──────────────────────────────┐
+                    │        _agentic-init          │
+                    │  Build context, load memories  │
+                    └──────────────┬───────────────┘
+                                   │
+                    ┌──────────────▼───────────────┐
+                    │      _agentic-react-loop      │
+                    │                               │
+              ┌────►│  1. Send context to LLM       │
+              │     │  2. Check response type        │
+              │     │                               │
+              │     │  ┌─ Text response ─► Done     │
+              │     │  │                            │
+              │     │  └─ Tool call ─► Execute      │
+              │     │      │                        │
+              │     │      ▼                        │
+              │     │  _route-tool                  │
+              │     │      │                        │
+              │     │      ▼                        │
+              │     │  Append result to context     │
+              │     │      │                        │
+              │     │      ▼                        │
+              │     │  Budget check                 │
+              │     │      │                        │
+              │     └──────┼────────────────────────┘
+              │            │
+              │   (under budget)
+              └────────────┘
+```
+
+## Initialization (`_agentic-init`)
+
+Before the loop starts, the context is built:
+
+1. **System prompt** — From the agent configuration
+2. **Working memory** — Previous scratchpad content (if any)
+3. **Session memory** — Conversation history within the current session
+4. **Long-term memory recall** — Queries the [Memories workspace](/tools/memories) for relevant past memories
+5. **Tool definitions** — System tools + custom tools formatted as function schemas
+6. **Guardrail context** — Active guardrail configurations
+
+The built context is passed to `_agentic-react-loop`.
+
+## ReAct Loop (`_agentic-react-loop`)
+
+Each iteration:
+
+1. **LLM call** — Send the full context (system prompt + messages + tool results) to the LLM via [LLM Gateway](/services/llm-gateway/overview)
+2. **Response analysis**:
+   - **Text response** → Return to user (loop ends)
+   - **Tool call** → Execute via `_route-tool`, append result, continue loop
+3. **Budget check** — Verify tokens, tool calls, and cost are within limits
+4. **Context size check** — If context exceeds `context_budget`, trigger compaction
+
+### Budget Limits
+
+Each profile defines hard limits:
+
+| Profile | Max Turns | Token Budget | Tool Calls | Cost Budget |
+|---------|-----------|-------------|------------|-------------|
+| `agent_light` | 10 | 20K | 15 | — |
+| `agent_full` | 30 | 100K | 50 | $1.00 |
+| `orchestrator` | 50 | 200K | 100 | $5.00 |
+
+When a budget is exceeded, the agent is forced to produce a final text response summarizing its progress.
+
+## Context Compaction (`_context-compaction`)
+
+When the conversation context grows beyond the `context_budget` (default: 120K tokens), the system compacts it:
+
+1. **Summarize** older messages into a concise summary
+2. **Preserve** the most recent messages (last N turns)
+3. **Keep** the system prompt and tool definitions intact
+4. **Update** working memory with the summary
+
+This allows long-running conversations to continue without hitting model context limits.
+
+**Compaction strategies:**
+- `summarize` (default) — LLM-generated summary of older context
+- `truncate` — Drop oldest messages (cheaper, less intelligent)
+
+## Memory Management
+
+### Working Memory
+
+A per-conversation scratchpad that the agent can write to and read from. Used for:
+- Keeping track of intermediate results
+- Storing plans and progress
+- Maintaining state across tool calls
+
+Configuration:
+```json
+{
+  "max_tokens": 4000,
+  "compaction_strategy": "summarize"
+}
+```
+
+When working memory exceeds `max_tokens`, it's compacted using the configured strategy.
+
+### Session Memory (`_session-memory`)
+
+Persists conversation state across turns. Stored in the conversation record. Includes:
+- Message history
+- Tool call results
+- Working memory snapshots
+- Context summaries from compaction
+
+### Long-Term Memory
+
+Cross-conversation memory powered by the [Memories workspace](/tools/memories):
+
+- **Save** — Agent can explicitly save facts, preferences, relationships, and instructions
+- **Recall** — Automatically queried during initialization to load relevant past memories
+- **Scope** — `global` (shared across agents) or `agent` (per-agent)
+
+```yaml
+# _load-long-term-memories
+- fetch:
+    url: '{{global.apiUrl}}/workspaces/slug:{{config.tools_memories_slug}}/webhooks/recall'
+    headers:
+      Authorization: 'Bearer {{_wsJwt.jwt}}'
+    body:
+      user_id: '{{auth.userId}}'
+      agent_id: '{{agent.id}}'
+      query: '{{userMessage}}'
+      top_k: 10
+    output: memories
+```
+
+## Planning (Agent Full+)
+
+When planning is enabled, the agent can create structured plans before executing tasks:
+
+```json
+{
+  "tool": "planning_create_plan",
+  "arguments": {
+    "goal": "Research Q3 market trends",
+    "steps": [
+      {
+        "description": "Search knowledge base for Q3 reports",
+        "expected_output": "List of relevant documents"
+      },
+      {
+        "description": "Analyze key metrics from reports",
+        "expected_output": "Summary of trends"
+      },
+      {
+        "description": "Compare with Q2 data",
+        "expected_output": "Quarter-over-quarter analysis"
+      }
+    ]
+  }
+}
+```
+
+Plans are tracked in the conversation context. The agent can refer to the plan to guide its actions and report progress.
+
+## Reflection (Agent Full+)
+
+After completing actions, the agent can self-evaluate:
+
+```json
+{
+  "tool": "reflection_evaluate",
+  "arguments": {
+    "progress": "Completed 2 of 3 planned steps",
+    "quality": "Data quality is good, but missing competitive analysis",
+    "next_steps": "Search for competitor reports before finalizing"
+  }
+}
+```
+
+Reflection results are added to the context, helping the agent course-correct.
+
+## Multi-Agent Delegation (Orchestrator)
+
+Orchestrator agents can delegate subtasks to other agents:
+
+```json
+{
+  "tool": "agent_delegate",
+  "arguments": {
+    "agent_id": "agent_specialist_123",
+    "task": "Analyze the financial data in the attached spreadsheet",
+    "context": {
+      "file_id": "file_xyz",
+      "focus": "revenue trends"
+    }
+  }
+}
+```
+
+**Constraints:**
+- Maximum delegation depth: 3 (prevents infinite loops)
+- The orchestrator waits for the delegate's response before continuing
+- Delegate responses are added to the orchestrator's context
+
+The orchestrator can discover available agents via `agent_list_available`.
+
+## Streaming
+
+During the agentic loop, events are streamed to the client in real-time:
+
+| Phase | Events Streamed |
+|-------|----------------|
+| LLM thinking | `token` events (text generation) |
+| Tool selection | `tool_call` event with tool name and arguments |
+| Tool execution | `tool_result` event with result |
+| Planning | `plan` event with step details |
+| Reflection | `reflection` event with evaluation |
+| Memory operations | `memory_save`, `memory_recall` events |
+| Guardrail checks | `guardrail_input`, `guardrail_output` events |
+| Completion | `done` event with usage statistics |
+
+This gives the frontend full visibility into the agent's reasoning process.

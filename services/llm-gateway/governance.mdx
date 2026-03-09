@@ -1,0 +1,126 @@
+---
+title: "Governance"
+description: "Model access control, quotas, carbon footprint tracking, and usage limits"
+---
+
+LLM Gateway integrates with [AI Governance](/products/ai-governance/overview) to enforce access controls, quotas, and usage limits on LLM operations.
+
+## Governance Resolution
+
+When a request arrives with an `iak_*` API key, the `_resolve-governance` automation fetches the governance context:
+
+```yaml
+# From API key validation response
+{
+  "orgSlug": "acme-corp",
+  "permissions": ["llm:completions:use"],
+  "scopes": {
+    "models": ["gpt-4o", "gpt-4o-mini"]
+  },
+  "subscriptionLimits": {
+    "llm_requests_per_minute": 100,
+    "max_tokens_per_request": 8000,
+    "monthly_budget_usd": 500
+  },
+  "llm": {
+    "allowed_providers": ["openai", "azure"],
+    "default_model": "gpt-4o",
+    "blocked_models": []
+  }
+}
+```
+
+For workspace JWT calls, the governance context comes from `user.meta.llm` (user session flow) or is trusted entirely (workspace-to-workspace).
+
+## Model Access Control
+
+`_check-model-access` validates that the requested model is allowed:
+
+1. **Permission check** — Is `llm:completions:use` (or `llm:embeddings:use`) granted?
+2. **Scope check** — Is the model in the API key's `scopes.models` list?
+3. **Provider check** — Is the model's provider in `llm.allowed_providers`?
+4. **Block list** — Is the model in `llm.blocked_models`?
+
+If any check fails, the request is rejected with a `403` error explaining which restriction was violated.
+
+## Quota Enforcement
+
+`_check-llm-quota` enforces rate and usage limits:
+
+| Limit | Scope | Description |
+|-------|-------|-------------|
+| `llm_requests_per_minute` | Per API key | Maximum requests per minute |
+| `max_tokens_per_request` | Per request | Maximum tokens in a single request |
+| `monthly_budget_usd` | Per organization | Monthly cost ceiling |
+
+When a limit is reached:
+- Rate limits return `429 Too Many Requests` with a `Retry-After` header
+- Budget limits return `403 Forbidden` with a budget exhaustion message
+- Token limits truncate the request or return `400 Bad Request`
+
+## Usage Recording
+
+After every LLM call, `_record-llm-usage` emits an `analytics.llm.completion` event and increments usage counters:
+
+```json
+{
+  "type": "analytics.llm.completion",
+  "payload": {
+    "orgSlug": "acme-corp",
+    "model": "gpt-4o",
+    "provider": "openai",
+    "tokens": {
+      "input": 1200,
+      "output": 450,
+      "total": 1650
+    },
+    "cost_usd": 0.0128,
+    "carbon_g": 0.85,
+    "duration_ms": 1200,
+    "stream": true,
+    "api_key_id": "key_xyz"
+  }
+}
+```
+
+Usage events power the [observability dashboards](/products/ai-governance/observability) in AI Governance.
+
+## Carbon Footprint
+
+`_compute-carbon-footprint` estimates the environmental impact of each LLM call:
+
+```
+energy_kwh = tokens × energy_kwh_per_1k_tokens / 1000
+carbon_g = energy_kwh × carbon_g_per_kwh
+```
+
+The `eco_metrics` for each model are defined in the [model catalog](/services/llm-gateway/models):
+
+```json
+{
+  "eco_metrics": {
+    "energy_kwh_per_1k_tokens": 0.001,
+    "carbon_g_per_kwh": 400
+  }
+}
+```
+
+Carbon metrics vary by:
+- **Model size** — Larger models consume more energy
+- **Provider** — Cloud regions have different energy mixes
+- **Operation type** — Embeddings are cheaper than chat completions
+
+Carbon data is included in analytics events and available in the governance observability dashboard.
+
+## Subscription Limits
+
+Organizations have subscription-level limits enforced at the gateway:
+
+| Limit | Description |
+|-------|-------------|
+| Requests per minute | Total LLM API calls |
+| Monthly token budget | Total tokens across all models |
+| Monthly cost budget | Total cost in USD |
+| Concurrent requests | Simultaneous in-flight requests |
+
+Subscription limits are defined in AI Governance and returned as part of the API key validation response. They override any per-key limits when more restrictive.

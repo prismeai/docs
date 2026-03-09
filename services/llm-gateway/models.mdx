@@ -1,0 +1,138 @@
+---
+title: "Model Catalog"
+description: "Model management, intelligent routing, and failover configuration"
+---
+
+LLM Gateway maintains a catalog of available models with metadata about capabilities, pricing, failover behavior, and provider configuration.
+
+## Endpoints
+
+```
+GET    v1/models                # List all models
+POST   v1/models                # Register a model
+GET    v1/models/:model_id      # Get model details
+PUT    v1/models/:model_id      # Update model
+DELETE v1/models/:model_id      # Remove model
+```
+
+## Model Definition
+
+```json
+{
+  "id": "gpt-4o",
+  "name": "GPT-4o",
+  "provider": "openai",
+  "capabilities": {
+    "chat": true,
+    "vision": true,
+    "function_calling": true,
+    "json_mode": true,
+    "streaming": true
+  },
+  "pricing": {
+    "input_per_1k": 0.005,
+    "output_per_1k": 0.015,
+    "currency": "USD"
+  },
+  "limits": {
+    "max_context": 128000,
+    "max_output": 4096
+  },
+  "failover": "gpt-4o-mini",
+  "eco_metrics": {
+    "energy_kwh_per_1k_tokens": 0.001,
+    "carbon_g_per_kwh": 400
+  },
+  "enabled": true
+}
+```
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Model identifier (used in API calls) |
+| `provider` | string | Provider type (`openai`, `azure_openai`, `anthropic`, `vertex`, `bedrock`, `openai_like`) |
+| `capabilities` | object | What the model can do |
+| `pricing` | object | Cost per 1K tokens (input/output) |
+| `limits` | object | Context window and output limits |
+| `failover` | string | Model to fall back to on failure |
+| `eco_metrics` | object | Energy and carbon per token |
+| `enabled` | boolean | Whether the model is available |
+
+## Model Routing
+
+LLM Gateway supports intelligent model routing — selecting the best model for a request based on configurable strategies.
+
+### Routing Strategies
+
+| Strategy | Description |
+|----------|-------------|
+| `rules` | Rule-based routing (if/then logic based on request properties) |
+| `llm_classifier` | Use an LLM to classify the request and pick the best model |
+| `capabilities` | Match request requirements to model capabilities |
+| `cost_optimized` | Pick the cheapest model that meets requirements |
+| `hybrid` | Combine multiple strategies with weights |
+
+The `_route-model` automation implements routing logic:
+
+```yaml
+# Simplified routing flow
+1. Parse request requirements (tools needed? vision? json mode?)
+2. Filter models by capabilities
+3. Apply strategy:
+   - rules: evaluate rule chain
+   - capabilities: score models by capability match
+   - cost_optimized: sort by price, pick cheapest
+4. Return selected model
+```
+
+### Example: Rule-Based Routing
+
+```yaml
+routing:
+  strategy: rules
+  rules:
+    - condition: "tools in request"
+      model: gpt-4o
+    - condition: "message length > 50000 tokens"
+      model: gpt-4o-mini
+    - default: gpt-4o
+```
+
+## Provider Resolution
+
+When a model is selected, `_resolve-provider` finds the connection config:
+
+1. Look up the model's `provider` field
+2. Find the provider config in workspace settings (API keys, endpoints, regions)
+3. Handle model aliases (e.g., Vertex AI's long resource paths)
+4. Apply provider-specific parameter exclusions
+
+The resolution walks a provider chain until it finds valid credentials:
+
+```
+openai → azure_openai → openai_like → anthropic → vertex → bedrock → error
+```
+
+## Model Aliases
+
+Some providers use non-standard model identifiers. The `model_aliases` config maps friendly names to provider-specific IDs:
+
+```yaml
+model_aliases:
+  gemini-pro: 'projects/my-project/locations/us-central1/publishers/google/models/gemini-pro'
+  claude-3: 'anthropic.claude-3-sonnet-20240229-v1:0'
+```
+
+## Data Storage
+
+Models are stored in the `models` collection (via Collection app):
+
+| Field | Type | Indexed |
+|-------|------|---------|
+| `id` | text | Yes (unique) |
+| `provider` | text | Yes |
+| `capabilities` | json | — |
+| `pricing` | json | — |
+| `enabled` | boolean | Yes |

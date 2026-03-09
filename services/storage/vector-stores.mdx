@@ -1,0 +1,178 @@
+---
+title: "Vector Stores"
+description: "Vector store management, provider routing, and similarity search"
+---
+
+Vector stores are the core of the RAG pipeline. They store document chunks as embeddings and support similarity search for retrieval.
+
+## Endpoints
+
+### Vector Store CRUD
+
+```
+GET    v1/vector_stores                    # List vector stores
+POST   v1/vector_stores                    # Create vector store
+GET    v1/vector_stores/:id                # Get vector store
+PUT    v1/vector_stores/:id                # Update vector store
+DELETE v1/vector_stores/:id                # Delete vector store
+```
+
+### Vector Store Files
+
+```
+GET    v1/vector_stores/:id/files              # List files in store
+POST   v1/vector_stores/:id/files              # Add file to store
+GET    v1/vector_stores/:id/files/:file_id     # Get file status
+PUT    v1/vector_stores/:id/files/:file_id     # Update file
+DELETE v1/vector_stores/:id/files/:file_id     # Remove file from store
+POST   v1/vector_stores/:id/files/:file_id/reindex  # Re-index file
+```
+
+### Search
+
+```
+POST v1/vector_stores/:id/search
+```
+
+## Create Vector Store
+
+```json
+{
+  "name": "Company Knowledge Base",
+  "description": "All company documentation",
+  "provider": "opensearch",
+  "config": {
+    "dimensions": 1536,
+    "similarity": "cosine",
+    "embedding_model": "text-embedding-3-small"
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | (required) | Display name |
+| `provider` | string | `opensearch` | Vector provider |
+| `config.dimensions` | integer | 1536 | Embedding dimensions |
+| `config.similarity` | string | `cosine` | Similarity metric (`cosine`, `dot_product`, `l2`) |
+| `config.embedding_model` | string | (default model) | Model for embeddings |
+
+Creating a vector store automatically creates the underlying index via the vector provider's `create-index` operation.
+
+## Add File to Store
+
+```json
+{
+  "file_id": "file_abc",
+  "chunking": {
+    "strategy": "paragraph",
+    "chunk_size": 500,
+    "overlap": 50
+  }
+}
+```
+
+This triggers the [indexing pipeline](/services/storage/files#indexing):
+1. Parse the file
+2. Chunk the text
+3. Generate embeddings
+4. Upsert into the vector provider
+
+## Search
+
+```
+POST v1/vector_stores/:id/search
+```
+
+```json
+{
+  "query": "What are the Q3 revenue trends?",
+  "limit": 5,
+  "min_score": 0.7,
+  "filter": {
+    "scope": "org:acme-corp"
+  }
+}
+```
+
+### Parameters
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `query` | string | (required) | Search query (will be embedded) |
+| `limit` | integer | 5 | Maximum results |
+| `min_score` | float | 0.0 | Minimum similarity score |
+| `filter` | object | — | Metadata filter |
+
+### Search Flow
+
+```
+User query
+    │
+    ▼
+┌──────────────┐
+│ Embed query  │ ──► LLM Gateway /v1/embeddings
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│ Vector       │ ──► Provider search with filter
+│ Router       │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│ Results      │ ──► [{id, score, metadata, text}, ...]
+└──────────────┘
+```
+
+### Response
+
+```json
+{
+  "results": [
+    {
+      "id": "chunk_xyz",
+      "score": 0.92,
+      "metadata": {
+        "file_id": "file_abc",
+        "chunk_index": 3,
+        "page": 2
+      },
+      "text": "Q3 revenue showed a 15% increase..."
+    }
+  ],
+  "total": 1
+}
+```
+
+## RAG Scopes
+
+Vector store searches support **scope-based filtering** for multi-tenant isolation:
+
+| Scope Pattern | Description |
+|--------------|-------------|
+| `org:acme-corp` | Organization-level data |
+| `user:user_abc` | User-specific data |
+| `conversation:conv_xyz` | Conversation-scoped temporary data |
+
+Scopes are stored as metadata on each vector and filtered during search. This ensures that RAG queries only return data the user has access to.
+
+## Provider Routing
+
+The `_vector-router` dispatches operations to the configured provider. See [Vector Stores (Tools)](/tools/vector-stores) for details on each provider's implementation.
+
+Changing the provider for an existing vector store requires re-indexing all files.
+
+## Deletion
+
+Deleting a vector store:
+1. Removes all vectors from the provider (via `delete-index`)
+2. Removes all file associations from `vector_store_files`
+3. Removes the vector store record
+
+Files themselves are **not** deleted — they may belong to other vector stores.
+
+## Expiry
+
+The nightly `cleanup-expired-vectors` job removes vectors with expired `expires_at` metadata. This is used for conversation-scoped temporary data that should not persist beyond the conversation.

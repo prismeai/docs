@@ -1,0 +1,123 @@
+---
+title: "Architecture Overview"
+description: "High-level architecture of the new Prisme.ai platform — workspace mesh, frontend shell, and composable services"
+---
+
+The new Prisme.ai platform is built on a **workspace-as-microservice** pattern. Rather than monolithic backend services, each product and capability is a Prisme.ai workspace — a self-contained unit with its own API, data stores, security rules, and business logic. A single React frontend shell dynamically loads product UIs as JavaScript bundles.
+
+## Three Layers
+
+### 1. Platform Frontend (`services/platform`)
+
+A Vite + React single-page application that acts as a **meta-shell**. It provides:
+
+- **Authentication** — OIDC PKCE flow, token management
+- **IAM Context** — Organization, branding, navigation, permissions (fetched from AI Governance)
+- **Dynamic App Loading** — A module loader that fetches and executes product bundles at runtime
+- **Shared Module Registry** ("socle") — React, UI components, hooks, and SDK shared across all apps
+
+Each product (SecureChat, Agent Factory, AI Governance, etc.) is a builtin app compiled as a standalone JS bundle. The shell loads them based on URL routing via a `routes-manifest.json` generated at build time.
+
+See [Platform Frontend](/architecture/platform-frontend) for the full deep-dive.
+
+### 2. Backend Workspace Mesh
+
+The backend is a mesh of ~18 workspaces, each exposing APIs through Prisme.ai's automation engine:
+
+| Category | Workspaces | Role |
+|----------|------------|------|
+| **Core Products** | Agent Factory, AI Governance | Agent management, IAM, RBAC |
+| **Data Products** | AI Collection, AI Insights | Structured data, analytics |
+| **Infrastructure** | LLM Gateway, Storage | LLM routing, file/vector management |
+| **Tools** | Guardrails, Memories, Search, Prompt Library | Pluggable capabilities for agents |
+| **Providers** | Vector OpenSearch, Vector Elasticsearch, Vector Mock | Swappable storage backends |
+| **Registry** | Capabilities, Agent Evaluations | Tool catalog, testing |
+
+Workspaces communicate via three mechanisms:
+- **REST webhooks** — `POST /v2/workspaces/slug:{slug}/webhooks/v1/{endpoint}`
+- **Events** — Async event-driven messaging via the Prisme broker
+- **Workspace JWTs** — Signed tokens for trusted service-to-service calls
+
+See [Workspace APIs](/architecture/workspace-apis) and [Inter-Service Communication](/architecture/inter-service) for details.
+
+### 3. Prisme.ai Runtime (unchanged)
+
+The underlying Prisme.ai infrastructure remains the same:
+- **API Gateway** — Authentication, proxying, rate limiting (port 3001)
+- **Workspaces Service** — DSUL storage, RBAC, versioning (port 3002)
+- **Runtime Service** — Automation execution engine (port 3003)
+- **Events Service** — Event streaming, WebSockets, Elasticsearch (port 3004)
+
+These services are documented in the [existing Prisme.ai documentation](https://docs.prisme.ai).
+
+## Workspace Anatomy
+
+Every workspace follows the same structure:
+
+```
+workspaces/<slug>/
+├── index.yml           # Config: name, description, settings, event types
+├── security.yml        # RBAC: roles, permissions, access rules
+├── automations/
+│   ├── _auth.yml       # Private: authentication helper
+│   ├── _llm.yml        # Private: LLM Gateway client
+│   ├── v1/             # REST API endpoints
+│   │   ├── resources.yml
+│   │   └── resources/
+│   │       └── resource_id.yml
+│   ├── events/         # Event-driven handlers
+│   ├── jobs/           # Scheduled cron jobs
+│   └── tests-*.yml     # Integration test suites
+└── imports/            # Data stores (Collection app) and provider installations
+```
+
+**Naming conventions:**
+- `_name.yml` — Private helper automation (underscore prefix, `private: true`)
+- `v1/<resource>.yml` — REST endpoint for a resource
+- `v1/<resource>/<param>.yml` — REST endpoint with path parameter
+- `tests-*.yml` — Integration test suites (private endpoints)
+- `jobs/*.yml` — Scheduled cron jobs
+- `events/*.yml` — Event-driven handlers
+
+## Data Layer
+
+Workspaces use the **Collection app** as their data layer. Each `imports/*.yml` file defines a collection (table) with typed columns, indexes, and unique constraints:
+
+```yaml
+# imports/agents.yml
+appSlug: Collection
+config:
+  COLLECTION_NAME: agents2
+  slug: agents
+  properties:
+    name: { type: text }
+    profile: { type: text }
+    system_prompt: { type: localized_text }
+    tools: { type: json }
+    created_by: { type: text }
+  indexes:
+    - created_by
+    - profile
+  uniques:
+    - slug
+```
+
+Automations interact with collections via module calls: `agents.find`, `agents.insert`, `agents.update`, `agents.delete`.
+
+## Frontend-Backend Connection
+
+Each builtin app connects to one or more backend workspaces. The connection works through:
+
+1. **SDK instance** — The `@prisme.ai/sdk` package, configured with the API URL
+2. **REST calls** — `GET/POST https://api.prisme.ai/v2/workspaces/{slug}/webhooks/v1/{endpoint}`
+3. **WebSocket/SSE** — `sdk.streamEvents(workspaceId)` for real-time event streams (used by SecureChat for streaming responses)
+
+A single frontend app can consume multiple backend workspaces. For example, SecureChat connects to Agent Factory, AI Governance, Prompt Library, LLM Gateway, AI Insights, and Storage.
+
+## Design Principles
+
+1. **API-first** — Every workspace is usable headlessly through its REST API. The frontend is optional.
+2. **Composable** — Workspaces are independent units. Swap a vector provider, add a new guardrail, or replace the LLM gateway without touching consumers.
+3. **Convention over configuration** — All workspaces share the same patterns: `_auth` for authentication, `v1/` for REST, Collection app for data, workspace JWT for service calls.
+4. **Multi-tenant** — Tenant isolation is enforced at the data layer. Every query is scoped to `orgSlug` or `user_id`.
+5. **Progressive complexity** — Simple agents need only Agent Factory. Advanced agents pull in Guardrails, Memories, Evaluations, and custom tools.

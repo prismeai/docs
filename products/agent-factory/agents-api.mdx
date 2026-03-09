@@ -1,0 +1,260 @@
+---
+title: "Agents API"
+description: "CRUD operations, publishing, discovery, access control, and analytics for agents"
+---
+
+## Base URL
+
+```
+{API_URL}/workspaces/slug:agent-factory/webhooks/v1/agents
+```
+
+## Endpoints
+
+### List Agents
+
+```
+GET v1/agents
+```
+
+Query parameters:
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `limit` | integer | Results per page (default: 20) |
+| `offset` | integer | Pagination offset |
+| `profile` | string | Filter by profile (`simple`, `workflow`, `agent_light`, `agent_full`, `orchestrator`) |
+| `search` | string | Search by name or description |
+
+Returns a paginated list of agents the authenticated user has access to.
+
+### Create Agent
+
+```
+POST v1/agents
+```
+
+```json
+{
+  "name": "Research Assistant",
+  "description": "Helps with research tasks",
+  "profile": "agent_light",
+  "model": "gpt-4o",
+  "system_prompt": "You are a research assistant...",
+  "tools": [
+    {
+      "type": "system",
+      "name": "knowledge_search"
+    },
+    {
+      "type": "custom",
+      "name": "my-mcp-tool",
+      "config": { ... }
+    }
+  ],
+  "guardrails": [
+    {
+      "type": "input",
+      "name": "prompt_injection_detection",
+      "config": { "sensitivity": "high" }
+    }
+  ]
+}
+```
+
+The profile determines which features and limits are available. See [Agent Profiles](/products/agent-factory/overview#agent-profiles).
+
+### Get Agent
+
+```
+GET v1/agents/:agent_id
+```
+
+Returns the full agent configuration including tools, guardrails, and metadata.
+
+### Update Agent
+
+```
+PUT v1/agents/:agent_id
+```
+
+Accepts the same body as creation. Emits `agents.updated` event for cache invalidation.
+
+### Delete Agent
+
+```
+DELETE v1/agents/:agent_id
+```
+
+Deletes the agent and all associated data (conversations, tasks, bindings). Emits `agents.deleted` event.
+
+## Publishing
+
+### Publish Agent
+
+```
+POST v1/agents/:agent_id/publish
+```
+
+Makes an agent discoverable in the agent store. Published agents can be found via the discovery endpoint.
+
+### Discovery
+
+```
+GET v1/agents/discovery
+```
+
+Returns agents published and accessible to the current user's organization. Supports search and filtering.
+
+### Organization Agents
+
+```
+GET v1/orgs/:orgSlug/agents
+POST v1/orgs/:orgSlug/agents
+```
+
+List or create agents scoped to a specific organization.
+
+## Access Control
+
+Agents support fine-grained access control through bindings — linking agents to users or groups.
+
+### Get Access
+
+```
+GET v1/agents/:agent_id/access
+```
+
+Returns the list of principals (users, groups) with access to the agent.
+
+### Remove Access
+
+```
+DELETE v1/agents/:agent_id/access/:principal_type/:principal_id
+```
+
+Removes access for a specific user or group.
+
+When a group is deleted (event `iam.group.deleted`), all agent bindings referencing that group are automatically cleaned up.
+
+## Agent Tools
+
+Manage custom tools attached to an agent:
+
+```
+GET    v1/agents/:agent_id/tools
+POST   v1/agents/:agent_id/tools
+GET    v1/agents/:agent_id/tools/:tool_id
+PUT    v1/agents/:agent_id/tools/:tool_id
+DELETE v1/agents/:agent_id/tools/:tool_id
+```
+
+See [Tools System](/products/agent-factory/tools-system) for details on tool types and configuration.
+
+## Ratings
+
+```
+GET  v1/agents/:agent_id/ratings
+POST v1/agents/:agent_id/ratings
+```
+
+Users can rate agents. Ratings are stored in the `ratings` collection and emitted as `analytics.agent.rated` events.
+
+## Analytics
+
+```
+GET v1/agents/:agent_id/analytics
+```
+
+Returns usage analytics for the agent — conversation count, message count, average rating, etc. Metrics are aggregated hourly by a scheduled job (`5 * * * *`).
+
+## A2A Protocol
+
+Agent Factory implements the [Agent-to-Agent (A2A) Protocol](https://google.github.io/A2A/) for interoperability:
+
+### Agent Card
+
+```
+GET v1/agents/:agent_id/.well-known/agent.json
+GET .well-known/agent.json
+```
+
+Returns the A2A agent card — a standardized description of the agent's capabilities, supported content types, and endpoint URL.
+
+### Extended Agent Card
+
+```
+GET v1/agents/:agent_id/extendedAgentCard
+```
+
+Returns the full agent card with additional Prisme.ai-specific metadata.
+
+### A2A Endpoint
+
+```
+POST v1/a2a
+```
+
+The standard A2A protocol endpoint. Accepts A2A-formatted requests and routes them to the appropriate agent.
+
+## Artifacts
+
+Agents can generate artifacts (documents, code files, etc.) during conversations:
+
+```
+GET    v1/artifacts
+POST   v1/artifacts
+GET    v1/artifacts/:artifact_id
+PUT    v1/artifacts/:artifact_id
+DELETE v1/artifacts/:artifact_id
+```
+
+### Artifact Sharing
+
+```
+GET  v1/artifacts/:artifact_id/shares
+POST v1/artifacts/:artifact_id/shares
+```
+
+## Shares
+
+Share conversations or artifacts via public links:
+
+```
+GET    v1/shares
+POST   v1/shares
+GET    v1/shares/:share_id
+PUT    v1/shares/:share_id
+DELETE v1/shares/:share_id
+GET    v1/shared/:share_id    # Public access (no auth required)
+```
+
+## Agent Profiles
+
+```
+GET v1/profiles
+```
+
+Returns the list of available agent profiles with their features, limits, and use cases. Used by the frontend to render the agent creation wizard.
+
+## Authentication
+
+Agent Factory supports all three authentication modes:
+
+| Mode | Use Case |
+|------|----------|
+| **User session** | Frontend (SecureChat, Agent Factory UI) |
+| **API key (`iak_*`)** | External integrations, programmatic access |
+| **Workspace JWT** | Other workspaces (AI Insights, Evaluations) |
+
+API key validation results are cached for 60 seconds. User session lookups are also cached for 60 seconds per user.
+
+## Events
+
+| Event | When |
+|-------|------|
+| `agents.updated` | Agent configuration changed |
+| `agents.deleted` | Agent deleted |
+| `analytics.agent.rated` | User rated an agent |
+| `analytics.agent.published` | Agent published to store |
+| `agents.conversations.created` | New conversation started |

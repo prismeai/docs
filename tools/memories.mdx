@@ -1,0 +1,205 @@
+---
+title: "Memories"
+description: "Long-term memory storage and retrieval for AI agents — REST API and internal automation API"
+---
+
+The Memories workspace provides persistent, cross-conversation memory for AI agents. Agents can remember facts, preferences, relationships, and instructions about users, and recall them in future conversations.
+
+**Workspace:** `tools-memories` (21 automations)
+**App slug:** `ToolsMemories`
+
+## Dual API
+
+Memories exposes two APIs:
+
+| API | Purpose | Consumers |
+|-----|---------|-----------|
+| **Internal** (automation-to-automation) | Direct workspace calls | Agent Factory |
+| **REST** (`v1/`) | HTTP endpoints | Frontend, external integrations |
+
+## Memory Types
+
+| Type | Description |
+|------|-------------|
+| `fact` | Factual information about the user |
+| `preference` | User preferences and likes/dislikes |
+| `relationship` | Relationships between entities |
+| `instruction` | Persistent instructions from the user |
+
+## Memory Scopes
+
+| Scope | Description |
+|-------|-------------|
+| `global` | Shared across all agents for this user |
+| `agent` | Specific to one agent |
+
+## Internal API
+
+Called by Agent Factory during the [agentic loop](/products/agent-factory/agentic-loop):
+
+### remember
+
+Store a new memory.
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `user_id` | string | Yes | User identifier |
+| `agent_id` | string | No | Agent identifier (for agent-scoped memories) |
+| `content` | string | Yes | Memory content |
+| `type` | string | Yes | Memory type |
+| `scope` | string | No | `global` or `agent` (default: `global`) |
+| `tags` | array | No | Searchable tags |
+
+Generates an embedding via `_llm` and stores in the `memories` collection.
+
+### recall
+
+Retrieve relevant memories for a query.
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `user_id` | string | Yes | User identifier |
+| `agent_id` | string | No | Agent filter |
+| `query` | string | Yes | Search query |
+| `type` | string | No | Filter by type |
+| `top_k` | integer | No | Max results (default: 10) |
+
+Returns matching memories ranked by relevance. Updates LRU tracking on recalled memories.
+
+### forget
+
+Delete a memory.
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `user_id` | string | Yes | User identifier |
+| `memory_id` | string | Yes | Memory to delete |
+
+Verifies ownership before deletion.
+
+### update
+
+Update memory content.
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `user_id` | string | Yes | User identifier |
+| `memory_id` | string | Yes | Memory to update |
+| `content` | string | No | New content (re-generates embedding) |
+| `type` | string | No | New type |
+
+### get-user-memories
+
+List all memories for a user.
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `user_id` | string | Yes | User identifier |
+| `agent_id` | string | No | Filter by agent |
+| `types` | array | No | Filter by types |
+| `limit` | integer | No | Max results |
+
+## REST API
+
+Base URL: `{API_URL}/workspaces/slug:tools-memories/webhooks`
+
+### Create Memory
+
+```
+POST v1/memories
+```
+
+```json
+{
+  "content": "User prefers dark mode interfaces",
+  "type": "preference",
+  "scope": "global",
+  "tags": ["ui", "settings"]
+}
+```
+
+### List Memories
+
+```
+GET v1/memories
+```
+
+### Recall Memories
+
+```
+POST v1/memories/recall
+```
+
+```json
+{
+  "query": "What does the user prefer for UI?",
+  "top_k": 5
+}
+```
+
+### Update Memory
+
+```
+PATCH v1/memories/:memory_id
+```
+
+### Delete Memory
+
+```
+DELETE v1/memories/:memory_id
+```
+
+### Analytics Queries
+
+```
+POST v1/memories/query
+```
+
+Aggregation queries on memories — count, distinct values, aggregation pipeline. Multi-tenant isolation is enforced: `orgSlug` is always injected into queries.
+
+## Authentication
+
+Dual-mode authentication:
+
+| Mode | Detection | Behavior |
+|------|-----------|----------|
+| **User JWT** | `user.id` present | Extracts `orgSlug` from `user.meta.currentOrg`, checks permissions |
+| **Workspace JWT** | `run.authenticatedWorkspaceId` | Trusted: takes `user_id`/`orgSlug` from request body |
+
+### Permissions
+
+| Permission | Description |
+|-----------|-------------|
+| `memories:read` | Read and recall memories |
+| `memories:write` | Create, update, delete memories |
+| `memories:query` | Run analytics queries |
+| `memories:*` | All memory permissions |
+| `iam:*` | Full platform access |
+
+Default: authenticated users get `memories:read` + `memories:write` unless `user.meta.permissions` is explicitly set.
+
+## Data Storage
+
+Memories are stored in the `memories` collection:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `user_id` | text | Owner |
+| `agent_id` | text | Associated agent (nullable) |
+| `content` | text | Memory content |
+| `type` | text | fact/preference/relationship/instruction |
+| `scope` | text | global/agent |
+| `tags` | json | Searchable tags |
+| `embedding` | json | 1536-dim vector |
+| `orgSlug` | text | Organization (tenant isolation) |
+| `last_recalled_at` | datetime | LRU tracking |
+
+Indexes: `(user_id, agent_id, scope)`, `(user_id, type)`, `(orgSlug, agent_id)`, `(orgSlug, createdAt)`
+
+## Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Max memories per user | 1000 | Hard limit |
+| Similarity threshold | 0.7 | Minimum score for recall |
+| Default top_k | 10 | Default recall results |

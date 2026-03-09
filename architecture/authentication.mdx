@@ -1,0 +1,232 @@
+---
+title: "Authentication"
+description: "Three authentication modes — user sessions, API keys, and workspace JWTs — and how each workspace implements them"
+---
+
+The platform supports three authentication modes. Each serves a different caller type, and workspaces implement them through their `_auth` private automation.
+
+## Authentication Modes
+
+| Mode | Caller | Trigger | Token Format |
+|------|--------|---------|--------------|
+| **User Session** | Browser / frontend | OIDC PKCE flow | Bearer token in `Authorization` header |
+| **API Key** | External integrations | `iak_*` prefixed key | Bearer token in `Authorization` header |
+| **Workspace JWT** | Other workspaces | `auth: { workspace: true }` | Signed JWT with workspace ID claim |
+
+## User Session (OIDC)
+
+The frontend authenticates users via OIDC PKCE flow through the Prisme.ai API Gateway.
+
+**Flow:**
+1. User visits the platform → redirected to OIDC provider
+2. Authorization code exchange via `sdk.getToken()`
+3. Access token stored in `localStorage` under `platform-token`
+4. Token included as `Authorization: Bearer {token}` on all API calls
+5. CSRF token from `sdk._csrfToken` included on mutating requests
+
+**In automations**, the authenticated user is available as:
+- `user.id` — User ID
+- `user.email` — Email
+- `user.meta.currentOrg` — Current organization slug
+- `user.meta.permissions` — Explicit permission grants
+- `user.meta.llm` — LLM governance config from subscription
+
+## API Keys (`iak_*`)
+
+API keys are created and managed through AI Governance. They enable programmatic access to the platform from external systems.
+
+**Key format:** `iak_` prefix followed by a random string (e.g., `iak_abc123def456`).
+
+**Validation flow:**
+
+```
+Client                    Workspace               AI Governance
+  │                          │                          │
+  │  Authorization: Bearer   │                          │
+  │  iak_abc123def456        │                          │
+  │ ───────────────────────► │                          │
+  │                          │  Workspace JWT           │
+  │                          │ ────────────────────────►│
+  │                          │  POST v1/auth/apikey     │
+  │                          │                          │
+  │                          │  ◄────────────────────── │
+  │                          │  { orgSlug, permissions, │
+  │                          │    scopes, limits,       │
+  │                          │    subscriptionLimits }  │
+  │                          │                          │
+```
+
+The validation result is **cached for 60 seconds** in the workspace's global cache (`global.apikey_auth_cache`) to avoid hitting Governance on every request.
+
+**API key context includes:**
+- `orgSlug` — Organization the key belongs to
+- `permissions` — Granted permissions (e.g., `llm:completions:use`, `memories:read`)
+- `scopes` — Resource scopes (e.g., allowed models, agent IDs)
+- `subscriptionLimits` — Rate limits and quotas from the org's subscription
+- `llm` — LLM governance configuration (allowed models, providers)
+
+## Workspace JWT (Service-to-Service)
+
+When a workspace needs to call another workspace, it generates a **workspace JWT** — a signed token that identifies the calling workspace.
+
+**In DSUL automations:**
+
+```yaml
+- auth:
+    workspace: true
+    output: _wsJwt
+
+- fetch:
+    url: '{{global.apiUrl}}/workspaces/slug:llm-gateway/webhooks/v1/chat/completions'
+    headers:
+      Authorization: 'Bearer {{_wsJwt.jwt}}'
+    body:
+      model: gpt-4o
+      messages: '{{messages}}'
+```
+
+**On the receiving side**, workspace JWTs are detected via:
+- `user.authType === "workspace"` — Set by the runtime
+- `run.authenticatedWorkspaceId` — The calling workspace's ID
+
+Workspace JWTs are **fully trusted** — they bypass API key validation and user permission checks. The receiving workspace trusts that the caller has already authenticated and authorized the end user.
+
+## Per-Workspace Implementation
+
+Each workspace implements `_auth` differently based on its access patterns:
+
+### Agent Factory (Full Three-Mode)
+
+```
+iak_* header? ──► Fetch AI Governance /v1/auth/apikey (60s cache)
+                  Returns: orgSlug, permissions, scopes
+
+user.id? ──────► User session with org from user.meta.currentOrg
+                  Cached: 60s per user
+
+Neither? ──────► 401 Unauthorized
+```
+
+Agent Factory supports all three modes because it's accessed by:
+- The SecureChat frontend (user session)
+- External integrations (API keys)
+- AI Insights and other workspaces (workspace JWT)
+
+### AI Governance
+
+```
+iak_* header? ──► internal/auth-apikey built-in
+                  Also checks platform_admins list for root role
+
+user.id? ──────► User session
+                  Checks platform_admins for root elevation
+
+run.authenticatedWorkspaceId? ──► Workspace JWT (trusted)
+```
+
+Governance has a special `platform_admins` list that grants `root` role to specific user IDs.
+
+### Storage (Internal Service)
+
+```
+run.authenticatedWorkspaceId? ──► Workspace JWT
+                                   Trusts body.user_id + body.orgSlug
+
+user.id? ──────────────────────► User session
+
+Neither? ──────────────────────► 401
+```
+
+Storage does **not** support `iak_*` keys — it's an internal service only accessed by other workspaces or the frontend.
+
+### LLM Gateway (Inline Auth)
+
+```
+iak_* header? ──► Fetch AI Governance /v1/auth/apikey (60s cache)
+                  Check llm:completions:use permission
+                  Check model access against scopes
+
+run.authenticatedWorkspaceId? ──► Workspace JWT (trusted)
+```
+
+LLM Gateway implements auth inline in its endpoint automations rather than in a shared `_auth` helper, because it needs model-level access checks.
+
+### AI Collection (Agent Context Only)
+
+```
+user.id? ──► User session (called from agent context)
+```
+
+AI Collection only supports user sessions because it's always called from within an agent execution context, never directly by external clients.
+
+## Permission Model
+
+Permissions are string-based and follow a `resource:action:scope` pattern:
+
+```
+memories:read
+memories:write
+memories:*
+llm:completions:use
+iam:*
+```
+
+Permission checking uses a cascading approach:
+
+```yaml
+# _check-permission example
+- conditions:
+    or:
+      - '{{permissions}}':
+          $in:
+            - '{{required_permission}}'
+      - '{{permissions}}':
+          $in:
+            - '{{resource}}:*'
+      - '{{permissions}}':
+          $in:
+            - 'iam:*'
+    then:
+      - # Allowed
+    else:
+      - set:
+          __statusCode: 403
+      - output:
+          error: Insufficient permissions
+```
+
+## Security Rules (RBAC)
+
+Each workspace defines RBAC rules in `security.yml`:
+
+```yaml
+authorizations:
+  roles:
+    editor: {}
+    viewer: {}
+    workspace:
+      auth:
+        apiKey: {}
+  rules:
+    - role: editor
+      action: [read, update, get_usage]
+      subject: workspaces
+    - role: viewer
+      action: read
+      subject: [workspaces, pages]
+    - role: workspace
+      action: [create, update, read, delete]
+      subject: files
+    - action: create
+      subject: events
+      conditions:
+        source.serviceTopic: topic:runtime:emit
+      reason: Anyone can create events via runtime
+```
+
+Key concepts:
+- **Roles**: `editor`, `viewer`, `workspace` (API key service account)
+- **Subjects**: `workspaces`, `pages`, `files`, `events`, `automations`
+- **Actions**: `read`, `create`, `update`, `delete`, `manage` (all)
+- **Conditions**: Filter rules by event source, session, user ID
+- **Inverted rules**: `inverted: true` creates deny rules (e.g., block reading API key events)

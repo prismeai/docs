@@ -1,0 +1,206 @@
+---
+title: "Agent Evaluations"
+description: "Automated agent testing with LLM judge — test cases, evaluation runs, and nightly batches"
+---
+
+The Agent Evaluations workspace provides automated testing for AI agents. It runs predefined test cases against agents and uses an LLM judge to score responses against expected outcomes.
+
+**Workspace:** `agent-evaluations` (22 automations)
+
+## How It Works
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Test Cases  │────►│  Evaluation  │────►│  Results     │
+│  (manual or  │     │  Run         │     │  (scored by  │
+│   imported)  │     │              │     │   LLM judge) │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
+
+1. Define test cases with input messages and expected outputs
+2. Start an evaluation run against an agent
+3. For each case: send message to agent, receive response
+4. LLM judge scores the response against expectations
+5. Results stored with per-criteria scores and reasoning
+
+## Data Model
+
+| Collection | Purpose |
+|-----------|---------|
+| `eval_cases` | Test case definitions |
+| `eval_runs` | Evaluation run metadata and progress |
+| `eval_results` | Per-case results with scores |
+| `eval_batches` | Nightly batch run tracking |
+
+## Test Cases
+
+### Endpoints
+
+```
+GET    v1/eval/cases                  # List cases
+POST   v1/eval/cases                  # Create case
+GET    v1/eval/cases/:case_id         # Get case
+PATCH  v1/eval/cases/:case_id         # Update case
+DELETE v1/eval/cases/:case_id         # Delete case
+POST   v1/eval/cases/import           # Bulk import (JSON array)
+GET    v1/eval/cases/export           # Export as CSV
+```
+
+### Case Definition
+
+```json
+{
+  "agent_id": "agent_abc",
+  "input": "What are our return policies?",
+  "expected_output": "Our return policy allows returns within 30 days of purchase...",
+  "criteria": ["accuracy", "completeness"],
+  "tags": ["critical", "customer-service"],
+  "enabled": true
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agent_id` | string | Agent to test |
+| `input` | string | User message to send |
+| `expected_output` | string | Expected response content |
+| `criteria` | array | Evaluation criteria to apply |
+| `tags` | array | Tags for filtering (`critical`, `regression`, etc.) |
+| `enabled` | boolean | Include in evaluations |
+
+### Bulk Import
+
+```
+POST v1/eval/cases/import
+```
+
+```json
+[
+  { "agent_id": "agent_abc", "input": "...", "expected_output": "..." },
+  { "agent_id": "agent_abc", "input": "...", "expected_output": "..." }
+]
+```
+
+CSV file upload is also supported (the security rules whitelist `text/csv` MIME type).
+
+## Evaluation Runs
+
+### Start Run
+
+```
+POST v1/eval/runs
+```
+
+```json
+{
+  "agent_id": "agent_abc",
+  "mode": "full"
+}
+```
+
+**Run modes:**
+
+| Mode | Description |
+|------|-------------|
+| `full` | Run all enabled test cases |
+| `sample` | Random 20% of test cases |
+| `tagged` | Only `critical` and `regression` tagged cases |
+
+The run validates that the agent exists (via Agent Factory API), checks for no concurrent runs, then emits an `eval.run.start` event.
+
+### Run Lifecycle
+
+```
+pending ──► running ──► completed
+                   └──► failed
+```
+
+### Get Run
+
+```
+GET v1/eval/runs/:run_id
+```
+
+Add `?include_results=true` to include per-case results.
+
+### List Runs
+
+```
+GET v1/eval/runs
+```
+
+### Export Results
+
+```
+GET v1/eval/runs/:run_id/export
+```
+
+Exports results as CSV.
+
+## Evaluation Flow
+
+When `eval.run.start` is emitted, `_run-evaluation` processes each case:
+
+```
+For each enabled test case:
+    │
+    ├──► Call Agent Factory
+    │    POST webhooks/v1/agents/{id}/messages/send
+    │    Send test case input
+    │
+    ├──► Receive agent response
+    │
+    ├──► Call _judge-case
+    │    Send to LLM judge with structured prompt:
+    │    - Input message
+    │    - Expected output
+    │    - Actual response
+    │    - Evaluation criteria
+    │
+    ├──► Parse judge response
+    │    { score: 0-100, passed: bool, criteria: [...], reasoning: "..." }
+    │
+    ├──► Store in eval_results
+    │
+    └──► Update progress in eval_runs
+```
+
+## LLM Judge
+
+The judge uses:
+- **Model:** `gpt-4o-mini` (fallback: `gpt-3.5-turbo`)
+- **Temperature:** 0.1 (near-deterministic)
+- **Pass threshold:** 70/100 (configurable via `config.scoring.pass_threshold`)
+
+The judge evaluates against a criteria library including:
+- **Accuracy** — Does the response match expected output?
+- **Completeness** — Are all key points covered?
+- **Relevance** — Is the response on-topic?
+- **Safety** — Does it follow guidelines?
+
+## Nightly Batch
+
+A cron job (`0 2 * * *`) runs batch evaluations:
+
+1. Find all unique agent IDs with enabled test cases
+2. Create evaluation runs for each agent
+3. Emit `eval.run.start` events with stagger delay (default: 2000ms between runs)
+4. Track overall batch progress in `eval_batches`
+
+Emits `eval.run.completed` when each run finishes.
+
+## Retention
+
+Old runs are automatically cleaned up — only the last 10 runs per agent are retained (`config.retention.runs_per_agent`).
+
+## Rate Limits
+
+| Operation | Limit |
+|-----------|-------|
+| Cases | 100/min |
+| Runs | 10/min |
+| Import | 10/hour |
+
+## Authentication
+
+Agent Evaluations uses **user session authentication**. Communication with Agent Factory uses API key (`x-api-key` header) with the key stored as `{{secret.AGENT_FACTORY_API_KEY}}`.

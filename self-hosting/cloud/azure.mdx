@@ -1,254 +1,74 @@
 ---
-title: "Deploying on Azure"
-description: "Guide and best practices for deploying Prisme.ai in a self-hosted environment using Azure."
+title: "Azure"
+description: "Deploy Prisme.ai on Azure using AKS, CosmosDB, Azure Cache, and Blob Storage"
 ---
 
-Deploying Prisme.ai on Microsoft Azure leverages managed Azure services for scalability, reliability, and ease of management. This guide walks through setting up Prisme.ai using Azure Kubernetes Service (AKS) and other Azure-native resources.
-
----
-
-## Azure Prerequisites
-
-Ensure these prerequisites are ready before deploying:
-
-- An active **Azure subscription** with sufficient privileges.
-- **Azure CLI** installed and authenticated.
-- Familiarity with Kubernetes and basic Azure services (AKS, CosmosDB/MongoDB/PostgreSQL, Redis, Blob storage).
-
----
-
-## Recommended Azure Infrastructure
-
-Set up Prisme.ai using the following Azure-managed resources:
+## Azure Resources
 
 <AccordionGroup>
   <Accordion title="Kubernetes (AKS)">
-    - **Service**: Azure Kubernetes Service (AKS)
-    - **Recommended Configuration**:
-      - 3-5 nodes with at least **Standard_D4s_v4** (4 vCPU, 16GB RAM each)
-      - Cluster Autoscaler enabled
-    - **Best Practices**:
-      - Use Azure Availability Zones for high availability
-      - Integrate Azure AD for AKS cluster authentication
-    - **Deployment Example**:
-
-      ```bash
-      az aks create --name prisme-ai-cluster --resource-group PrismeRG \
-      --node-count 3 --enable-cluster-autoscaler \
-      --min-count 3 --max-count 5 --node-vm-size Standard_D4s_v4
-      ```
+    - Azure Kubernetes Service
+    - 3-5 nodes, Standard_D4s_v3 or equivalent
+    - Availability zones enabled
   </Accordion>
-  <Accordion title="MongoDB (Azure CosmosDB) or PostgreSQL">
-    - **Service**: Azure Cosmos DB API for MongoDB or Azure Database PostgreSQL
-    - **Recommended Configuration**:
-      - 3-node replication (multi-region optional)
-      - Provision throughput according to your workload (400-10,000 RU/s)
-    - **Best Practices**:
-      - Enable Geo-replication for disaster recovery
-      - Regularly monitor and scale throughput dynamically
-      - Use [Microsoft Entra ID](#passwordless-authentication) authentication with PostgreSQL
+  <Accordion title="Database">
+    - Azure CosmosDB (MongoDB API) or Azure Database for PostgreSQL
+    - 3-node configuration with zone redundancy
   </Accordion>
-  <Accordion title="Search Engine (ElasticSearch / OpenSearch)">
-    - **Service**: Elasticsearch on Elastic Cloud or ES/OS deployed via AKS-managed containers
-    - **Recommended Configuration**:
-      - Elasticsearch cluster with at least 3 nodes (8GB RAM per node)
-    - **Best Practices**:
-      - Snapshot regularly to Cloud Storage
-      - Secure using private networking and access controls
+  <Accordion title="Redis (Azure Cache)">
+    - Azure Cache for Redis, Premium tier
+    - Zone redundancy enabled
+    - Supports Microsoft Entra ID passwordless authentication via managed identity
   </Accordion>
-  <Accordion title="Redis Cache (Azure Cache for Redis)">
-    - **Service**: Azure Cache for Redis
-    - **Recommended Configuration**:
-      - Premium P1 or P2 tier for HA and clustering
-      - Multi-zone redundancy enabled
-    - **Best Practices**:
-      - Regularly perform maintenance and updates
-      - Integrate with Azure Monitor for metrics
-      - Use [Microsoft Entra ID](#passwordless-authentication) authentication with Redis
+  <Accordion title="Storage">
+    - Azure Blob Storage for objects (models, uploads)
+    - Azure Files for RWX shared filesystem
   </Accordion>
-  <Accordion title="Object Storage (Azure Blob Storage)">
-    - **Service**: Azure Blob Storage
-    - **Configuration**:
-      - Separate containers for private uploads, public assets, and models
-    - **Best Practices**:
-      - Use Azure CDN to serve public assets efficiently
-      - Enable lifecycle management policies
-  </Accordion>
-  <Accordion title="File Storage (Azure Files)">
-    - **Service**: Azure Files with Azure Storage Accounts
-    - **Recommended Configuration**:
-      - Premium SSD tier for optimal performance
-      - Integration with AKS using CSI drivers for persistent volumes
-    - **Best Practices**:
-      - Secure access via Private Endpoints
-      - Enable regular backups via Azure Backup
+  <Accordion title="Elasticsearch">
+    - Elastic Cloud on Azure or self-managed OpenSearch on AKS
   </Accordion>
 </AccordionGroup>
 
----
+## Microsoft Entra ID Integration
 
-## Azure Deployment Steps
+Azure deployments can use **passwordless authentication** with managed identities for Redis and PostgreSQL:
+
+1. Create a user-assigned managed identity
+2. Configure federated credentials for AKS
+3. Grant the identity access to your databases
+
+Key Helm values for passwordless auth:
+
+```yaml
+global:
+  azureSystemIdentity: "your-managed-identity-client-id"
+  azureManagedIdentityClientId: "your-managed-identity-client-id"
+  permissions:
+    user: "managed-identity-username"
+```
+
+See [Enterprise Authentication](/self-hosting/enterprise/authentication) for SSO configuration.
+
+## Deployment
 
 <Steps>
-  <Step title="Create Resource Group">
-    Create a dedicated Azure Resource Group:
-
+  <Step title="Create AKS Cluster">
     ```bash
-    az group create --name PrismeRG --location westeurope
+    az aks create --resource-group prisme-rg --name prisme-aks \
+      --node-count 3 --node-vm-size Standard_D4s_v3 \
+      --zones 1 2 3
     ```
   </Step>
-  <Step title="Deploy AKS Cluster">
-    Provision your AKS cluster:
-
-    ```bash
-    az aks create --name prisme-ai --resource-group PrismeRG --node-count 3 --generate-ssh-keys
-    ```
+  <Step title="Provision Services">
+    Set up CosmosDB/PostgreSQL, Azure Cache, Blob Storage, Azure Files.
   </Step>
-  <Step title="Provision Managed Databases">
-    Set up Cosmos DB, Azure Search, and Redis via Azure Portal or CLI:
-
-    ```bash
-    az cosmosdb create --name prisme-ai-db --resource-group PrismeRG --kind MongoDB
-    az redis create --name prisme-ai-cache --resource-group PrismeRG --sku Premium --vm-size P1
-    ```
-  </Step>
-  <Step title="Configure DNS & Networking">
-    - Configure Azure DNS for your domains:
-      - `api.yourdomain.com`
-      - `studio.yourdomain.com`
-      - `*.pages.yourdomain.com`
-    - Use Azure Application Gateway as ingress if desired.
-  </Step>
-  <Step title="Deploy Prisme.ai via Helm">
-    Deploy Prisme.ai using Helm in AKS:
-
+  <Step title="Deploy via Helm">
     ```bash
     helm repo add prismeai https://helm.prisme.ai/charts
     helm install prisme-core prismeai/prismeai-core --namespace prisme -f values.yaml
     ```
   </Step>
-  <Step title="Set up Ingress and SSL">
-    Set up Azure Application Gateway with AKS Ingress Controller:
-
-    ```bash
-    kubectl apply -f ingress.yaml
-    ```
-
-    Use Azure Key Vault to manage SSL certificates.
+  <Step title="Deploy Platform & Workspaces">
+    See [Platform Service](/self-hosting/platform-service) and [Workspace Deployment](/self-hosting/workspace-deployment).
   </Step>
 </Steps>
-
----
-
-## Passwordless authentication
-
-Microsoft Entra ID authentication enable passwordless authentication using [system-assigned or user-assigned managed identities](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/overview).  
-
-For both Redis and PostgreSQL, start following these common steps :  
-
-1. Create a managed identity :
-```bash
-az identity create --name PrismeaiIdentity --resource-group RESOURCE_GROUP
-```
-
-2. Allow our future Kubernetes deployments to endorse this manage identity using one of these 2 methods :  
-
-**2a. Bind this identity with your Azure Kubernetes Cluster :**  
-```bash
-az aks update  --resource-group RESOURCE_GROUP  --name CLUSTER_NAME  --enable-managed-identity  --assign-identity IDENTITY_ID  --assign-kubelet-identity IDENTITY_ID
-```
-
-With this method, managed identity authentication can be enabled from prismeai Helm value files by defining all `azureSystemIdentity` values to `true`.  
-
-**2b. Or, create a federated identity :**
-This will bind the managed identity with the Kubernetes service account which will be used our backend deployments :  
-```bash
-az identity federated-credential create    --name prismeai-core-fic  --identity-name PrismeaiIdentity    --resource-group RESOURCE_GROUP    --issuer <aks_oidc_issuer>    --subject system:serviceaccount:CORE_NAMESPACE:prismeai-backends-sa    --audiences api://AzureADTokenExchange
-az identity federated-credential create    --name prismeai-apps-fic  --identity-name PrismeaiIdentity    --resource-group RESOURCE_GROUP    --issuer <aks_oidc_issuer>    --subject system:serviceaccount:APPS_NAMESPACE:prismeai-backends-sa    --audiences api://AzureADTokenExchange
-```
-
-<Note>
-* Here, all Prismeai backends services (everything except prismeai-console and prismeai-pages) will need a `serviceAccount.name: prismeai-backends-sa` value in Helm value files.   
-* CORE_NAMESPACE and APPS_NAMESPACE must be replaced with the expected **core** and **apps** namespace names.  
-</Note>
-
-From there, managed identity authentication can be enabled from prismeai Helm value files by defining all `azureManagedIdentityClientId` values to the managed identity **clientId**.   
-
-### Redis
-
-1. Open your Azure Managed Redis or Azure Cache For Redis
-2. Open Settings > Authentication in left menu
-3. Enable Microsoft Entra ID authentication and select your created managed identity
-
-This is all ! 
-
-### PostgreSQL
-
-1. Connect to the Postgres cluster with your Entra admin user : 
-```bash
-export AZ_DATABASE_SERVER_NAME=prismeai
-export CURRENT_USERNAME=$(az ad signed-in-user show --query userPrincipalName --output tsv)
-export AZ_DATABASE_NAME="db server name"
-psql "host=$AZ_DATABASE_SERVER_NAME.postgres.database.azure.com user=$CURRENT_USERNAME dbname=$AZ_DATABASE_NAME port=5432 password=$(az account get-access-token --resource-type oss-rdbms --output tsv --query accessToken) sslmode=require"
-```
-
-2. Create a postgres user attached to our managed identity (by using the same name) :
-```sql
-select * from pgaadauth_create_principal('PrismeaiIdentity', false, false);
-```
-3. Assign permissions :
-```sql
-GRANT CREATE ON SCHEMA public TO "PrismeaiIdentity";
-GRANT USAGE ON SCHEMA public TO "PrismeaiIdentity";
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "PrismeaiIdentity";
-# Give default permissions for future tables
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "PrismeaiIdentity";
-```
-
-**PrismeaiIdentity** must match the managed identity name you created in first step.  
-
-4. In Helm value files, specify the **managed identity username** (_PrismeaiIdentity_) for all 3 PostgreSQL clients :  
-
-* `global.permissions.user` 
-* `prismeai-api-gateway.storage.users.user`
-* `prismeai-runtime.storage.collections.user`
-
-
---- 
-
-## Security Best Practices
-
-<CardGroup cols="2">
-  <Card title="Azure AD Integration" icon="shield-halved">
-    - Secure your AKS cluster using Azure Active Directory integration.
-    - Implement RBAC for access management.
-  </Card>
-  <Card title="Private Networking" icon="network-wired">
-    - Deploy AKS within a private Virtual Network (VNet).
-    - Utilize Azure Firewall or Network Security Groups (NSGs) for controlled access.
-  </Card>
-  <Card title="Secrets Management" icon="key">
-    - Store sensitive configurations in Azure Key Vault.
-    - Regularly rotate keys and passwords.
-  </Card>
-  <Card title="Monitoring & Alerts" icon="eye">
-    - Utilize Azure Monitor and Azure Log Analytics.
-    - Set alerts for resource anomalies.
-  </Card>
-</CardGroup>
-
----
-
-## Next Steps
-
-<CardGroup cols="2">
-  <Card title="Helm Deployment" icon="ship" href="/self-hosting/kubernetes/helm">
-    Deploy Prisme.ai using Helm on Kubernetes
-  </Card>
-  <Card title="Products Configuration" icon="store" href="/self-hosting/configuration/ai-store">
-    Configure your Prisme.ai AI products
-  </Card>
-  <Card title="Operations Management" icon="scale-unbalanced" href="/self-hosting/operations/scaling">
-    Learn about scaling operations efficiently
-  </Card>
-</CardGroup>
