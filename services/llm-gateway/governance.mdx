@@ -7,108 +7,141 @@ LLM Gateway integrates with [AI Governance](/products/ai-governance/overview) to
 
 ## Governance Resolution
 
-When a request arrives with an `iak_*` API key, the `_resolve-governance` automation fetches the governance context:
+The `_resolve-governance` automation resolves governance context differently based on auth mode:
+
+**API key (`iak_*`) flow**: the `api_key_context` is provided by the endpoint automation after validating the key against AI Governance (`/v1/auth/apikey`). It contains:
 
 ```yaml
-# From API key validation response
 {
   "orgSlug": "acme-corp",
-  "permissions": ["llm:completions:use"],
-  "scopes": {
-    "models": ["gpt-4o", "gpt-4o-mini"]
+  "gov": {
+    "allowed_models": ["gpt-4o", "gpt-4o-mini"],
+    "default_completion_model": "gpt-4o",
+    "default_embedding_model": "text-embedding-3-small",
+    "quota_policy": "soft_downgrade",    # or "hard_block"
+    "failover_mapping": { "gpt-4o": "gpt-4o-mini" },
+    "downgrade_mapping": { "gpt-4o": "gpt-4o-mini" },
+    "routing_config": { ... }
   },
-  "subscriptionLimits": {
-    "llm_requests_per_minute": 100,
-    "max_tokens_per_request": 8000,
-    "monthly_budget_usd": 500
-  },
-  "llm": {
-    "allowed_providers": ["openai", "azure"],
-    "default_model": "gpt-4o",
-    "blocked_models": []
-  }
+  "limits": [
+    { "metric": "llm.requests.rpm", "limit": 100 },
+    { "metric": "llm.tokens.monthly", "limit": 10000000 }
+  ],
+  "api_key_scopes": ["models:gpt-4o", "models:gpt-4o-mini"]
 }
 ```
 
-For workspace JWT calls, the governance context comes from `user.meta.llm` (user session flow) or is trusted entirely (workspace-to-workspace).
+**Workspace JWT flow (user session)**: governance context comes from `user.meta.llm` (for the `gov` field) and `user.meta.currentOrg` (for `orgSlug`).
+
+**Workspace-to-workspace calls**: the caller passes `api_key_context` and `analytics_context` in the request body, allowing the gateway to apply the caller's governance rules.
 
 ## Model Access Control
 
-`_check-model-access` validates that the requested model is allowed:
+`_check-model-access` validates the requested model against three sequential allowlists:
 
-1. **Permission check** — Is `llm:completions:use` (or `llm:embeddings:use`) granted?
-2. **Scope check** — Is the model in the API key's `scopes.models` list?
-3. **Provider check** — Is the model's provider in `llm.allowed_providers`?
-4. **Block list** — Is the model in `llm.blocked_models`?
+1. **Org allowlist** — Is the model in `gov.allowed_models`? (if list exists and has entries)
+2. **Agent allowlist** — Is the model in `agent_allowed_models`? (passed by agent-factory)
+3. **API key scopes** — Is the model allowed by the API key's scopes? Supports two formats:
+   - New array format: `["models:gpt-4o", "models:*"]` (with wildcard support)
+   - Legacy object format: `{models: ["gpt-4o"]}`
 
-If any check fails, the request is rejected with a `403` error explaining which restriction was violated.
+Each check is skipped if the corresponding list is empty or absent. If any check fails, the behavior depends on `gov.quota_policy`:
+- **`soft_downgrade`**: silently swaps to `gov.default_completion_model` and emits a `governance.model.downgraded` event
+- **`hard_block`** (default): returns a `403` error with `MODEL_NOT_ALLOWED`
 
 ## Quota Enforcement
 
 `_check-llm-quota` enforces rate and usage limits:
 
-| Limit | Scope | Description |
-|-------|-------|-------------|
-| `llm_requests_per_minute` | Per API key | Maximum requests per minute |
-| `max_tokens_per_request` | Per request | Maximum tokens in a single request |
-| `monthly_budget_usd` | Per organization | Monthly cost ceiling |
+| Metric | Scope | Implementation |
+|--------|-------|----------------|
+| `llm.requests.rpm` | Per org | Local `rateLimit` instruction (60s window) |
+| `llm.tokens.monthly` | Per org | HTTP call to AI Governance `/v1/usage/check` (cached 15s) |
 
-When a limit is reached:
-- Rate limits return `429 Too Many Requests` with a `Retry-After` header
-- Budget limits return `403 Forbidden` with a budget exhaustion message
-- Token limits truncate the request or return `400 Bad Request`
+When a limit is reached, the behavior depends on `gov.quota_policy`:
+- **`soft_downgrade`**: swaps the model using `gov.downgrade_mapping` and emits a `governance.quota.downgraded` event
+- **`hard_block`** (default): returns `429` with `RATE_LIMITED` or `QUOTA_EXCEEDED` error code
+
+The quota check **fails open**: if AI Governance is unreachable, the request proceeds.
+
+> **Note**: Monthly cost budget checking (`monthly_budget_usd`) is defined but currently disabled until pricing data is fully configured.
 
 ## Usage Recording
 
-After every LLM call, `_record-llm-usage` emits an `analytics.llm.completion` event and increments usage counters:
+After every LLM call, two things happen:
 
-```json
-{
-  "type": "analytics.llm.completion",
-  "payload": {
-    "orgSlug": "acme-corp",
-    "model": "gpt-4o",
-    "provider": "openai",
-    "tokens": {
-      "input": 1200,
-      "output": 450,
-      "total": 1650
-    },
-    "cost_usd": 0.0128,
-    "carbon_g": 0.85,
-    "duration_ms": 1200,
-    "stream": true,
-    "api_key_id": "key_xyz"
-  }
-}
-```
+1. **Analytics event** — `analytics.llm.completion` is emitted (see [chat completions analytics](/services/llm-gateway/chat-completions#analytics-event) for the full schema)
+2. **Governance usage increment** — `_record-llm-usage` POSTs to AI Governance `/v1/usage/increment` with `orgSlug`, `total_tokens`, and `cost` (non-blocking, `emitErrors: false`)
 
 Usage events power the [observability dashboards](/products/ai-governance/observability) in AI Governance.
 
 ## Carbon Footprint
 
-`_compute-carbon-footprint` estimates the environmental impact of each LLM call:
+`_compute-carbon-footprint` estimates the environmental impact of each LLM call using model specs from the `metrics` field in the [model catalog](/services/llm-gateway/models).
+
+### Calculation
 
 ```
-energy_kwh = tokens × energy_kwh_per_1k_tokens / 1000
-carbon_g = energy_kwh × carbon_g_per_kwh
+# GPU energy (input tokens weighted at 33% of output — encoding vs generation)
+gpu_energy = (input_tokens × energy_per_token × 0.33) + (output_tokens × energy_per_token)
+
+# Server overhead (~0.1kW × estimated processing time at ~0.02s/token)
+server_energy = 0.1 × (total_tokens × 0.02) / 3600
+
+# Total energy with PUE (datacenter efficiency multiplier)
+total_energy_kwh = (gpu_energy + server_energy) × pue
+
+# Carbon emissions
+carbon_kgCO2eq = total_energy_kwh × regional_emission_factor
 ```
 
-The `eco_metrics` for each model are defined in the [model catalog](/services/llm-gateway/models):
+### PUE Profiles
+
+| Profile | Multiplier |
+|---------|-----------|
+| `efficient` | 1.1 |
+| `average` (default) | 1.58 |
+| `inefficient` | 2.0 |
+
+### Regional Emission Factors (kgCO2/kWh)
+
+| Region | Factor |
+|--------|--------|
+| `world` (default) | 0.475 |
+| `eu-west` | 0.276 |
+| `eu-north` | 0.231 |
+| `us-east` | 0.389 |
+| `us-west` | 0.352 |
+| `asia` | 0.638 |
+
+### Model Catalog Fields
+
+The relevant fields in the model's `metrics` object:
 
 ```json
 {
-  "eco_metrics": {
-    "energy_kwh_per_1k_tokens": 0.001,
-    "carbon_g_per_kwh": 400
-  }
+  "metrics": {
+    "energy_per_token": 0.000001,
+    "pue_profile": "efficient",
+    "eco_score": "low",
+    "cost_tier": "medium"
+  },
+  "region": "eu-west"
 }
 ```
 
-Carbon metrics vary by:
-- **Model size** — Larger models consume more energy
-- **Provider** — Cloud regions have different energy mixes
-- **Operation type** — Embeddings are cheaper than chat completions
+### Output Format
+
+Results include uncertainty margins (+/- 20%):
+
+```json
+{
+  "energy": { "value": 0.000012, "min": 0.0000096, "max": 0.0000144, "unit": "kWh" },
+  "gwp": { "value": 0.0000033, "min": 0.0000026, "max": 0.000004, "unit": "kgCO2eq" },
+  "details": { "gpu_energy": 0.000008, "server_energy": 0.000002, "pue": 1.1, "emission_factor": 0.276, "region": "eu-west" },
+  "pricing": { "input_per_1m_tokens": 2.5, "output_per_1m_tokens": 10 }
+}
+```
 
 Carbon data is included in analytics events and available in the governance observability dashboard.
 
@@ -116,11 +149,19 @@ Carbon data is included in analytics events and available in the governance obse
 
 Organizations have subscription-level limits enforced at the gateway:
 
-| Limit | Description |
-|-------|-------------|
-| Requests per minute | Total LLM API calls |
-| Monthly token budget | Total tokens across all models |
-| Monthly cost budget | Total cost in USD |
-| Concurrent requests | Simultaneous in-flight requests |
+| Metric | Description | Status |
+|--------|-------------|--------|
+| `llm.requests.rpm` | Requests per minute per org | Implemented |
+| `llm.tokens.monthly` | Monthly token budget across all models | Implemented |
+| Monthly cost budget | Monthly cost ceiling in USD | Disabled (pending pricing data) |
 
-Subscription limits are defined in AI Governance and returned as part of the API key validation response. They override any per-key limits when more restrictive.
+Subscription limits are defined in AI Governance and returned as part of the governance context (either from API key validation or user session metadata). They are provided as an array:
+
+```json
+{
+  "limits": [
+    { "metric": "llm.requests.rpm", "limit": 100 },
+    { "metric": "llm.tokens.monthly", "limit": 10000000 }
+  ]
+}
+```

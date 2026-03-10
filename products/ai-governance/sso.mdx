@@ -7,13 +7,13 @@ AI Governance supports Single Sign-On (SSO) for organizations, allowing users to
 
 ## Endpoints
 
-### Get SSO Configuration
+### Lookup SSO Configuration by Domain
 
 ```
-GET v1/sso/config
+GET v1/sso/config?domain=acme.com
 ```
 
-Returns the public SSO configuration for the current organization (safe to expose to the frontend).
+Public endpoint (no auth required). Called by the Auth Service to determine the SSO provider for a user's email domain. Returns provider config **without secrets** (e.g., `clientSecret` is stripped).
 
 ### Get Full SSO Configuration
 
@@ -23,85 +23,89 @@ GET v1/sso/config-full
 
 Returns the complete SSO configuration including secrets. Requires admin permissions.
 
-### Create / Update SSO Configuration
-
-```
-POST v1/sso/config
-```
-
-```json
-{
-  "provider": "azure",
-  "config": {
-    "client_id": "your-azure-client-id",
-    "client_secret": "your-azure-client-secret",
-    "tenant_id": "your-azure-tenant-id",
-    "discovery_url": "https://login.microsoftonline.com/{tenant}/.well-known/openid-configuration"
-  },
-  "auto_provision": true,
-  "default_role": "viewer"
-}
-```
-
 ### Organization-Level SSO
 
 ```
-GET  v1/orgs/:org_slug/sso
-POST v1/orgs/:org_slug/sso
+PUT v1/orgs/:org_slug/sso
 ```
 
-Configure SSO at the organization level. Each organization can have its own identity provider.
+Self-service endpoint for organization owners to configure their SSO settings. Requires `iam:org:manage` permission.
 
-## Configuration Options
+## SSO Config Structure
+
+SSO configuration is stored as part of the organization object (`ssoConfig` field):
+
+```json
+{
+  "enabled": true,
+  "domains": ["acme.com", "acme.co.uk"],
+  "provider": {
+    "type": "oidc",
+    "oidc": {
+      "issuer": "https://login.microsoftonline.com/{tenant}/v2.0",
+      "clientId": "your-client-id",
+      "clientSecret": "your-client-secret"
+    }
+  },
+  "settings": {
+    "enforceSSO": false,
+    "autoProvision": true,
+    "defaultRole": "user",
+    "allowedRoles": ["user", "admin"]
+  }
+}
+```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `provider` | string | Identity provider type (`azure`, `okta`, `google`, `saml`, `oidc`) |
-| `config` | object | Provider-specific credentials and endpoints |
-| `auto_provision` | boolean | Automatically create accounts for new SSO users |
-| `default_role` | string | Role assigned to auto-provisioned users |
+| `enabled` | boolean | Whether SSO is active |
+| `domains` | string[] | Email domains that trigger SSO (must be unique across orgs) |
+| `provider.type` | string | `saml` or `oidc` |
+| `provider.saml` | object | SAML config: `entryPoint`, `issuer`, `cert` |
+| `provider.oidc` | object | OIDC config: `issuer`, `clientId`, `clientSecret` |
+| `settings.enforceSSO` | boolean | Require SSO (disable local auth) |
+| `settings.autoProvision` | boolean | Auto-create accounts for new SSO users |
+| `settings.defaultRole` | string | Role assigned to auto-provisioned users (must exist in org) |
+| `settings.allowedRoles` | string[] | Roles that SSO users can be assigned |
 
 ## Provider Configuration
 
 <Tabs>
-  <Tab title="Azure AD">
+  <Tab title="SAML">
     ```json
     {
-      "provider": "azure",
-      "config": {
-        "client_id": "...",
-        "client_secret": "...",
-        "tenant_id": "...",
-        "discovery_url": "https://login.microsoftonline.com/{tenant}/.well-known/openid-configuration"
+      "provider": {
+        "type": "saml",
+        "saml": {
+          "entryPoint": "https://idp.example.com/sso/saml",
+          "issuer": "https://your-platform.com",
+          "cert": "MIIC..."
+        }
       }
     }
     ```
+    All three fields (`entryPoint`, `issuer`, `cert`) are required.
   </Tab>
-  <Tab title="Okta">
+  <Tab title="OIDC">
     ```json
     {
-      "provider": "okta",
-      "config": {
-        "client_id": "...",
-        "client_secret": "...",
-        "issuer": "https://your-org.okta.com/oauth2/default"
+      "provider": {
+        "type": "oidc",
+        "oidc": {
+          "issuer": "https://login.microsoftonline.com/{tenant}/v2.0",
+          "clientId": "your-client-id",
+          "clientSecret": "your-client-secret"
+        }
       }
     }
     ```
-  </Tab>
-  <Tab title="Generic OIDC">
-    ```json
-    {
-      "provider": "oidc",
-      "config": {
-        "client_id": "...",
-        "client_secret": "...",
-        "discovery_url": "https://your-idp.com/.well-known/openid-configuration"
-      }
-    }
-    ```
+    All three fields (`issuer`, `clientId`, `clientSecret`) are required. Works with Azure AD, Okta, Google Workspace, or any OIDC-compliant provider.
   </Tab>
 </Tabs>
+
+## Domain Validation
+
+When updating SSO config, the system validates that domains are not already claimed by another organization. If a domain conflict is found, the update is rejected with a `DOMAIN_ALREADY_USED` error identifying the conflicting org.
 
 ## Integration with Platform Frontend
 
@@ -118,10 +122,10 @@ When SSO is configured, the sign-in page shows additional buttons for each provi
 
 ## Auto-Provisioning
 
-When `auto_provision` is enabled:
+When `autoProvision` is enabled:
 1. User authenticates via SSO for the first time
 2. A platform account is automatically created
-3. The user is added to the organization with `default_role`
-4. Join rules (email domain matching) are also applied if configured
+3. The user is added to the organization with `defaultRole`
+4. Join rules are also applied if configured
 
 This eliminates the need for manual invitation for users authenticating through corporate SSO.

@@ -32,21 +32,24 @@ POST v1/orgs
 ```json
 {
   "name": "Acme Corp",
-  "slug": "acme-corp",
-  "description": "Enterprise AI deployment"
+  "slug": "acme-corp"
 }
 ```
 
-The creating user is automatically assigned the `owner` role.
+On creation, the platform automatically provisions:
+- Default roles (`owner`, `admin`, `user`)
+- A default subscription (free tier)
+- The creating user as `owner`
 
 ### Get / Update Organization
 
 ```
 GET v1/orgs/:org_slug
 PUT v1/orgs/:org_slug
+DELETE v1/orgs/:org_slug
 ```
 
-Update supports changing name, description, and branding settings (logo, colors, fonts, custom CSS).
+Update supports changing `name`, `branding` (logo, colors, fonts, custom CSS), `navigation`, `joinRules`, and `settings` (including `settings.llm` for model governance, gated behind `llm:governance:manage` permission). Platform admins can also update `status` and `ssoConfig`.
 
 ## Members
 
@@ -153,12 +156,11 @@ Roles define what permissions a user has within an organization. There are built
 
 ### Built-in Roles
 
-| Role | Description |
-|------|-------------|
-| `owner` | Full organization management |
-| `admin` | Organization administration (cannot delete org) |
-| `editor` | Create and manage resources |
-| `viewer` | Read-only access |
+| Role | Permissions | Description |
+|------|------------|-------------|
+| `owner` | `*` (wildcard) | Full organization management |
+| `admin` | `secure-chat:*`, `store:*`, `agent-builder:*`, `builder:*`, `knowledge:*`, `agents:use/manage/share`, `iam:members:manage`, `iam:groups:manage`, `iam:branding:manage`, `iam:navigation:manage`, `iam:join-rules:manage`, `iam:invites:manage`, `iam:subscriptions:manage`, `analytics:view` | Organization administration |
+| `user` | `secure-chat:use`, `store:browse`, `agents:use`, `iam:groups:read` | Standard user access |
 
 ### Custom Roles
 
@@ -196,7 +198,7 @@ Groups allow organizing users for bulk access control. Agents can be bound to gr
 GET    v1/orgs/:org_slug/groups
 POST   v1/orgs/:org_slug/groups
 GET    v1/orgs/:org_slug/groups/:group_slug
-PUT    v1/orgs/:org_slug/groups/:group_slug
+PATCH  v1/orgs/:org_slug/groups/:group_slug
 DELETE v1/orgs/:org_slug/groups/:group_slug
 ```
 
@@ -212,38 +214,45 @@ When a group is deleted, the `iam.group.deleted` event is emitted, and Agent Fac
 
 ## Join Rules
 
-Join rules allow automatic organization membership based on email domain or other criteria:
+Join rules allow automatic organization membership based on generic field matching against the user object. This supports email domains, group membership, or any user attribute:
 
 ```json
 {
-  "type": "email_domain",
-  "value": "acme.com",
-  "role": "viewer",
-  "auto_approve": true
+  "field": "email",
+  "matchValue": "@acme.com",
+  "orgSlug": "acme-corp",
+  "roleSlug": "user"
 }
 ```
 
-When a user signs up with a matching email domain, they are automatically added to the organization with the specified role.
+| Field | Description |
+|-------|-------------|
+| `field` | User object field path (e.g., `email`, `groups`, `authData.google.hd`) |
+| `matchValue` | Value to match (contains for strings, includes for arrays) |
+| `orgSlug` | Organization to auto-join |
+| `roleSlug` | Role to assign on auto-join |
+
+Join rules are evaluated during `internal/resolve-context` (i.e., on the user's next IAM context call). When a match is found and the user isn't already a member, they are automatically added with the org's default subscription.
 
 Changes to join rules trigger the `joinrules.sync` event for cache invalidation.
 
 ## Users
 
 ```
-GET v1/users
-GET v1/users/:user_id
-PUT v1/users/:user_id
+GET    v1/users
+PATCH  v1/users/:user_id
+DELETE v1/users/:user_id
 ```
 
-User endpoints allow platform admins to list, view, and update user profiles across all organizations.
+User endpoints allow platform admins to list, update status (`pending`, `validated`, `deactivated`), or delete users. Deleting a user cascades membership and group cleanup across all organizations.
 
 ## IAM Membership
 
 ```
-POST v1/iam/memberships
+GET v1/iam/memberships
 ```
 
-Returns all organization memberships for the authenticated user.
+Returns all organization memberships for the authenticated user, enriched with org name, status, role name, and subscription ID.
 
 ```
 POST v1/iam/switch-org

@@ -33,7 +33,7 @@ AI Governance is the authority workspace for the entire platform. It manages org
 
 ## Architecture
 
-AI Governance is a **dependency sink** — it is called by nearly every workspace but makes no outbound cross-workspace calls itself. This makes it the single source of truth for identity and access.
+AI Governance is the **central authority** — it is called by nearly every workspace for identity and access. It also makes limited outbound calls: to the native Users API (for user meta sync and contact enrichment) and to the LLM Gateway events index (for cost/usage aggregation).
 
 ```mermaid
 flowchart LR
@@ -42,6 +42,8 @@ flowchart LR
     INS[AI Insights] --> GOV
     SC[SecureChat] --> GOV
     AE[AI Engage] --> GOV
+    GOV -.->|user meta sync| API[Native Users API]
+    GOV -.->|cost aggregation| LLM
 ```
 
 **How workspaces use it:**
@@ -51,22 +53,22 @@ flowchart LR
 
 ## Data Model
 
-| Collection | Table | Purpose |
-|-----------|-------|---------|
-| `organizations` | `iam_organizations` | Organization metadata |
-| `memberships` | `iam_memberships` | User-to-org membership with role |
-| `roles` | `iam_roles` | Custom role definitions with permissions |
-| `groups` | `iam_groups` | User groups for access control |
-| `group_members` | `iam_group_members` | Group membership |
-| `invites` | `iam_invites` | Invitation codes |
-| `join_rules` | `iam_join_rules` | Auto-join rules (email domain matching) |
-| `apikeys` | `iam_apikeys` | API keys (hashed) with permissions and scopes |
-| `service_accounts` | `iam_service_accounts` | Service account credentials |
-| `subscriptions` | `iam_subscriptions` | Organization subscription plans |
-| `usage` | `iam_usage` | Usage tracking for quota enforcement |
-| `announcements` | `iam_announcements` | Platform-wide announcements |
-| `user_announcement_state` | `iam_user_announcement_state` | Per-user announcement read state |
-| `platform_metrics` | `iam_platform_metrics` | Aggregated platform metrics |
+| Collection | Purpose |
+|-----------|---------|
+| `organizations` | Organization metadata, branding, navigation, SSO config |
+| `memberships` | User-to-org membership with role and subscription |
+| `roles` | Role definitions with permission strings |
+| `groups` | User groups for access control |
+| `group_members` | Group membership |
+| `invites` | Shareable invitation codes |
+| `join_rules` | Auto-join rules (generic field matching, not just email) |
+| `apikeys` | API keys (hashed) with permissions and scopes |
+| `service_accounts` | Service account identities for agents |
+| `subscriptions` | Organization subscription plans with limits |
+| `usage` | Usage tracking for quota enforcement |
+| `announcements` | Platform-wide announcements with targeting |
+| `user_announcement_state` | Per-user announcement read/dismiss state |
+| `platform_metrics` | Pre-aggregated observability metrics |
 
 ## API Surface Overview
 
@@ -105,8 +107,38 @@ A special `platform_admins` list in the workspace config grants the `root` role 
 
 ## Events
 
+### IAM Lifecycle Events
+
 | Event | When |
 |-------|------|
-| `iam.cache.invalidate` | Membership or role changes (consumed by other workspaces) |
-| `joinrules.sync` | Join rules updated |
-| `apikeys.*` | API key operations (creation, rotation, revocation) |
+| `iam.member.added` | Member added to an organization |
+| `iam.member.invited` | Invitation email sent |
+| `iam.member.joined` | User accepted invite or joined via code |
+| `iam.member.auto-joined` | User auto-joined via join rules |
+| `iam.member.updated` | Member role or subscription changed |
+| `iam.member.removed` | Member removed from organization |
+| `iam.role.created` | Custom role created |
+| `iam.role.updated` | Role permissions modified |
+| `iam.role.deleted` | Role deleted |
+| `iam.organization.created` | Organization created |
+| `iam.organization.updated` | Organization settings, branding, navigation, or join rules updated |
+| `iam.organization.deleted` | Organization deleted (cascade info included) |
+| `iam.group.created` | Group created |
+| `iam.group.updated` | Group metadata updated |
+| `iam.group.deleted` | Group deleted (Agent Factory cleans up agent bindings) |
+| `iam.group.member.added` | Users added to a group |
+| `iam.group.member.removed` | User removed from a group |
+| `iam.user.updated` | Platform user status changed |
+| `iam.user.deleted` | Platform user deleted (cascades membership + group cleanup) |
+
+### System Events
+
+| Event | When |
+|-------|------|
+| `iam.audit` | All governance actions (compliance trail with actor, target, changes) |
+| `iam.cache.invalidated` | After cache invalidation runs for affected users |
+| `iam.joinrules.synced` | After join rules synced to the inverted index |
+| `iam.warning` | Non-fatal warnings (e.g., missing default subscription) |
+| `internal.apikey.used` | API key authenticated (async — triggers `lastUsedAt` / `usageCount` update) |
+
+The `events/iam-cache-invalidate` listener subscribes to all `iam.member.*`, `iam.role.*`, `iam.organization.updated`, `iam.group.*`, and `iam.user.*` events. It determines affected users and sets `user.meta._iamVersion = "invalidated"`, forcing a fresh context rebuild on the next `v1/iam/context` call.

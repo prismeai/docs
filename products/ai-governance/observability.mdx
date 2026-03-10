@@ -34,10 +34,9 @@ GET v1/observability/:workspace_id/metrics
 
 | Param | Type | Description |
 |-------|------|-------------|
-| `period` | string | Time period (`1h`, `24h`, `7d`, `30d`) |
-| `granularity` | string | Data point interval (`5m`, `1h`, `1d`) |
+| `period` | string | Time period (`1h`, `24h`, `7d`, `30d`) — default `24h` |
 
-Returns time-series data:
+Data is always at hourly granularity (from pre-aggregated `platform_metrics`). Returns time-series data:
 - Request count and latency
 - LLM token usage (input/output)
 - Active users
@@ -87,10 +86,18 @@ GET v1/observability/:workspace_id/health
 ```
 
 Returns workspace health indicators:
-- Overall status (`healthy`, `degraded`, `unhealthy`)
+- Health score (0-100) and status (`healthy` ≥90, `degraded` ≥70, `warning` ≥50, `critical` <50)
+- Score breakdown with three components:
+  - **Success score** (40%): `successRate × 40`
+  - **Error score** (30%): `(1 - cappedErrorRate × 2) × 30` — error rate capped at 0.5
+  - **Latency score** (30%): `(1 - p95_ms / 5000) × 30` — floored at 0
 - Latency percentiles (p50, p95, p99)
-- Error rate vs. threshold
-- Dependency health (connected workspaces)
+- Error rate with severity thresholds
+- Auto-detected issues (high error rate, high latency, low activity)
+
+<Note>
+The platform-level aggregation job (`jobs/aggregate-platform-metrics`) uses a slightly different formula: `(successRate × 40) + ((1 - errorRate × 10) × 30) + (latencyScore × 30)`, with thresholds `<40` critical, `<70` degraded, else healthy (no "warning" tier).
+</Note>
 
 ### Activity Feed
 
@@ -142,7 +149,7 @@ Metrics are aggregated by scheduled jobs:
 
 | Schedule | Job | Purpose |
 |----------|-----|---------|
-| `5 * * * *` | `_aggregate-platform-hour` | Hourly platform-wide metric aggregation |
+| `15 * * * *` | `jobs/aggregate-platform-metrics` | Hourly aggregation at 3 levels: platform, per-org, per-workspace |
 | On-demand | `v1/admin/refresh-metrics` | Force-refresh metrics (admin only) |
 
 Aggregated data is stored in the `platform_metrics` collection.

@@ -7,13 +7,13 @@ API keys (`iak_*`) enable programmatic access to the Prisme.ai platform from ext
 
 ## Key Format
 
-All API keys use the `iak_` prefix followed by a random string:
+All API keys use the format `iak_{orgSlug}_{uuid}`:
 
 ```
-iak_a1b2c3d4e5f6g7h8i9j0...
+iak_acme-corp_a1b2c3d4e5f6g7h8...
 ```
 
-Keys are stored **hashed** in the `iam_apikeys` collection. The plaintext key is returned only once at creation time.
+The embedded `orgSlug` allows the auth middleware to resolve the organization without a database lookup. Keys are stored **hashed** (SHA-256) in the `iam_apikeys` collection. A truncated prefix (`iak_{orgSlug}_{first8chars}`) is stored for identification. The plaintext key is returned only once at creation time.
 
 ## Endpoints
 
@@ -41,10 +41,11 @@ POST v1/orgs/:org_slug/apikeys
     "memories:read",
     "memories:write"
   ],
-  "scopes": {
-    "models": ["gpt-4o", "gpt-4o-mini"],
-    "agents": ["agent_abc123"]
-  },
+  "scopes": [
+    "models:gpt-4o",
+    "models:gpt-4o-mini",
+    "agents:agent_abc123"
+  ],
   "expires_at": "2026-12-31T23:59:59Z"
 }
 ```
@@ -53,10 +54,10 @@ POST v1/orgs/:org_slug/apikeys
 ```json
 {
   "id": "key_xyz",
-  "key": "iak_a1b2c3d4e5f6g7h8i9j0...",
+  "key": "iak_acme-corp_a1b2c3d4e5f6g7h8...",
   "name": "Production Integration",
   "permissions": [...],
-  "scopes": {...},
+  "scopes": [...],
   "created_at": "2026-01-15T10:00:00Z"
 }
 ```
@@ -69,12 +70,6 @@ PUT v1/orgs/:org_slug/apikeys/:key_id
 ```
 
 Update allows changing name, permissions, scopes, and expiration. The key value itself cannot be changed (use rotation instead).
-
-### Delete API Key
-
-```
-DELETE v1/orgs/:org_slug/apikeys/:key_id
-```
 
 ### Revoke API Key
 
@@ -94,7 +89,7 @@ Generates a new key value while preserving the key's permissions and scopes. The
 
 ## Permissions
 
-API key permissions follow a `resource:action` pattern:
+API key permissions follow a `product:resource:action` pattern with wildcard support:
 
 | Permission | Description |
 |-----------|-------------|
@@ -115,19 +110,20 @@ Wildcard permissions are supported: `memories:*` grants all memory permissions.
 
 ## Scopes
 
-Scopes restrict **which resources** a key can access, even if the permission allows the action:
+Scopes restrict **which resources** a key can access, even if the permission allows the action. They use a flat `resourceType:resourceId` format:
 
 ```json
 {
-  "scopes": {
-    "models": ["gpt-4o", "gpt-4o-mini"],
-    "agents": ["agent_abc123", "agent_def456"]
-  }
+  "scopes": [
+    "agents:agent-abc-123",
+    "models:gpt-4o",
+    "models:gpt-4o-mini",
+    "orgs:acme"
+  ]
 }
 ```
 
-- **`models`** — Restricts which LLM models the key can use via the LLM Gateway
-- **`agents`** — Restricts which agents the key can interact with
+Wildcards are supported: `agents:*` grants access to all agents, `*` grants access to all resources.
 
 If scopes are empty or omitted, the key has access to all resources within its permissions.
 
@@ -146,13 +142,11 @@ This internal endpoint (called via workspace JWT) returns the full API key conte
   "valid": true,
   "orgSlug": "acme-corp",
   "permissions": ["llm:completions:use", "agents:read"],
-  "scopes": {
-    "models": ["gpt-4o"]
-  },
-  "subscriptionLimits": {
-    "llm_requests_per_minute": 100,
-    "max_tokens_per_request": 8000
-  },
+  "scopes": ["models:gpt-4o"],
+  "subscriptionLimits": [
+    { "metric": "llm_requests", "type": "rate", "window": "minute", "limit": 100 },
+    { "metric": "max_tokens_per_request", "type": "cumulative", "limit": 8000 }
+  ],
   "llm": {
     "allowed_providers": ["openai", "azure"],
     "default_model": "gpt-4o"

@@ -39,7 +39,7 @@ This endpoint supports **dual authentication**:
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | (required) | Model identifier |
+| `model` | string | `gpt-4o` (from config) | Model identifier. Use `"auto"` for intelligent routing. |
 | `messages` | array | (required) | Conversation messages |
 | `temperature` | float | 1.0 | Randomness (0-2) |
 | `max_tokens` | integer | — | Maximum response tokens |
@@ -95,23 +95,34 @@ data: {"id":"chatcmpl-abc","choices":[{"delta":{},"index":0,"finish_reason":"sto
 data: [DONE]
 ```
 
-Stream chunks are processed by `_process-stream-chunk` which handles usage accumulation and event emission.
+Stream chunks are processed inline within the `v1/chat/completions` automation, which accumulates content and tool call deltas, captures usage from the final chunk (via `stream_options.include_usage`), and sends SSE events in A2A format (`task.output.delta`).
 
 ## Failover
 
-If the primary model call fails, LLM Gateway automatically tries the **failover model** defined in the model catalog:
+If the primary model call fails, LLM Gateway automatically tries a **failover model** from the governance configuration (not the model catalog):
 
 ```mermaid
 flowchart TD
     P[Primary: gpt-4o] --> R1{Result?}
     R1 -->|Success| RES1[Return response]
-    R1 -->|Failure| F[Failover: gpt-4o-mini]
+    R1 -->|5xx| FM{Failover mapping?}
+    FM -->|Yes| F[Failover model from gov.failover_mapping]
+    FM -->|No| FD[Fall back to gov.default_completion_model]
     F --> R2{Result?}
     R2 -->|Success| RES2[Return response]
-    R2 -->|Failure| ERR[Return error]
+    R2 -->|Failure| ERR[Return error after max retries]
+    FD --> R2
+    R1 -->|429| WAIT[5s backoff, retry same model]
+    WAIT --> P
+    R1 -->|Other 4xx| ERR2[Return error immediately]
 ```
 
-The `_failover-call` automation handles this logic. The failover model is configured per model in the [model catalog](/services/llm-gateway/models).
+The `_failover-call` automation handles this logic:
+- **5xx errors**: switches to the failover model defined in `gov.failover_mapping`, or falls back to `gov.default_completion_model`
+- **429 rate limits**: retries the same model after a 5s backoff
+- **Other 4xx errors**: returned immediately without retry
+- Up to 3 attempts (configurable via `config.max_retries`)
+- Failover models are validated against governance access controls before use
 
 ## Analytics Event
 
@@ -119,14 +130,24 @@ Every completion emits an `analytics.llm.completion` event:
 
 ```json
 {
+  "orgSlug": "acme-corp",
+  "agent_id": "agent_xyz",
+  "user_id": "user_123",
+  "context_id": "ctx_456",
   "model": "gpt-4o",
   "provider": "openai",
   "tokens": { "input": 25, "output": 12, "total": 37 },
-  "cost_usd": 0.000185,
-  "carbon_g": 0.012,
+  "cost": { "total": 0.000185 },
+  "carbon": {
+    "energy": { "value": 0.000012, "min": 0.0000096, "max": 0.0000144, "unit": "kWh" },
+    "gwp": { "value": 0.0000057, "min": 0.0000046, "max": 0.0000068, "unit": "kgCO2eq" }
+  },
   "duration_ms": 850,
   "stream": false,
-  "failover_used": false
+  "tools_available": 3,
+  "tools_called": 1,
+  "tool_names": ["search"],
+  "timestamp": "2025-01-15T10:30:00Z"
 }
 ```
 

@@ -11,72 +11,56 @@ The IAM Context endpoint is the bridge between AI Governance and the platform fr
 GET v1/iam/context
 ```
 
-This is the first API call the platform shell makes after authentication. It returns:
+This is the first API call the platform shell makes after authentication. It uses the `x-org` header to select an organization (falls back to session org, then first membership). It returns:
 
 ```json
 {
-  "organization": {
+  "org": {
     "slug": "acme-corp",
     "name": "Acme Corp",
+    "status": "active",
     "branding": {
-      "logo": "https://...",
-      "colors": {
-        "primary": "#1b4abb",
-        "secondary": "#6c757d"
-      },
-      "fonts": {
-        "heading": "Inter",
-        "body": "Inter"
-      },
-      "custom_css_url": "https://..."
+      "logo": { "light": "https://...", "dark": "https://..." },
+      "colors": { "primary": "#1b4abb", "secondary": "#6c757d" },
+      "fonts": { "heading": "Inter", "body": "Inter" },
+      "customCssUrl": "https://..."
     },
-    "platform_name": "Acme AI Platform"
+    "navigation": {
+      "version": "2",
+      "menu": [
+        {
+          "id": "products",
+          "type": "group",
+          "label": "AI Products",
+          "items": [
+            { "id": "secure-chat", "label": "SecureChat", "icon": "MessageSquare", "href": "/" },
+            { "id": "agent-factory", "label": "Agent Factory", "icon": "Bot", "href": "/apps/agent-factory", "permissions": ["agent-builder:*"] }
+          ]
+        }
+      ],
+      "footer": null,
+      "quickActions": null
+    }
   },
   "membership": {
-    "role": "admin",
-    "permissions": ["agents:*", "insights:read", "iam:*"],
-    "groups": ["engineering", "ml-team"]
+    "roleSlug": "admin",
+    "status": "active",
+    "subscriptionId": "sub-acme-default"
   },
-  "navigation": [
-    {
-      "category": "AI Products",
-      "items": [
-        {
-          "key": "secure-chat",
-          "label": "SecureChat",
-          "icon": "MessageSquare",
-          "path": "/",
-          "badge": null
-        },
-        {
-          "key": "agent-factory",
-          "label": "Agent Factory",
-          "icon": "Bot",
-          "path": "/apps/agent-factory"
-        },
-        {
-          "key": "ai-knowledge",
-          "label": "AI Knowledge",
-          "icon": "BookOpen",
-          "path": "/apps/ai-knowledge"
-        }
-      ]
-    },
-    {
-      "category": "Administration",
-      "items": [
-        {
-          "key": "governance",
-          "label": "Governance",
-          "icon": "Shield",
-          "path": "/apps/ai-governance"
-        }
-      ]
-    }
-  ],
+  "role": {
+    "slug": "admin",
+    "name": "Administrator",
+    "permissions": ["secure-chat:*", "agent-builder:*", "iam:members:manage"]
+  },
   "organizations": [
-    { "slug": "acme-corp", "name": "Acme Corp" },
-    { "slug": "beta-inc", "name": "Beta Inc" }
+    { "slug": "acme-corp", "name": "Acme Corp", "role": "admin" },
+    { "slug": "beta-inc", "name": "Beta Inc", "role": "user" }
+  ],
+  "groups": ["group_engineering_abc"],
+  "llm": { "allowedProviders": ["openai"], "defaultModel": "gpt-4o" },
+  "subscriptionLimits": [
+    { "metric": "users", "type": "cumulative", "limit": 50 },
+    { "metric": "agents.rpm", "type": "rate", "window": "minute", "limit": 100 }
   ]
 }
 ```
@@ -87,37 +71,28 @@ The sidebar navigation is fully dynamic — defined in the AI Governance workspa
 
 ### Menu Item Structure
 
+Navigation is stored on the organization object and served within `org.navigation`. Menu items support groups with nested items, permission gating, and feature lists.
+
 | Field | Type | Description |
 |-------|------|-------------|
-| `key` | string | Unique identifier |
+| `id` | string | Unique identifier |
+| `type` | string | `group` for collapsible category, omit for direct item |
 | `label` | string | Display label |
 | `icon` | string | Icon name (from curated icon map in the frontend) |
-| `path` | string | URL path |
-| `badge` | string/null | Badge text (e.g., "New", "Beta") |
-| `external` | boolean | Opens in new tab |
+| `href` | string | URL path |
+| `color` | string | Icon/label color |
+| `target` | string | Link target (e.g., `_blank`) |
+| `expanded` | boolean | Whether group starts expanded |
+| `permissions` | string[] | Required permissions (item hidden if user lacks all of them) |
+| `items` | array | Nested items (for groups) |
+| `features` | array | Feature list entries `{ slug, agentId, label, permissions }` |
+| `badge` | object | Badge configuration |
+| `visibility.tiers` | string[] | Subscription tiers that can see this item |
+| `visibility.features` | string[] | Feature flags required |
 
-### Categories
+### Permission Filtering
 
-Menu items are grouped into collapsible categories:
-
-```json
-{
-  "category": "AI Products",
-  "items": [...]
-}
-```
-
-The frontend renders categories as collapsible sections in the sidebar. Items without a category appear at the top level.
-
-### Dividers
-
-A special item type for visual separation:
-
-```json
-{
-  "type": "divider"
-}
-```
+The navigation is **server-side filtered** based on the user's role permissions before being returned. Items with `permissions` are checked via wildcard matching (e.g., `iam:*` matches `iam:members:manage`). Groups are only included if they have at least one visible sub-item after filtering. Feature lists within items are also filtered by permissions.
 
 ## Branding
 
@@ -125,13 +100,19 @@ Organizations can customize the platform appearance:
 
 | Setting | Description |
 |---------|-------------|
-| `logo` | Organization logo URL (replaces Prisme.ai logo) |
+| `version` | Branding schema version |
+| `platformName` | Custom platform name (replaces "Prisme.ai") |
+| `description` | Platform description |
+| `logo.light` | Logo URL for light theme |
+| `logo.dark` | Logo URL for dark theme |
+| `favicon` | Favicon URL |
 | `colors.primary` | Primary brand color |
 | `colors.secondary` | Secondary brand color |
+| `colors.accent` | Accent color |
 | `fonts.heading` | Heading font family |
 | `fonts.body` | Body text font family |
-| `custom_css_url` | URL to a custom CSS file for advanced theming |
-| `platform_name` | Custom platform name (replaces "Prisme.ai") |
+| `customCssUrl` | URL to a custom CSS file for advanced theming |
+| `customCssInline` | Inline CSS string |
 
 Branding is applied by the `IAMProvider` in the platform shell. CSS variables are set on the root element, and the custom CSS file (if any) is injected as a `<link>` tag.
 

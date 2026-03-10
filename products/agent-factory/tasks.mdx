@@ -15,7 +15,7 @@ GET v1/agents/:agent_id/tasks
 
 | Param | Type | Description |
 |-------|------|-------------|
-| `status` | string | Filter by status (`pending`, `running`, `completed`, `failed`, `cancelled`) |
+| `status` | string | Filter by status (`submitted`, `working`, `completed`, `failed`, `canceled`, `input-required`, `auth-required`, `rejected`) |
 | `limit` | integer | Results per page |
 | `offset` | integer | Pagination offset |
 
@@ -38,7 +38,7 @@ Returns:
 ```json
 {
   "task_id": "task_abc123",
-  "status": "pending",
+  "status": "submitted",
   "created_at": "2026-03-01T10:00:00Z"
 }
 ```
@@ -54,7 +54,7 @@ Returns the current status, progress, and result (if completed):
 ```json
 {
   "task_id": "task_abc123",
-  "status": "running",
+  "status": "working",
   "progress": {
     "steps_completed": 3,
     "steps_total": 5,
@@ -92,18 +92,28 @@ Returns a Server-Sent Events stream with real-time task updates:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending
-    pending --> running
-    running --> completed
-    running --> failed
-    running --> cancelled
+    [*] --> submitted
+    submitted --> working
+    working --> completed
+    working --> failed
+    working --> canceled
+    working --> input_required: input-required
+    working --> auth_required: auth-required
+    working --> rejected
+    input_required --> working: user responds
+    auth_required --> working: auth provided
 ```
 
-1. **Pending** — Task created, waiting for execution
-2. **Running** — Agent is actively processing the task
-3. **Completed** — Task finished successfully, result available
-4. **Failed** — Task encountered an unrecoverable error
-5. **Cancelled** — Task was cancelled by the user
+Task statuses follow the [A2A Protocol](https://google.github.io/A2A/) specification:
+
+1. **submitted** — Task created, waiting for execution
+2. **working** — Agent is actively processing the task
+3. **completed** — Task finished successfully, result available
+4. **failed** — Task encountered an unrecoverable error
+5. **canceled** — Task was canceled by the user
+6. **input-required** — Agent needs human input (approval or clarification via HITL)
+7. **auth-required** — Agent needs additional authentication to proceed
+8. **rejected** — Task was rejected (e.g., by guardrails or access control)
 
 ## Async Finalization
 
@@ -122,6 +132,17 @@ A nightly scheduled job (`0 3 * * *`) archives completed tasks:
 3. The `tasks` collection stays lean for active task queries
 
 Archived tasks remain accessible for audit and analytics purposes but are stored separately to maintain query performance on active tasks.
+
+## Human-in-the-Loop (HITL)
+
+When an agent needs human input during task execution, the task transitions to `input-required`:
+
+1. The agent calls `human_request_approval` or `human_ask_clarification`
+2. The full loop state (messages, tool calls, budget counters) is serialized to the task's `pending_approval` field
+3. The task status is set to `input-required`
+4. When the user responds, the loop state is restored from `pending_approval` and execution resumes
+
+This allows long-running agentic loops to pause and resume across requests without losing context.
 
 ## Rate Limits
 

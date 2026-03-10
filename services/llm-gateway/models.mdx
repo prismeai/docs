@@ -11,7 +11,7 @@ LLM Gateway maintains a catalog of available models with metadata about capabili
 GET    v1/models                # List all models
 POST   v1/models                # Register a model
 GET    v1/models/:model_id      # Get model details
-PUT    v1/models/:model_id      # Update model
+PATCH  v1/models/:model_id      # Update model (partial)
 DELETE v1/models/:model_id      # Remove model
 ```
 
@@ -19,30 +19,48 @@ DELETE v1/models/:model_id      # Remove model
 
 ```json
 {
-  "id": "gpt-4o",
-  "name": "GPT-4o",
-  "provider": "openai",
+  "model_id": "gpt-4o",
+  "type": "completion",
+  "display": {
+    "name": "GPT-4o",
+    "brand": "OpenAI",
+    "icon": "https://...",
+    "hidden": false,
+    "subtitle": { "en": "Fast and capable", "fr": "Rapide et performant" },
+    "description": { "en": "...", "fr": "..." }
+  },
   "capabilities": {
-    "chat": true,
+    "text": true,
     "vision": true,
-    "function_calling": true,
-    "json_mode": true,
-    "streaming": true
+    "image": false,
+    "audio": false,
+    "file": { "enabled": true, "max_size": 10485760 }
   },
   "pricing": {
-    "input_per_1k": 0.005,
-    "output_per_1k": 0.015,
-    "currency": "USD"
+    "input_per_1m_tokens": 2.5,
+    "output_per_1m_tokens": 10
   },
   "limits": {
-    "max_context": 128000,
-    "max_output": 4096
+    "context": 128000,
+    "response_tokens": 4096,
+    "rate": { "rpm": 500, "tpm": 800000 }
   },
   "failover": "gpt-4o-mini",
-  "eco_metrics": {
-    "energy_kwh_per_1k_tokens": 0.001,
-    "carbon_g_per_kwh": 400
+  "region": "us-east",
+  "metrics": {
+    "energy_per_token": 0.000001,
+    "pue_profile": "efficient",
+    "eco_score": "low",
+    "cost_tier": "medium",
+    "training_date": "2024-05-01"
   },
+  "provider_config": {
+    "batch_size": 96,
+    "batch_parallel": 5,
+    "prompt_cache": { "system": true },
+    "additional_body": { "completions": {}, "embeddings": {} }
+  },
+  "tags": ["fast", "reasoning", "eu-compliant"],
   "enabled": true
 }
 ```
@@ -51,13 +69,17 @@ DELETE v1/models/:model_id      # Remove model
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | string | Model identifier (used in API calls) |
-| `provider` | string | Provider type (`openai`, `azure_openai`, `anthropic`, `vertex`, `bedrock`, `openai_like`) |
-| `capabilities` | object | What the model can do |
-| `pricing` | object | Cost per 1K tokens (input/output) |
-| `limits` | object | Context window and output limits |
-| `failover` | string | Model to fall back to on failure |
-| `eco_metrics` | object | Energy and carbon per token |
+| `model_id` | string | Unique model identifier (used in API calls) |
+| `type` | string | Model type: `completion`, `embeddings`, or `image_generation` |
+| `display` | object | User-facing display info (name, brand, icon, subtitle, description) |
+| `capabilities` | object | What the model can do (`text`, `vision`, `image`, `audio`, `file`) |
+| `pricing` | object | Cost per 1M tokens (input/output) |
+| `limits` | object | Context window (`context`), max output (`response_tokens`), rate limits (`rate.rpm`, `rate.tpm`) |
+| `failover` | string | Model to fall back to on failure (note: failover is currently driven by governance config, not this field) |
+| `region` | string | Deployment region (used for carbon footprint emission factors) |
+| `metrics` | object | Eco and cost metrics (`energy_per_token`, `pue_profile`, `eco_score`, `cost_tier`, `training_date`) |
+| `provider_config` | object | Provider-specific config (batch sizes for embeddings, prompt cache, additional body fields) |
+| `tags` | array | Filterable tags for routing and filtering |
 | `enabled` | boolean | Whether the model is available |
 
 ## Model Routing
@@ -102,18 +124,17 @@ routing:
 
 ## Provider Resolution
 
-When a model is selected, `_resolve-provider` finds the connection config:
-
-1. Look up the model's `provider` field
-2. Find the provider config in workspace settings (API keys, endpoints, regions)
-3. Handle model aliases (e.g., Vertex AI's long resource paths)
-4. Apply provider-specific parameter exclusions
-
-The resolution walks a provider chain until it finds valid credentials:
+When a model is selected for chat completions, `_resolve-provider` finds the connection config by scanning each provider's `models` list in order:
 
 ```
-openai → azure_openai → openai_like → anthropic → vertex → bedrock → error
+openai → azure_openai (prismeai set) → openailike → anthropic → fallback to openai
 ```
+
+The automation does **not** look up a `provider` field on the model — it iterates through provider configs in `index.yml` until it finds a match. If no provider claims the model, it falls back to OpenAI.
+
+Provider-specific parameter exclusions (e.g., `top_p` for Anthropic, `max_tokens` for some Azure deployments) are applied automatically.
+
+> **Note**: Vertex and Bedrock models are not resolved by `_resolve-provider`. They are handled by the **OpenAI app import** (used for embeddings and image generation), not by the direct HTTP calls used for chat completions.
 
 ## Model Aliases
 
@@ -131,8 +152,17 @@ Models are stored in the `models` collection (via Collection app):
 
 | Field | Type | Indexed |
 |-------|------|---------|
-| `id` | text | Yes (unique) |
-| `provider` | text | Yes |
+| `model_id` | text | Yes (unique) |
+| `type` | text | Yes |
+| `enabled` | boolean | Yes |
+| `tags` | json | Yes |
+| `display` | json | — |
 | `capabilities` | json | — |
 | `pricing` | json | — |
-| `enabled` | boolean | Yes |
+| `limits` | json | — |
+| `metrics` | json | — |
+| `provider_config` | json | — |
+| `failover` | text | — |
+| `region` | text | — |
+
+Model specs are cached in `global.models_cache` (keyed by `model_id`, invalidated on PATCH/DELETE) for carbon footprint computation and embedding batch configuration.

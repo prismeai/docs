@@ -70,8 +70,9 @@ When the conversation context grows beyond the `context_budget` (default: 120K t
 This allows long-running conversations to continue without hitting model context limits.
 
 **Compaction strategies:**
-- `summarize` (default) — LLM-generated summary of older context
-- `truncate` — Drop oldest messages (cheaper, less intelligent)
+- `summarize_oldest` — Keeps the last N turns intact, summarizes older messages via LLM call
+- `compact_tool_results` — Replaces old tool results with compact placeholders, preserving structure
+- `hybrid` (default) — Runs `compact_tool_results` first, then `summarize_oldest` if still over threshold
 
 ## Memory Management
 
@@ -209,3 +210,18 @@ During the agentic loop, events are streamed to the client in real-time:
 | Completion | `done` event with usage statistics |
 
 This gives the frontend full visibility into the agent's reasoning process.
+
+## Caching
+
+The agentic loop uses multiple cache layers to minimize redundant work:
+
+| Cache | Scope | Key | Invalidation |
+|-------|-------|-----|-------------|
+| Agent config | Global (double-buffered) | `agents_cache_a` / `agents_cache_b` | `agents.updated` / `agents.deleted` events |
+| Init (tools, memory config) | Session | `agent_init_<agent_id>` | Agent `updatedAt` version mismatch |
+| IAM permissions | Global | `agent_perms_v3_<agent_id>` | TTL-based |
+| MCP tools/list | Global | Sanitized server URL | TTL-based |
+| Auth (API keys, user session) | Global | Per-key / per-user | 60s TTL |
+| Conversation metadata | Session | `conv_meta` (max 100 entries) | Evicted on overflow |
+
+The double-buffered agent cache alternates between two maps (`a`/`b`), each holding up to 50 entries. When one fills up, the other is cleared and becomes active, ensuring bounded memory usage.
