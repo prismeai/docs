@@ -13,33 +13,17 @@ AI Insights includes GDPR compliance tools for handling user data rights — the
 POST v1/gdpr/users/:user_id/deletion
 ```
 
-```json
-{
-  "reason": "User requested account deletion",
-  "scope": "all",
-  "requested_by": "admin_user_id"
-}
-```
-
-Creates a deletion request record in `gdpr_requests` with status `pending`.
-
-**Scope options:**
-- `all` — Delete all user data across the platform
-- `conversations` — Delete only conversation data
-- `memories` — Delete only memory data
-- `analytics` — Delete only analytics/insights data
+Creates a deletion request record in `gdpr_requests` with status `pending`. No request body is needed — the user ID comes from the path parameter and authentication context.
 
 ### Deletion Processing
 
 Pending deletion requests are processed nightly (`0 3 * * *`) by `gdpr/process-pending-requests`:
 
-1. Fetch all `pending` requests
+1. Fetch requests approaching their 30-day GDPR deadline
 2. For each request, call `gdpr/process-deletion`:
-   - Delete conversations from Agent Factory
-   - Delete memories from Memories workspace
    - Delete insights records
-   - Delete feedback records
-   - Anonymize any retained analytics data
+   - Delete analysis queue items
+   - Delete aggregated statistics
 3. Update request status to `completed`
 4. Log the deletion for audit
 
@@ -61,38 +45,30 @@ Deletion requests can be tracked through the `gdpr_requests` collection. Statuse
 GET v1/gdpr/users/:user_id/export
 ```
 
-Exports all user data in a structured format:
+Exports all user data. Returns:
 
 ```json
 {
-  "user_id": "user_abc",
-  "exported_at": "2026-03-01T10:00:00Z",
-  "data": {
-    "conversations": [...],
-    "memories": [...],
-    "feedback": [...],
-    "insights": [...],
-    "ratings": [...]
+  "download_url": "https://...",
+  "expires_at": "2026-03-02T10:00:00Z",
+  "record_counts": {
+    "insights": 42,
+    "feedback": 15
   }
 }
 ```
 
-The export includes all data associated with the user across all workspaces accessible to AI Insights.
-
 ## Text Anonymization
 
-The `_anonymize-text` automation provides PII removal from text data:
+The `_anonymize-text` automation supports three anonymization modes:
 
-- Email addresses → `[EMAIL]`
-- Phone numbers → `[PHONE]`
-- Names → `[NAME]`
-- Addresses → `[ADDRESS]`
-- Other PII patterns → `[PII]`
+| Mode | Description |
+|------|-------------|
+| `hash` | Replace PII with one-way hashes (preserves uniqueness for analytics) |
+| `redact` | Replace PII with type placeholders (`[EMAIL]`, `[PHONE]`, etc.) |
+| `pseudonymize` | Replace PII with consistent fake values (reversible with key) |
 
-Anonymization is used:
-- During data export (optional, configurable)
-- When retaining analytics data after a deletion request
-- For creating anonymized datasets for analysis
+Anonymization is used when retaining analytics data after a deletion request or during data retention policy enforcement.
 
 ## Retention Policies
 
@@ -100,19 +76,11 @@ Retention policies define how long data is kept before automatic purging:
 
 ```json
 {
-  "conversations": {
-    "ttl_days": 365,
-    "anonymize_after_days": 90
-  },
-  "memories": {
-    "ttl_days": 730
-  },
-  "insights": {
-    "ttl_days": 365
-  },
-  "feedbacks": {
-    "ttl_days": 365
-  }
+  "retention_days": 90,
+  "auto_anonymize_after_days": 365,
+  "applies_to": ["insights", "feedbacks"],
+  "is_default": true,
+  "enabled": true
 }
 ```
 

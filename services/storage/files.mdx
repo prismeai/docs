@@ -9,7 +9,6 @@ description: "Upload, manage, and retrieve files for knowledge bases and agent u
 GET    v1/files              # List files
 POST   v1/files              # Upload file
 GET    v1/files/:file_id     # Get file metadata
-PUT    v1/files/:file_id     # Update file metadata
 DELETE v1/files/:file_id     # Delete file
 GET    v1/files/:file_id/content  # Download file content
 ```
@@ -25,9 +24,7 @@ Content-Type: multipart/form-data
 |-------|------|-------------|
 | `file` | binary | File content |
 | `name` | string | File name |
-| `purpose` | string | `knowledge`, `attachment`, `export` |
-| `metadata` | JSON | Custom metadata |
-| `ttl` | integer | Time-to-live in seconds (0 = no expiry) |
+| `purpose` | string | Classification label (default: `user_data`) |
 
 ### Supported Formats
 
@@ -48,7 +45,7 @@ GET v1/files
 | `purpose` | string | Filter by purpose |
 | `status` | string | Filter by status (`uploaded`, `processing`, `indexed`, `failed`) |
 | `limit` | integer | Results per page |
-| `offset` | integer | Pagination offset |
+| `page` | integer | Page number (starts at 1) |
 
 ## File Lifecycle
 
@@ -72,17 +69,17 @@ Files are indexed into vector stores through the indexing pipeline:
 ```mermaid
 flowchart TD
     UP[File uploaded] --> PARSE["Parse (Crawler)\nExtract text from document"]
-    PARSE --> CHUNK["Chunk (_chunk-text)\nSplit into segments"]
-    CHUNK --> EMBED["Embed (_llm)\nGenerate vectors via LLM Gateway"]
-    EMBED --> UPSERT["Upsert (Router)\nStore in vector provider"]
+    PARSE --> CHUNK["Chunk\nSplit into segments"]
+    CHUNK --> EMBED["Embed\nGenerate vectors via LLM Gateway"]
+    EMBED --> UPSERT["Upsert\nStore in vector provider"]
 ```
 
-### Chunking (`_chunk-text`)
+### Chunking
 
 Text is split into chunks with configurable parameters:
 - **Chunk size** — Target tokens per chunk
 - **Overlap** — Token overlap between consecutive chunks
-- **Strategy** — Sentence-based, paragraph-based, or fixed-size
+- **Strategy** — `static` (fixed-size), `semantic` (heading-aware), or `auto` (detects content type: prose, markdown, code, structured)
 
 Each chunk stores metadata:
 ```json
@@ -91,16 +88,13 @@ Each chunk stores metadata:
   "vector_store_id": "vs_xyz",
   "chunk_index": 3,
   "text": "The quarterly revenue...",
-  "page": 2,
-  "start_char": 1500,
-  "end_char": 2200,
-  "scope": "org:acme-corp"
+  "scope": "knowledge"
 }
 ```
 
 ### Parse Failure Handling
 
-If document parsing fails, `_handle-parse-failure`:
+If document parsing fails:
 1. Sets file status to `failed`
 2. Stores the error message
 3. Emits a failure event for monitoring
@@ -118,6 +112,4 @@ Returns the raw file content. Useful for:
 
 ## Expiry
 
-Files with a `ttl` are automatically cleaned up by the nightly `cleanup-expired-files` job. This is used for temporary files (e.g., conversation attachments) that don't need permanent storage.
-
-The `user_data_expires_after` config (default: 1800 seconds) sets the TTL for user-uploaded temporary data.
+Files are automatically cleaned up by the nightly `cleanup-expired-files` job based on the `user_data_expires_after` config (default: 1800 seconds). This is used for temporary files (e.g., conversation attachments) that don't need permanent storage.

@@ -9,7 +9,8 @@ For agents with profiles `agent_light` and above, Agent Factory implements a **R
 
 ```mermaid
 flowchart TD
-    INIT["_agentic-init\nBuild context, load memories"] --> LOOP
+    INIT["_agentic-init\nDefaults, tools, memory config"] --> CTX["Context Building\nParse message, load history,\nrecall long-term memories,\nbuild system prompt,\nrun input guardrails"]
+    CTX --> LOOP
 
     subgraph LOOP["_agentic-react-loop"]
         SEND[1. Send context to LLM] --> CHECK{2. Check response type}
@@ -20,18 +21,24 @@ flowchart TD
     end
 
     BUDGET -->|Under budget| SEND
+    DONE --> FIN["Finalize Response\nOutput guardrails, async tasks"]
 ```
 
-## Initialization (`_agentic-init`)
+## Initialization
 
-Before the loop starts, the context is built:
+The initialization happens in two phases:
 
-1. **System prompt** — From the agent configuration
-2. **Working memory** — Previous scratchpad content (if any)
-3. **Session memory** — Conversation history within the current session
-4. **Long-term memory recall** — Queries the [Memories workspace](/tools/memories) for relevant past memories
-5. **Tool definitions** — System tools + custom tools formatted as function schemas
-6. **Guardrail context** — Active guardrail configurations
+**Phase 1: `_agentic-init`** — Sets up defaults, resolves tools, and configures memory:
+1. **Profile defaults** — Apply budget, turn limits, and feature flags from the agent's profile
+2. **Tool resolution** — Resolve system tools + custom tools into function schemas
+3. **Memory configuration** — Configure working memory, session memory, and long-term memory settings
+
+**Phase 2: Context Building** — Prepares the LLM context:
+1. **Parse message** — Extract user message and attachments
+2. **Load history** — Retrieve conversation history (session memory)
+3. **Long-term memory recall** — Query the [Memories workspace](/tools/memories) for relevant past memories
+4. **Build system prompt** — Assemble system prompt with agent configuration
+5. **Input guardrails** — Run configured input guardrails before the LLM call
 
 The built context is passed to `_agentic-react-loop`.
 
@@ -60,7 +67,7 @@ When a budget is exceeded, the agent is forced to produce a final text response 
 
 ## Context Compaction (`_context-compaction`)
 
-When the conversation context grows beyond the `context_budget` (default: 120K tokens), the system compacts it:
+When the conversation context grows beyond 70% of the `context_budget`, the system compacts it:
 
 1. **Summarize** older messages into a concise summary
 2. **Preserve** the most recent messages (last N turns)
@@ -71,7 +78,7 @@ This allows long-running conversations to continue without hitting model context
 
 **Compaction strategies:**
 - `summarize_oldest` — Keeps the last N turns intact, summarizes older messages via LLM call
-- `compact_tool_results` — Replaces old tool results with compact placeholders, preserving structure
+- `compact_tool_results` — Replaces old tool results with compact status placeholders
 - `hybrid` (default) — Runs `compact_tool_results` first, then `summarize_oldest` if still over threshold
 
 ## Memory Management
@@ -106,22 +113,7 @@ Persists conversation state across turns. Stored in the conversation record. Inc
 Cross-conversation memory powered by the [Memories workspace](/tools/memories):
 
 - **Save** — Agent can explicitly save facts, preferences, relationships, and instructions
-- **Recall** — Automatically queried during initialization to load relevant past memories
-- **Scope** — `global` (shared across agents) or `agent` (per-agent)
-
-```yaml
-# _load-long-term-memories
-- fetch:
-    url: '{{global.apiUrl}}/workspaces/slug:{{config.tools_memories_slug}}/webhooks/recall'
-    headers:
-      Authorization: 'Bearer {{_wsJwt.jwt}}'
-    body:
-      user_id: '{{auth.userId}}'
-      agent_id: '{{agent.id}}'
-      query: '{{userMessage}}'
-      top_k: 10
-    output: memories
-```
+- **Recall** — Automatically queried during initialization to load relevant past memories (up to 50 memories by default, configurable via `max_memories`)
 
 ## Planning (Agent Full+)
 
@@ -134,16 +126,19 @@ When planning is enabled, the agent can create structured plans before executing
     "goal": "Research Q3 market trends",
     "steps": [
       {
+        "step_number": 1,
         "description": "Search knowledge base for Q3 reports",
-        "expected_output": "List of relevant documents"
+        "expected_outcome": "List of relevant documents"
       },
       {
+        "step_number": 2,
         "description": "Analyze key metrics from reports",
-        "expected_output": "Summary of trends"
+        "expected_outcome": "Summary of trends"
       },
       {
+        "step_number": 3,
         "description": "Compare with Q2 data",
-        "expected_output": "Quarter-over-quarter analysis"
+        "expected_outcome": "Quarter-over-quarter analysis"
       }
     ]
   }
@@ -160,9 +155,11 @@ After completing actions, the agent can self-evaluate:
 {
   "tool": "reflection_evaluate",
   "arguments": {
-    "progress": "Completed 2 of 3 planned steps",
-    "quality": "Data quality is good, but missing competitive analysis",
-    "next_steps": "Search for competitor reports before finalizing"
+    "what_worked": "Knowledge base search returned relevant Q3 documents",
+    "what_didnt_work": "Missing competitive analysis data",
+    "alternative_approaches": "Try searching external sources for competitor data",
+    "confidence_level": "medium",
+    "should_continue": true
   }
 }
 ```
@@ -196,20 +193,15 @@ The orchestrator can discover available agents via `agent_list_available`.
 
 ## Streaming
 
-During the agentic loop, events are streamed to the client in real-time:
+During the agentic loop, events are streamed to the client using [A2A Protocol](https://google.github.io/A2A/) event names:
 
-| Phase | Events Streamed |
-|-------|----------------|
-| LLM thinking | `token` events (text generation) |
-| Tool selection | `tool_call` event with tool name and arguments |
-| Tool execution | `tool_result` event with result |
-| Planning | `plan` event with step details |
-| Reflection | `reflection` event with evaluation |
-| Memory operations | `memory_save`, `memory_recall` events |
-| Guardrail checks | `guardrail_input`, `guardrail_output` events |
-| Completion | `done` event with usage statistics |
+| Event | Description |
+|-------|-------------|
+| `task.status` | Task status changed (e.g., `working`, `completed`, `input-required`) |
+| `task.output.delta` | Incremental output — text tokens, tool calls, tool results |
+| `task.output.completed` | Final output with usage statistics |
 
-This gives the frontend full visibility into the agent's reasoning process.
+This gives the frontend visibility into the agent's reasoning process.
 
 ## Caching
 

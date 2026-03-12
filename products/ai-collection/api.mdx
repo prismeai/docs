@@ -29,13 +29,13 @@ POST v1/collections
 {
   "name": "Products",
   "description": "Product catalog",
-  "schema": {
-    "name": { "type": "text", "required": true },
+  "properties": {
+    "name": { "type": "text", "nullable": false },
     "price": { "type": "float" },
     "category": { "type": "text" },
     "metadata": { "type": "json" }
   },
-  "agent_ids": ["agent_abc", "agent_def"],
+  "agent_id": "agent_abc",
   "ttl_days": 0,
   "max_records": 10000
 }
@@ -50,7 +50,7 @@ GET v1/collections/:collection_id
 #### Update Collection
 
 ```
-PUT v1/collections/:collection_id
+PATCH v1/collections/:collection_id
 ```
 
 #### Delete Collection
@@ -87,8 +87,8 @@ GET v1/collections/:collection_id/data
 | `filter` | JSON | MongoDB-style filter |
 | `sort` | JSON | Sort specification |
 | `limit` | integer | Results per page |
-| `offset` | integer | Pagination offset |
-| `fields` | string | Comma-separated field names to return |
+| `page` | integer | Page number (starts at 1) |
+| `fields` | array | Array of field names to return (projection) |
 
 Example with filter:
 ```
@@ -104,13 +104,26 @@ GET v1/collections/:collection_id/data/:record_id
 #### Update Record
 
 ```
-PUT v1/collections/:collection_id/data/:record_id
+PATCH v1/collections/:collection_id/data/:record_id
 ```
 
 ```json
 {
   "price": 34.99,
   "category": "electronics-updated"
+}
+```
+
+#### Upsert Records
+
+```
+POST v1/collections/:collection_id/data/upsert
+```
+
+```json
+{
+  "data": { "name": "Widget A", "price": 34.99, "category": "electronics" },
+  "match_fields": ["name"]
 }
 ```
 
@@ -125,26 +138,13 @@ DELETE v1/collections/:collection_id/data/:record_id
 #### Count
 
 ```
-POST v1/collections/:collection_id/data/count
-```
-
-```json
-{
-  "filter": { "category": "electronics" }
-}
+GET v1/collections/:collection_id/data/count?filter={"category":"electronics"}
 ```
 
 #### Distinct
 
 ```
-POST v1/collections/:collection_id/data/distinct
-```
-
-```json
-{
-  "field": "category",
-  "filter": {}
-}
+GET v1/collections/:collection_id/data/distinct?field=category
 ```
 
 #### Aggregate
@@ -155,12 +155,16 @@ POST v1/collections/:collection_id/data/aggregate
 
 ```json
 {
-  "pipeline": [
-    { "$match": { "category": "electronics" } },
-    { "$group": { "_id": "$category", "avg_price": { "$avg": "$price" }, "count": { "$sum": 1 } } }
-  ]
+  "filter": { "category": "electronics" },
+  "steps": [
+    { "type": "avg", "input_field": "price", "output_field": "avg_price" },
+    { "type": "count", "output_field": "total" }
+  ],
+  "group_by": "category"
 }
 ```
+
+Supported step types: `sum`, `avg`, `count`.
 
 ## MCP Protocol
 
@@ -203,7 +207,7 @@ Response:
 }
 ```
 
-Returns the 10 tool definitions with their input schemas.
+Returns the available tool definitions with their input schemas.
 
 ### Call Tool
 
@@ -260,11 +264,11 @@ When Agent Factory calls AI Collection via MCP, it passes context in the argumen
 
 The `agent_id`, `tool_id`, and `owner_id` are set by the calling Agent Factory automation, not by the user. This ensures proper data isolation.
 
-## Collection Resolution (`_resolve-collection`)
+## Collection Resolution
 
 When a data operation is received, AI Collection resolves the target storage:
 
-1. **`collection_id` provided** — Look up in `collections` metadata, verify ownership (`owner_id` match or `agent_ids` membership), use the collection's dedicated storage
-2. **No `collection_id`** — Use the default `mcp_data_v2` collection, scope by `agent_id` + `tool_id`
+1. **`collection_id` provided** — Look up in collections metadata, verify ownership (`owner_id` match or authorized `agent_id`), use the collection's dedicated storage
+2. **No `collection_id`** — Use the default shared collection, scoped by `agent_id` + `tool_id`
 
 This dual-mode approach allows both simple per-agent data isolation and explicit shared collections.

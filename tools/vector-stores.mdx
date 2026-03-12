@@ -1,9 +1,9 @@
 ---
 title: "Vector Stores"
-description: "Interchangeable vector storage providers — OpenSearch, Elasticsearch, and Mock"
+description: "Interchangeable vector storage providers — OpenSearch and Elasticsearch"
 ---
 
-Three vector provider workspaces implement the same interface, making them interchangeable backends for the [Storage](/services/storage/overview) service's RAG pipeline.
+Two vector provider workspaces implement the same interface, making them interchangeable backends for the [Storage](/services/storage/overview) service's RAG pipeline.
 
 ## Providers
 
@@ -11,7 +11,6 @@ Three vector provider workspaces implement the same interface, making them inter
 |----------|-----------|----------|--------|
 | **OpenSearch** | `vector-opensearch` | `VectorOpensearch` | k-NN plugin (HNSW via Lucene) |
 | **Elasticsearch** | `vector-elasticsearch` | `VectorElasticsearch` | Native `dense_vector` + `knn` queries |
-| **Mock** | `vector-mock` | `VectorMock` | In-memory fake results (testing only) |
 
 ## Shared Interface
 
@@ -26,6 +25,8 @@ Creates a vector index for storing embeddings.
 | `index` | string | Index name |
 | `dimensions` | integer | Vector dimensions (e.g., 1536) |
 | `similarity` | string | Similarity metric (`cosine`, `dot_product`, `l2`) |
+
+Both providers accept normalized names (`cosine`, `dot_product`, `l2_norm`). OpenSearch maps these to its native equivalents (`cosinesimil`, `innerproduct`, `l2`).
 
 Returns: `{ success: true, index: "..." }`
 
@@ -49,7 +50,8 @@ Performs similarity search.
 | `index` | string | Index name |
 | `vector` | array | Query embedding |
 | `limit` | integer | Max results |
-| `filter` / `filter_json` | object/string | Metadata filter |
+| `filter` | object | Metadata filter (Elasticsearch) |
+| `filter_json` | string | Metadata filter as JSON string (OpenSearch — preserves flat dotted keys) |
 | `min_score` | float | Minimum similarity score |
 
 Returns: `{ results: [{ id, score, metadata }], total: N }`
@@ -86,10 +88,7 @@ All providers store vectors with this metadata:
 | `vector_store_id` | string | Parent vector store |
 | `chunk_index` | integer | Position in source document |
 | `text` | string | Original text chunk |
-| `page` | integer | Source page number |
-| `start_char` | integer | Character offset start |
-| `end_char` | integer | Character offset end |
-| `scope` | string | Access scope (e.g., `org:acme-corp`) |
+| `scope` | string | Access scope (`knowledge` or `conversation`) |
 | `conversation_id` | string | For conversation-scoped data |
 | `expires_at` | datetime | Expiration timestamp |
 
@@ -100,6 +99,7 @@ All providers store vectors with this metadata:
 - Uses the **k-NN plugin** with `knn_vector` field type and HNSW algorithm (Lucene engine)
 - Filters passed as raw JSON string (`filter_json`) because Prisme.ai's template engine interprets dotted keys (e.g., `metadata.scope`) as nested objects. The JSON string workaround preserves flat keys.
 - Auth via `Basic` HTTP header from `config.auth_header`
+- Does **not** support `$or` filter operators
 
 ### Elasticsearch
 
@@ -107,16 +107,6 @@ All providers store vectors with this metadata:
 - Filters constructed as standard Prisme objects (ES handles dotted keys natively)
 - Supports `$or` operators via Elasticsearch's `should` clauses
 - Same `Basic` auth pattern
-
-### Mock
-
-- **No external calls** — returns hardcoded fake results
-- 5 pre-defined mock texts with random scores between 0.5–1.0
-- Configurable `mock_latency_ms` and `mock_error_rate` for testing error paths
-- All operations return `mock: true` in output
-- Emits `vector-mock.*` events for observability
-
-Use Mock for development and integration testing without a real vector engine.
 
 ## How Storage Routes to Providers
 
@@ -129,8 +119,6 @@ The Storage workspace's `_vector-router` dispatches to the correct provider base
         - VectorOpensearch.search: ...
       elasticsearch:
         - VectorElasticsearch.search: ...
-      mock:
-        - VectorMock.search: ...
 ```
 
 Changing provider requires:

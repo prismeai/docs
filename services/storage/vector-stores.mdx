@@ -13,7 +13,6 @@ Vector stores are the core of the RAG pipeline. They store document chunks as em
 GET    v1/vector_stores                    # List vector stores
 POST   v1/vector_stores                    # Create vector store
 GET    v1/vector_stores/:id                # Get vector store
-PUT    v1/vector_stores/:id                # Update vector store
 DELETE v1/vector_stores/:id                # Delete vector store
 ```
 
@@ -22,8 +21,7 @@ DELETE v1/vector_stores/:id                # Delete vector store
 ```
 GET    v1/vector_stores/:id/files              # List files in store
 POST   v1/vector_stores/:id/files              # Add file to store
-GET    v1/vector_stores/:id/files/:file_id     # Get file status
-PUT    v1/vector_stores/:id/files/:file_id     # Update file
+PATCH  v1/vector_stores/:id/files/:file_id     # Update file tags
 DELETE v1/vector_stores/:id/files/:file_id     # Remove file from store
 POST   v1/vector_stores/:id/files/:file_id/reindex  # Re-index file
 ```
@@ -39,23 +37,18 @@ POST v1/vector_stores/:id/search
 ```json
 {
   "name": "Company Knowledge Base",
-  "description": "All company documentation",
-  "provider": "opensearch",
-  "config": {
-    "dimensions": 1536,
-    "similarity": "cosine",
-    "embedding_model": "text-embedding-3-small"
-  }
+  "provider": "elasticsearch",
+  "dimensions": 1536,
+  "chunking_strategy": { "type": "auto" }
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | (required) | Display name |
-| `provider` | string | `opensearch` | Vector provider |
-| `config.dimensions` | integer | 1536 | Embedding dimensions |
-| `config.similarity` | string | `cosine` | Similarity metric (`cosine`, `dot_product`, `l2`) |
-| `config.embedding_model` | string | (default model) | Model for embeddings |
+| `provider` | string | `elasticsearch` | Vector provider |
+| `dimensions` | integer | 1536 | Embedding dimensions |
+| `chunking_strategy` | object | — | Chunking configuration |
 
 Creating a vector store automatically creates the underlying index via the vector provider's `create-index` operation.
 
@@ -64,13 +57,18 @@ Creating a vector store automatically creates the underlying index via the vecto
 ```json
 {
   "file_id": "file_abc",
-  "chunking": {
-    "strategy": "paragraph",
-    "chunk_size": 500,
-    "overlap": 50
-  }
+  "scope": "knowledge",
+  "tags": { "department": "engineering" }
 }
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file_id` | string | File to add (required) |
+| `scope` | string | `knowledge` or `conversation` |
+| `conversation_id` | string | For conversation-scoped files |
+| `tags` | object | Custom metadata tags |
+| `expires_at` | string | Expiration timestamp |
 
 This triggers the [indexing pipeline](/services/storage/files#indexing):
 1. Parse the file
@@ -87,10 +85,12 @@ POST v1/vector_stores/:id/search
 ```json
 {
   "query": "What are the Q3 revenue trends?",
-  "limit": 5,
-  "min_score": 0.7,
-  "filter": {
-    "scope": "org:acme-corp"
+  "max_num_results": 5,
+  "ranking_options": {
+    "score_threshold": 0.7
+  },
+  "filters": {
+    "scope": "knowledge"
   }
 }
 ```
@@ -100,9 +100,11 @@ POST v1/vector_stores/:id/search
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `query` | string | (required) | Search query (will be embedded) |
-| `limit` | integer | 5 | Maximum results |
-| `min_score` | float | 0.0 | Minimum similarity score |
-| `filter` | object | — | Metadata filter |
+| `max_num_results` | integer | 10 | Maximum results |
+| `ranking_options.score_threshold` | float | 0.0 | Minimum similarity score |
+| `filters` | object | — | Metadata filter |
+| `conversation_id` | string | — | Filter to a specific conversation |
+| `rewrite_query` | boolean | — | Enable query rewriting |
 
 ### Search Flow
 
@@ -110,40 +112,43 @@ POST v1/vector_stores/:id/search
 flowchart TD
     Q[User query] --> EMB[Embed query\nLLM Gateway /v1/embeddings]
     EMB --> VR[Vector Router\nProvider search with filter]
-    VR --> RES["Results\n[{id, score, metadata, text}, ...]"]
+    VR --> RES[Results]
 ```
 
 ### Response
 
 ```json
 {
-  "results": [
+  "data": [
     {
-      "id": "chunk_xyz",
+      "file_id": "file_abc",
+      "filename": "quarterly-report.pdf",
       "score": 0.92,
-      "metadata": {
-        "file_id": "file_abc",
+      "content": [
+        { "type": "text", "text": "Q3 revenue showed a 15% increase..." }
+      ],
+      "attributes": {
+        "page": 2,
         "chunk_index": 3,
-        "page": 2
-      },
-      "text": "Q3 revenue showed a 15% increase..."
+        "scope": "knowledge"
+      }
     }
   ],
-  "total": 1
+  "search_query": "What are the Q3 revenue trends?",
+  "has_more": false
 }
 ```
 
-## RAG Scopes
+## Scopes
 
-Vector store searches support **scope-based filtering** for multi-tenant isolation:
+Vector store searches support **scope-based filtering** for data isolation:
 
-| Scope Pattern | Description |
-|--------------|-------------|
-| `org:acme-corp` | Organization-level data |
-| `user:user_abc` | User-specific data |
-| `conversation:conv_xyz` | Conversation-scoped temporary data |
+| Scope | Description |
+|-------|-------------|
+| `knowledge` | Persistent knowledge base data |
+| `conversation` | Temporary conversation-scoped data |
 
-Scopes are stored as metadata on each vector and filtered during search. This ensures that RAG queries only return data the user has access to.
+Conversation-scoped data is filtered by `conversation_id` metadata. Scopes are stored as metadata on each chunk and filtered during search.
 
 ## Provider Routing
 
@@ -155,8 +160,9 @@ Changing the provider for an existing vector store requires re-indexing all file
 
 Deleting a vector store:
 1. Removes all vectors from the provider (via `delete-index`)
-2. Removes all file associations from `vector_store_files`
-3. Removes the vector store record
+2. Removes all file associations
+3. Deletes the associated crawler instance
+4. Removes the vector store record
 
 Files themselves are **not** deleted — they may belong to other vector stores.
 

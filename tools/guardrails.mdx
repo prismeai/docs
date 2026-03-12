@@ -5,7 +5,7 @@ description: "AI safety tools — PII detection, prompt injection prevention, to
 
 The Guardrails workspace provides six safety checks that can be applied to agent input and/or output. Each guardrail is a standalone automation exposed via webhook endpoint.
 
-**Workspace:** `tools-guardrails` (17 automations)
+**Workspace:** `tools-guardrails`
 **App slug:** `ToolsGuardrails`
 
 ## Available Guardrails
@@ -35,9 +35,9 @@ All guardrails return:
 | `detected` / `toxic` / `off_topic` | boolean | Whether the check triggered |
 | `blocked` | boolean | Whether the text should be blocked |
 | `transformed_text` | string | Modified text (if applicable) |
-| `findings` / `categories` | array | Detailed results |
+| `findings` / `type` | array/string | Detailed results |
 | `message` | string | User-facing message |
-| `needs_regeneration` | boolean | Signal to retry LLM generation |
+| `needs_regeneration` | boolean | Signal to retry LLM generation (toxicity-check and hallucination-check only) |
 
 ## PII Detection
 
@@ -54,9 +54,9 @@ Detects and optionally masks personally identifiable information.
 **PII Types:** email, phone, SSN, credit card, and more.
 
 **Actions:**
-- `mask` — Replace PII with placeholders (`[EMAIL]`, `[PHONE]`, etc.)
+- `mask` — Replace PII with placeholders (`[EMAIL_MASKED]`, `[PHONE_MASKED]`, `[SSN_MASKED]`, `[CARD_MASKED]`)
 - `block` — Reject the text entirely
-- `flag` — Allow but log for review
+- `warn` — Allow but log for review
 
 ```json
 {
@@ -74,10 +74,10 @@ Response:
 {
   "detected": true,
   "blocked": false,
-  "transformed_text": "Contact me at [EMAIL] or [PHONE]",
+  "transformed_text": "Contact me at [EMAIL_MASKED] or [PHONE_MASKED]",
   "findings": [
-    { "type": "email", "value": "john@example.com", "position": [14, 30] },
-    { "type": "phone", "value": "555-0123", "position": [34, 42] }
+    { "type": "email", "masked": "[EMAIL_MASKED]" },
+    { "type": "phone", "masked": "[PHONE_MASKED]" }
   ]
 }
 ```
@@ -91,10 +91,10 @@ POST webhooks/injection-detect
 Detects prompt injection, jailbreak attempts, and role manipulation.
 
 **LLM-based only** — analyzes the text for:
-- Direct injection attempts
-- Role confusion attacks
-- System prompt extraction attempts
-- Encoding-based evasion
+- Jailbreak attempts
+- Prompt injection
+- Role manipulation
+- Instruction override
 
 ```json
 {
@@ -107,7 +107,8 @@ Response:
 {
   "detected": true,
   "blocked": true,
-  "categories": ["direct_injection", "system_prompt_extraction"],
+  "type": "prompt_injection",
+  "severity": "high",
   "message": "Potential prompt injection detected"
 }
 ```
@@ -135,9 +136,9 @@ Scores text for toxicity on a 0–1 scale and takes action based on threshold.
 **Actions:**
 - `regenerate` — Set `needs_regeneration: true` (agent should retry)
 - `block` — Replace response with safety message
-- `flag` — Allow but log
+- `warn` — Allow but log
 
-Emits `guardrail.toxicity_flagged` on flag action.
+Emits `guardrail.toxicity_flagged` on warn action.
 
 ## Hallucination Check
 
@@ -150,8 +151,11 @@ Verifies that a response is grounded in provided source documents (RAG context).
 ```json
 {
   "text": "The agent's response to verify",
+  "sources": [
+    { "content": "Source document 1...", "name": "doc1" },
+    { "content": "Source document 2...", "name": "doc2" }
+  ],
   "config": {
-    "sources": ["Source document 1...", "Source document 2..."],
     "confidence_threshold": 0.8
   }
 }
@@ -192,11 +196,11 @@ Pattern-matches action names against predefined impact rules. This is **rule-bas
 
 ```json
 {
-  "text": "delete_all_records",
+  "action": "delete_all_records",
   "config": {
-    "rules": [
-      { "pattern": "delete_*", "impact": "high", "requires_approval": true },
-      { "pattern": "read_*", "impact": "low", "requires_approval": false }
+    "patterns": [
+      { "pattern": "delete_*", "impact": "high" },
+      { "pattern": "read_*", "impact": "low" }
     ]
   }
 }
@@ -204,17 +208,7 @@ Pattern-matches action names against predefined impact rules. This is **rule-bas
 
 ## LLM Integration
 
-All LLM-backed guardrails use a shared `_llm` helper that calls the [LLM Gateway](/services/llm-gateway/overview) via workspace JWT:
-
-```yaml
-- auth:
-    workspace: true
-    output: _wsJwt
-- fetch:
-    url: '{{global.apiUrl}}/workspaces/slug:llm-gateway/webhooks/{{endpoint}}'
-    headers:
-      Authorization: 'Bearer {{_wsJwt.jwt}}'
-```
+All LLM-backed guardrails use a shared `_llm` helper that calls the [LLM Gateway](/services/llm-gateway/overview) via workspace JWT.
 
 ## Usage in Agent Factory
 
