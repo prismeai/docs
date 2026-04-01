@@ -57,6 +57,7 @@ Configure the Crawler and SearchEngine microservices with the following environm
   | `REDIS_URL` | Redis connection URL for communication between services | `redis://localhost:6379` | Both |
   | `REDIS_PASSWORD` | Redis connection password |  | Both |
   | `REDIS_TLS_CA_FILE` | Redis CA certificate filepath |  | Both |
+  | `REDIS_MAX_CLIENTS` | Maximum number of Redis client connections in the pool | `20` | Both |
   | `DOCUMENTS_STORAGE_DRIVER` | Documents storage driver : elasticsearch or opensearch | `elasticsearch` | Both |
   | `ELASTIC_URL` | Elasticsearch connection URL for document storage | `http://localhost:9200` | Both |
   | `ELASTIC_USER` | Elasticsearch user | `` | Both |
@@ -76,6 +77,8 @@ Configure the Crawler and SearchEngine microservices with the following environm
   | `REQUEST_QUEUES_POLLING_SIZE`     | Number of requests to start from the queue in a single poll          | `1` | prismeai-crawler |
   | `USER_AGENT`                      | Crawler HTTP user agent | `Prisme.ai (https://prisme.ai)` | prismeai-crawler
   | `ROBOTSTXT_OBEY`                  | Whether the crawler should respect the site's `robots.txt`. <br/><br/>- Recommended: **`True`** for all public websites. <br/>- For **internal portals (e.g. SharePoint, intranet)**, you may set **`False`** if robots.txt prevents access to content you are authorized to crawl. <br/><br/>⚠️ Disabling this option should only be done in controlled/internal environments. | `True` | prismeai-crawler |
+  | `DEFAULT_ENGINE_WEBPAGES_LIMIT`   | Maximum pages that can be indexed per search engine before crawling stops | `30000` | prismeai-crawler |
+  | `MAX_SEARCHENGINES_NB`            | Maximum number of search engines to run concurrently. `-1` means unlimited. | `-1` | prismeai-crawler |
 
 </Accordion>
 
@@ -85,8 +88,14 @@ Configure the Crawler and SearchEngine microservices with the following environm
   | Variable Name | Description | Default Value | Affected Services |
   |---------------|-------------|---------------|-------------------|
   | `ACK_ENABLED` | Enable/disable the request acknowledgment mechanism. When enabled, requests are tracked atomically in Redis and automatically reclaimed if the crawler crashes during processing. Disabling this reverts to the original behavior where crashed requests are lost. | `True` | prismeai-crawler |
+  | `ACK_DUPEFILTER_DROPS` | When `True`, requests dropped by the deduplication filter are also ACKed (cleaned up from pending structures). | `True` | prismeai-crawler |
+  | `SKIP_NON_RETRIABLE_ERRORS` | When `True`, HTTP 400/401/403/404/410 errors and certain exceptions (`UnsupportedFormat`, `CorruptedFile`, `AuthenticationFailed`) are moved to the DLQ immediately rather than retried. | `True` | prismeai-crawler |
   | `PENDING_VISIBILITY_TIMEOUT` | Time in seconds before a pending request is considered stale and eligible for reclaim. Set this to 2-3x your longest document processing time (e.g., large PDFs). If a request takes longer than this timeout, it will be retried. | `900` (15 minutes) | prismeai-crawler |
   | `PENDING_RECLAIM_INTERVAL` | Interval in seconds between checks for stale pending requests. The reclaim loop runs at this frequency to find and re-queue abandoned tasks. | `60` | prismeai-crawler |
+  | `PENDING_RECLAIM_BATCH_SIZE` | Maximum number of stale tasks to reclaim per reclaim loop iteration. | `10` | prismeai-crawler |
+  | `MAX_RETRY_ATTEMPTS` | Maximum number of times a task can be reclaimed/retried before it is moved to the DLQ permanently. Set to `0` to disable retry limits. | `3` | prismeai-crawler |
+  | `DLQ_MAX_SIZE` | Monitoring alert threshold: when the Dead Letter Queue grows beyond this size, warnings are emitted. Does not hard-cap the DLQ. Once limit is reached a log is shown periodically but it doesn't affect crawling. | `1000` | prismeai-crawler |
+  | `DLQ_RETENTION_DAYS` | Number of days DLQ entries are retained before cleanup. | `7` | prismeai-crawler |
 
 </Accordion>
 
@@ -108,6 +117,9 @@ Configure the Crawler and SearchEngine microservices with the following environm
   | `RESOURCE_CHECK_INTERVAL` | Interval in seconds between resource usage checks. Lower values provide faster response to resource pressure but increase overhead. | `1.0` | prismeai-crawler |
   | `RESOURCE_CIRCUIT_BREAKER_THRESHOLD` | Number of consecutive resource check failures before escalating to a CRITICAL alert. This helps identify persistent resource issues vs. temporary spikes. | `10` | prismeai-crawler |
   | `RESOURCE_CIRCUIT_BREAKER_SHUTDOWN_TIMEOUT` | Seconds the crawler can remain stuck in critical state before initiating automatic pod shutdown. The pod exits gracefully, allowing Kubernetes to restart it with fresh state. Set to `0` to disable auto-shutdown. | `900` (15 minutes) | prismeai-crawler |
+  | `RESOURCE_THROTTLE_FAST_RECLAIM` | When `True` and a critical resource threshold is hit, tasks are immediately released back to the Redis queue for other pods, rather than waiting for the visibility timeout to expire. | `True` | prismeai-crawler |
+  | `CONTAINER_CPU_LIMIT_MILLICORES` | Fallback CPU limit in millicores (e.g. `2000` = 2 cores) for restricted Kubernetes clusters where cgroup files are inaccessible. Used only if cgroup v1/v2 detection fails. |  | prismeai-crawler |
+  | `CONTAINER_MEMORY_LIMIT_BYTES` | Fallback container memory limit in bytes for restricted Kubernetes clusters where cgroup files are inaccessible. If all detection methods fail, falls back to system total memory. |  | prismeai-crawler |
   | `RESOURCE_CIRCUIT_BREAKER_FORCE_EXIT_TIMEOUT` | Hard timeout in seconds for graceful reactor shutdown during circuit breaker auto-shutdown. If the reactor doesn't stop within this time, `os._exit(1)` is called to force termination. | `60` | prismeai-crawler |
 
 </Accordion>
@@ -120,6 +132,9 @@ Configure the Crawler and SearchEngine microservices with the following environm
   | `DOCUMENTS_DEFAULT_PARSER` | Default parser for document processing. Options: `unstructured` (recommended, uses the Unstructured library), `tika` (Apache Tika - requires TIKA_PATH to be configured), `docling` (IBM Docling - requires HUGGINGFACE_MODEL_PATH). Can be overridden per-searchengine via parser configuration. | `unstructured` | prismeai-crawler |
   | `UNSTRUCTURED_DEFAULT_STRATEGY` | Default parsing strategy for the Unstructured library. Options: `fast` (no OCR, fastest), `auto` (automatic detection), `hi_res` (full OCR processing, slowest but most accurate for scanned documents), `ocr_only` (OCR only). Can be overridden per-searchengine. | `fast` | prismeai-crawler |
   | `TIKA_OCR_SKIP` | Skip OCR (Tesseract) processing when using Apache Tika parser. Set to `True` for faster parsing at the cost of not extracting text from images within documents. Similar to Unstructured's `fast` strategy. Can be overridden per-searchengine using parser config: `{"type": "tika", "skip_ocr": true}`. | `True` | prismeai-crawler |
+  | `TIKA_PATH` | Path to the directory containing `tika-server.jar`. If not set, Tika is disabled and the default parser falls back to Unstructured. | `/app/tika/` (in Docker image) | prismeai-crawler |
+  | `TIKA_PARSING_TIMEOUT` | Timeout in seconds for a single Tika parsing request. | `600` | prismeai-crawler |
+  | `TIKA_MAX_RETRIES` | Maximum retries for Tika parse requests before giving up. | `3` | prismeai-crawler |
 
 </Accordion>
 
