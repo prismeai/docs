@@ -1,0 +1,132 @@
+---
+title: "Access Manager Module"
+description: "Manage organization service account tokens at runtime"
+---
+
+The **access-manager** module manages organization service account tokens at runtime. It keeps client secrets **in memory only** (never persisted to Redis), restricts usage to **privileged workspaces** defined via environment variable, and automatically invalidates caches when service accounts are modified.
+
+<Warning>
+This module is only available to workspaces listed in the `PRIVILEGED_WORKSPACES` environment variable. Calling it from any other workspace throws an error.
+</Warning>
+
+## Functions
+
+### getServiceAccountToken — Get a JWT token for a service account
+
+```yaml
+- run:
+    module: access-manager
+    function: getServiceAccountToken
+    parameters:
+      orgSlug: "{{orgSlug}}"
+      serviceAccountSlug: "{{saSlug}}"
+      create: true
+      expiresIn: 3600
+    output: tokenResult
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `orgSlug` | string | yes | Organization slug |
+| `serviceAccountSlug` | string | yes | Service account slug |
+| `create` | boolean | no | When `true`, creates the service account if it doesn't exist and rotates the secret if needed. When `false` or omitted, only works with a cached secret. |
+| `name` | string | no | Display name for the service account (used on creation) |
+| `roleSlug` | string | no | Role to assign. Must be in the workspace's `allowedRoleSlugs`. Defaults to the workspace's `defaultRoleSlug`. |
+| `expiresIn` | number | no | Token TTL in seconds |
+
+Returns the token response including `accessToken`, `tokenType`, `expiresAt`, `permissions`, and `scopes`.
+
+### createServiceAccount — Create a new service account
+
+```yaml
+- run:
+    module: access-manager
+    function: createServiceAccount
+    parameters:
+      orgSlug: "{{orgSlug}}"
+      serviceAccountSlug: "{{saSlug}}"
+      name: "My Agent"
+      roleSlug: "agent-standard"
+    output: result
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `orgSlug` | string | yes | Organization slug |
+| `serviceAccountSlug` | string | yes | Service account slug |
+| `name` | string | no | Display name |
+| `roleSlug` | string | no | Role to assign (validated against allowed roles) |
+
+Returns the created service account including `slug` and `clientSecret`. If the service account already exists, returns `{ slug }` without error.
+
+### rotateServiceAccountSecret — Rotate a service account's client secret
+
+```yaml
+- run:
+    module: access-manager
+    function: rotateServiceAccountSecret
+    parameters:
+      orgSlug: "{{orgSlug}}"
+      serviceAccountSlug: "{{saSlug}}"
+    output: result
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `orgSlug` | string | yes | Organization slug |
+| `serviceAccountSlug` | string | yes | Service account slug |
+
+Returns the new `clientSecret`.
+
+### deleteServiceAccount — Delete a service account
+
+```yaml
+- run:
+    module: access-manager
+    function: deleteServiceAccount
+    parameters:
+      orgSlug: "{{orgSlug}}"
+      serviceAccountSlug: "{{saSlug}}"
+    output: result
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `orgSlug` | string | yes | Organization slug |
+| `serviceAccountSlug` | string | yes | Service account slug |
+
+## Cache behavior
+
+The module caches client secrets in memory after creation or rotation. This cache is automatically invalidated when:
+- A service account is **deleted** (clears secret + permissions cache)
+- A service account secret is **rotated** (clears secret cache)
+- A service account is **updated** (clears permissions cache)
+
+Cache invalidation is event-driven and applies to all runtime instances simultaneously.
+
+## Complete example — issuing a token for an agent
+
+```yaml
+slug: get-agent-token
+name: Get Agent Token
+do:
+  # Create (or reuse) a service account and get a JWT token
+  - run:
+      module: access-manager
+      function: getServiceAccountToken
+      parameters:
+        orgSlug: "{{orgSlug}}"
+        serviceAccountSlug: "agent-{{agentId}}"
+        name: "Agent {{agentId}}"
+        create: true
+        expiresIn: 3600
+      output: tokenResult
+
+  # Use the token to call an API
+  - fetch:
+      url: "{{config.apiUrl}}/resources"
+      method: GET
+      headers:
+        Authorization: "Bearer {{tokenResult.accessToken}}"
+      output: resources
+```
