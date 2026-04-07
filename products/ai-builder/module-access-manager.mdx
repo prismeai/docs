@@ -1,15 +1,19 @@
 ---
 title: "Access Manager Module"
-description: "Manage organization service account tokens at runtime"
+description: "Manage service account tokens, product bindings, and access checks at runtime"
 ---
 
-The **access-manager** module manages organization service account tokens at runtime. It keeps client secrets **in memory only** (never persisted to Redis), restricts usage to **privileged workspaces** defined via environment variable, and automatically invalidates caches when service accounts are modified.
+The **access-manager** module provides three groups of functions:
+
+1. **Service account management** — Create, rotate, delete service accounts and issue JWT tokens. Restricted to **privileged workspaces** defined via `PRIVILEGED_WORKSPACES`.
+2. **Product bindings** — CRUD operations on the `product_bindings` collection to link resources to users, orgs, or groups. Available to **any workspace**.
+3. **Access checking** — High-level `checkAccess` function that combines permissions, scopes, and bindings to determine if a caller can access a resource. Available to **any workspace**.
 
 <Warning>
-This module is only available to workspaces listed in the `PRIVILEGED_WORKSPACES` environment variable. Calling it from any other workspace throws an error.
+Service account functions (`getServiceAccountToken`, `createServiceAccount`, `rotateServiceAccountSecret`, `deleteServiceAccount`) are only available to workspaces listed in the `PRIVILEGED_WORKSPACES` environment variable. Binding and access check functions are available to all workspaces.
 </Warning>
 
-## Functions
+## Service Account Functions
 
 ### getServiceAccountToken — Get a JWT token for a service account
 
@@ -104,7 +108,7 @@ The module caches client secrets in memory after creation or rotation. This cach
 
 Cache invalidation is event-driven and applies to all runtime instances simultaneously.
 
-## Complete example — issuing a token for an agent
+## Service Account Example
 
 ```yaml
 slug: get-agent-token
@@ -129,4 +133,300 @@ do:
       headers:
         Authorization: "Bearer {{tokenResult.accessToken}}"
       output: resources
+```
+
+---
+
+## Product Bindings Functions
+
+Product bindings associate resources (agents, workflows, etc.) to principals (users, orgs, groups) within a workspace. All binding functions automatically scope queries to the caller's `workspaceId` — it cannot be overridden.
+
+### findBindings — Query bindings
+
+```yaml
+- run:
+    module: access-manager
+    function: findBindings
+    parameters:
+      query:
+        resourceType: agents
+        principalType: user
+        principalId: "{{userId}}"
+      options:
+        pagination:
+          limit: 50
+          page: 0
+        sort:
+          createdAt: desc
+    output: bindings
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | object | yes | Filter fields matching `ProductBinding` (e.g. `resourceType`, `resourceId`, `principalType`, `principalId`, `orgSlug`) |
+| `options.pagination` | object | no | `{ page, skip, limit }` |
+| `options.sort` | object | no | Sort fields (e.g. `{ createdAt: 'desc' }`) |
+| `options.fields` | array | no | Fields to return |
+
+Returns an array of binding documents.
+
+### findAndCountBindings — Query bindings with total count
+
+```yaml
+- run:
+    module: access-manager
+    function: findAndCountBindings
+    parameters:
+      query:
+        resourceType: agents
+      options:
+        pagination:
+          limit: 20
+          page: 0
+    output: result
+# result.items = [...], result.total = 42
+```
+
+Same parameters as `findBindings`. Returns `{ items: [...], total: number }`.
+
+### countBindings — Count matching bindings
+
+```yaml
+- run:
+    module: access-manager
+    function: countBindings
+    parameters:
+      query:
+        resourceType: agents
+        orgSlug: "{{orgSlug}}"
+    output: count
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | object | yes | Filter fields |
+
+Returns a number.
+
+### insertBinding — Create a binding
+
+```yaml
+- run:
+    module: access-manager
+    function: insertBinding
+    parameters:
+      data:
+        resourceType: agents
+        resourceId: "{{agentId}}"
+        principalType: user
+        principalId: "{{targetUserId}}"
+        orgSlug: "{{orgSlug}}"
+        grantedBy: "{{userId}}"
+        email: "{{targetEmail}}"
+    output: result
+# result.acknowledged = true, result.insertedId = "..."
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `data.resourceType` | string | yes | Resource type (e.g. `agents`, `workflows`) |
+| `data.resourceId` | string | yes | Resource identifier |
+| `data.principalType` | string | yes | `user`, `org`, or `group` |
+| `data.principalId` | string | yes | Principal identifier |
+| `data.orgSlug` | string | yes | Organization slug |
+| `data.grantedBy` | string | yes | User who granted the binding |
+| `data.email` | string | no | Email for user bindings |
+
+The `workspaceId` and `workspaceSlug` are set automatically from the caller's context. Emits a `runtime.bindings.created` event.
+
+A unique constraint prevents duplicate bindings for the same `(workspaceId, resourceType, resourceId, principalType, principalId)`.
+
+### deleteOneBinding — Delete a single binding
+
+```yaml
+- run:
+    module: access-manager
+    function: deleteOneBinding
+    parameters:
+      query:
+        resourceType: agents
+        resourceId: "{{agentId}}"
+        principalType: user
+        principalId: "{{targetUserId}}"
+    output: result
+# result.deletedCount = 1
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | object | yes | Filter to match the binding to delete |
+
+Emits a `runtime.bindings.deleted` event if a binding was deleted.
+
+### deleteManyBindings — Delete multiple bindings
+
+```yaml
+- run:
+    module: access-manager
+    function: deleteManyBindings
+    parameters:
+      query:
+        resourceType: agents
+        resourceId: "{{agentId}}"
+    output: result
+# result.deletedCount = 5
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | object | yes | Filter to match bindings to delete |
+
+Emits a `runtime.bindings.deleted.many` event if any bindings were deleted.
+
+### Workspace cleanup
+
+When a workspace is deleted, all its bindings are automatically removed.
+
+---
+
+## Access Check Function
+
+The `checkAccess` function provides a high-level access control check that combines three sources: **permissions** (from `run.permissions`), **scopes** (from `run.scopes`), and **bindings** (from the `product_bindings` collection). This replaces the need for complex DSUL-based permission checking.
+
+### checkAccess — Check resource access
+
+```yaml
+- run:
+    module: access-manager
+    function: checkAccess
+    parameters:
+      resourceType: agents
+      resourceId: "{{agentId}}"
+      action: read
+    output: access
+```
+
+All parameters are optional. When called without `resourceType`/`action`, it only checks authentication and returns `isWorkspaceAdmin`.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `resourceType` | string | no | Resource type (e.g. `agents`, `workflows`). Must be set together with `action`. |
+| `resourceId` | string | no | Specific resource ID. Requires `resourceType`. |
+| `action` | string | no | `read`, `write`, or `manage`. Must be set together with `resourceType`. |
+| `list` | boolean | no | When `true`, returns the list of granted resource IDs instead of a single grant |
+
+### Return value
+
+| Field | Type | Description |
+|---|---|---|
+| `granted` | boolean | Whether access is granted |
+| `reason` | string | Why access was granted: `permission`, `wildcard-scope`, `scope`, `binding:user`, `binding:org`, or `binding:group` |
+| `grantedIds` | string[] | Only in list mode — merged set of IDs from scopes and bindings |
+| `hasWildcardScope` | boolean | `true` if the caller has wildcard scope (sees all resources of this type) |
+| `isWorkspaceAdmin` | boolean | `true` if the caller has `*` or `{workspaceSlug}` manage permission |
+| `error` | object | Only when `granted` is `false` — contains `error` (code) and `message` (human-readable) |
+
+The `error` object follows the same shape as `_auth` automations:
+
+| `error.error` | `error.message` | When |
+|---|---|---|
+| `Unauthorized` | `Authentication required` | No authenticated user (no `userId` and no org API key) |
+| `Forbidden` | `Access denied: missing permission '{workspaceSlug}:{resourceType}:{action}'` | User is authenticated but has no matching permission |
+
+### Resolution order
+
+0. **Authentication** — The caller must have a `userId` (user session) or an `orgSlug` (org API key). If neither is present, returns `Unauthorized` immediately.
+
+1. **Permissions** — Checked from `run.permissions` (set by the token's role). The function checks in order:
+   - `*` with `manage` → workspace admin
+   - `{workspaceSlug}` with `manage` → workspace admin
+   - `{workspaceSlug}:{resourceType}` with `manage` or `{action}` → access
+   - If no permission matches → returns `Forbidden` immediately (scopes and bindings are not checked)
+
+2. **Scopes** — Parsed from `run.scopes` (only if permission was granted):
+   - `*`, `{workspaceSlug}:*`, or `{workspaceSlug}:{resourceType}:*` → wildcard scope (all resources)
+   - `{workspaceSlug}:{resourceType}:{id}` → adds `id` to scoped IDs
+
+3. **Bindings** — Looked up in `product_bindings` for the caller's identity (userId, org, groups). Only checked for single resource mode when the scope doesn't match.
+
+### Modes
+
+**Auth-only** (no `resourceType`, no `action`):
+- Returns `{ granted: true, isWorkspaceAdmin }` — just confirms the caller is authenticated
+
+**Unauthenticated caller:**
+- Returns `{ granted: false, error: { error: 'Unauthorized', message: 'Authentication required' } }`
+
+**Single resource** (`resourceId` provided):
+- If wildcard scope → `{ granted: true, reason: 'wildcard-scope', hasWildcardScope: true, isWorkspaceAdmin }`
+- If scoped ID match → `{ granted: true, reason: 'scope', hasWildcardScope: false, isWorkspaceAdmin }`
+- If binding found → `{ granted: true, reason: 'binding:{type}', hasWildcardScope: false, isWorkspaceAdmin }`
+- Otherwise → `{ granted: false, hasWildcardScope: false, error: { error: 'Forbidden', message: '...' } }`
+
+**List mode** (`list: true`, no `resourceId`):
+- If wildcard scope → `{ granted: true, grantedIds: [], hasWildcardScope: true }` (caller sees everything)
+- Otherwise → `{ granted: true, grantedIds: [...], hasWildcardScope: false }` (merged+deduplicated scoped IDs + binding IDs)
+
+**Permission-only** (`resourceType` + `action`, no `resourceId`, no `list`):
+- Returns `{ granted: true, reason: 'permission', hasWildcardScope, isWorkspaceAdmin }`
+
+### Access check examples
+
+#### Guard a specific resource
+
+```yaml
+- run:
+    module: access-manager
+    function: checkAccess
+    parameters:
+      resourceType: agents
+      resourceId: "{{agentId}}"
+      action: read
+    output: access
+
+# access.error is set when granted=false (UNAUTHORIZED or FORBIDDEN)
+- conditions:
+    "{{access.error}}":
+        - break:
+            automation: true
+            output:
+              error: "{{access.error.error}}"
+              message: "{{access.error.message}}"
+```
+
+#### Check auth + admin status only
+
+```yaml
+- run:
+    module: access-manager
+    function: checkAccess
+    output: access
+
+# access.granted = true if authenticated
+# access.isWorkspaceAdmin = true if user has * or workspace-level manage
+```
+
+#### List all accessible resources
+
+```yaml
+- run:
+    module: access-manager
+    function: checkAccess
+    parameters:
+      resourceType: agents
+      action: read
+      list: true
+    output: access
+
+# If access.hasWildcardScope is true, query all agents without filter
+# Otherwise, filter agents by access.grantedIds
+- conditions:
+    "{{access.hasWildcardScope}}":
+        - fetch:
+            url: "{{config.apiUrl}}/agents"
+            output: agents
+    default:
+        - fetch:
+            url: "{{config.apiUrl}}/agents?ids={{access.grantedIds | join ','}}"
+            output: agents
 ```
