@@ -236,10 +236,36 @@ Returns a number.
 | `data.orgSlug` | string | yes | Organization slug |
 | `data.grantedBy` | string | yes | User who granted the binding |
 | `data.email` | string | no | Email for user bindings |
+| `data.roleSlug` | string \| null | no | Optional role slug controlling which actions this binding grants. See [Role-based bindings](#role-based-bindings). When `null` or omitted, the binding grants every action **except `delete`**. |
 
 The `workspaceId` and `workspaceSlug` are set automatically from the caller's context. Emits a `runtime.bindings.created` event.
 
 A unique constraint prevents duplicate bindings for the same `(workspaceId, resourceType, resourceId, principalType, principalId)`.
+
+### updateBinding — Update an existing binding
+
+```yaml
+- run:
+    module: access-manager
+    function: updateBinding
+    parameters:
+      query:
+        resourceType: agents
+        resourceId: "{{agentId}}"
+        principalType: user
+        principalId: "{{targetUserId}}"
+      data:
+        roleSlug: editor
+    output: result
+# result.matchedCount = 1, result.modifiedCount = 1
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | object | yes | Filter to match the binding(s) to update |
+| `data.roleSlug` | string \| null | no | New role slug to apply. Pass `null` to clear the role (binding will then grant all actions except `delete`). |
+
+Only `roleSlug` can be updated through this function — other fields are immutable. Emits a `runtime.bindings.updated` event when at least one binding is modified.
 
 ### deleteOneBinding — Delete a single binding
 
@@ -312,15 +338,16 @@ All parameters are optional. When called without `resourceType`/`action`, it onl
 |---|---|---|---|
 | `resourceType` | string | no | Resource type (e.g. `agents`, `workflows`). Must be set together with `action`. |
 | `resourceId` | string | no | Specific resource ID. Requires `resourceType`. |
-| `action` | string | no | `read`, `write`, or `manage`. Must be set together with `resourceType`. |
+| `action` | string | no | Action to check (typically `read`, `write`, `share`, `delete`, `manage`, but any string is accepted — must match the keys in `roles[*].permissions`). Must be set together with `resourceType`. |
 | `list` | boolean | no | When `true`, returns the list of granted resource IDs instead of a single grant |
+| `roles` | object | no | Role definitions for binding role enforcement. `Record<string, { name?: string, permissions: string[] }>`. **Required as soon as any matching binding has a `roleSlug`** — otherwise `checkAccess` throws. See [Role-based bindings](#role-based-bindings). |
 
 ### Return value
 
 | Field | Type | Description |
 |---|---|---|
 | `granted` | boolean | Whether access is granted |
-| `reason` | string | Why access was granted: `permission`, `wildcard-scope`, `scope`, `binding:user`, `binding:org`, or `binding:group` |
+| `reason` | string | Why access was granted: `permission`, `wildcard-scope`, `scope`, or `binding:{principalType}` (e.g. `binding:user`, `binding:org`, `binding:group`). When the matching binding carries a `roleSlug`, the reason becomes `binding:{principalType}:{roleSlug}` (e.g. `binding:user:editor`). |
 | `grantedIds` | string[] | Only in list mode — merged set of IDs from scopes and bindings |
 | `hasWildcardScope` | boolean | `true` if the caller has wildcard scope (sees all resources of this type) |
 | `isWorkspaceAdmin` | boolean | `true` if the caller has `*` or `{workspaceSlug}` manage permission |
@@ -347,7 +374,52 @@ The `error` object follows the same shape as `_auth` automations:
    - `*`, `{workspaceSlug}:*`, or `{workspaceSlug}:{resourceType}:*` → wildcard scope (all resources)
    - `{workspaceSlug}:{resourceType}:{id}` → adds `id` to scoped IDs
 
-3. **Bindings** — Looked up in `product_bindings` for the caller's identity (userId, org, groups). Only checked for single resource mode when the scope doesn't match.
+3. **Bindings** — Looked up in `product_bindings` for the caller's identity (userId, org, groups). Only checked for single resource mode when the scope doesn't match. Each matching binding is then evaluated against the requested action through [role-based bindings](#role-based-bindings).
+
+### Role-based bindings
+
+Bindings can carry a `roleSlug` to restrict which actions they grant. The role definitions themselves live **outside** the binding — they must be passed to `checkAccess` via the `roles` parameter (typically loaded from `config.roles`):
+
+```yaml
+- run:
+    module: access-manager
+    function: checkAccess
+    parameters:
+      resourceType: agents
+      resourceId: "{{agentId}}"
+      action: write
+      roles:
+        owner:
+          name: Owner
+          permissions: [read, write, share, delete]
+        admin:
+          name: Admin
+          permissions: [read, write, share]
+        editor:
+          name: Editor
+          permissions: [read, write]
+        reader:
+          name: Reader
+          permissions: [read]
+    output: access
+```
+
+Resolution rules applied to each candidate binding:
+
+| Binding `roleSlug` | `roles` parameter | Behavior |
+|---|---|---|
+| `null` / unset | (any) | Binding grants **every action except `delete`**. Used for legacy bindings or "full collaborator" semantics. |
+| set (e.g. `editor`) | provided, slug exists | Action must be in `roles[slug].permissions` — otherwise the binding is ignored and `checkAccess` continues to the next binding (or returns `Forbidden`). |
+| set | not provided **at all** | `checkAccess` **throws** — passing `roles` is required as soon as any binding could be role-typed. |
+| set | provided but slug missing | The binding is ignored (treated as having no permissions). |
+
+`checkAccess` only stops at the **first** binding that grants the requested action. If a user has multiple bindings (e.g. `reader` and `editor`), the most permissive applicable one wins.
+
+When the binding is granted, the `reason` field reflects the role: `binding:user:editor`, `binding:org:admin`, etc.
+
+<Tip>
+Keep your role catalog in `config.roles` so it can be referenced consistently from every endpoint that calls `checkAccess` (and from `insertBinding` / `updateBinding` for validation).
+</Tip>
 
 ### Modes
 
@@ -360,7 +432,7 @@ The `error` object follows the same shape as `_auth` automations:
 **Single resource** (`resourceId` provided):
 - If wildcard scope → `{ granted: true, reason: 'wildcard-scope', hasWildcardScope: true, isWorkspaceAdmin }`
 - If scoped ID match → `{ granted: true, reason: 'scope', hasWildcardScope: false, isWorkspaceAdmin }`
-- If binding found → `{ granted: true, reason: 'binding:{type}', hasWildcardScope: false, isWorkspaceAdmin }`
+- If binding found and the binding's `roleSlug` allows the action → `{ granted: true, reason: 'binding:{principalType}' or 'binding:{principalType}:{roleSlug}', hasWildcardScope: false, isWorkspaceAdmin }`
 - Otherwise → `{ granted: false, hasWildcardScope: false, error: { error: 'Forbidden', message: '...' } }`
 
 **List mode** (`list: true`, no `resourceId`):
