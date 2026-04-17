@@ -1,0 +1,91 @@
+---
+title: "Joining Organizations"
+description: "How users join organizations — SSO auto-provisioning, join rules, invite codes, and direct invitations"
+---
+
+There are four mechanisms for users to join an organization. Each offers different levels of automation, role assignment, and ongoing management.
+
+## SSO Auto-Provisioning
+
+When an SSO provider is associated with an organization (via `ssoConfig`), every user who authenticates through that provider is automatically added to the organization with the org's `defaultRole`.
+
+- **Trigger:** First SSO login through the associated provider
+- **Role:** The organization's `defaultRole` (configured in SSO settings)
+- **Groups:** Not assigned — SSO auto-join does not support group membership
+- **One-time:** The membership is created once and never re-evaluated
+
+See [SSO](/products/ai-governance/sso) for provider configuration details.
+
+## Join Rules
+
+Join rules allow automatic organization membership based on user attributes. Rules are evaluated dynamically and can assign both a role and group memberships.
+
+### Rule Structure
+
+Each join rule contains an array of conditions with AND logic — all conditions in a rule must match:
+
+```json
+{
+  "rules": [
+    { "field": "email", "operator": "endsWith", "value": "@acme.com" },
+    { "field": "authData.google.hd", "operator": "equals", "value": "acme.com" }
+  ],
+  "role": "member",
+  "groups": ["engineering", "default-access"]
+}
+```
+
+An organization can have multiple join rules — they use OR logic between entries (only one rule needs to match).
+
+### Condition Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `field` | string | Dot-notation path on the user object (e.g. `email`, `authData.google.hd`, `meta.department`) |
+| `operator` | string | `equals`, `startsWith`, or `endsWith` (case-insensitive) |
+| `value` | string | The value to match against |
+
+### Evaluation
+
+Join rules are evaluated on every `/me` API call (the first call the platform makes after authentication). A per-user version cache ensures rules are only re-evaluated when they change:
+
+1. Each org's join rules have a version counter (incremented when rules are updated)
+2. The gateway tracks which version was last evaluated for each user
+3. If the version matches, evaluation is skipped for that org
+
+### Re-evaluation on Rule Changes
+
+When an organization's join rules are updated, the platform re-evaluates all existing members who joined via join rules:
+
+- Members who **no longer match** any rule are automatically removed from the organization
+- New users who now match are **not** retroactively added — they join on their next `/me` call
+- Re-evaluation processes members in batches of 500
+
+## Invite Codes
+
+Organization admins can create shareable invitation codes that allow users to self-join:
+
+- **Format:** `{orgSlug}-{code}` (e.g. `acme-corp-A1B2C3D4`)
+- **Role:** Each code specifies a `roleSlug` — all users who redeem it get that role
+- **Limits:** Codes can have `max_uses` and `expires_at` constraints
+- **Redemption:** Users redeem codes via the onboarding modal or a direct link
+
+Invite codes are managed via the native v2 API — see the [API Reference](/api-reference).
+
+## Direct Invitation by Email
+
+Admins can invite specific users by email address:
+
+1. Admin sends an invitation specifying the user's email and role
+2. A pending membership record is created
+3. The invitation is claimed when the user logs in or signs up with that email
+4. The user is added to the organization with the admin-chosen role
+
+## Comparison
+
+| Mechanism | Trigger | Role | Groups | Re-evaluation |
+|-----------|---------|------|--------|---------------|
+| SSO auto-join | SSO login | `defaultRole` | No | One-time |
+| Join rules | Every `/me` call | Rule's `role` | Rule's `groups` | Yes (removed if no longer matches) |
+| Invite code | User redeems link | Code's `roleSlug` | No | No |
+| Email invite | First login/signup | Admin-chosen role | No | No |

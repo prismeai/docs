@@ -1,0 +1,116 @@
+---
+title: "Roles & Permissions"
+description: "Permission model, resource scopes, system roles, custom roles, and the permission tree editor"
+---
+
+Roles define **what actions** a user can perform (permissions) and **which resources** they can access (scopes) within an organization. Every organization member is assigned exactly one role.
+
+## Permission Format
+
+Permissions follow a hierarchical `product:resource:action` pattern with wildcard support:
+
+| Product | Key | Example Permissions |
+|---------|-----|-------------------|
+| Organization | `orgs` | `orgs:members:manage`, `orgs:groups:read`, `orgs:apikeys:create`, `orgs:branding:update`, `orgs:sso:manage`, `orgs:service-accounts:manage`, `orgs:navigation:manage`, `orgs:invites:manage`, `orgs:join-rules:manage`, `orgs:roles:read` |
+| Users (Platform) | `users` | `users:read`, `users:update`, `users:delete`, `users:manage` |
+| LLM | `llm` | `llm:completions:use`, `llm:embeddings:use`, `llm:governance:manage` |
+| Tools | `tools` | `tools:web_search`, `tools:knowledge_search`, `tools:code_execution`, `tools:api_call` |
+| Agents | `agent-factory` | `agent-factory:agents:read`, `agent-factory:agents:write`, `agent-factory:agents:delete`, `agent-factory:agents:publish`, `agent-factory:agents:share`, `agent-factory:agents:explore` |
+| Storage / Knowledge | `storage` | `storage:vector_stores:read/write/share/delete`, `storage:files:read/write/delete`, `storage:skills:read/write/delete` |
+| SecureChat | `secure-chat` | `secure-chat:*` |
+| Builder | `builder` | `builder:*` |
+| AI Governance | `ai-governance-v2` | `ai-governance-v2:observability:read`, `ai-governance-v2:observability_platform:read`, `ai-governance-v2:announcements:write` |
+| AI Insights | `insights` | `insights:*` |
+| Engage | `engage` | `engage:*` |
+| Collections | `collections` | `collections:*` |
+
+Wildcards are supported at any level: `orgs:members:*` grants all member actions, `storage:*` grants all storage permissions, `*` grants everything.
+
+## Resource Scopes
+
+Scopes restrict **which specific resources** a role can access, independent of permissions. They use the format `product:resource:id`:
+
+```json
+{
+  "scopes": [
+    "agent-factory:agents:agent_abc123",
+    "storage:vector_stores:kb_xyz",
+    "llm:models:gpt-4o"
+  ]
+}
+```
+
+- `*` grants access to all resources
+- `agent-factory:agents:*` grants access to all agents
+- Empty or omitted scopes mean no resources are accessible
+
+Scopes are available on both roles and [API keys](/products/ai-governance/api-keys#scopes). Some products don't support instance-level scoping (e.g. `orgs`, `ai-governance-v2`) — for these, the scope UI is hidden in the role editor.
+
+## System Roles
+
+### Core Roles
+
+| Role | Slug | Permissions | Scopes | Description |
+|------|------|------------|--------|-------------|
+| Owner | `org:owner` | `*` | `*` | Full organization management. Cannot be overridden. |
+| Admin | `org:admin` | `orgs:members:manage`, `orgs:groups:manage`, `orgs:branding:manage`, `orgs:navigation:manage`, `orgs:invites:manage`, `orgs:join-rules:manage`, `orgs:apikeys:manage`, `users:manage`, `secure-chat:*`, `agent-factory:*`, `builder:*`, `engage:*`, `storage:*`, `collections:*`, `insights:*`, `ai-governance-v2:*` | `*` | Organization administration |
+| Member | `org:member` | `orgs:roles:read`, `users:read`, `orgs:groups:read`, `orgs:members:read`, `agent-factory:agents:read`, `agent-factory:agents:explore`, `storage:vector_stores:read`, `storage:files:read`, `storage:skills:read`, `secure-chat:*` | — | Basic organization member |
+
+### Additional System Roles
+
+Additional system roles can be defined via the `ORG_ADDITIONAL_SYSTEM_ROLES` environment variable (JSON array). Default additional roles when the env var is not set:
+
+| Role | Slug | Permissions | Description |
+|------|------|------------|-------------|
+| Agent Maker | `agent-maker` | Member base + `agent-factory:*`, `storage:*`, `knowledge:*` | Full agent-factory & knowledge access |
+| Builder | `builder` | Agent Maker + `builder:*` | Builder + agent-factory + knowledge access |
+| Agent Standard | `agent-standard` | `llm:*`, `tools:*` | Default agent role (for service accounts) |
+
+## Overriding System Roles
+
+All system roles except `owner` can be customized per organization. When an admin edits a system role (e.g. `org:admin`) in the AI Governance UI, a custom role override is saved for that organization. The custom override **shadows** the system definition — it fully replaces the system role's permissions and scopes for that org. The override is stored as a custom role with the same slug and cached per-org in the API gateway.
+
+## Custom Roles
+
+Organizations can create custom roles with specific permissions and optional resource scopes:
+
+```json
+{
+  "slug": "analyst",
+  "name": "Data Analyst",
+  "permissions": [
+    "agent-factory:agents:read",
+    "agent-factory:agents:explore",
+    "storage:vector_stores:read",
+    "storage:files:read"
+  ],
+  "scopes": [
+    "storage:vector_stores:kb_abc123",
+    "agent-factory:agents:agent_xyz"
+  ]
+}
+```
+
+Custom roles are managed via the native v2 API — see the [API Reference](/api-reference) for CRUD endpoints.
+
+## Groups
+
+Groups allow organizing users for bulk access control. Agents can be bound to groups (via [Agent Factory access control](/products/agent-factory/agents-api#access-control)), giving all group members access.
+
+When a group is deleted, the `iam.group.deleted` event is emitted, and Agent Factory automatically cleans up all agent bindings referencing that group.
+
+Groups are managed via the native v2 API — see the [API Reference](/api-reference) for CRUD endpoints.
+
+## Permission Tree Editor
+
+The AI Governance role editor displays permissions as a hierarchical tree organized by product > resource > action:
+
+- Checking a **product** node sets the product-level wildcard (e.g. `storage:*`)
+- Checking a **resource** node sets the resource-level wildcard (e.g. `storage:vector_stores:*`)
+- Individual actions can be toggled independently
+- Children are visually disabled when a parent wildcard is active
+- A counter shows checked/total actions per resource and product
+- For products supporting instance scoping, a **Scopes** section appears under each resource, allowing admins to set the "All resources" wildcard or add specific resource IDs
+- Custom (non-tree-managed) permissions can be added manually via a free-text input
+
+The same permission tree component is used for both role editing and [API key](/products/ai-governance/api-keys) permission management.

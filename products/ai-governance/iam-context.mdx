@@ -1,20 +1,50 @@
 ---
 title: "IAM Context"
-description: "Navigation configuration, branding, onboarding flow, and platform shell integration"
+description: "Active organization, navigation, branding, onboarding flow, and platform shell integration"
 ---
 
-The IAM Context endpoint is the bridge between AI Governance and the platform frontend. It provides everything the shell needs to render: navigation, branding, permissions, and organization data.
+The `/me` endpoint is the bridge between AI Governance and the platform frontend. It provides everything the shell needs to render: the active organization context, navigation, branding, permissions, and user data.
 
-## Context Endpoint
+## Active Organization
+
+Every authenticated user has an **active organization** that scopes which products, permissions, and resources they can access via their organization role. The active org is resolved on each request with the following priority:
+
+1. **URL path** — If the request targets `/v2/orgs/:orgSlug/...`, that org is used
+2. **Session** — The org last selected by the user (persisted in the server-side session)
+3. **First membership** — Falls back to the user's first organization
+
+If the session references an org the user is no longer a member of, it is automatically reset to the first available org.
+
+### Switching Organizations
+
+For users with multiple organizations, the frontend calls:
 
 ```
-GET v1/iam/context
+PUT /v2/user/active-org
 ```
-
-This is the first API call the platform shell makes after authentication. It uses the `x-org` header to select an organization (falls back to session org, then first membership). It returns:
 
 ```json
 {
+  "orgSlug": "beta-inc"
+}
+```
+
+This updates the server-side session, invalidates the user cache, and returns the new org's full context (navigation, branding, permissions, role). The frontend then reloads. See the [API Reference](/api-reference) for details.
+
+The organizations list from the `/me` response populates the org switcher dropdown in the sidebar.
+
+## The `/me` Endpoint
+
+```
+GET /v2/me
+```
+
+This is the first API call the platform shell makes after authentication. It returns the user profile merged with the active organization's context:
+
+```json
+{
+  "id": "user_abc",
+  "email": "user@acme.com",
   "org": {
     "slug": "acme-corp",
     "name": "Acme Corp",
@@ -37,64 +67,35 @@ This is the first API call the platform shell makes after authentication. It use
             { "id": "agent-factory", "label": "Agent Factory", "icon": "Bot", "href": "/apps/agent-factory", "permissions": ["agent-builder:*"] }
           ]
         }
-      ],
-      "footer": null,
-      "quickActions": null
-    }
+      ]
+    },
+    "role": {
+      "slug": "admin",
+      "name": "Administrator",
+      "permissions": ["secure-chat:*", "agent-factory:*", "orgs:members:manage", "storage:*"],
+      "scopes": ["*"]
+    },
+    "groups": ["group_engineering_abc"],
+    "settings": { "llm": { ... } },
+    "subscription": { ... }
   },
-  "membership": {
-    "roleSlug": "admin",
-    "status": "active",
-    "subscriptionId": "sub-acme-default"
-  },
-  "role": {
-    "slug": "admin",
-    "name": "Administrator",
-    "permissions": ["secure-chat:*", "agent-factory:*", "orgs:members:manage", "storage:*"],
-    "scopes": ["*"]
-  },
+  "permissions": ["secure-chat:*", "agent-factory:*", "orgs:members:manage", "storage:*"],
   "organizations": [
     { "slug": "acme-corp", "name": "Acme Corp", "role": "admin" },
     { "slug": "beta-inc", "name": "Beta Inc", "role": "user" }
   ],
-  "acl": { ... },
-  "groups": ["group_engineering_abc"],
-  "llm": { "allowedProviders": ["openai"], "defaultModel": "gpt-4o" },
-  "subscriptionLimits": [
-    { "metric": "users", "type": "cumulative", "limit": 50 },
-    { "metric": "agents.rpm", "type": "rate", "window": "minute", "limit": 100 }
-  ]
+  "sessionId": "sess_xyz",
+  "expires": "2026-04-18T12:00:00Z"
 }
 ```
 
+The `org` object contains everything scoped to the active organization: branding, navigation, the user's role (with permissions and scopes), group memberships, settings, and subscription.
+
 ## Navigation Configuration
 
-The sidebar navigation is fully dynamic — defined in the AI Governance workspace configuration and served via the IAM context endpoint.
+The sidebar navigation is fully dynamic — defined per organization and served within `org.navigation` in the `/me` response. The navigation is **server-side filtered** based on the user's role permissions before being returned.
 
-### Menu Item Structure
-
-Navigation is stored on the organization object and served within `org.navigation`. Menu items support groups with nested items, permission gating, and feature lists.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | string | Unique identifier |
-| `type` | string | `group` for collapsible category, omit for direct item |
-| `label` | string | Display label |
-| `icon` | string | Icon name (from curated icon map in the frontend) |
-| `href` | string | URL path |
-| `color` | string | Icon/label color |
-| `target` | string | Link target (e.g., `_blank`) |
-| `expanded` | boolean | Whether group starts expanded |
-| `permissions` | string[] | Required permissions (item hidden if user lacks all of them) |
-| `items` | array | Nested items (for groups) |
-| `features` | array | Feature list entries `{ slug, agentId, label, permissions }` |
-| `badge` | object | Badge configuration |
-| `visibility.tiers` | string[] | Subscription tiers that can see this item |
-| `visibility.features` | string[] | Feature flags required |
-
-### Permission Filtering
-
-The navigation is **server-side filtered** based on the user's role permissions before being returned. Items with `permissions` are checked via wildcard matching (e.g., `iam:*` matches `iam:members:manage`). Groups are only included if they have at least one visible sub-item after filtering. Feature lists within items are also filtered by permissions.
+For full details on menu item structure, permission gating, features, and the visual editor, see the [Menu Builder](/products/ai-governance/menu-builder) documentation.
 
 ## Branding
 
@@ -124,25 +125,9 @@ When a user has no organization membership, the platform shows an **onboarding m
 
 1. **Join with invite code** — Enter a code shared by an organization admin
 2. **Create organization** — Available only to users with `PlatformAdmin` role
-3. **Auto-join** — If join rules match the user's email domain, they're automatically added
+3. **Auto-join** — If [join rules](/products/ai-governance/joining-organizations#join-rules) match the user's attributes, they're automatically added
 
-The onboarding flow is handled entirely by the frontend using the IAM context response.
-
-## Organization Switching
-
-```
-POST v1/iam/switch-org
-```
-
-```json
-{
-  "orgSlug": "beta-inc"
-}
-```
-
-Switches the user's active organization. Updates `user.meta.currentOrg`. The frontend reloads the IAM context to get the new organization's navigation, branding, and permissions.
-
-The organizations list from the IAM context populates the org switcher dropdown in the sidebar.
+The onboarding flow is handled entirely by the frontend using the `/me` response.
 
 ## Degraded Mode
 
@@ -154,11 +139,4 @@ If no AI Governance workspace is configured (or it's unreachable), the platform 
 - Basic user info from the OIDC session
 
 This ensures the platform remains usable for development even without the governance layer.
-
-## Service Account Context
-
-```
-GET/POST v1/service-accounts/:id/context
-```
-
-Service accounts (used for machine-to-machine access) have their own context endpoint that returns permissions and scopes without navigation or branding. POST is used when providing additional identity data in the request body.
+**You still can access native governance features from /apps/ai-governance url.**

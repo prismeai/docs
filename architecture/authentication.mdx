@@ -1,17 +1,19 @@
 ---
 title: "Authentication"
-description: "Three authentication modes — user sessions, API keys, and workspace JWTs — and how each workspace implements them"
+description: "Authentication modes — user sessions, API keys, access tokens, cross-workspace calls — and how each workspace implements them"
 ---
 
-The platform supports three authentication modes. Each serves a different caller type, and workspaces implement them through their `_auth` private automation.
+The platform supports multiple authentication modes. Each serves a different caller type, and workspaces implement them through their `_auth` private automation.
 
 ## Authentication Modes
 
 | Mode | Caller | Trigger | Token Format |
 |------|--------|---------|--------------|
-| **User Session** | Browser / frontend | OIDC PKCE flow | Bearer token in `Authorization` header |
+| **User Session** | Browser / frontend | OIDC PKCE flow | Bearer token in `Authorization` header or access-token cookie |
 | **API Key** | External integrations | `iak_*` prefixed key | Bearer token in `Authorization` header |
-| **Workspace JWT** | Other workspaces | `auth: { workspace: true }` | Signed JWT with workspace ID claim |
+| **Access Token** | Programmatic clients | `at:` prefixed token | Bearer token in `Authorization` header giving some user's identity |
+| **Cross-Workspace Call** | Other workspaces | `fetch` to webhook URL | Identified by `run.sourceWorkspaceId` |
+| **Internal Auth** | Runtime → API Gateway | Runtime-signed JWT | `prismeaiInternal` claim |
 
 ## User Session (OIDC)
 
@@ -22,20 +24,65 @@ The frontend authenticates users via OIDC PKCE flow through the Prisme.ai API Ga
 2. Authorization code exchange via `sdk.getToken()`
 3. Access token stored in `localStorage` under `platform-token`
 4. Token included as `Authorization: Bearer {token}` on all API calls
-5. CSRF token from `sdk._csrfToken` included on mutating requests
+5. CSRF token included on mutating requests via `x-prismeai-csrf-token` header
 
-**In automations**, the authenticated user is available as:
-- `user.id` — User ID
-- `user.email` — Email
-- `user.meta.currentOrg` — Current organization slug
-- `user.meta.permissions` — Explicit permission grants
-- `user.meta.llm` — LLM governance config from subscription
+**CSRF protection:** Required only for cookie-authenticated browser requests on non-GET methods. Bypassed for bearer token auth, cross-workspace calls, and unauthenticated requests.
+
+### Active Organization
+
+The user's **active organization** determines which permissions and scopes apply. It is resolved on each request:
+1. URL path (`/v2/orgs/:orgSlug/...`) takes priority
+2. Then the session-persisted `activeOrgSlug`
+3. Falls back to the user's first organization membership
+
+See [IAM Context > Active Organization](/products/ai-governance/iam-context#active-organization) for details on switching.
+
+### Context Available in Automations
+
+**`session` context** — The active org and its role are available via the session:
+
+| Variable | Description |
+|----------|-------------|
+| `{{session.id}}` | Session ID |
+| `{{session.org.slug}}` | Active organization slug |
+| `{{session.org.name}}` | Organization name |
+| `{{session.org.role.slug}}` | User's role slug in the active org |
+| `{{session.org.role.permissions}}` | Role permission strings (array) |
+| `{{session.org.role.scopes}}` | Role scope strings (array) |
+| `{{session.org.groups}}` | Groups the user belongs to in this org |
+| `{{session.org.settings}}` | Org settings (e.g. LLM governance) |
+| `{{session.org.subscription}}` | Org subscription object |
+
+**`user` context** — Persistent user profile data:
+
+| Variable | Description |
+|----------|-------------|
+| `{{user.id}}` | User ID (read-only) |
+| `{{user.email}}` | User email |
+| `{{user.role}}` | Workspace CASL role (e.g. `owner`, `editor`) — **not** the org role |
+| `{{user.orgSlugs}}` | Array of all org slugs the user belongs to (read-only) |
+
+**`run` context** — Current execution metadata (read-only):
+
+| Variable | Description |
+|----------|-------------|
+| `{{run.permissions}}` | Org permissions as a nested object (`{product: {resource: {action: true}}}`) |
+| `{{run.scopes}}` | Raw scopes array from org role |
+| `{{run.correlationId}}` | Request correlation ID |
+| `{{run.ip}}` | Client IP address |
+| `{{run.authenticatedWorkspaceId}}` | Calling workspace ID (for service-to-service calls) |
+| `{{run.sourceWorkspaceId}}` | Source workspace ID |
+| `{{run.trigger}}` | Trigger info: `{type, value, id, import}` |
+
+<Note>
+`user.role` is the **workspace-level** role (from CASL security rules), not the organization role. The organization role is in `session.org.role`.
+</Note>
 
 ## API Keys (`iak_*`)
 
 API keys are created and managed through AI Governance. They enable programmatic access to the platform from external systems.
 
-**Key format:** `iak_` prefix followed by a random string (e.g., `iak_abc123def456`).
+**Key format:** `iak_{orgSlug}_{uuid}` (e.g., `iak_acme-corp_a1b2c3d4e5f6g7h8`).
 
 **Validation flow:**
 
@@ -45,8 +92,8 @@ sequenceDiagram
     participant W as Workspace
     participant G as AI Governance
 
-    C->>W: Authorization: Bearer iak_abc123...
-    W->>G: Workspace JWT — POST v1/auth/apikey
+    C->>W: Authorization: Bearer iak_acme-corp_...
+    W->>G: Cross-workspace — POST v1/auth/apikey
     G-->>W: orgSlug, permissions, scopes, limits, subscriptionLimits
 ```
 
@@ -59,30 +106,45 @@ The validation result is **cached for 60 seconds** in the workspace's global cac
 - `subscriptionLimits` — Rate limits and quotas from the org's subscription
 - `llm` — LLM governance configuration (allowed models, providers)
 
-## Workspace JWT (Service-to-Service)
+See [API Keys](/products/ai-governance/api-keys) for the full lifecycle documentation.
 
-When a workspace needs to call another workspace, it generates a **workspace JWT** — a signed token that identifies the calling workspace.
+## Access Tokens (`at:`)
+
+Access tokens are long-lived programmatic tokens created via `POST /v2/user/accessTokens`. Unlike OIDC tokens, they bypass the OAuth flow entirely.
+
+- **Format:** `at:` prefix followed by a random string
+- **Storage:** Stored hashed in MongoDB (not JWTs)
+- **Validation:** Looked up server-side on each request
+- **Use case:** CI/CD pipelines, scripts, and long-running integrations
+
+## Service Accounts
+
+Service accounts (`sa:` prefixed user IDs) provide machine-to-machine identity scoped to an organization. They authenticate via API keys and carry specific permissions and scopes.
+
+Service accounts are managed via the native v2 API — see the [API Reference](/api-reference).
+
+## Cross-Workspace Calls
+
+When a workspace calls another workspace's webhook, the platform automatically identifies the caller via `run.sourceWorkspaceId`. This is a guaranteed identity — the runtime injects it based on the calling workspace, and it cannot be forged.
 
 **In DSUL automations:**
 
 ```yaml
-- auth:
-    workspace: true
-    output: _wsJwt
-
 - fetch:
     url: '{{global.apiUrl}}/workspaces/slug:llm-gateway/webhooks/v1/chat/completions'
-    headers:
-      Authorization: 'Bearer {{_wsJwt.jwt}}'
     body:
       model: gpt-4o
       messages: '{{messages}}'
 ```
 
-**On the receiving side**, workspace JWTs are detected via:
-- `run.authenticatedWorkspaceId` — The calling workspace's ID
+**On the receiving side**, the calling workspace is identified via:
+- `run.sourceWorkspaceId` — The calling workspace's ID (injected by the runtime)
 
-Workspace JWTs are **fully trusted** — they bypass API key validation and user permission checks. The receiving workspace trusts that the caller has already authenticated and authorized the end user.
+Each receiving workspace implements its own authorization logic to decide what callers are allowed to do. For example, AI Governance allows Agent Factory to search LLM Gateway events.
+
+## Internal Auth
+
+For cross-service calls between the Runtime and the API Gateway (e.g., the `access-manager` module), the Runtime signs a JWT with a `prismeaiInternal: true` claim. This identifies the call as coming from a trusted platform service, distinct from workspace-to-workspace calls.
 
 ## Per-Workspace Implementation
 
@@ -96,14 +158,14 @@ flowchart LR
     IAK -->|Yes| GOV[Fetch AI Governance\n/v1/auth/apikey\n60s cache]
     GOV --> RES1[orgSlug, permissions, scopes]
     IAK -->|No| UID{user.id?}
-    UID -->|Yes| SESS[User session\norg from user.meta.currentOrg\n60s cache]
+    UID -->|Yes| SESS[User session\norg from session]
     UID -->|No| ERR[401 Unauthorized]
 ```
 
 Agent Factory supports all three modes because it's accessed by:
 - The SecureChat frontend (user session)
 - External integrations (API keys)
-- AI Insights and other workspaces (workspace JWT)
+- AI Insights and other workspaces (cross-workspace calls)
 
 ### AI Governance
 
@@ -113,7 +175,7 @@ flowchart LR
     IAK -->|Yes| BUILT[internal/auth-apikey\n+ platform_admins check]
     IAK -->|No| UID{user.id?}
     UID -->|Yes| SESS[User session\n+ platform_admins root elevation]
-    UID -->|No| WS{workspace JWT?}
+    UID -->|No| WS{cross-workspace?}
     WS -->|Yes| TRUST[Trusted]
 ```
 
@@ -123,7 +185,7 @@ Governance has a special `platform_admins` list that grants `root` role to speci
 
 ```mermaid
 flowchart LR
-    REQ[Request] --> WS{workspace JWT?}
+    REQ[Request] --> WS{cross-workspace?}
     WS -->|Yes| TRUST[Trusted\nbody.user_id + body.orgSlug]
     WS -->|No| UID{user.id?}
     UID -->|Yes| SESS[User session]
@@ -139,7 +201,7 @@ flowchart LR
     REQ[Request] --> IAK{iak_* header?}
     IAK -->|Yes| GOV[Fetch AI Governance\n/v1/auth/apikey — 60s cache]
     GOV --> CHK[Check llm:completions:use\n+ model access vs scopes]
-    IAK -->|No| WS{workspace JWT?}
+    IAK -->|No| WS{cross-workspace?}
     WS -->|Yes| TRUST[Trusted]
 ```
 
@@ -157,38 +219,45 @@ AI Collection only supports user sessions because it's always called from within
 
 ## Permission Model
 
-Permissions are string-based and follow a `resource:action:scope` pattern:
+Permissions are string-based and follow a `product:resource:action` pattern:
 
 ```
-memories:read
-memories:write
-memories:*
+orgs:members:manage
 llm:completions:use
-iam:*
+agent-factory:agents:*
+storage:*
+*
 ```
 
-Permission checking uses a cascading approach:
+See [Roles & Permissions](/products/ai-governance/roles-permissions) for the full permission catalog, resource scopes, and wildcard behavior.
+
+Permission checking in DSUL automations leverages `run.permissions`, a nested object parsed from the user's org role (e.g. `{"memories": {"read": true, "manage": true}}`):
 
 ```yaml
-# _check-permission example
+# _check-permission example (from tools-memories)
+# Input: permission = "memories:read"
+- set:
+    name: _parts
+    value: '{% split({{permission}}, ":") %}'
+- set:
+    name: _domain
+    value: '{{_parts.0}}'
+- set:
+    name: _action
+    value: '{{_parts.1}}'
 - conditions:
-    or:
-      - '{{permissions}}':
-          $in:
-            - '{{required_permission}}'
-      - '{{permissions}}':
-          $in:
-            - '{{resource}}:*'
-      - '{{permissions}}':
-          $in:
-            - 'iam:*'
-    then:
-      - # Allowed
-    else:
+    '{{run.permissions["*"].manage}}':
       - set:
-          __statusCode: 403
-      - output:
-          error: Insufficient permissions
+          name: allowed
+          value: true
+    '{{run.permissions[{{_domain}}][{{_action}}]}} or {{run.permissions[{{_domain}}].manage}}':
+      - set:
+          name: allowed
+          value: true
+    default:
+      - set:
+          name: allowed
+          value: false
 ```
 
 ## Security Rules (RBAC)
