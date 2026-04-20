@@ -13,16 +13,17 @@ POST   v1/models                # Register a model
 GET    v1/models/:model_id      # Get model details
 PATCH  v1/models/:model_id      # Update model (partial)
 DELETE v1/models/:model_id      # Remove model
+GET    v1/defaults              # Get resolved default models with metadata
 ```
 
 ## Model Definition
 
 ```json
 {
-  "model_id": "gpt-4o",
+  "model_id": "gpt-5-chat-latest",
   "type": "completion",
   "display": {
-    "name": "GPT-4o",
+    "name": "GPT-5",
     "brand": "OpenAI",
     "icon": "https://...",
     "hidden": false,
@@ -45,8 +46,10 @@ DELETE v1/models/:model_id      # Remove model
     "response_tokens": 4096,
     "rate": { "rpm": 500, "tpm": 800000 }
   },
-  "failover": "gpt-4o-mini",
+  "failover": "gpt-4o",
   "region": "us-east",
+  "dimensions": 3072,
+  "supported_dimensions": [256, 1024, 3072],
   "metrics": {
     "energy_per_token": 0.000001,
     "pue_profile": "efficient",
@@ -77,10 +80,14 @@ DELETE v1/models/:model_id      # Remove model
 | `limits` | object | Context window (`context`), max output (`response_tokens`), rate limits (`rate.rpm`, `rate.tpm`) |
 | `failover` | string | Model to fall back to on failure (note: failover is currently driven by governance config, not this field) |
 | `region` | string | Deployment region (used for carbon footprint emission factors) |
+| `dimensions` | integer | Default embedding dimensions for this model |
+| `supported_dimensions` | array | List of valid dimension options (e.g., `[256, 1024, 3072]`) |
 | `metrics` | object | Eco and cost metrics (`energy_per_token`, `pue_profile`, `eco_score`, `cost_tier`, `training_date`) |
 | `provider_config` | object | Provider-specific config (batch sizes for embeddings, prompt cache, additional body fields) |
 | `tags` | array | Filterable tags for routing and filtering |
 | `enabled` | boolean | Whether the model is available |
+
+The `dimensions` and `supported_dimensions` fields are primarily used by embedding models. They are returned by the `v1/defaults` endpoint to help callers know what dimensions are available.
 
 ## Model Routing
 
@@ -118,28 +125,34 @@ routing:
     - condition: messages_count
       operator: "<"
       threshold: 5
-      model: gpt-4o-mini
+      model: gpt-4o
     - condition: messages_count
       operator: ">="
       threshold: 5
-      model: gpt-4o
+      model: gpt-5-chat-latest
 ```
 
 The only supported condition type is `messages_count` with operators `<`, `>`, `<=`, `>=`, `=`. First matching rule wins. If the selected model is blocked by governance, routing falls back to the default.
 
 ## Provider Resolution
 
-When a model is selected for chat completions, `_resolve-provider` finds the connection config by scanning each provider's `models` list in order:
+LLM calls are delegated to the **OpenAI app import** (`OpenAI.chat-completion` for completions, `OpenAI.embeddings` for embeddings), which handles provider routing, format conversion, and authentication for all providers natively.
+
+For **analytics**, a lightweight `_resolve-provider-name` automation determines the provider name by scanning all configured providers:
 
 ```
-openai → azure_openai (prismeai set) → openailike → anthropic → fallback to openai
+openai → azure resources → openailike → anthropic → vertex → bedrock → fallback to openai
 ```
 
-The automation does **not** look up a `provider` field on the model — it iterates through provider configs in `index.yml` until it finds a match. If no provider claims the model, it falls back to OpenAI.
+Azure resources with `format: "anthropic"` are reported as `"anthropic"` provider for analytics purposes.
 
-Provider-specific parameter exclusions (e.g., `top_p` for Anthropic, `max_tokens` for some Azure deployments) are applied automatically.
+For the **failover path** (non-streaming retry logic), `_resolve-provider` resolves the connection config by scanning:
 
-> **Note**: Vertex and Bedrock models are not resolved by `_resolve-provider`. They are handled by the **OpenAI app import** (used for embeddings and image generation), not by the direct HTTP calls used for chat completions.
+```
+openai → azure resources → openailike → anthropic → fallback to openai
+```
+
+Provider-specific parameter exclusions (e.g., `top_p` for Anthropic, `max_tokens` for some Azure deployments) are configured per provider resource in `index.yml` via `options.excludeParameters`.
 
 ## Model Aliases
 
@@ -147,8 +160,11 @@ Some providers use non-standard model identifiers. The `model_aliases` config ma
 
 ```yaml
 model_aliases:
-  gemini-pro: 'projects/my-project/locations/us-central1/publishers/google/models/gemini-pro'
-  claude-3: 'anthropic.claude-3-sonnet-20240229-v1:0'
+  vertex-text-embedding-005: 'projects/my-project/.../text-embedding-005'
+  vertex-gemini-2.5-flash: 'projects/my-project/.../gemini-2.5-flash'
+  az-claude-opus-4-6: claude-opus-4-6
 ```
 
-Models are stored in the `models` collection (via Collection app) and cached in `global.models_cache` (keyed by `model_id`, invalidated on PATCH/DELETE) for carbon footprint computation and embedding batch configuration.
+## Caching
+
+Models are stored in the `models` collection (via Collection app) and cached in `global.models_cache` (keyed by `model_id`, invalidated on PATCH/DELETE) for carbon footprint computation, embedding batch configuration, and defaults metadata.

@@ -1,39 +1,37 @@
 ---
 title: "Governance"
-description: "Model access control, quotas, carbon footprint tracking, and usage limits"
+description: "Model access control, carbon footprint tracking, and governance policies"
 ---
 
-LLM Gateway integrates with [AI Governance](/products/ai-governance/overview) to enforce access controls, quotas, and usage limits on LLM operations.
+LLM Gateway integrates with [AI Governance](/products/ai-governance/overview) to enforce access controls and governance policies on LLM operations.
 
 ## Governance Resolution
 
-The `_resolve-governance` automation resolves governance context differently based on auth mode:
-
-**API key (`iak_*`) flow**: the `api_key_context` is provided by the endpoint automation after validating the key against AI Governance (`/v1/auth/apikey`). The raw context contains `llm`, `subscriptionLimits`, and `scopes` fields — `_resolve-governance` resolves these into the working format below:
+The `_resolve-governance` automation resolves governance context from the caller's session, which is injected by the runtime based on the authenticated context (API key, user session, or cross-workspace identity):
 
 ```yaml
 {
   "orgSlug": "acme-corp",
   "gov": {
-    "allowed_models": ["gpt-4o", "gpt-4o-mini"],
-    "default_completion_model": "gpt-4o",
-    "default_embedding_model": "text-embedding-3-small",
+    "allowed_models": ["gpt-5-chat-latest", "gpt-4o"],
+    "default_completion_model": "gpt-5-chat-latest",
+    "default_embedding_model": "text-embedding-3-large",
     "quota_policy": "soft_downgrade",    # or "hard_block"
-    "failover_mapping": { "gpt-4o": "gpt-4o-mini" },
-    "downgrade_mapping": { "gpt-4o": "gpt-4o-mini" },
+    "failover_mapping": { "gpt-5-chat-latest": "gpt-4o" },
+    "downgrade_mapping": { "gpt-5-chat-latest": "gpt-4o" },
     "routing_config": { ... }
   },
   "limits": [
     { "metric": "llm.requests.rpm", "limit": 100 },
     { "metric": "llm.tokens.monthly", "limit": 10000000 }
-  ],
-  "api_key_scopes": ["models:gpt-4o", "models:gpt-4o-mini"]
+  ]
 }
 ```
 
-**Cross-workspace flow (user session)**: governance context comes from `user.meta.llm` (for the `gov` field) and `session.org.slug` (for `orgSlug`).
-
-**Workspace-to-workspace calls**: the caller passes `api_key_context` and `analytics_context` in the request body, allowing the gateway to apply the caller's governance rules.
+The fields are resolved from:
+- `session.org.slug` → `orgSlug`
+- `session.org.settings.llm` → `gov`
+- `session.org.subscription.limits` → `limits`
 
 ## Model Access Control
 
@@ -51,27 +49,28 @@ Each check is skipped if the corresponding list is empty or absent. If any check
 
 ## Quota Enforcement
 
-`_check-llm-quota` enforces rate and usage limits:
+<Warning>
+Quota enforcement is currently **disabled** (commented out in both completions and embeddings flows). It is planned for re-implementation without cross-workspace HTTP calls. The sections below describe the intended behavior.
+</Warning>
+
+`_check-llm-quota` is designed to enforce rate and usage limits:
 
 | Metric | Scope | Implementation |
 |--------|-------|----------------|
 | `llm.requests.rpm` | Per org | Local `rateLimit` instruction (60s window) |
-| `llm.tokens.monthly` | Per org | HTTP call to AI Governance `/v1/usage/check` (cached 15s) |
+| `llm.tokens.monthly` | Per org | Check against governance usage data |
 
 When a limit is reached, the behavior depends on `gov.quota_policy`:
 - **`soft_downgrade`**: swaps the model using `gov.downgrade_mapping` and emits a `governance.quota.downgraded` event
 - **`hard_block`** (default): returns `429` with `RATE_LIMITED` or `QUOTA_EXCEEDED` error code
 
-The quota check **fails open**: if AI Governance is unreachable, the request proceeds.
+## Usage Tracking
 
-> **Note**: Monthly cost budget checking (`monthly_budget_usd`) is defined but currently disabled until pricing data is fully configured.
+After every LLM call, an **analytics event** is emitted:
+- `analytics.llm.completion` — for chat completions (see [chat completions analytics](/services/llm-gateway/chat-completions#analytics-event))
+- `analytics.llm.embedding` — for embeddings
 
-## Usage Recording
-
-After every LLM call, two things happen:
-
-1. **Analytics event** — `analytics.llm.completion` is emitted (see [chat completions analytics](/services/llm-gateway/chat-completions#analytics-event) for the full schema)
-2. **Governance usage increment** — `_record-llm-usage` sends two parallel POSTs to AI Governance: one for monthly token count and one for daily request count (non-blocking, `emitErrors: false`). Cost is not sent to governance — it's tracked via the analytics event only.
+These events include token counts, cost, carbon footprint, duration, provider, and caller context (`orgSlug`, `agent_id`, `user_id`, `call_type`, `message_turn`).
 
 Usage events power the [observability dashboards](/products/ai-governance/observability) in AI Governance.
 
@@ -143,25 +142,4 @@ Results include uncertainty margins (+/- 20%):
 }
 ```
 
-Carbon data is included in analytics events and available in the governance observability dashboard.
-
-## Subscription Limits
-
-Organizations have subscription-level limits enforced at the gateway:
-
-| Metric | Description | Status |
-|--------|-------------|--------|
-| `llm.requests.rpm` | Requests per minute per org | Implemented |
-| `llm.tokens.monthly` | Monthly token budget across all models | Implemented |
-| Monthly cost budget | Monthly cost ceiling in USD | Disabled (pending pricing data) |
-
-Subscription limits are defined in AI Governance and returned as part of the governance context (either from API key validation or user session metadata). They are provided as an array:
-
-```json
-{
-  "limits": [
-    { "metric": "llm.requests.rpm", "limit": 100 },
-    { "metric": "llm.tokens.monthly", "limit": 10000000 }
-  ]
-}
-```
+Carbon data is included in analytics events and the response's `usage` object. It is also available in the governance observability dashboard.

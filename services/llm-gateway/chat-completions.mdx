@@ -13,18 +13,20 @@ Base URL: `{API_URL}/workspaces/slug:llm-gateway/webhooks/v1/chat/completions`
 
 ## Authentication
 
-This endpoint supports **dual authentication**:
+An `Authorization` header is required. The endpoint returns `401` if missing.
 
-| Mode | How | Flow |
-|------|-----|------|
-| API key (`iak_*`) | `Authorization: Bearer iak_...` | Validates against AI Governance → checks `llm:completions:use` permission → checks model access via scopes |
-| Cross-workspace call | `run.sourceWorkspaceId` present | Trusted directly (no governance checks) |
+| Mode | How | Details |
+|------|-----|---------|
+| API key (`iak_*`) | `Authorization: Bearer iak_...` | Validated against AI Governance — checks `llm:completions:use` permission and model access via scopes |
+| Cross-workspace call | `run.sourceWorkspaceId` | Trusted — caller identified by the runtime; provides `analytics_context` for tracking |
+
+Governance controls (model access, routing) are resolved from the caller's `session.org` settings, which are injected by the runtime based on the authenticated context.
 
 ## Request
 
 ```json
 {
-  "model": "gpt-4o",
+  "model": "gpt-5-chat-latest",
   "messages": [
     { "role": "system", "content": "You are a helpful assistant." },
     { "role": "user", "content": "What is the capital of France?" }
@@ -39,18 +41,21 @@ This endpoint supports **dual authentication**:
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | `gpt-4o` (from config) | Model identifier. Use `"auto"` for intelligent routing. |
+| `model` | string | `gpt-5-chat-latest` (from config) | Model identifier. Use `"auto"` for intelligent routing. |
 | `messages` | array | (required) | Conversation messages |
 | `temperature` | float | 1.0 | Randomness (0-2) |
 | `max_tokens` | integer | — | Maximum response tokens |
+| `max_completion_tokens` | integer | — | Alternative to `max_tokens` (some providers prefer this) |
 | `stream` | boolean | false | Enable SSE streaming |
 | `top_p` | float | 1.0 | Nucleus sampling |
 | `stop` | string/array | — | Stop sequences |
 | `tools` | array | — | Tool/function definitions |
 | `tool_choice` | string/object | — | Tool selection strategy |
 | `response_format` | object | — | Response format (e.g., JSON mode) |
+| `seed` | integer | — | Deterministic sampling seed |
+| `analytics_context` | object | — | Caller context: `{orgSlug, agent_id, user_id, context_id, agent_allowed_models, call_type, message_turn}` |
 
-Some parameters are excluded per provider (e.g., `top_p` is excluded for Anthropic).
+Some parameters are excluded per provider (e.g., `top_p` for Anthropic, `max_tokens` for some Azure deployments). These exclusions are configured per provider resource in `index.yml`.
 
 ## Response (Non-Streaming)
 
@@ -58,7 +63,7 @@ Some parameters are excluded per provider (e.g., `top_p` is excluded for Anthrop
 {
   "id": "chatcmpl-abc123",
   "object": "chat.completion",
-  "model": "gpt-4o",
+  "model": "gpt-5-chat-latest",
   "choices": [
     {
       "index": 0,
@@ -72,30 +77,44 @@ Some parameters are excluded per provider (e.g., `top_p` is excluded for Anthrop
   "usage": {
     "prompt_tokens": 25,
     "completion_tokens": 12,
-    "total_tokens": 37
-  }
+    "cost": 0.000185,
+    "duration_ms": 850,
+    "carbon": {
+      "energy": { "value": 0.000012, "unit": "kWh" },
+      "gwp": { "value": 0.0000057, "unit": "kgCO2eq" }
+    }
+  },
+  "content": "The capital of France is Paris.",
+  "finish_reason": "stop"
 }
 ```
 
+The response includes flattened `content`, `tool_calls`, and `finish_reason` fields at the top level for convenience, alongside the standard OpenAI `choices` array. The `usage` object is enriched with `cost`, `duration_ms`, and `carbon` data.
+
 ## Streaming (SSE)
 
-When `stream: true`, the response is a Server-Sent Events stream:
+When `stream: true`, the response is a Server-Sent Events stream. The endpoint normalizes chunks from all providers (Anthropic, Bedrock, Vertex) into the standard OpenAI delta format:
 
 ```
-data: {"id":"chatcmpl-abc","choices":[{"delta":{"role":"assistant"},"index":0}]}
+data: {"choices":[{"delta":{"role":"assistant"},"index":0}]}
 
-data: {"id":"chatcmpl-abc","choices":[{"delta":{"content":"The"},"index":0}]}
+data: {"choices":[{"delta":{"content":"The"},"index":0}]}
 
-data: {"id":"chatcmpl-abc","choices":[{"delta":{"content":" capital"},"index":0}]}
+data: {"choices":[{"delta":{"content":" capital"},"index":0}]}
 
 ...
 
-data: {"id":"chatcmpl-abc","choices":[{"delta":{},"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"completion_tokens":12,"total_tokens":37}}
+data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"completion_tokens":12}}
 
 data: [DONE]
 ```
 
-Stream chunks are processed inline within the `v1/chat/completions` automation, which accumulates content and tool call deltas, captures usage from the final chunk (via `stream_options.include_usage`), and sends SSE events in A2A format (`task.output.delta`).
+Stream normalization is handled at the endpoint level (`completions-endpoint`), which:
+1. Receives raw provider chunks from the OpenAI app
+2. Converts Anthropic/Bedrock/Vertex native formats to OpenAI delta format
+3. Forwards normalized chunks via SSE
+4. Accumulates content and tool calls for the final response
+5. Computes carbon footprint, cost, and analytics post-stream
 
 ## Failover
 
@@ -103,7 +122,7 @@ If the primary model call fails, LLM Gateway automatically tries a **failover mo
 
 ```mermaid
 flowchart TD
-    P[Primary: gpt-4o] --> R1{Result?}
+    P[Primary: gpt-5-chat-latest] --> R1{Result?}
     R1 -->|Success| RES1[Return response]
     R1 -->|5xx| FM{Failover mapping?}
     FM -->|Yes| F[Failover model from gov.failover_mapping]
@@ -118,11 +137,12 @@ flowchart TD
 ```
 
 The `_failover-call` automation handles this logic:
-- **5xx errors**: switches to the failover model defined in `gov.failover_mapping`, or falls back to `gov.default_completion_model`
+- **5xx errors**: switches to the failover model defined in `gov.failover_mapping`, or falls back to `gov.default_completion_model` (with linear backoff 1s, 2s, 3s...)
 - **429 rate limits**: retries the same model after a 5s backoff
 - **Other 4xx errors**: returned immediately without retry
 - Up to 3 attempts (configurable via `config.max_retries`, hard cap of 10)
 - Failover models are validated against governance access controls before use
+- Failover only applies to **non-streaming** requests
 
 ## Analytics Event
 
@@ -134,7 +154,9 @@ Every completion emits an `analytics.llm.completion` event:
   "agent_id": "agent_xyz",
   "user_id": "user_123",
   "context_id": "ctx_456",
-  "model": "gpt-4o",
+  "call_type": "external",
+  "message_turn": 3,
+  "model": "gpt-5-chat-latest",
   "provider": "openai",
   "tokens": { "input": 25, "output": 12, "total": 37 },
   "cost": { "total": 0.000185 },
@@ -150,5 +172,7 @@ Every completion emits an `analytics.llm.completion` event:
   "timestamp": "2025-01-15T10:30:00Z"
 }
 ```
+
+The `call_type` field distinguishes between `"external"` (default) and caller-defined types. `message_turn` tracks the conversation turn index.
 
 This powers the [observability](/products/ai-governance/observability) dashboards.
