@@ -1,0 +1,290 @@
+---
+title: 'Azure OCR'
+description: 'Extract text and structured data from images and documents via Azure Computer Vision and Document Intelligence'
+---
+
+The Azure OCR app wraps two Azure AI services behind a single Prisme.ai app: **Azure Computer Vision** for lightweight image OCR (Read, Caption, Tags, Objects, People) and **Azure Document Intelligence** for structured extraction of documents (layouts, invoices, receipts, ID documents, …).
+
+<CardGroup cols={2}>
+  <Card title="Computer Vision" icon="image">
+    Fast OCR and visual analysis for images via a single synchronous call
+  </Card>
+  <Card title="Document Intelligence" icon="file-lines">
+    Async, structured extraction for PDFs and complex layouts with prebuilt
+    models
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- An **Azure subscription** with access to Azure AI services
+- A **Computer Vision** (or Multi-Service Cognitive) resource and its **endpoint** + **API key**
+- A **Document Intelligence** resource and its **endpoint** + **API key**
+
+<Note>
+  You can configure only one of the two services — each automation only requires
+  the config of the service it targets.
+</Note>
+
+## Installation
+
+1. Go to **Apps** in your workspace
+2. Search for **Azure OCR** and install it
+3. Open the app instance configuration and fill in the required fields
+
+## Configuration
+
+| Field                                | Description                                                               |
+| ------------------------------------ | ------------------------------------------------------------------------- |
+| **Computer Vision — Endpoint**       | Azure endpoint hostname, e.g. `az-aismsa-xxx.cognitiveservices.azure.com` |
+| **Computer Vision — API Key**        | API key, stored as the workspace secret `computervisionApiKey`            |
+| **Document Intelligence — Endpoint** | Azure endpoint hostname, e.g. `az-di-xxx.cognitiveservices.azure.com`     |
+| **Document Intelligence — API Key**  | API key, stored as the workspace secret `documentIntelligenceApiKey`      |
+
+<Note>
+  Endpoints are stored as **hostnames only** — the app automatically strips
+  `https://` and trailing slashes, so both
+  `https://xxx.cognitiveservices.azure.com/` and
+  `xxx.cognitiveservices.azure.com` work.
+</Note>
+
+## Available Instructions
+
+### analyzeImage (Computer Vision)
+
+Send an image URL to Azure Computer Vision and return the analysis result (OCR and optional visual features). This call is synchronous.
+
+| Argument   | Description                                                                                                |
+| ---------- | ---------------------------------------------------------------------------------------------------------- |
+| `source`\* | Public URL of the image to analyze                                                                         |
+| `features` | Comma-separated features (default `Read`). Accepted values: `Read`, `Caption`, `Tags`, `Objects`, `People` |
+| `language` | Language hint (default `en`, e.g. `fr`)                                                                    |
+
+Uses the Image Analysis API version `2024-02-01`.
+
+```yaml
+- Azure OCR.analyzeImage:
+    source: https://example.com/receipt.jpg
+    features: Read,Caption,Tags
+    language: fr
+    output: result
+```
+
+Returns the raw Azure response body (`readResult`, `captionResult`, `tagsResult`, …).
+
+### analyzeDocument (Document Intelligence)
+
+Send a document (URL or base64) to Azure Document Intelligence, poll for the result, and return either a simplified or raw extraction. This automation handles the async submit-and-poll cycle internally (2s interval, 60s timeout).
+
+| Argument              | Description                                                             |
+| --------------------- | ----------------------------------------------------------------------- |
+| `source`\*            | Document URL or base64 content                                          |
+| `sourceType`          | `url` (default) or `base64`                                             |
+| `model`               | Document Intelligence model (default `prebuilt-layout`). See list below |
+| `pages`               | Pages to analyze, e.g. `1-3,5,7-9`                                      |
+| `locale`              | Locale hint, e.g. `fr-FR`                                               |
+| `outputContentFormat` | `text` (default) or `markdown`                                          |
+| `outputFormat`        | `simple` (default, post-processed) or `raw` (full Azure response)       |
+
+Available **prebuilt models**:
+
+| Model                   | Use case                                    |
+| ----------------------- | ------------------------------------------- |
+| `prebuilt-read`         | Pure text extraction (fastest, lightweight) |
+| `prebuilt-layout`       | Text + tables + structure (default)         |
+| `prebuilt-invoice`      | Structured invoice fields                   |
+| `prebuilt-receipt`      | Structured receipt fields                   |
+| `prebuilt-idDocument`   | Passports, IDs, driver's licences           |
+| `prebuilt-businessCard` | Business card fields                        |
+
+Uses the Document Intelligence API version `2024-11-30`.
+
+#### URL source
+
+```yaml
+- Azure OCR.analyzeDocument:
+    source: https://example.com/invoice.pdf
+    model: prebuilt-invoice
+    locale: fr-FR
+    outputContentFormat: markdown
+    output: invoice
+```
+
+#### Base64 source
+
+```yaml
+- Azure OCR.analyzeDocument:
+    source: '{{pdf_base64}}'
+    sourceType: base64
+    model: prebuilt-layout
+    pages: 1-3
+    output: layout
+```
+
+#### Raw output
+
+Set `outputFormat: raw` to bypass the internal simplification and receive the full `analyzeResult` payload from Azure (pages, tables, key-value pairs, styles, …).
+
+```yaml
+- Azure OCR.analyzeDocument:
+    source: '{{document_url}}'
+    model: prebuilt-layout
+    outputFormat: raw
+    output: raw_result
+```
+
+## Error Handling
+
+Both instructions emit an `error` event and return a structured error payload instead of raising. The payload shape is:
+
+```json
+{
+  "error": "ConfigurationError | ValidationError | NetworkError | AzureError | Unauthorized | Forbidden | NotFound | RateLimited | ServerError | ProcessingFailed | Timeout",
+  "message": "Human-readable explanation",
+  "details": {
+    "service": "computervision | documentIntelligence",
+    "automation": "analyzeImage | analyzeDocument",
+    "status": 401,
+    "body": {}
+  }
+}
+```
+
+| Error                | Typical cause                                                                                            |
+| -------------------- | -------------------------------------------------------------------------------------------------------- |
+| `ConfigurationError` | Missing endpoint or API key in the app config                                                            |
+| `ValidationError`    | `source` argument is empty                                                                               |
+| `NetworkError`       | Endpoint unreachable — check hostname format (no scheme, no path)                                        |
+| `Unauthorized`       | Invalid or revoked API key                                                                               |
+| `Forbidden`          | The resource exists but the key lacks access (Computer Vision only)                                      |
+| `NotFound`           | `prebuilt-<model>` does not exist, or the Computer Vision resource is missing                            |
+| `RateLimited`        | Azure throttling — retry with back-off                                                                   |
+| `ServerError`        | Azure 5xx                                                                                                |
+| `ProcessingFailed`   | Document Intelligence could not process the document (corrupted, password-protected, unsupported format) |
+| `Timeout`            | Document Intelligence polling exceeded 60s — try `prebuilt-read` or fewer pages                          |
+
+### Listening for Errors
+
+Because both instructions emit an `error` event on failure, you can globally monitor Azure OCR issues from another automation:
+
+```yaml
+slug: onAzureOcrError
+when:
+  events:
+    - error
+do:
+  - conditions:
+      '{{payload.details.service}} == "documentIntelligence" || {{payload.details.service}} == "computervision"':
+        - comment: Forward to monitoring
+        - fetch:
+            url: '{{config.monitoringWebhook}}'
+            method: POST
+            body: '{{payload}}'
+```
+
+## Example Use Cases
+
+<Tabs>
+  <Tab title="Invoice OCR">
+    Extract structured invoice data from a PDF sent by email.
+
+    ```yaml
+    - Azure OCR.analyzeDocument:
+        source: '{{attachment.url}}'
+        model: prebuilt-invoice
+        locale: fr-FR
+        output: invoice
+    - conditions:
+        '{{invoice.error}}':
+          - emit:
+              event: invoice.ocr.failed
+              payload: '{{invoice}}'
+        default:
+          - emit:
+              event: invoice.parsed
+              payload: '{{invoice}}'
+    ```
+
+  </Tab>
+
+  <Tab title="ID Verification">
+    Run KYC-style extraction on a passport scan.
+
+    ```yaml
+    - Azure OCR.analyzeDocument:
+        source: '{{scan_base64}}'
+        sourceType: base64
+        model: prebuilt-idDocument
+        output: id
+    ```
+
+  </Tab>
+
+  <Tab title="Image OCR">
+    Quick text extraction from a receipt photo.
+
+    ```yaml
+    - Azure OCR.analyzeImage:
+        source: '{{photo_url}}'
+        features: Read
+        language: fr
+        output: ocr
+    ```
+
+  </Tab>
+
+  <Tab title="Markdown Layout">
+    Get a markdown-formatted rendering of a multi-page document for LLM ingestion.
+
+    ```yaml
+    - Azure OCR.analyzeDocument:
+        source: '{{doc_url}}'
+        model: prebuilt-layout
+        outputContentFormat: markdown
+        outputFormat: simple
+        output: layout
+    ```
+
+  </Tab>
+</Tabs>
+
+## Best Practices
+
+- **Hostname only** — always strip `https://` and the trailing slash from endpoints to avoid `NetworkError`.
+- **Pick the right model** — `prebuilt-read` is ~3× faster than `prebuilt-layout`; use `layout` only when tables or structure matter.
+- **Prefer `url` over `base64`** for large documents — base64 uploads go through the Prisme.ai runtime and inflate the request size by ~33%.
+- **Handle the 60s timeout** — for long PDFs, either reduce `pages` or split the document upstream.
+- **Use `simple` output** for LLM pipelines (flattened text/markdown) and `raw` when you need Azure's full structured result (bounding boxes, tables, key-value pairs).
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card
+    title="Azure Computer Vision"
+    icon="book"
+    href="https://learn.microsoft.com/en-us/azure/ai-services/computer-vision/overview-image-analysis"
+  >
+    Image Analysis 4.0 reference
+  </Card>
+  <Card
+    title="Azure Document Intelligence"
+    icon="book"
+    href="https://learn.microsoft.com/en-us/azure/ai-services/document-intelligence/overview"
+  >
+    Document Intelligence overview and prebuilt models
+  </Card>
+  <Card
+    title="Prebuilt Models"
+    icon="table"
+    href="https://learn.microsoft.com/en-us/azure/ai-services/document-intelligence/concept-model-overview"
+  >
+    Full list of prebuilt and custom models
+  </Card>
+  <Card
+    title="API Keys & Endpoints"
+    icon="key"
+    href="https://learn.microsoft.com/en-us/azure/ai-services/multi-service-resource"
+  >
+    Create a Multi-Service Cognitive resource
+  </Card>
+</CardGroup>
