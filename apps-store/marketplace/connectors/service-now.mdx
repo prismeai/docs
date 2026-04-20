@@ -1,0 +1,494 @@
+---
+title: 'ServiceNow'
+description: 'Manage ServiceNow ITSM tickets, change requests, problems and service catalog from Prisme.ai'
+---
+
+The ServiceNow app provides read/write access to the [ServiceNow](https://www.servicenow.com) ITSM platform via its Table API. It can be used either as a Builder app (automations call ServiceNow instructions directly) or as a remote MCP server consumed by an AI Knowledge agent — covering incidents, change requests, problems, service catalog, requests, attachments, users and groups.
+
+<CardGroup cols={3}>
+  <Card title="ITSM Tickets" icon="headset">
+    Incidents, changes and problems with transitions and work notes
+  </Card>
+  <Card title="Service Catalog" icon="cart-shopping">
+    List, inspect and order catalog items with variables
+  </Card>
+  <Card title="Generic Table Access" icon="table">
+    Query any ServiceNow table with encoded queries and aggregates
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- A **ServiceNow** instance (URL format: `https://<instance>.service-now.com`)
+- Either **Basic Auth** credentials (user with `itil` / `admin` role) **or** an **OAuth2 client** (`client_credentials` flow)
+- Roles required for the intended tables: `itil` for incidents, `change_manager` for changes, `problem_manager` for problems, `sn_request_write` for catalog requests, etc.
+
+---
+
+<Tabs>
+  <Tab title="Usage as App">
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **ServiceNow** and install it
+    3. Open the app instance configuration and fill in the required fields
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Instance URL** | `https://<instance>.service-now.com` |
+    | **Authentication Type** | `basic` or `oauth2` |
+    | **Username** / **Password** | Required when `authType = basic` |
+    | **OAuth2 Client ID** / **Client Secret** | Required when `authType = oauth2` (uses `client_credentials` grant) |
+    | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this instance |
+    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header. Do not modify |
+
+    <Note>
+      Credentials are stored as workspace secrets. `MCP Endpoint` and `MCP API Key` are generated automatically by the `onInstall` flow and are only needed to expose this instance as an MCP server (see the next tab).
+    </Note>
+
+    ## Available Instructions
+
+    Every instruction resolves credentials via `buildAppAuth` (Basic or OAuth2 depending on `authType`). Most list operations accept `limit`, `offset`, `fields` (comma-separated) and `displayValue` (`true`/`false`/`all`) to control the response shape.
+
+    <Note>
+      `displayValue` controls how reference/choice fields are rendered: `true` → labels, `false` → sys_ids, `all` → both (under `value` and `display_value`).
+    </Note>
+
+    ### Generic Table Access
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `queryRecords` | `tableName`*, `query` (encoded query), `fields`, `limit`, `offset`, `displayValue` |
+    | `getRecord` | `tableName`*, `sysId`*, `fields`, `displayValue` |
+    | `getStats` | `tableName`*, `query`, `count`, `sumFields`, `avgFields`, `groupBy` |
+
+    ### Incidents
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listIncidents` | `query`, `state` (`1`=New, `2`=InProgress, `3`=OnHold, `6`=Resolved, `7`=Closed), `priority` (`1`=Critical → `4`=Low), `assignedTo`, `assignmentGroup`, `fields`, `limit`, `offset`, `displayValue` |
+    | `getIncident` | `sysId` **or** `number` (e.g. `INC0010001`), `fields`, `displayValue` |
+    | `createIncident` | `shortDescription`*, `description`, `callerId`, `category`, `subcategory`, `impact` (`1`/`2`/`3`), `urgency` (`1`/`2`/`3`), `priority`, `assignmentGroup`, `assignedTo`, `cmdbCi`, `contactType` |
+    | `updateIncident` | `sysId`*, `state`, `shortDescription`, `description`, `impact`, `urgency`, `priority`, `assignmentGroup`, `assignedTo`, `workNotes`, `comments`, `closeCode`, `closeNotes` |
+
+    ### Change Requests
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listChanges` | `query`, `state`, `priority`, `type` (`normal`/`standard`/`emergency`), `assignedTo`, `assignmentGroup`, `fields`, `limit`, `offset`, `displayValue` |
+    | `getChange` | `sysId`*, `fields`, `displayValue` |
+    | `createChange` | `changeType`* (`normal`/`standard`/`emergency`), `shortDescription`*, `description`, `category`, `priority`, `risk`, `impact`, `assignmentGroup`, `assignedTo`, `startDate`, `endDate`, `implementationPlan`, `backoutPlan`, `testPlan`, `cmdbCi` |
+    | `updateChange` | `sysId`*, `shortDescription`, `description`, `priority`, `risk`, `impact`, `assignmentGroup`, `assignedTo`, `startDate`, `endDate`, `implementationPlan`, `backoutPlan`, `testPlan`, `workNotes` |
+    | `getChangeTransitions` | `sysId`* |
+    | `transitionChange` | `sysId`*, `state`* (target state value) |
+
+    `startDate` / `endDate` use the ServiceNow format `YYYY-MM-DD HH:mm:ss` (UTC on the instance timezone).
+
+    ### Problems
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listProblems` | `query`, `state`, `priority`, `assignedTo`, `assignmentGroup`, `fields`, `limit`, `offset`, `displayValue` |
+    | `getProblem` | `sysId`*, `fields`, `displayValue` |
+    | `createProblem` | `shortDescription`*, `description`, `category`, `impact`, `urgency`, `priority`, `assignmentGroup`, `assignedTo`, `cmdbCi` |
+    | `updateProblem` | `sysId`*, `state`, `shortDescription`, `description`, `priority`, `assignmentGroup`, `assignedTo`, `workaround`, `causeNotes`, `fixNotes`, `workNotes` |
+
+    ### Service Catalog
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listCatalogItems` | `catalog`, `category`, `query`, `limit`, `offset` |
+    | `getCatalogItem` | `sysId`* (returns the item with its variables / form fields) |
+    | `orderCatalogItem` | `sysId`*, `quantity`, `variables` (object: form field values) |
+
+    ### Requests & Request Items
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listRequests` | `query`, `fields`, `limit`, `offset`, `displayValue` |
+    | `getRequest` | `sysId`*, `fields`, `displayValue` |
+    | `listRequestItems` | `query`, `requestId` (filter by parent request sys_id), `fields`, `limit`, `offset`, `displayValue` |
+
+    ### Attachments
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listAttachments` | `tableName`*, `tableSysId`* |
+    | `uploadAttachment` | `tableName`*, `tableSysId`*, `fileName`*, `contentBase64`*, `contentType` |
+
+    ### Users & Groups
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listUsers` | `query`, `active`, `fields`, `limit`, `offset` |
+    | `getUser` | `sysId` **or** `username`, `fields` |
+    | `listGroups` | `query`, `active`, `fields`, `limit`, `offset` |
+
+    <Note>
+      Arguments flagged with `*` are required.
+    </Note>
+
+    ## DSUL Examples
+
+    ### Open an Incident From a Form
+
+    ```yaml
+    - ServiceNow.createIncident:
+        shortDescription: VPN disconnects every 10 minutes
+        description: '{{payload.message}}'
+        callerId: '{{caller_sys_id}}'
+        category: network
+        impact: '2'
+        urgency: '2'
+        assignmentGroup: Network Support
+        contactType: email
+        output: incident
+    ```
+
+    ### Assign and Resolve
+
+    ```yaml
+    - ServiceNow.updateIncident:
+        sysId: '{{incident.sys_id}}'
+        assignedTo: '{{engineer_sys_id}}'
+        state: '2'
+        workNotes: Investigating the VPN concentrator logs.
+    - ServiceNow.updateIncident:
+        sysId: '{{incident.sys_id}}'
+        state: '6'
+        closeCode: Solved (Permanently)
+        closeNotes: Rolled back the firmware to 7.2.1.
+    ```
+
+    ### Query With an Encoded Query
+
+    ```yaml
+    - ServiceNow.queryRecords:
+        tableName: incident
+        query: active=true^priority=1^assignment_groupSTARTSWITHNetwork
+        fields: number,short_description,assigned_to,priority
+        limit: 50
+        displayValue: all
+        output: critical
+    ```
+
+    ### Order a Catalog Item
+
+    ```yaml
+    - ServiceNow.getCatalogItem:
+        sysId: '{{laptop_item_id}}'
+        output: item
+    - ServiceNow.orderCatalogItem:
+        sysId: '{{laptop_item_id}}'
+        quantity: 1
+        variables:
+          laptop_model: macbook_pro_16
+          delivery_date: 2026-05-01
+        output: request
+    ```
+
+    ### Aggregate Statistics
+
+    ```yaml
+    - ServiceNow.getStats:
+        tableName: incident
+        query: active=true
+        count: true
+        groupBy: priority,assignment_group
+        output: stats
+    ```
+
+    ### Attach a File
+
+    ```yaml
+    - ServiceNow.uploadAttachment:
+        tableName: incident
+        tableSysId: '{{incident.sys_id}}'
+        fileName: vpn-logs.txt
+        contentBase64: '{{logs_base64}}'
+        contentType: text/plain
+    ```
+  </Tab>
+
+  <Tab title="Usage as MCP">
+    The ServiceNow app ships with a built-in MCP server. Each app instance gets its own signed `mcp-api-key` that encodes the workspace ID and a credentials lookup URL — ServiceNow credentials (Basic or OAuth2) are never passed through headers and are resolved server-side from the app configuration.
+
+    ## Legacy MCP Install (Advanced > Tools)
+
+    Use this flow to plug the ServiceNow MCP into an AI Knowledge agent that does not yet support the native MCP picker.
+
+    <Steps>
+      <Step title="Install the ServiceNow app">
+        Install and configure the app in the same workspace as your agent (see the *Usage as App* tab). Once configured, `mcpEndpoint` and `mcpApiKey` are auto-populated.
+      </Step>
+      <Step title="Copy the MCP credentials">
+        Open the app instance config and copy the values of **MCP Endpoint** and **MCP API Key**.
+      </Step>
+      <Step title="Open your AI Knowledge project">
+        Navigate to **Advanced > Tools**.
+      </Step>
+      <Step title="Add an MCP tool">
+        Click **Add** and select the **MCP** tab.
+      </Step>
+      <Step title="Fill in the endpoint">
+        Paste the **MCP Endpoint** URL copied from the app instance.
+      </Step>
+      <Step title="Add the auth header">
+        In the **Headers** field, add the signed API key:
+
+        ```json
+        {
+          "mcp-api-key": "your-mcp-api-key"
+        }
+        ```
+      </Step>
+      <Step title="Save">
+        The agent can now list and call ServiceNow tools through the MCP endpoint.
+      </Step>
+    </Steps>
+
+    <Note>
+      The signed `mcp-api-key` encodes the workspace ID and the `getConfig` webhook URL. The MCP server validates the signature using the central app secret and transparently fetches the ServiceNow instance URL and credentials (Basic or OAuth2) from the installed app. Credentials are cached per tenant for 10 minutes.
+    </Note>
+
+    ## Authentication Modes
+
+    The MCP server uses whatever mode is configured on the app instance:
+
+    - **Basic Auth** — `authType: basic`, sends `Authorization: Basic <base64(username:password)>` on every call.
+    - **OAuth2 Client Credentials** — `authType: oauth2`, the MCP server exchanges `clientId` / `clientSecret` for an access token against `/oauth_token.do` and caches it, then sends `Authorization: Bearer <token>`.
+
+    Switch modes by editing the app instance configuration; no MCP tool lets you change credentials at runtime.
+
+    ## Available Tools
+
+    ### Generic Table Access
+
+    | Tool | Description |
+    |------|-------------|
+    | `queryRecords` | Query any ServiceNow table using encoded query syntax |
+    | `getRecord` | Get a single record from any table by `sys_id` |
+    | `getStats` | Aggregate statistics for a table (count, sum, avg, min, max, group by) |
+
+    ### Incidents
+
+    | Tool | Description |
+    |------|-------------|
+    | `listIncidents` | List incidents (state / priority / assignedTo / assignmentGroup filters) |
+    | `getIncident` | Get an incident by `sysId` or `number` |
+    | `createIncident` | Create an incident |
+    | `updateIncident` | Update an incident (supports `workNotes`, `comments`, `closeCode`, `closeNotes`) |
+
+    ### Change Requests
+
+    | Tool | Description |
+    |------|-------------|
+    | `listChanges` | List change requests |
+    | `getChange` | Get a change request |
+    | `createChange` | Create a `normal` / `standard` / `emergency` change |
+    | `updateChange` | Update a change request |
+    | `getChangeTransitions` | Get available state transitions |
+    | `transitionChange` | Transition to a new state |
+
+    ### Problems
+
+    | Tool | Description |
+    |------|-------------|
+    | `listProblems` / `getProblem` / `createProblem` / `updateProblem` | Full problem lifecycle (supports `workaround`, `causeNotes`, `fixNotes`) |
+
+    ### Service Catalog
+
+    | Tool | Description |
+    |------|-------------|
+    | `listCatalogItems` | List available catalog items |
+    | `getCatalogItem` | Get a catalog item with its variables |
+    | `orderCatalogItem` | Order a catalog item (creates a request + request item) |
+
+    ### Requests & Request Items
+
+    | Tool | Description |
+    |------|-------------|
+    | `listRequests` / `getRequest` | Browse service catalog requests |
+    | `listRequestItems` | List RITMs, optionally filtered by parent request |
+
+    ### Attachments, Users & Groups
+
+    | Tool | Description |
+    |------|-------------|
+    | `listAttachments` | List attachments on a record |
+    | `uploadAttachment` | Upload a file (base64) to a record |
+    | `listUsers` / `getUser` | List users or fetch one by `sysId` / `username` |
+    | `listGroups` | List user groups |
+
+    ## Tool Details
+
+    ### queryRecords
+
+    Query any ServiceNow table using the [encoded query](https://docs.servicenow.com/bundle/utah-platform-administration/page/use/using-lists/concept/c_EncodedQueryStrings.html) syntax.
+
+    ```json
+    {
+      "name": "queryRecords",
+      "arguments": {
+        "tableName": "incident",
+        "query": "active=true^priority=1^assignment_groupSTARTSWITHNetwork",
+        "fields": "number,short_description,assigned_to,priority",
+        "limit": 50,
+        "displayValue": "all"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `tableName` | Yes | `incident`, `change_request`, `problem`, `sc_req_item`, `sys_user`, … |
+    | `query` | No | Encoded query (operators: `=`, `!=`, `STARTSWITH`, `CONTAINS`, `IN`, `^`, `^OR`, …) |
+    | `fields` | No | Comma-separated field names to return |
+    | `limit` | No | Max records (default 20) |
+    | `offset` | No | Pagination offset |
+    | `displayValue` | No | `true` / `false` / `all` |
+
+    ### createIncident
+
+    ```json
+    {
+      "name": "createIncident",
+      "arguments": {
+        "shortDescription": "VPN disconnects every 10 minutes",
+        "callerId": "caller-sys-id",
+        "category": "network",
+        "impact": "2",
+        "urgency": "2",
+        "assignmentGroup": "Network Support",
+        "contactType": "email"
+      }
+    }
+    ```
+
+    ### updateIncident
+
+    ```json
+    {
+      "name": "updateIncident",
+      "arguments": {
+        "sysId": "incident-sys-id",
+        "state": "6",
+        "closeCode": "Solved (Permanently)",
+        "closeNotes": "Rolled back the firmware to 7.2.1."
+      }
+    }
+    ```
+
+    State codes for incidents: `1` New, `2` In Progress, `3` On Hold, `6` Resolved, `7` Closed, `8` Canceled.
+
+    ### transitionChange
+
+    Use `getChangeTransitions` first to discover which target states are legal for a given change, then call `transitionChange`:
+
+    ```json
+    {
+      "name": "transitionChange",
+      "arguments": {
+        "sysId": "change-sys-id",
+        "state": "-2"
+      }
+    }
+    ```
+
+    Common change states (model-dependent): `-5` New, `-4` Assess, `-3` Authorize, `-2` Scheduled, `-1` Implement, `0` Review, `3` Closed, `4` Canceled.
+
+    ### orderCatalogItem
+
+    ```json
+    {
+      "name": "orderCatalogItem",
+      "arguments": {
+        "sysId": "catalog-item-sys-id",
+        "quantity": 1,
+        "variables": {
+          "laptop_model": "macbook_pro_16",
+          "delivery_date": "2026-05-01"
+        }
+      }
+    }
+    ```
+
+    `variables` keys must match the catalog item's variable names. Use `getCatalogItem` first to discover the expected variable set.
+
+    ### getStats
+
+    ```json
+    {
+      "name": "getStats",
+      "arguments": {
+        "tableName": "incident",
+        "query": "active=true",
+        "count": true,
+        "groupBy": "priority,assignment_group"
+      }
+    }
+    ```
+
+    Combine `sumFields` / `avgFields` (comma-separated) with `groupBy` to produce aggregates for reporting.
+
+    ### uploadAttachment
+
+    ```json
+    {
+      "name": "uploadAttachment",
+      "arguments": {
+        "tableName": "incident",
+        "tableSysId": "incident-sys-id",
+        "fileName": "vpn-logs.txt",
+        "contentBase64": "VlBOIGxvZ3MgY29udGVudC4uLg==",
+        "contentType": "text/plain"
+      }
+    }
+    ```
+
+    Max attachment size is set by the instance (default 1 GB via `com.glide.attachment.max_size`, but most instances restrict it further).
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+| HTTP Status | Error | Solution |
+|-------------|-------|----------|
+| 401 | Unauthorized | Verify credentials; for OAuth2, check the `client_credentials` grant is enabled on the app registry |
+| 403 | Forbidden | The user/client lacks an ACL on the target table — grant `itil`, `change_manager`, `problem_manager`, or a table-specific role |
+| 404 | Not Found | Verify `sys_id` / `number` and that the record is not in a restricted domain |
+| 409 | Conflict | State transition is not allowed — call `getChangeTransitions` to get valid targets |
+| 429 | Rate Limited | The instance returned a `X-RateLimit-*` error — back off; ServiceNow also enforces per-user transaction quotas |
+
+### Common Issues
+
+**"Instance not configured"** — `instanceUrl` is missing from the app config. Paste the full URL with scheme (`https://acme.service-now.com`).
+
+**"Basic Auth requires username and password"** — `authType` is `basic` but one credential is empty. Either fill both or switch to `oauth2`.
+
+**"OAuth2 requires clientId and clientSecret"** — `authType` is `oauth2` but the client credentials are missing. Create an **Application Registry** in ServiceNow (`System OAuth > Application Registry`) with the `client_credentials` grant.
+
+**"Invalid API key" (MCP)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
+
+**Empty results with a seemingly valid query** — encoded queries are case-sensitive and ACL-filtered. Try `displayValue: all` and verify the effective roles of the account.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="ServiceNow Table API" icon="book" href="https://developer.servicenow.com/dev.do#!/reference/api/utah/rest/c_TableAPI">
+    Official Table API reference
+  </Card>
+  <Card title="Encoded Query Strings" icon="magnifying-glass" href="https://docs.servicenow.com/bundle/utah-platform-administration/page/use/using-lists/concept/c_EncodedQueryStrings.html">
+    Operators and syntax for `query`
+  </Card>
+  <Card title="OAuth Inbound Setup" icon="key" href="https://docs.servicenow.com/bundle/utah-platform-security/page/administer/security/task/t_CreateEndpointforExternalClients.html">
+    Create an OAuth Application Registry
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/create-agents/tool-agents/overview">
+    Plug MCP servers into AI Knowledge agents
+  </Card>
+</CardGroup>
