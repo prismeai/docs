@@ -67,38 +67,48 @@ gpt-4 → gpt-4-turbo
 
 Failover activates when the primary model returns errors, not for quota limits.
 
+**Failover behavior:**
+- **5xx errors**: switches to the failover model from the mapping, or falls back to the default completion model (with linear backoff 1s, 2s, 3s...)
+- **429 rate limits**: retries the same model after a 5s backoff
+- **Other 4xx errors**: returned immediately without retry
+- Up to 3 attempts (configurable, hard cap of 10)
+- Failover models are validated against governance access controls before use
+- Failover only applies to **non-streaming** requests
+
 ## Model Routing
 
-Advanced routing strategies automatically select the best model based on request characteristics.
+The LLM Gateway supports intelligent model routing — selecting the best model for a request based on configurable strategies. Use `model: "auto"` in API calls to trigger routing.
 
 ### Routing Strategies
 
 | Strategy | Description |
 |----------|-------------|
 | **Disabled** | No automatic routing; use specified model |
-| **Rules** | Route based on conditions (e.g., message count) |
-| **LLM Classifier** | Use an LLM to classify request complexity |
-| **Capabilities** | Match model capabilities to request needs |
-| **Cost Optimized** | Prefer cheaper models when appropriate |
-| **Hybrid** | Combine multiple strategies |
+| **Rules** | Rule-based routing — first matching rule wins |
+| **LLM Classifier** | Use a cheap LLM to classify the request and map category to model |
+| **Capabilities** | Query model catalog for enabled models matching required tags |
+| **Cost Optimized** | Same as capabilities but iterates cost tiers (`low` → `medium` → `high`) to pick cheapest match |
+| **Hybrid** | Try rules first, fall back to LLM classifier if no rule matches |
 
 ### Rule-Based Routing
 
 Define conditions to route requests to different models:
 
 ```yaml
-# Use fast model for short conversations
-- condition: messages_count
-  operator: "<"
-  threshold: 5
-  model: claude-3-haiku
-
-# Use powerful model for complex tasks
-- condition: messages_count
-  operator: ">="
-  threshold: 5
-  model: claude-3-sonnet
+routing:
+  strategy: rules
+  rules:
+    - condition: messages_count
+      operator: "<"
+      threshold: 5
+      model: claude-3-haiku
+    - condition: messages_count
+      operator: ">="
+      threshold: 5
+      model: claude-3-sonnet
 ```
+
+The only supported condition type is `messages_count` with operators `<`, `>`, `<=`, `>=`, `=`. If the selected model is blocked by governance, routing falls back to the default.
 
 ## Usage Monitoring
 
@@ -153,6 +163,58 @@ In the context of Model Governance:
 - Link service accounts to specific agents
 - Track which service accounts consume LLM resources
 - Control model access per service account
+
+## Model Access Control
+
+When a request arrives, the LLM Gateway validates the requested model against three sequential allowlists:
+
+1. **Org allowlist** — Is the model in the organization's allowed models? (if the list exists and has entries)
+2. **Agent allowlist** — Is the model in the agent's allowed models? (passed by agent-factory)
+3. **API key scopes** — Is the model allowed by the API key's scopes?
+
+Each check is skipped if the corresponding list is empty or absent. If any check fails, the behavior depends on the quota policy:
+- **Soft Downgrade**: silently swaps to the default completion model
+- **Hard Block** (default): returns a `403` error with `MODEL_NOT_ALLOWED`
+
+## Carbon Footprint Tracking
+
+Every LLM call includes an estimated environmental impact in the response:
+
+```json
+{
+  "usage": {
+    "carbon": {
+      "energy": { "value": 0.000012, "unit": "kWh" },
+      "gwp": { "value": 0.0000057, "unit": "kgCO2eq" }
+    }
+  }
+}
+```
+
+The calculation considers GPU energy per token, server overhead, datacenter PUE (Power Usage Effectiveness), and regional emission factors. Results include uncertainty margins (+/- 20%).
+
+| PUE Profile | Multiplier |
+|-------------|-----------|
+| Efficient | 1.1 |
+| Average (default) | 1.58 |
+| Inefficient | 2.0 |
+
+Carbon data is included in analytics events and powers the observability dashboards.
+
+## Supported Providers
+
+The LLM Gateway abstracts multiple providers behind a unified API:
+
+| Provider | Models | Notes |
+|----------|--------|-------|
+| OpenAI | GPT-5, GPT-4o, o3-mini, embeddings, DALL-E 3 | Direct API |
+| Azure OpenAI | GPT-5, GPT-4o, embeddings, Claude (via Azure AI) | Multiple resource configs |
+| OpenAI-compatible | Gemini, DeepSeek, Mistral, Cerebras, OVH, Linagora | Via `openailike` provider type |
+| Anthropic | Claude Sonnet 4.5, Claude 3.7 Sonnet, Claude 3.5 Sonnet | Native API |
+| Google Vertex AI | Gemini 2.5/3, Imagen 4.0, text-embedding-005 | Via model aliases + service account |
+| AWS Bedrock | Claude, Titan, Cohere, Nova, Llama | Multiple region/credential sets |
+
+All providers are normalized to the OpenAI API format for chat completions and streaming (SSE).
 
 ## Best Practices
 

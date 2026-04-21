@@ -64,6 +64,7 @@ Select a period to analyze:
 | **Input Tokens** | Tokens from user messages |
 | **Output Tokens** | Tokens in agent responses |
 | **Total Cost** | Estimated API cost |
+| **Carbon (kgCO2eq)** | Estimated carbon footprint |
 
 ## Trend Charts
 
@@ -127,6 +128,53 @@ Based on analytics, consider:
 | Slow responses | Consider faster model or simplify tools |
 | Low tool usage | Update instructions to use tools more |
 
+## How It Works
+
+### Pipeline Overview
+
+```
+ ES events                    agent_metrics (Mongo)              API response
+ ─────────                    ────────────────────              ────────────
+
+ agents.conversations.created ─┐                                ┌─ summary (cached)
+ analytics.agent.rated ────────┼─→ Bulk Aggregator ─→ hourly ───┤
+ analytics.llm.completion ─────┘      (cron)          daily     └─ series[]
+                                                      summary
+```
+
+Analytics flow through three stages:
+
+1. **Event emission** — As agents are used, Elasticsearch events are emitted by agent-factory and llm-gateway
+2. **Aggregation** — A scheduled job reads these events and writes pre-aggregated rows into the `agent_metrics` collection
+3. **Read** — The analytics endpoint reads from `agent_metrics`, self-heals if needed, and returns the result
+
+### Event Sources
+
+| Event | Emitted by | Contains |
+|-------|-----------|----------|
+| `agents.conversations.created` | agent-factory | User ID, conversation ID, agent ID |
+| `analytics.agent.rated` | agent-factory | Rating value (1–5) |
+| `analytics.llm.completion` | llm-gateway | Model, token counts, cost, duration, tool names, call type |
+
+### Caching
+
+Summary metrics are cached for 1 hour in the `agent_metrics` collection. With warm cache, response time drops from ~1.5s to ~100ms.
+
+### Self-Healing
+
+The analytics endpoint performs two checks:
+
+- **Current interval refresh**: The current in-progress hour or day is re-aggregated if stale (15-minute threshold for hourly, 1-hour for daily)
+- **Gap detection**: If fewer intervals exist than expected (e.g., cron missed a run), a full re-aggregation is triggered
+
+### Scheduled Jobs
+
+| Job | Schedule | Description |
+|-----|----------|-------------|
+| Aggregate metrics | `30 1 * * *` (daily at 01:30 UTC) | Aggregates daily metrics for all active agents |
+| Cleanup old metrics | `0 3 * * *` (daily) | Deletes metric rows older than 30 days |
+| Refresh agent counters | `*/15 * * * *` (every 15 min) | Updates per-agent conversation and message counters |
+
 ## Refreshing Data
 
 Analytics are cached for performance. To see the latest data:
@@ -137,6 +185,8 @@ Analytics are cached for performance. To see the latest data:
 <Note>
 Analytics may have a delay of up to 15 minutes for very recent activity.
 </Note>
+
+You can also force a re-aggregation via the API: `POST v1/agents/:agent_id/refresh-metrics` with an optional `hours_back` parameter (max 168 = 1 week).
 
 ## Exporting Data
 
