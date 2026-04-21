@@ -1,0 +1,133 @@
+---
+title: "Analytics"
+description: "How agent usage metrics are collected, aggregated, cached, and served"
+---
+
+Agent Factory provides per-agent analytics covering users, conversations, messages, LLM usage, cost, latency, quality ratings, model and tool breakdowns. This page explains how the pipeline works under the hood. For API reference (endpoints, parameters, response schemas), see [Agents API — Analytics](/products/agent-factory/agents-api#analytics).
+
+## Pipeline Overview
+
+```
+ ES events                    agent_metrics (Mongo)              API response
+ ─────────                    ────────────────────              ────────────
+
+ agents.conversations.created ─┐                                ┌─ summary (cached)
+ analytics.agent.rated ────────┼─→ Bulk Aggregator ─→ hourly ───┤
+ analytics.llm.completion ─────┘      (cron)          daily     └─ series[]
+                                                      summary
+```
+
+Analytics flow through three stages:
+
+1. **Event emission** — As agents are used, Elasticsearch events are emitted by agent-factory and llm-gateway
+2. **Aggregation** — A scheduled job reads these events and writes pre-aggregated rows into the `agent_metrics` collection
+3. **Read** — The analytics endpoint reads from `agent_metrics`, self-heals if needed, and returns the result
+
+## Event Sources
+
+Two Elasticsearch indices feed the pipeline:
+
+| Event | Emitted by | Contains |
+|-------|-----------|----------|
+| `agents.conversations.created` | agent-factory | User ID, conversation ID, agent ID |
+| `analytics.agent.rated` | agent-factory | Rating value (1–5) |
+| `analytics.llm.completion` | llm-gateway | Model, token counts, cost, duration, tool names, call type |
+
+The `analytics.llm.completion` event is the richest source — it carries token usage, cost, carbon footprint, latency, and which tools were called. Each LLM call within the agentic loop emits one event.
+
+## Aggregation
+
+### Granularity
+
+Metrics are aggregated at two granularities:
+
+| Granularity | Interval | Use case |
+|-------------|----------|----------|
+| `hourly` | 1 hour | Short-range views (1d, 7d) |
+| `daily` | 1 day (UTC) | Long-range views (30d, 90d) |
+
+Each aggregated row is stored in `agent_metrics` with a `period_type` (`hourly` or `daily`) and a `period_start` timestamp aligned to the interval boundary.
+
+### Bulk Aggregator
+
+The core automation (`_aggregate-agent-metrics-bulk`) runs two parallel Elasticsearch queries for a given agent and time window:
+
+1. **agent-factory events** — Aggregates unique users (cardinality), conversation count, and ratings (sum, distribution) using `date_histogram` bucketed by interval
+2. **llm-gateway events** — Aggregates LLM calls, user messages, tokens, cost, carbon, latency percentiles (p50/p95), errors, model breakdown, and tool breakdown per interval
+
+Results are joined by interval bucket and upserted into `agent_metrics`. Each row gets a deterministic ID: `{agent_id}_{period_type}_{iso_timestamp}`.
+
+### Completeness Tracking
+
+Each row has a `status` field:
+
+- **`complete`** — The interval has ended; metrics are final
+- **`incomplete`** — The interval is still in progress; values will increase on next aggregation
+
+This distinction lets the read endpoint know which data points may need refreshing.
+
+### Zero-Fill
+
+If an interval has no activity, the aggregator writes a zero-filled row (all counters at 0, status `complete`). This ensures the time series has no gaps — important for charts to render correctly.
+
+## Caching
+
+### Summary Cache
+
+Computing the summary requires scanning the full period (up to 90 days of events) with two Elasticsearch aggregation queries. To avoid this cost on every page load, the result is cached:
+
+- **Storage**: A row in `agent_metrics` with `period_type: summary` and ID `{agent_id}_summary_{period}`
+- **TTL**: 1 hour (based on `computed_at` timestamp)
+- **Hit**: If a fresh cache entry exists, the summary is returned directly — no ES queries
+- **Miss**: Summary is recomputed from ES and the cache row is upserted
+
+On a typical page load with warm cache, the endpoint only reads from Mongo (series + cached summary), bringing response time from ~1.5s down to ~100ms.
+
+### Invalidation
+
+The summary cache is invalidated (deleted) when:
+
+- The user triggers **Refresh Metrics** (`POST v1/agents/:agent_id/refresh-metrics`)
+- The global admin refresh is triggered (`POST v1/admin/refresh-agent-metrics`)
+
+After invalidation, the next analytics read recomputes the summary from ES.
+
+## Self-Healing
+
+The read endpoint does not blindly trust the pre-aggregated data. It performs two checks:
+
+### Current Interval Refresh
+
+The current (in-progress) hour or day may have new activity since last aggregation. If the cached row is older than **15 minutes** (or absent), the endpoint re-aggregates just that one interval before returning. This provides near-real-time data without constant re-computation.
+
+### Gap Detection
+
+The endpoint counts how many closed (completed) intervals exist in Mongo for the requested period. If fewer than expected — for example, if the hourly cron job missed a run — it triggers a full re-aggregation for the period and re-reads the data. This makes the system resilient to transient cron failures.
+
+## Scheduled Jobs
+
+| Job | Schedule | What it does |
+|-----|----------|-------------|
+| Aggregate metrics | `0 * * * *` (top of every hour) | Runs the bulk aggregator for the previous hour across all agents that had activity |
+| Cleanup old metrics | `0 3 * * *` (daily at 3 AM) | Deletes `agent_metrics` rows older than 30 days |
+| Refresh agent counters | `*/15 * * * *` (every 15 min) | Updates per-agent `conversations_count` and `messages_count` fields |
+
+## Data Model
+
+All analytics data lives in the `agent_metrics` collection:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Deterministic key (e.g., `{agent_id}_hourly_2026-04-21T08:00:00.000Z`) |
+| `agent_id` | string | Agent identifier |
+| `period_type` | string | `hourly`, `daily`, or `summary` |
+| `period_start` | datetime | Start of the interval (or start of the sliding window for summaries) |
+| `status` | string | `complete` or `incomplete` (null for summaries) |
+| `computed_at` | datetime | When this row was last computed |
+| `users` | object | `{ active, new, returning, churned }` |
+| `engagement` | object | `{ conversations, messages, llm_calls, llm_calls_per_message, avg_messages_per_conversation }` |
+| `quality` | object | `{ ratings_avg, ratings_count, ratings_sum, ratings_distribution, resolution_rate }` |
+| `performance` | object | `{ p50_ms, p95_ms, error_count, error_rate }` |
+| `cost` | object | `{ tokens_input, tokens_output, tokens_total, cost, carbon_kgco2 }` |
+| `models` | object | Per-model breakdown: `{ "model-name": { calls, tokens, cost } }` |
+| `tools` | object | Per-tool breakdown: `{ tool_calls, "tool-name": { calls } }` |
