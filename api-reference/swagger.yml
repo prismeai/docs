@@ -20,6 +20,7 @@ security:
   - BearerAuth: []
     WorkspaceApiKeyAuth: []
 
+
 components:
   securitySchemes:
     BearerAuth:
@@ -81,6 +82,32 @@ components:
               type: array
               items:
                 type: string
+            membership:
+              type: object
+              description: Organization membership info (only returned when includeOrgMembership is set)
+              properties:
+                roleSlug:
+                  type: string
+                status:
+                  type: string
+                  enum:
+                    - active
+                    - invited
+                    - suspended
+                joinedAt:
+                  type: string
+                joinedVia:
+                  type: string
+                  enum:
+                    - direct
+                    - invite-code
+                    - invite-email
+                    - auto-join
+                    - join-rule
+                invitedAt:
+                  type: string
+                invitedBy:
+                  type: string
 
         - $ref: '#/components/schemas/Object'
 
@@ -131,6 +158,10 @@ components:
               $ref: '#/components/schemas/SupportedMFA'
             meta:
               type: object
+            orgSlugs:
+              type: array
+              items:
+                type: string
             platformRole:
               type: string
             groupAcls:
@@ -141,6 +172,12 @@ components:
                 properties:
                   role:
                     type: string
+            createdAt:
+              type: string
+            updatedAt:
+              type: string
+            updatedBy:
+              type: string
         - $ref: '#/components/schemas/Contact'
 
     UserPatch:
@@ -424,7 +461,20 @@ components:
         - workspaces
         - automations
         - secrets
+        - secure_secrets
+        - workspace_keyrings
         - roles
+        - orgs
+        - orgs:members
+        - orgs:groups
+        - orgs:groups:members
+        - orgs:invites
+        - orgs:subscriptions
+        - orgs:roles
+        - orgs:apikeys
+        - orgs:sso
+        - orgs:service-accounts
+        - users
         - all
 
     SharableSubjectTypes:
@@ -490,6 +540,11 @@ components:
           type: object
           description: 'Matching conditions written using a subset of MongoDB queries. This rule will take effect only if conditions match (or are empty). See https://casl.js.org/v5/en/guide/conditions-in-depth'
           additionalProperties: true
+        fields:
+          type: array
+          items:
+            type: string
+          description: 'Field-level permissions. When specified, the rule only applies to these fields of the subject.'
         priority:
           type: number
 
@@ -513,6 +568,38 @@ components:
               type: string
               description: 'Source or dest repository id as described in workspace configuration'
 
+    WorkspaceGitRepositoryConfig:
+      type: object
+      required:
+        - url
+        - branch
+      properties:
+        url:
+          type: string
+        branch:
+          type: string
+        dirpath:
+          type: string
+          description: 'Sub-directory path within the repository where the workspace is stored'
+        auth:
+          type: object
+          properties:
+            user:
+              type: string
+            password:
+              type: string
+            sshkey:
+              type: string
+
+    WorkspaceFilesystemRepositoryConfig:
+      type: object # Filesystem config
+      required:
+        - dirpath
+      properties:
+        dirpath:
+          type: string
+          description: 'Absolute path to the directory containing workspace folders'
+
     WorkspaceRepository:
       type: object
       required:
@@ -527,6 +614,7 @@ components:
           enum:
             - 'git'
             - 'archive'
+            - 'filesystem'
         mode:
           type: string
           enum:
@@ -534,25 +622,14 @@ components:
             - 'read-only'
         config:
           anyOf:
-            - type: object
-              required:
-                - url
-                - branch
-              properties:
-                url:
-                  type: string
-                branch:
-                  type: string
-                auth:
-                  type: object
-                  properties:
-                    user:
-                      type: string
-                    password:
-                      type: string
-                    sshkey:
-                      type: string
+            - $ref: "#/components/schemas/WorkspaceGitRepositoryConfig"
+            - $ref: "#/components/schemas/WorkspaceFilesystemRepositoryConfig"
             - type: object # Empty config for archive
+        groups:
+          type: array
+          description: "Only for platform repositories fetched from the Platform workspaces ; indicates which groups can be pulled/pushed"
+          items:
+            type: string
         pull:
           type: object
           properties:
@@ -586,6 +663,20 @@ components:
           description: 'Custom configuration per event type'
           additionalProperties:
             $ref: '#/components/schemas/WorkspaceEventConfiguration'
+
+    WorkspaceWriteLock:
+      type: object
+      description: 'Lock preventing writes during versioning operations or unresolved merge conflicts'
+      additionalProperties: false
+      properties:
+        lockedAt:
+          type: string
+        lockedBy:
+          type: string
+          description: 'User ID who initiated the lock'
+        reason:
+          type: string
+          description: 'Reason for the lock (e.g., pull_in_progress, merge_conflict)'
 
     DSUL:
       type: object
@@ -627,6 +718,11 @@ components:
           description: 'Remote versioning repositories'
           additionalProperties:
             $ref: '#/components/schemas/WorkspaceRepository'
+        platformRepositories:
+          type: object
+          description: 'Platform remote versioning repositories'
+          additionalProperties:
+            $ref: '#/components/schemas/WorkspaceRepository'
         secrets:
           type: object
           additionalProperties: false
@@ -636,6 +732,8 @@ components:
                 $ref: '#/components/schemas/TypedArgument'
         events:
           $ref: '#/components/schemas/WorkspaceEventsConfiguration'
+        writeLock:
+          $ref: '#/components/schemas/WorkspaceWriteLock'
 
     RuntimeModel:
       allOf:
@@ -1169,6 +1267,10 @@ components:
         shareToken:
           type: string
           description: 'A share token to append as a ?token query parameter to grant read access with given url'
+        orgSlug:
+          type: string
+          nullable: true
+          description: 'Organization slug set at creation time'
 
     ###############################################################################################################################################
     ############################################################ Automation Instructions ############################################################
@@ -1616,7 +1718,6 @@ components:
               description: Will save the caught event inside this variable
               example: nameOfResultVariable
 
-
     Run:
       type: object
       required:
@@ -1763,6 +1864,135 @@ components:
             $ref: '#/components/schemas/Role'
           policies:
             $ref: '#/components/schemas/Policies'
+
+    AuthProviderType:
+      type: string
+      enum:
+        - oidc
+        - saml
+
+    AuthProviderOidcConfig:
+      type: object
+      required:
+        - client_id
+        - authorization_endpoint
+        - token_endpoint
+        - jwks_uri
+      properties:
+        client_id:
+          type: string
+        client_secret:
+          type: string
+        authorization_endpoint:
+          type: string
+        token_endpoint:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        state:
+          type: boolean
+        jwks_uri:
+          type: string
+        pkce:
+          type: boolean
+
+    AuthProviderSamlConfig:
+      type: object
+      properties:
+        idp_metadata_filepath:
+          type: string
+          description: "Absolute path to the SAML XML config file in the container"
+        idp_metadata_xml:
+          type: string
+          description: "Raw SAML XML config"
+        issuer:
+          type: string
+          description: "Required"
+        audience:
+          type: string
+          description: "Required, should match issuer"
+        skipRequestCompression:
+          type: boolean
+        wantAuthnResponseSigned:
+          type: boolean
+        identifierFormat:
+          type: string
+          description: "Required if neither idp_metadata_xml or idp_metadata_filepath are configured"
+        identityProviderUrl:
+          type: string
+          description: "Required if neither idp_metadata_xml or idp_metadata_filepath are configured"
+        entryPoint:
+          type: string
+          description: "Required if neither idp_metadata_xml or idp_metadata_filepath are configured"
+        logoutUrl:
+          type: string
+        idpCert:
+          type: string
+          description: "Required if neither idp_metadata_xml or idp_metadata_filepath are configured"
+
+    AuthProvider:
+      type: object
+      required:
+        - slug
+        - type
+        - config
+      properties:
+        id:
+          type: string
+        slug:
+          type: string
+          description: Unique provider identifier (e.g. "google", "okta-saml")
+        name:
+          type: string
+          description: Display name for the provider (e.g. "Google", "Corporate SSO")
+        icon:
+          type: string
+          description: Icon URL or identifier for the provider
+        type:
+          $ref: "#/components/schemas/AuthProviderType"
+          description: Authentication protocol type
+        config:
+          type: object
+          additionalProperties: true
+          description: Provider-specific configuration (OIDC or SAML settings)
+          anyOf:
+            - $ref: "#/components/schemas/AuthProviderOidcConfig"
+            - $ref: "#/components/schemas/AuthProviderSamlConfig"
+        attributesMapping:
+          type: object
+          additionalProperties:
+            type: string
+          properties:
+            firstName:
+              type: string
+            lastName:
+              type: string
+            email:
+              type: string
+          description: Maps provider claims to user fields (e.g. firstName, email)
+        source:
+          type: string
+          enum:
+            - file
+            - database
+          description: Where this provider is configured (read-only, returned by GET)
+        enabled:
+          type: boolean
+          description: Whether this provider is active (default true). Disabled providers are not registered as passport strategies.
+        meta:
+          type: object
+          additionalProperties: true
+          description: Free-form metadata JSON
+        domains:
+          type: array
+          items:
+            type: string
+          description: Associated domain names
+        orgSlug:
+          type: string
+          description: Associated organization slug
 
     AccessToken:
       type: object
@@ -1948,9 +2178,6 @@ components:
           example: apps.someApp.someCustomEvent
         source:
           type: object
-          required:
-            - correlationId
-            - host
           properties:
             appSlug:
               type: string
@@ -2147,9 +2374,7 @@ components:
               type: string
             message:
               type: string
-            details:
-              type: object
-              additionalProperties: true
+            details: {}
           additionalProperties: true
 
     ########################## API Keys #############################
@@ -2421,27 +2646,27 @@ components:
               type: object
               oneOf:
                 - required:
-                  - ids
+                    - ids
                 - required:
-                  - emails
+                    - emails
               properties:
-                  ids:
-                    type: array
-                    items:
-                      type: string
-                  emails:
-                    type: array
-                    items:
-                      type: string
-            behaviour:
-                type: object
-                properties:
-                  groups:
+                ids:
+                  type: array
+                  items:
                     type: string
-                    enum:
-                      - replace
-                      - add
-                      - delete
+                emails:
+                  type: array
+                  items:
+                    type: string
+            behaviour:
+              type: object
+              properties:
+                groups:
+                  type: string
+                  enum:
+                    - replace
+                    - add
+                    - delete
             data:
               type: object
               description: The data object that was applied to the users
@@ -2487,6 +2712,891 @@ components:
               type: array
               items:
                 type: string
+
+    UpdatedSsoProviders:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: gateway.sso.updated
+          enum:
+            - gateway.sso.updated
+        payload:
+          type: object
+          required:
+            - type
+            - slug
+            - orgSlug
+            - authProvider
+          properties:
+            type:
+              type: string
+            slug:
+              type: string
+            orgSlug:
+              type: string
+            authProvider:
+              $ref: "#/components/schemas/AuthProvider"
+
+    ########################## Organizations events ##########################
+
+    OrgCreated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.created
+          enum:
+            - organizations.created
+        payload:
+          type: object
+          required:
+            - slug
+            - createdBy
+          properties:
+            slug:
+              type: string
+            createdBy:
+              type: string
+
+    OrgUpdated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.updated
+          enum:
+            - organizations.updated
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - updatedBy
+          properties:
+            slug:
+              type: string
+            orgSlug:
+              type: string
+            updatedBy:
+              type: string
+
+    OrgDeleted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.deleted
+          enum:
+            - organizations.deleted
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - deletedBy
+          properties:
+            slug:
+              type: string
+            orgSlug:
+              type: string
+            deletedBy:
+              type: string
+
+    OrgMembersAdded:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.members.added
+          enum:
+            - organizations.members.added
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - userIds
+          properties:
+            orgSlug:
+              type: string
+            userIds:
+              type: array
+              items:
+                type: string
+            joinedVia:
+              type: string
+              description: How the user joined (e.g. "direct", "join-rule", "invite-code")
+
+    OrgMemberUpdated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.members.updated
+          enum:
+            - organizations.members.updated
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - userId
+          properties:
+            orgSlug:
+              type: string
+            userId:
+              type: string
+
+    OrgMembersRemoved:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.members.removed
+          enum:
+            - organizations.members.removed
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - userIds
+          properties:
+            orgSlug:
+              type: string
+            userIds:
+              type: array
+              items:
+                type: string
+
+    OrgRoleCreated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.roles.created
+          enum:
+            - organizations.roles.created
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - slug
+          properties:
+            orgSlug:
+              type: string
+            slug:
+              type: string
+
+    OrgRoleUpdated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.roles.updated
+          enum:
+            - organizations.roles.updated
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - slug
+          properties:
+            orgSlug:
+              type: string
+            slug:
+              type: string
+
+    OrgRoleDeleted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.roles.deleted
+          enum:
+            - organizations.roles.deleted
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - slug
+          properties:
+            orgSlug:
+              type: string
+            slug:
+              type: string
+
+    OrgGroupCreated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.groups.created
+          enum:
+            - organizations.groups.created
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - slug
+          properties:
+            orgSlug:
+              type: string
+            slug:
+              type: string
+
+    OrgGroupUpdated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.groups.updated
+          enum:
+            - organizations.groups.updated
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - slug
+          properties:
+            orgSlug:
+              type: string
+            slug:
+              type: string
+
+    OrgGroupDeleted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.groups.deleted
+          enum:
+            - organizations.groups.deleted
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - slug
+          properties:
+            orgSlug:
+              type: string
+            slug:
+              type: string
+
+    OrgGroupMembersAdded:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.groups.members.added
+          enum:
+            - organizations.groups.members.added
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - groupSlug
+            - userIds
+          properties:
+            orgSlug:
+              type: string
+            groupSlug:
+              type: string
+            userIds:
+              type: array
+              items:
+                type: string
+            joinedVia:
+              type: string
+              description: How the user joined (e.g. "direct", "join-rule", "invite-code")
+
+    OrgGroupMembersRemoved:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.groups.members.removed
+          enum:
+            - organizations.groups.members.removed
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - groupSlug
+            - userIds
+          properties:
+            orgSlug:
+              type: string
+            groupSlug:
+              type: string
+            userIds:
+              type: array
+              items:
+                type: string
+
+    OrgInviteCreated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.invites.created
+          enum:
+            - organizations.invites.created
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - code
+          properties:
+            orgSlug:
+              type: string
+            code:
+              type: string
+
+    OrgInviteRevoked:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.invites.revoked
+          enum:
+            - organizations.invites.revoked
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - code
+          properties:
+            orgSlug:
+              type: string
+            code:
+              type: string
+
+    OrgSubscription:
+      type: object
+      required:
+        - slug
+        - name
+        - tier
+        - status
+      properties:
+        id:
+          type: string
+        slug:
+          type: string
+        name:
+          type: string
+        tier:
+          type: string
+        plan:
+          type: string
+        status:
+          type: string
+          enum:
+            - active
+            - inactive
+            - trialing
+            - past_due
+            - canceled
+        isDefault:
+          type: boolean
+        limits:
+          type: object
+          additionalProperties: true
+        features:
+          type: object
+          additionalProperties: true
+        billing:
+          type: object
+          additionalProperties: true
+        startedAt:
+          type: string
+        expiresAt:
+          type: string
+        createdBy:
+          type: string
+        updatedBy:
+          type: string
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+
+    UserOrgDetails:
+      type: object
+      properties:
+        org:
+          type: object
+          nullable: true
+          properties:
+            slug:
+              type: string
+            name:
+              type: string
+            status:
+              type: string
+            branding:
+              type: object
+              additionalProperties: true
+            navigation:
+              $ref: '#/components/schemas/Navigation'
+            role:
+              type: object
+              properties:
+                slug:
+                  type: string
+                name:
+                  type: string
+                permissions:
+                  type: array
+                  items:
+                    type: string
+                scopes:
+                  type: array
+                  items:
+                    type: string
+            groups:
+              type: array
+              items:
+                type: string
+            settings:
+              type: object
+              additionalProperties: true
+            subscription:
+              $ref: '#/components/schemas/OrgSubscription'
+        permissions:
+          type: array
+          items:
+            type: string
+        organizations:
+          type: array
+          items:
+            type: object
+            properties:
+              slug:
+                type: string
+              name:
+                type: string
+              roleSlug:
+                type: string
+              groups:
+                type: array
+                items:
+                  type: string
+
+    OrgSubscriptionCreated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.subscriptions.created
+          enum:
+            - organizations.subscriptions.created
+        payload:
+          type: object
+          required:
+            - subscriptionSlug
+          properties:
+            subscriptionSlug:
+              type: string
+
+    OrgSubscriptionUpdated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.subscriptions.updated
+          enum:
+            - organizations.subscriptions.updated
+        payload:
+          type: object
+          required:
+            - subscriptionSlug
+          properties:
+            subscriptionSlug:
+              type: string
+
+    OrgSubscriptionDeleted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.subscriptions.deleted
+          enum:
+            - organizations.subscriptions.deleted
+        payload:
+          type: object
+          required:
+            - subscriptionSlug
+          properties:
+            subscriptionSlug:
+              type: string
+
+    OrgApiKeyCreated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.apikeys.created
+          enum:
+            - organizations.apikeys.created
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - keyId
+          properties:
+            orgSlug:
+              type: string
+            keyId:
+              type: string
+
+    OrgApiKeyUpdated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.apikeys.updated
+          enum:
+            - organizations.apikeys.updated
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - keyId
+          properties:
+            orgSlug:
+              type: string
+            keyId:
+              type: string
+
+    OrgApiKeyDeleted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.apikeys.deleted
+          enum:
+            - organizations.apikeys.deleted
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - keyId
+          properties:
+            orgSlug:
+              type: string
+            keyId:
+              type: string
+
+    OrgApiKeyRotated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.apikeys.rotated
+          enum:
+            - organizations.apikeys.rotated
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - keyId
+          properties:
+            orgSlug:
+              type: string
+            keyId:
+              type: string
+
+    OrgServiceAccountCreated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.serviceAccounts.created
+          enum:
+            - organizations.serviceAccounts.created
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - saSlug
+          properties:
+            orgSlug:
+              type: string
+            saSlug:
+              type: string
+
+    OrgServiceAccountUpdated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.serviceAccounts.updated
+          enum:
+            - organizations.serviceAccounts.updated
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - saSlug
+          properties:
+            orgSlug:
+              type: string
+            saSlug:
+              type: string
+
+    OrgServiceAccountDeleted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.serviceAccounts.deleted
+          enum:
+            - organizations.serviceAccounts.deleted
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - saSlug
+          properties:
+            orgSlug:
+              type: string
+            saSlug:
+              type: string
+
+    OrgServiceAccountRotated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.serviceAccounts.rotated
+          enum:
+            - organizations.serviceAccounts.rotated
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - saSlug
+          properties:
+            orgSlug:
+              type: string
+            saSlug:
+              type: string
+
+    OrgServiceAccountTokenIssued:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.serviceAccounts.tokenIssued
+          enum:
+            - organizations.serviceAccounts.tokenIssued
+        payload:
+          type: object
+          required:
+            - orgSlug
+            - saSlug
+          properties:
+            orgSlug:
+              type: string
+            saSlug:
+              type: string
+
+    BindingCreated:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: access-manager.bindings.created
+          enum:
+            - access-manager.bindings.created
+        payload:
+          type: object
+          required:
+            - workspaceId
+            - resourceType
+            - resourceId
+            - principalType
+            - principalId
+            - orgSlug
+            - grantedBy
+          properties:
+            workspaceId:
+              type: string
+            workspaceSlug:
+              type: string
+            resourceType:
+              type: string
+            resourceId:
+              type: string
+            principalType:
+              type: string
+            principalId:
+              type: string
+            orgSlug:
+              type: string
+            grantedBy:
+              type: string
+
+    BindingDeleted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: access-manager.bindings.deleted
+          enum:
+            - access-manager.bindings.deleted
+        payload:
+          type: object
+          required:
+            - workspaceId
+          properties:
+            workspaceId:
+              type: string
+            workspaceSlug:
+              type: string
+            query:
+              type: object
+            deletedCount:
+              type: number
+
+    OrgAudit:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: organizations.audit
+          enum:
+            - organizations.audit
+        payload:
+          type: object
+          required:
+            - category
+            - action
+            - orgSlug
+          properties:
+            category:
+              type: string
+              description: "Entity category: org, member, role, group, apikey, invite, subscription"
+            action:
+              type: string
+              description: "Action performed: created, updated, deleted, revoked, rotated, joined, members_added, member_removed"
+            orgSlug:
+              type: string
+            target:
+              type: object
+              properties:
+                type:
+                  type: string
+                id:
+                  type: string
+                name:
+                  type: string
+                email:
+                  type: string
+            changes:
+              type: object
+              properties:
+                before:
+                  type: object
+                after:
+                  type: object
+            metadata:
+              type: object
+
     ########################## Events API events ##########################
 
     EventWorkspaceSubscriber:
@@ -2716,6 +3826,11 @@ components:
           properties:
             workspace:
               $ref: '#/components/schemas/Workspace'
+            reason:
+              type: object
+              properties:
+                type:
+                  type: string
 
     DeletedWorkspace:
       type: object
@@ -2762,6 +3877,11 @@ components:
               type: string
             migrated:
               type: string
+            reason:
+              type: object
+              properties:
+                type:
+                  type: string
 
     ImportedWorkspace:
       type: object
@@ -2797,6 +3917,19 @@ components:
               items:
                 type: object
                 additionalProperties: true
+            endEvents:
+              type: array
+              items:
+                type: object
+                properties:
+                  type:
+                    type: string
+                  source:
+                    type: object
+                  payload:
+                    type: object
+            publishedAppSlug:
+              type: string
 
     ConfiguredWorkspace:
       type: object
@@ -2817,6 +3950,11 @@ components:
             config:
               $ref: '#/components/schemas/Config'
             oldConfig: {}
+            reason:
+              type: object
+              properties:
+                type:
+                  type: string
 
     UpdatedWorkspaceSecurity:
       type: object
@@ -2883,6 +4021,40 @@ components:
             events:
               $ref: '#/components/schemas/WorkspaceEventsConfiguration'
 
+    WorkspaceVersionChanges:
+      type: object
+      properties:
+        files:
+          type: array
+          items:
+            type: string
+        created:
+          type: array
+          items:
+            type: string
+        deleted:
+          type: array
+          items:
+            type: string
+        insertions:
+          type: object
+          additionalProperties:
+            type: number
+        deletions:
+          type: object
+          additionalProperties:
+            type: number
+        summary:
+          type: object
+          properties:
+            changes:
+              type: number
+            deletions:
+              type: number
+            insertions:
+              type: number
+
+
     PublishedWorkspaceVersion:
       type: object
       required:
@@ -2901,6 +4073,8 @@ components:
           properties:
             version:
               $ref: '#/components/schemas/WorkspaceVersion'
+            changes:
+              $ref: '#/components/schemas/WorkspaceVersionChanges'
 
     DeletedWorkspaceVersion:
       type: object
@@ -2920,6 +4094,411 @@ components:
           properties:
             version:
               $ref: '#/components/schemas/WorkspaceVersion'
+
+    WorkspaceVersionProgress:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: workspaces.versions.progress
+          enum:
+            - workspaces.versions.progress
+        payload:
+          type: object
+          required:
+            - operation
+            - step
+            - message
+            - startedAt
+          properties:
+            operation:
+              type: string
+              description: The type of versioning operation (pull or push)
+              enum:
+                - pull
+                - push
+            step:
+              type: string
+              description: The current step of the operation
+              enum:
+                - 'checkout'
+                - 'pull'
+                - 'pull:import'
+                - 'pull:import:done'
+                - 'pull:merge'
+                - 'write'
+                - 'push'
+                - 'pull:done'
+                - 'push:merge'
+                - 'push:tag'
+                - 'push:done'
+                - 'error'
+            message:
+              type: string
+              description: Human-readable description of the current step
+            startedAt:
+              type: string
+              description: ISO timestamp of when the operation started
+            repositoryId:
+              type: string
+            branch:
+              type: string
+            stepDuration:
+              type: number
+              description: Duration of the current step in milliseconds
+
+    BulkImportStarted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: workspaces.bulkImport.started
+          enum:
+            - workspaces.bulkImport.started
+        payload:
+          type: object
+          required:
+            - repositoryId
+          properties:
+            repositoryId:
+              type: string
+            groups:
+              type: array
+              items:
+                type: string
+            workspaces:
+              type: array
+              items:
+                type: object
+                properties:
+                  slug:
+                    type: string
+
+    BulkImportCompleted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: workspaces.bulkImport.completed
+          enum:
+            - workspaces.bulkImport.completed
+        payload:
+          type: object
+          required:
+            - repositoryId
+          properties:
+            repositoryId:
+              type: string
+            groups:
+              type: array
+              items:
+                type: string
+            duration:
+              type: number
+            errors:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+                properties:
+                  error:
+                    type: string
+                  message:
+                    type: string
+                  details:
+                    type: object
+            createdWorkspaceIds:
+              type: array
+              items:
+                type: string
+            updatedWorkspaceIds:
+              type: array
+              items:
+                type: string
+            skippedWorkspaceIds:
+              type: array
+              items:
+                type: string
+            importedFilesCount:
+              type: number
+              description: Total number of files imported across all workspaces
+            deletedFilesCount:
+              type: number
+              description: Total number of files deleted across all workspaces
+            workspaces:
+              type: array
+              items:
+                type: object
+                properties:
+                  slug:
+                    type: string
+                  workspaceId:
+                    type: string
+                  name:
+                    type: string
+                  version:
+                    type: string
+                  status:
+                    type: string
+                  reason:
+                    type: string
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  importedFilesCount:
+                    type: number
+                  deletedFilesCount:
+                    type: number
+                  duration:
+                    type: number
+                  app:
+                    type: object
+                    properties:
+                      slug:
+                        type: string
+                      name:
+                        type: string
+                      description:
+                        $ref: '#/components/schemas/LocalizedText'
+
+    BulkImportProgress:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: workspaces.bulkImport.progress
+          enum:
+            - workspaces.bulkImport.progress
+        payload:
+          type: object
+          required:
+            - repositoryId
+            - workspaceSlug
+            - status
+            - current
+            - total
+            - percentage
+          properties:
+            repositoryId:
+              type: string
+            workspaceSlug:
+              type: string
+            workspaceId:
+              type: string
+            workspaceName:
+              type: string
+            status:
+              type: string
+              enum:
+                - imported
+                - skipped
+                - error
+            duration:
+              type: number
+            errors:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+            importedFilesCount:
+              type: number
+              description: Number of files imported for this workspace
+            deletedFilesCount:
+              type: number
+              description: Number of files deleted for this workspace
+            current:
+              type: number
+              description: Current workspace number (1-indexed)
+            total:
+              type: number
+              description: Total number of workspaces
+            percentage:
+              type: number
+              description: Progress percentage (0-100)
+
+    BulkPushStarted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: workspaces.bulkPush.started
+          enum:
+            - workspaces.bulkPush.started
+        payload:
+          type: object
+          required:
+            - repositoryId
+            - groups
+          properties:
+            repositoryId:
+              type: string
+            groups:
+              type: array
+              items:
+                type: string
+            workspaces:
+              type: array
+              items:
+                type: object
+                properties:
+                  slug:
+                    type: string
+                  workspaceId:
+                    type: string
+                  name:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - candidate
+                      - mergeConflict
+                      - inProgress
+                      - alreadyPushed
+
+    BulkPushCompleted:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: workspaces.bulkPush.completed
+          enum:
+            - workspaces.bulkPush.completed
+        payload:
+          type: object
+          required:
+            - repositoryId
+            - groups
+          properties:
+            repositoryId:
+              type: string
+            groups:
+              type: array
+              items:
+                type: string
+            duration:
+              type: number
+            errors:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+                properties:
+                  error:
+                    type: string
+                  message:
+                    type: string
+                  details:
+                    type: object
+            pushedWorkspaceIds:
+              type: array
+              items:
+                type: string
+            mergeConflictWorkspaceIds:
+              type: array
+              items:
+                type: string
+            alreadyPushedWorkspaceIds:
+              type: array
+              items:
+                type: string
+            workspaces:
+              type: array
+              items:
+                type: object
+                properties:
+                  slug:
+                    type: string
+                  workspaceId:
+                    type: string
+                  name:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - pushed
+                      - error
+                      - mergeConflict
+                      - alreadyPushed
+                  reason:
+                    type: string
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  duration:
+                    type: number
+
+    BulkPushProgress:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: workspaces.bulkPush.progress
+          enum:
+            - workspaces.bulkPush.progress
+        payload:
+          type: object
+          required:
+            - repositoryId
+            - workspaceSlug
+            - status
+            - current
+            - total
+            - percentage
+          properties:
+            repositoryId:
+              type: string
+            workspaceSlug:
+              type: string
+            workspaceId:
+              type: string
+            workspaceName:
+              type: string
+            status:
+              type: string
+              enum:
+                - pushed
+                - error
+            duration:
+              type: number
+            errors:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+            current:
+              type: number
+              description: Current workspace number (1-indexed)
+            total:
+              type: number
+              description: Total number of candidate workspaces
+            percentage:
+              type: number
+              description: Progress percentage (0-100)
 
     DuplicatedWorkspace:
       type: object
@@ -3014,6 +4593,11 @@ components:
           properties:
             slug:
               type: string
+            reason:
+              type: object
+              properties:
+                type:
+                  type: string
 
     InstalledAppInstance:
       type: object
@@ -3038,6 +4622,11 @@ components:
               type: string
             events:
               $ref: '#/components/schemas/ProcessedEvents'
+            reason:
+              type: object
+              properties:
+                type:
+                  type: string
 
     ConfiguredAppInstance:
       type: object
@@ -3071,6 +4660,11 @@ components:
               description: Filled with the previous appInstance slug when renamed
             events:
               $ref: '#/components/schemas/ProcessedEvents'
+            reason:
+              type: object
+              properties:
+                type:
+                  type: string
 
     CreatedAutomation:
       type: object
@@ -3743,6 +5337,43 @@ components:
         payload:
           $ref: '#/components/schemas/AnyValue'
 
+
+    ServiceReadinessResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        errors:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/GenericError"
+              - type: object
+                properties:
+                  module:
+                    type: string
+                  driver:
+                    type: string
+        modulesReady:
+          type: array
+          items:
+            type: object
+            properties:
+              module:
+                type: string
+              driver:
+                type: string
+
+    ServiceReadiness:
+      type: object
+      properties:
+        status:
+          type: string
+        url:
+          type: string
+        response:
+          $ref: "#/components/schemas/ServiceReadinessResponse"
+
     GenericError:
       type: object
       properties:
@@ -3793,9 +5424,607 @@ components:
           type: string
           example: Forbidden
 
+    Organization:
+      type: object
+      required:
+        - name
+        - slug
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+        photo:
+          type: string
+        status:
+          type: string
+          enum:
+            - active
+            - suspended
+        domains:
+          type: array
+          items:
+            type: string
+        branding:
+          type: object
+          additionalProperties: true
+          properties:
+            version:
+              type: string
+            platformName:
+              type: string
+            description:
+              type: string
+            logo:
+              type: object
+              properties:
+                light:
+                  type: string
+                dark:
+                  type: string
+            favicon:
+              type: string
+            colors:
+              type: object
+              properties:
+                primary:
+                  type: string
+                secondary:
+                  type: string
+                accent:
+                  type: string
+            fonts:
+              type: object
+              properties:
+                heading:
+                  type: string
+                body:
+                  type: string
+            customCssUrl:
+              type: string
+            customCssInline:
+              type: string
+        navigation:
+          $ref: '#/components/schemas/Navigation'
+        joinRules:
+          type: array
+          description: >-
+            Auto-join rules. Each item is an OR case with AND-chained conditions in rules[].
+            Example: [{ rules: [{ field: "email", operator: "endsWith", value: "@acme.com" }], role: "member", groups: ["engineering"] }]
+          items:
+            type: object
+            required:
+              - rules
+            properties:
+              rules:
+                type: array
+                description: Conditions that must ALL match (AND logic)
+                items:
+                  type: object
+                  required:
+                    - field
+                    - operator
+                    - value
+                  properties:
+                    field:
+                      type: string
+                      description: >-
+                        User attribute to match, supports dot notation for nested fields
+                        (e.g. "email", "authData.google.hd")
+                    operator:
+                      type: string
+                      enum:
+                        - equals
+                        - startsWith
+                        - endsWith
+                      description: Match operator
+                    value:
+                      type: string
+                      description: Value to match against (case-insensitive)
+              role:
+                type: string
+                description: Role slug to assign (defaults to org's defaultRole)
+              groups:
+                type: array
+                description: Group slugs to add the user to
+                items:
+                  type: string
+        defaultRole:
+          type: string
+        settings:
+          type: object
+          additionalProperties: true
+        subscriptionSlug:
+          type: string
+        createdBy:
+          type: string
+        updatedBy:
+          type: string
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+
+    NavigationFeature:
+      type: object
+      description: Feature attached to a navigation item (agent or template)
+      required:
+        - type
+        - slug
+        - label
+      properties:
+        type:
+          type: string
+          enum:
+            - agent
+            - template
+        slug:
+          type: string
+          description: Unique identifier for this feature within the menu item
+        label:
+          type: string
+          description: Display label for the feature
+        agentId:
+          type: string
+          description: Agent ID (required when type=agent)
+        templateId:
+          type: string
+          description: Template ID (required when type=template)
+        permissions:
+          type: array
+          description: Permissions required to see this feature
+          items:
+            type: string
+
+    NavigationItem:
+      type: object
+      description: Menu item in the navigation structure
+      required:
+        - id
+        - type
+      properties:
+        id:
+          type: string
+          description: Unique identifier for this menu item
+        type:
+          type: string
+          enum:
+            - category
+            - item
+            - divider
+        label:
+          type: string
+          description: Display label (not required for dividers)
+        icon:
+          type: string
+          description: Icon name (from lucide-react)
+        color:
+          type: string
+          description: Icon color (CSS color value)
+        href:
+          type: string
+          description: Link destination (for type=item)
+        target:
+          type: string
+          enum:
+            - _self
+            - _blank
+          description: Link target
+        expanded:
+          type: boolean
+          description: Whether category is expanded by default
+        badge:
+          type: string
+          description: Badge text to show (e.g., "New", "Beta")
+        permissions:
+          type: array
+          description: Permissions required to see this item
+          items:
+            type: string
+        features:
+          type: array
+          description: Features attached to this item
+          items:
+            $ref: '#/components/schemas/NavigationFeature'
+        visibility:
+          type: object
+          description: Visibility rules for subscription tiers/features
+          properties:
+            tiers:
+              type: array
+              items:
+                type: string
+            features:
+              type: array
+              items:
+                type: string
+        items:
+          type: array
+          description: Child items (for type=category)
+          items:
+            $ref: '#/components/schemas/NavigationItem'
+
+    Navigation:
+      type: object
+      description: Organization navigation configuration
+      properties:
+        version:
+          type: integer
+          description: Schema version number
+        homePage:
+          type: string
+          description: >-
+            Route to use as home page (e.g., "/apps/agent-factory").
+            Must be a valid relative path starting with /.
+            If not set, defaults to the platform default (SecureChat).
+          pattern: '^\/[a-zA-Z0-9\-_\/]*$'
+        menu:
+          type: array
+          description: Main menu items
+          items:
+            $ref: '#/components/schemas/NavigationItem'
+        footer:
+          type: array
+          description: Footer menu items
+          items:
+            $ref: '#/components/schemas/NavigationItem'
+        quickActions:
+          type: array
+          description: Quick action buttons
+          items:
+            $ref: '#/components/schemas/NavigationItem'
+
+    OrgMembership:
+      type: object
+      required:
+        - orgSlug
+        - userId
+        - status
+      properties:
+        id:
+          type: string
+        orgSlug:
+          type: string
+        userId:
+          type: string
+        roleSlug:
+          type: string
+        status:
+          type: string
+          enum:
+            - active
+            - invited
+            - suspended
+        invitedBy:
+          type: string
+        invitedAt:
+          type: string
+        inviteEmail:
+          type: string
+        inviteToken:
+          type: string
+        joinedAt:
+          type: string
+        joinedVia:
+          type: string
+          enum:
+            - direct
+            - invite-code
+            - invite-email
+            - auto-join
+            - join-rule
+        groups:
+          type: array
+          description: >-
+            Org group slugs the user belongs to. Only populated on
+            listOrgMembers when includeGroups=true.
+          items:
+            type: string
+        createdBy:
+          type: string
+        updatedBy:
+          type: string
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+
+    OrgRole:
+      type: object
+      required:
+        - name
+        - slug
+      properties:
+        id:
+          type: string
+        orgSlug:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+        permissions: &ORG_PERMISSIONS
+          type: array
+          description: >-
+            Array of permission strings. Convention: {product}:{resource}:{action}
+
+            Wildcards: Use * at end only (e.g., orgs:* matches orgs:members:manage)
+
+            Platform permissions: - orgs:* (full org access) - orgs:members:manage,
+            orgs:roles:manage, orgs:manage - orgs:branding:manage,
+            orgs:navigation:manage - orgs:subscriptions:view, orgs:subscriptions:manage
+            - orgs:apikeys:manage, orgs:invites:manage, orgs:join-rules:manage -
+            secure-chat:*, store:*, knowledge:*, builder:* - agent-builder:*,
+            analytics:view, platform-admin:*
+
+            Custom app permissions: {app-slug}:{resource}:{action} Example:
+            my-crm:contacts:read, my-crm:deals:manage
+
+            Super admin: ["*"] (matches everything)
+          items:
+            type: string
+        scopes:
+          type: array
+          description: >-
+            Resource scopes granted by this role. Wildcards: ["*"] grants access
+            to all resources.
+          items:
+            type: string
+        createdBy:
+          type: string
+        updatedBy:
+          type: string
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+        isSystem:
+          type: boolean
+
+    OrgApiKey:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Internal role ID
+        slug:
+          type: string
+          description: Unique slug identifying the API key within the org
+        name:
+          type: string
+        permissions: *ORG_PERMISSIONS
+        scopes:
+          type: array
+          description: >-
+            Optional string array of resource patterns restricting where permissions
+            apply. Format: resourceType:resourceId. Examples: agents:agent-abc-123,
+            models:gpt-4o, orgs:acme, agents:*, models:*, *
+          items:
+            type: string
+        expiresAt:
+          type: string
+          format: date-time
+        disabled:
+          type: boolean
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+
+    OrgApiKeyWithSecret:
+      type: object
+      description: Returned on create/rotate — raw key shown only once
+      properties:
+        id:
+          type: string
+          description: Internal role ID
+        slug:
+          type: string
+          description: Unique slug identifying the API key within the org
+        apiKey:
+          type: string
+          description: The raw API key (iak_{orgSlug}_{uuid}). Shown only once.
+        name:
+          type: string
+        permissions: *ORG_PERMISSIONS
+        expiresAt:
+          type: string
+          format: date-time
+
+    OrgServiceAccount:
+      type: object
+      properties:
+        id:
+          type: string
+        userId:
+          type: string
+          description: Synthetic user ID used in JWT sub (sa:{orgSlug}:{slug})
+        orgSlug:
+          type: string
+        slug:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        roleSlug:
+          type: string
+          description: Organization role assigned to this service account
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Optional scope restrictions (empty means all permissions from roleSlug)
+        disabled:
+          type: boolean
+        lastUsedAt:
+          type: string
+          format: date-time
+        createdBy:
+          type: string
+        updatedBy:
+          type: string
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+
+    OrgServiceAccountToken:
+      type: object
+      description: JWT token issued for a service account
+      properties:
+        accessToken:
+          type: string
+          description: JWT access token
+        expiresAt:
+          type: string
+          format: date-time
+          description: Token expiration timestamp
+        tokenType:
+          type: string
+          example: Bearer
+        permissions:
+          type: array
+          items:
+            type: string
+          description: Effective permissions from the assigned role
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Scope restrictions applied to this service account
+
+    OrgGroup:
+      type: object
+      required:
+        - name
+        - slug
+      properties:
+        id:
+          type: string
+        orgSlug:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+        memberCount:
+          type: number
+        createdBy:
+          type: string
+        updatedBy:
+          type: string
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+
+    OrgGroupMember:
+      type: object
+      required:
+        - orgSlug
+        - groupSlug
+        - userId
+      properties:
+        id:
+          type: string
+        orgSlug:
+          type: string
+        groupSlug:
+          type: string
+        userId:
+          type: string
+        createdBy:
+          type: string
+        createdAt:
+          type: string
+
+    OrgInvite:
+      type: object
+      required:
+        - orgSlug
+        - status
+      properties:
+        id:
+          type: string
+        code:
+          type: string
+        orgSlug:
+          type: string
+        roleSlug:
+          type: string
+        status:
+          type: string
+          enum:
+            - active
+            - revoked
+        usedCount:
+          type: number
+        createdBy:
+          type: string
+        revokedAt:
+          type: string
+        revokedBy:
+          type: string
+        createdAt:
+          type: string
+
   ## End of schemas
 paths:
   ############################################# gateway
+
+  /v2/login/providers:
+    get:
+      description: Login capabilities discovery. Returns available login methods and SSO providers.
+      operationId: getLoginProviders
+      tags:
+        - API Gateway
+      security: []
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - localSignin
+                  - localSignup
+                  - providers
+                properties:
+                  localSignin:
+                    type: boolean
+                    description: Whether local email/password signin is enabled
+                  localSignup:
+                    type: boolean
+                    description: Whether local email/password signup is enabled
+                  providers:
+                    type: array
+                    description: Globally available SSO providers
+                    items:
+                      type: object
+                      required:
+                        - slug
+                        - type
+                      properties:
+                        slug:
+                          type: string
+                        type:
+                          type: string
+                        name:
+                          type: string
+                        icon:
+                          type: string
+                        meta:
+                          type: object
 
   /v2/login/anonymous:
     post:
@@ -3870,7 +6099,7 @@ paths:
 
   /v2/login:
     get:
-      description: Starts generic authentication
+      description: Starts generic authentication. Provide either a provider slug or a domain to auto-discover the SSO provider.
       operationId: genericAuthInit
       tags:
         - API Gateway
@@ -3878,13 +6107,31 @@ paths:
       parameters:
         - name: 'provider'
           in: 'query'
-          description: 'Auth provider name as configured in api gateway environment variables'
-          required: true
+          description: 'Auth provider slug. Required if domain is not provided.'
+          required: false
+          schema:
+            type: string
+        - name: 'domain'
+          in: 'query'
+          description: 'Email domain (e.g. "acme.com"). When provided, auto-discovers the SSO provider matching this domain. If no SSO provider matches, returns a 200 JSON response with provider "local".'
+          required: false
           schema:
             type: string
       responses:
+        '200':
+          description: SSO or local authentication identifier
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  provider:
+                    type: string
+                    example: local
+                required:
+                  - provider
         '302':
-          description: Redirection response
+          description: Redirection to the SSO provider
 
   /v2/login/callback:
     get: &LOGIN_CALLBACK
@@ -3986,6 +6233,7 @@ paths:
                         type: string
                       expires:
                         type: string
+                  - $ref: '#/components/schemas/UserOrgDetails'
         '401':
           description: Unauthenticated
           content:
@@ -4166,6 +6414,2061 @@ paths:
               schema:
                 $ref: '#/components/schemas/AuthenticationError'
 
+  /v2/orgs/{orgSlug}/auth/sso:
+    get:
+      description: List all configured SSO auth providers (file + database). File-based providers take precedence over database providers with the same slug.
+      operationId: listAuthProviders
+      tags:
+        - API Gateway
+      parameters:
+        - name: 'orgSlug'
+          in: 'path'
+          description: 'Organization slug'
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuthProvider'
+        '401': *AuthenticationError
+    post:
+      description: Create a new SSO auth provider (super admin only)
+      operationId: createAuthProvider
+      tags:
+        - API Gateway
+      parameters:
+        - name: 'orgSlug'
+          in: 'path'
+          description: 'Organization slug'
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthProvider'
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthProvider'
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadParametersError'
+        '401': *AuthenticationError
+
+  /v2/orgs/{orgSlug}/auth/sso/{slug}:
+    get:
+      description: Get a specific SSO auth provider by slug
+      operationId: getAuthProvider
+      tags:
+        - API Gateway
+      parameters:
+        - name: 'orgSlug'
+          in: 'path'
+          description: 'Organization slug'
+          required: true
+          schema:
+            type: string
+        - name: 'slug'
+          in: 'path'
+          description: 'Provider slug'
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthProvider'
+        '401': *AuthenticationError
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    put:
+      description: Update an existing SSO auth provider (super admin only, database providers only)
+      operationId: updateAuthProvider
+      tags:
+        - API Gateway
+      parameters:
+        - name: 'orgSlug'
+          in: 'path'
+          description: 'Organization slug'
+          required: true
+          schema:
+            type: string
+        - name: 'slug'
+          in: 'path'
+          description: 'Provider slug'
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthProvider'
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthProvider'
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadParametersError'
+        '401': *AuthenticationError
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    delete:
+      description: Delete an SSO auth provider (super admin only, database providers only)
+      operationId: deleteAuthProvider
+      tags:
+        - API Gateway
+      parameters:
+        - name: 'orgSlug'
+          in: 'path'
+          description: 'Organization slug'
+          required: true
+          schema:
+            type: string
+        - name: 'slug'
+          in: 'path'
+          description: 'Provider slug'
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthProvider'
+        '401': *AuthenticationError
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+
+  /v2/orgs:
+    post:
+      description: Create a new organization
+      operationId: createOrganization
+      tags:
+        - Organizations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Organization'
+      responses:
+        '201':
+          description: Organization created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadParametersError'
+        '401': *AuthenticationError
+    get:
+      description: List organizations for the authenticated user
+      operationId: listOrganizations
+      tags:
+        - Organizations
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: number
+        - name: page
+          in: query
+          schema:
+            type: number
+        - name: search
+          in: query
+          description: 'Search organizations by name'
+          schema:
+            type: string
+        - name: status
+          in: query
+          description: 'Filter organizations by status'
+          schema:
+            type: string
+            enum:
+              - active
+              - suspended
+        - name: sort
+          in: query
+          description: 'Sort field and direction, e.g. -createdAt'
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Organization'
+                  total:
+                    type: number
+        '401': *AuthenticationError
+
+  /v2/orgs/{orgSlug}:
+    get:
+      description: Get an organization by slug
+      operationId: getOrganization
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '401': *AuthenticationError
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    patch:
+      description: Update an organization
+      operationId: updateOrganization
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Organization'
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    delete:
+      description: Delete an organization
+      operationId: deleteOrganization
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/orgs/{orgSlug}/members:
+    post:
+      description: Add members to an organization in bulk. Provide userIds and/or emails. Known emails are added as active members; unknown emails create pending invitations with tokens.
+      operationId: addOrgMembers
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userIds:
+                  type: array
+                  items:
+                    type: string
+                emails:
+                  type: array
+                  items:
+                    type: string
+                roleSlug:
+                  type: string
+      responses:
+        '201':
+          description: Members added
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OrgMembership'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+    get:
+      description: List members of an organization
+      operationId: listOrgMembers
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: number
+        - name: page
+          in: query
+          schema:
+            type: number
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: sort
+          in: query
+          description: 'Sort field and direction, e.g. -createdAt'
+          schema:
+            type: string
+        - name: userIds
+          in: query
+          description: 'Comma-separated list of user IDs to filter on'
+          schema:
+            type: string
+        - name: includeGroups
+          in: query
+          description: >-
+            When true, each returned membership includes a `groups` field
+            listing the slugs of org groups the user belongs to. Requires an
+            additional lookup per page.
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrgMembership'
+                  total:
+                    type: number
+        '401': *AuthenticationError
+    delete:
+      description: Remove members from an organization in bulk
+      operationId: removeOrgMembers
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - userIds
+              properties:
+                userIds:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/orgs/{orgSlug}/members/{userId}:
+    get:
+      description: Get a specific member of an organization
+      operationId: getOrgMember
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgMembership'
+        '401': *AuthenticationError
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    patch:
+      description: Update a member's role or status
+      operationId: updateOrgMember
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                roleSlug:
+                  type: string
+                status:
+                  type: string
+                  enum:
+                    - active
+                    - invited
+                    - suspended
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgMembership'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+    delete:
+      description: Remove a member from an organization
+      operationId: removeOrgMember
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/orgs/{orgSlug}/invites:
+    post:
+      description: Create an invite code for an organization
+      operationId: createOrgInvite
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrgInvite'
+      responses:
+        '201':
+          description: Invite created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgInvite'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+    get:
+      description: List invite codes for an organization
+      operationId: listOrgInvites
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: number
+        - name: page
+          in: query
+          schema:
+            type: number
+        - name: sort
+          in: query
+          description: 'Sort field and direction, e.g. -createdAt'
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrgInvite'
+                  total:
+                    type: number
+        '401': *AuthenticationError
+
+  /v2/orgs/{orgSlug}/invites/{inviteCode}:
+    get:
+      description: Get a specific invite code
+      operationId: getOrgInvite
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: inviteCode
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgInvite'
+        '401': *AuthenticationError
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    delete:
+      description: Revoke an invite code
+      operationId: revokeOrgInvite
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: inviteCode
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgInvite'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/orgs/join:
+    get:
+      description: Join an organization with an invite code or email token. Redirects to the console on success or to the sign-in page with an error parameter on failure.
+      operationId: joinOrganization
+      tags:
+        - Organizations
+      parameters:
+        - name: code
+          in: query
+          schema:
+            type: string
+          description: Invite code to join with
+        - name: token
+          in: query
+          schema:
+            type: string
+          description: Email invite token to join with
+      responses:
+        '302':
+          description: Redirect to console on success or to sign-in page with error on failure
+        '401': *AuthenticationError
+
+  /v2/orgs/{orgSlug}/roles:
+    post:
+      description: Create a new role in the organization
+      operationId: createOrgRole
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - slug
+              properties:
+                name:
+                  type: string
+                slug:
+                  type: string
+                description:
+                  type: string
+                permissions: *ORG_PERMISSIONS
+                scopes:
+                  type: array
+                  description: >-
+                    Resource scopes granted by this role. Wildcards: ["*"] grants access
+                    to all resources.
+                  items:
+                    type: string
+      responses:
+        '201':
+          description: Role created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgRole'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+    get:
+      description: List roles in an organization
+      operationId: listOrgRoles
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: number
+        - name: page
+          in: query
+          schema:
+            type: number
+        - name: sort
+          in: query
+          description: 'Sort field and direction, e.g. -createdAt'
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrgRole'
+                  total:
+                    type: number
+        '401': *AuthenticationError
+
+  /v2/orgs/{orgSlug}/roles/{roleSlug}:
+    get:
+      description: Get a specific role in an organization
+      operationId: getOrgRole
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: roleSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgRole'
+        '401': *AuthenticationError
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    patch:
+      description: Update a role in an organization
+      operationId: updateOrgRole
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: roleSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                permissions: *ORG_PERMISSIONS
+                scopes:
+                  type: array
+                  description: >-
+                    Resource scopes granted by this role. Wildcards: ["*"] grants access
+                    to all resources.
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgRole'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    delete:
+      description: Delete a role from an organization
+      operationId: deleteOrgRole
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: roleSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/orgs/{orgSlug}/api-keys:
+    post:
+      description: Create a new API key for the organization. The raw key is returned only once.
+      operationId: createOrgApiKey
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - slug
+                - name
+                - expiresAt
+              properties:
+                slug:
+                  type: string
+                  description: Unique identifier for this API key within the organization
+                name:
+                  type: string
+                permissions: *ORG_PERMISSIONS
+                scopes:
+                  type: array
+                  items:
+                    type: string
+                  description: >-
+                    Optional resource patterns restricting where permissions apply.
+                    Format: resourceType:resourceId
+                expiresAt:
+                  type: string
+                  format: date-time
+      responses:
+        '201':
+          description: API key created. The raw key is shown only once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgApiKeyWithSecret'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+    get:
+      description: List API keys for an organization. Does not expose raw keys or hashes.
+      operationId: listOrgApiKeys
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: number
+        - name: page
+          in: query
+          schema:
+            type: number
+        - name: sort
+          in: query
+          description: 'Sort field and direction, e.g. -createdAt'
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrgApiKey'
+                  total:
+                    type: number
+        '401': *AuthenticationError
+
+  /v2/orgs/{orgSlug}/api-keys/{keyId}:
+    patch:
+      description: Update an API key (name, permissions, expiration, disabled status)
+      operationId: updateOrgApiKey
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: keyId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                permissions: *ORG_PERMISSIONS
+                scopes:
+                  type: array
+                  items:
+                    type: string
+                  description: >-
+                    Optional resource patterns restricting where permissions apply.
+                    Format: resourceType:resourceId
+                expiresAt:
+                  type: string
+                  format: date-time
+                disabled:
+                  type: boolean
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgApiKey'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    delete:
+      description: Delete an API key from an organization
+      operationId: deleteOrgApiKey
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: keyId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/orgs/{orgSlug}/api-keys/{keyId}/rotate:
+    post:
+      description: Rotate an API key. Regenerates the token on the same role. The new raw key is shown only once.
+      operationId: rotateOrgApiKey
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: keyId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expiresAt:
+                  type: string
+                  format: date-time
+      responses:
+        '200':
+          description: Key rotated. The new raw key is shown only once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgApiKeyWithSecret'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+
+  /v2/orgs/{orgSlug}/api-keys/validate:
+    post:
+      description: Validate an org API key and retrieve its details. The key must belong to the specified organization. No authentication required.
+      operationId: validateOrgApiKey
+      tags:
+        - Organizations
+      security: []
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: x-prismeai-api-key
+          in: header
+          required: false
+          schema:
+            type: string
+          description: The raw API key to validate (alternative to body)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                apiKey:
+                  type: string
+                  description: The raw API key to validate (iak_{orgSlug}_{uuid})
+      responses:
+        '200':
+          description: API key is valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgApiKey'
+        '401': *AuthenticationError
+
+  /v2/orgs/{orgSlug}/service-accounts:
+    post:
+      description: Create a new service account for the organization. The client secret is returned only once.
+      operationId: createOrgServiceAccount
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - slug
+                - name
+                - roleSlug
+              properties:
+                slug:
+                  type: string
+                  description: Unique identifier for this service account within the organization
+                name:
+                  type: string
+                description:
+                  type: string
+                roleSlug:
+                  type: string
+                  description: Organization role to assign to this service account
+                scopes:
+                  type: array
+                  items:
+                    type: string
+                  description: Optional scope restrictions
+      responses:
+        '201':
+          description: Service account created. The client secret is shown only once.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OrgServiceAccount'
+                  - type: object
+                    properties:
+                      clientSecret:
+                        type: string
+                        description: The raw client secret (sas_{orgSlug}_{uuid}). Shown only once.
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+    get:
+      description: List service accounts for an organization.
+      operationId: listOrgServiceAccounts
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: number
+        - name: page
+          in: query
+          schema:
+            type: number
+        - name: search
+          in: query
+          description: Search by name or slug (case-insensitive partial match)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrgServiceAccount'
+                  total:
+                    type: number
+        '401': *AuthenticationError
+
+  /v2/orgs/{orgSlug}/service-accounts/{saSlug}:
+    get:
+      description: Get a service account by slug
+      operationId: getOrgServiceAccount
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: saSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgServiceAccount'
+        '401': *AuthenticationError
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    patch:
+      description: Update a service account (name, description, roleSlug, scopes, disabled)
+      operationId: updateOrgServiceAccount
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: saSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                roleSlug:
+                  type: string
+                scopes:
+                  type: array
+                  items:
+                    type: string
+                disabled:
+                  type: boolean
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgServiceAccount'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    delete:
+      description: Delete a service account from an organization
+      operationId: deleteOrgServiceAccount
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: saSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/orgs/{orgSlug}/service-accounts/{saSlug}/rotate:
+    post:
+      description: Rotate a service account's client secret. The new secret is shown only once.
+      operationId: rotateOrgServiceAccountSecret
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: saSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: New secret generated. Shown only once.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OrgServiceAccount'
+                  - type: object
+                    properties:
+                      clientSecret:
+                        type: string
+                        description: The raw client secret (sas_{orgSlug}_{uuid}). Shown only once.
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+
+  /v2/orgs/{orgSlug}/service-accounts/{saSlug}/token:
+    post:
+      description: Exchange a service account client secret for a short-lived JWT token. No authentication required.
+      operationId: issueOrgServiceAccountToken
+      tags:
+        - Organizations
+      security: []
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: saSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - clientSecret
+              properties:
+                clientSecret:
+                  type: string
+                  description: The raw client secret (sas_{orgSlug}_{uuid})
+                expiresIn:
+                  type: number
+                  description: Requested token TTL in seconds (default 3600, max SA_TOKEN_MAX_TTL env)
+      responses:
+        '200':
+          description: JWT token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgServiceAccountToken'
+        '401': *AuthenticationError
+
+  /v2/orgs/{orgSlug}/groups:
+    post:
+      description: Create a new group in the organization
+      operationId: createOrgGroup
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - slug
+              properties:
+                name:
+                  type: string
+                slug:
+                  type: string
+                description:
+                  type: string
+
+      responses:
+        '201':
+          description: Group created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgGroup'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+    get:
+      description: List groups in an organization
+      operationId: listOrgGroups
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: number
+        - name: page
+          in: query
+          schema:
+            type: number
+        - name: search
+          in: query
+          description: 'Search groups by name'
+          schema:
+            type: string
+        - name: sort
+          in: query
+          description: 'Sort field and direction, e.g. -createdAt'
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrgGroup'
+                  total:
+                    type: number
+        '401': *AuthenticationError
+
+  /v2/orgs/{orgSlug}/groups/{groupSlug}:
+    get:
+      description: Get a specific group in an organization
+      operationId: getOrgGroup
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: groupSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgGroup'
+        '401': *AuthenticationError
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    patch:
+      description: Update a group in an organization
+      operationId: updateOrgGroup
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: groupSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgGroup'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    delete:
+      description: Delete a group from an organization
+      operationId: deleteOrgGroup
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: groupSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/orgs/{orgSlug}/groups/{groupSlug}/members:
+    post:
+      description: Add members to a group in bulk. Provide either userIds or emails. All users must already be members of the organization.
+      operationId: addOrgGroupMembers
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: groupSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userIds:
+                  type: array
+                  items:
+                    type: string
+                emails:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '201':
+          description: Members added to group
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OrgGroupMember'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+    get:
+      description: List members of a group
+      operationId: listOrgGroupMembers
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: groupSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: number
+        - name: page
+          in: query
+          schema:
+            type: number
+        - name: sort
+          in: query
+          description: 'Sort field and direction, e.g. -createdAt'
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrgGroupMember'
+                  total:
+                    type: number
+        '401': *AuthenticationError
+    delete:
+      description: Remove members from a group in bulk
+      operationId: removeOrgGroupMembers
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: groupSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - userIds
+              properties:
+                userIds:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/orgs/subscriptions:
+    post:
+      description: Create a new subscription template (SuperAdmin only)
+      operationId: createOrgSubscription
+      tags:
+        - Subscriptions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - slug
+                - name
+                - tier
+                - status
+              properties:
+                slug:
+                  type: string
+                name:
+                  type: string
+                tier:
+                  type: string
+                plan:
+                  type: string
+                status:
+                  type: string
+                isDefault:
+                  type: boolean
+                limits:
+                  type: object
+                  additionalProperties: true
+                features:
+                  type: object
+                  additionalProperties: true
+                billing:
+                  type: object
+                  additionalProperties: true
+                startedAt:
+                  type: string
+                expiresAt:
+                  type: string
+      responses:
+        '201':
+          description: Subscription created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgSubscription'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+    get:
+      description: List subscriptions with optional filters (SuperAdmin only)
+      operationId: listOrgSubscriptions
+      tags:
+        - Subscriptions
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: tier
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrgSubscription'
+                  total:
+                    type: number
+        '401': *AuthenticationError
+
+  /v2/orgs/subscriptions/{subscriptionSlug}:
+    get:
+      description: Get a specific subscription (SuperAdmin only)
+      operationId: getOrgSubscription
+      tags:
+        - Subscriptions
+      parameters:
+        - name: subscriptionSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgSubscription'
+        '401': *AuthenticationError
+        '404':
+          description: Not Found
+    patch:
+      description: Update a subscription (SuperAdmin only)
+      operationId: updateOrgSubscription
+      tags:
+        - Subscriptions
+      parameters:
+        - name: subscriptionSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                tier:
+                  type: string
+                plan:
+                  type: string
+                status:
+                  type: string
+                isDefault:
+                  type: boolean
+                limits:
+                  type: object
+                  additionalProperties: true
+                features:
+                  type: object
+                  additionalProperties: true
+                billing:
+                  type: object
+                  additionalProperties: true
+                startedAt:
+                  type: string
+                expiresAt:
+                  type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgSubscription'
+        '401': *AuthenticationError
+        '404':
+          description: Not Found
+    delete:
+      description: Delete a subscription (SuperAdmin only)
+      operationId: deleteOrgSubscription
+      tags:
+        - Subscriptions
+      parameters:
+        - name: subscriptionSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401': *AuthenticationError
+        '404':
+          description: Not Found
+
   /v2/user/mfa:
     post:
       description: Setup MFA
@@ -4292,6 +8595,24 @@ paths:
           required: false
           schema:
             type: number
+        - name: 'createdBefore'
+          in: 'query'
+          description: 'User signed up before that date (ISO8601), reserved to super admins'
+          required: false
+          schema:
+            type: string
+        - name: 'createdAfter'
+          in: 'query'
+          description: 'User signed up before that date (ISO8601), reserved to super admins'
+          required: false
+          schema:
+            type: string
+        - name: 'orgSlug'
+          in: 'query'
+          description: 'Filter users by organization slug, reserved to super admins / root'
+          required: false
+          schema:
+            type: string
       requestBody:
         required: true
         content:
@@ -4303,7 +8624,7 @@ paths:
                   type: string
                 text:
                   type: string
-                  description: "Search in both email & id"
+                  description: 'Search in both email & id'
                 ids:
                   type: array
                   items:
@@ -4323,6 +8644,9 @@ paths:
                   type: array
                   items:
                     type: string
+                includeOrgMembership:
+                  type: string
+                  description: Org slug — enrich contacts with membership data from this org (requires super admin or org admin permissions)
       responses:
         '200':
           description: Success Response
@@ -4375,27 +8699,27 @@ paths:
                   additionalProperties: false
                   oneOf:
                     - required:
-                      - ids
+                        - ids
                     - required:
-                      - emails
+                        - emails
                   properties:
-                      ids:
-                        type: array
-                        items:
-                          type: string
-                      emails:
-                        type: array
-                        items:
-                          type: string
-                behaviour:
-                    type: object
-                    properties:
-                      groups:
+                    ids:
+                      type: array
+                      items:
                         type: string
-                        enum:
-                          - replace
-                          - add
-                          - delete
+                    emails:
+                      type: array
+                      items:
+                        type: string
+                behaviour:
+                  type: object
+                  properties:
+                    groups:
+                      type: string
+                      enum:
+                        - replace
+                        - add
+                        - delete
                 data:
                   $ref: '#/components/schemas/UserPatch'
       responses:
@@ -4552,6 +8876,43 @@ paths:
               schema:
                 $ref: '#/components/schemas/BadParametersError'
 
+  /v2/user/active-org:
+    put:
+      description: Set the active organization for the current session
+      operationId: setActiveOrg
+      tags:
+        - API Gateway
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - orgSlug
+              properties:
+                orgSlug:
+                  type: string
+      responses:
+        '200':
+          description: Success — returns updated org details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserOrgDetails'
+        '401':
+          description: Unauthenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationError'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
   /v2/user/password:
     post:
       description: Ask to reset a password for a specific user given an email. If the email is unknown, the API call will not fail.
@@ -4661,6 +9022,53 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ObjectNotFoundError'
+
+  ############################################# readiness
+  /v2/readiness:
+    get:
+      description: Check platform readiness (configuration, connectivity, databases). Reserved to super admins
+      operationId: getPlatformReadiness
+      tags:
+        - monitoring
+      parameters:
+        - name: 'services'
+          in: 'query'
+          description: 'Only check given services, comma separated (api-gateway,runtime,events,workspaces)'
+          schema:
+            type: string
+          allowReserved: true
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - services
+                properties:
+                  status:
+                    type: string
+                    enum:
+                      - error
+                      - ready
+                  services:
+                    type: object
+                    additionalProperties:
+                      $ref: "#/components/schemas/ServiceReadiness"
+        '400':
+          description: Platform not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadParametersError'
+        '401':
+          description: AuthenticationError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationError'
 
   ############################################# permissions
   /v2/{subjectType}/{subjectId}/permissions:
@@ -5202,7 +9610,7 @@ paths:
       parameters:
         - name: 'workspaceId'
           in: 'path'
-          description: 'Workspace ID'
+          description: 'Workspace ID, or slug prefixed with "slug:" (e.g. slug:my-workspace)'
           required: true
           schema:
             type: string
@@ -5263,6 +9671,41 @@ paths:
 
   ############################################# workspaces
   ## workspaces
+  /v2/workspaces/labels:
+    get:
+      description: Aggregate all labels from workspaces the user has access to
+      operationId: getWorkspaceLabels
+      tags:
+        - 'Prisme.ai Workspaces'
+      parameters:
+        - name: 'limit'
+          in: 'query'
+          description: 'Maximum number of labels to retrieve'
+          required: false
+          schema:
+            type: number
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+        '401':
+          description: AuthenticationError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationError'
+        '403':
+          description: Bad permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
   /v2/workspaces:
     get:
       description: Fetch my workspaces (those I own and shared ones)
@@ -5325,6 +9768,18 @@ paths:
           schema:
             type: string
           allowReserved: true
+        - name: owned
+          in: query
+          description: Filter only user owned workspaces
+          required: false
+          schema:
+            type: boolean
+        - name: dirty
+          in: query
+          description: Filter only dirty workspaces (i.e not saved to a git repository)
+          required: false
+          schema:
+            type: boolean
       responses:
         '200':
           description: Success Response
@@ -5339,6 +9794,19 @@ paths:
                       type: string
                     name:
                       type: string
+                    dirty:
+                      type: boolean
+                    lastPush:
+                      type: object
+                      properties:
+                        createdAt:
+                          type: string
+                        createdBy:
+                          type: string
+                        version:
+                          type: string
+                        repositoryId:
+                          type: string
         '401':
           description: AuthenticationError
           content:
@@ -5686,6 +10154,11 @@ paths:
           required: true
           schema:
             type: string
+        - name: 'timeout'
+          in: 'query'
+          description: 'Timeout (seconds)'
+          schema:
+            type: number
       requestBody:
         required: true
         content:
@@ -5699,7 +10172,14 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/WorkspaceVersion'
+                anyOf:
+                  - type: object
+                    properties:
+                      processing:
+                        type: boolean
+                      message:
+                        type: string
+                  - $ref: '#/components/schemas/WorkspaceVersion'
         '401':
           description: AuthenticationError
           content:
@@ -5794,6 +10274,11 @@ paths:
           required: true
           schema:
             type: string
+        - name: 'timeout'
+          in: 'query'
+          description: 'Timeout (seconds)'
+          schema:
+            type: number
       requestBody:
         required: false
         content:
@@ -5807,30 +10292,42 @@ paths:
                   properties:
                     id:
                       type: string
-
+                discardLocalChanges:
+                  type: boolean
+                  default: false
+                  description: >
+                    When true, skips saving the current platform state to Git before pulling.
+                    Local changes not previously pushed will be lost. Use with caution.
       responses:
         '200':
           description: Success Response
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  imported:
-                    type: array
-                    items:
-                      type: string
-                  errors:
-                    type: array
-                    items:
-                      type: object
-                      additionalProperties: true
-                  workspace:
-                    type: object
-                  deleted:
-                    type: array
-                    items:
-                      type: string
+                anyOf:
+                  - type: object
+                    properties:
+                      processing:
+                        type: boolean
+                      message:
+                        type: string
+                  - type: object
+                    properties:
+                      imported:
+                        type: array
+                        items:
+                          type: string
+                      errors:
+                        type: array
+                        items:
+                          type: object
+                          additionalProperties: true
+                      workspace:
+                        type: object
+                      deleted:
+                        type: array
+                        items:
+                          type: string
         '400':
           description: Bad parameters
           content:
@@ -5855,6 +10352,195 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/workspaces/platform/versions/latest/pull:
+    post:
+      description: >
+        Trigger a bulk import of workspaces from a platform repository.
+        Clones/pulls the repository once, then imports each workspace in
+        dependency order (topological sort on .import.yml dependsOn).
+        Workspaces already at the current version are skipped.
+      operationId: PullPlatformVersions
+      tags:
+        - 'Prisme.ai Workspaces'
+      parameters:
+        - name: 'timeout'
+          in: 'query'
+          description: 'HTTP timeout in seconds (default 15s). If the import exceeds this, the response returns {processing: true} and the result is emitted as a workspaces.bulkImport.completed event.'
+          schema:
+            type: number
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repository:
+                  type: object
+                  required:
+                    - id
+                  properties:
+                    id:
+                      type: string
+                      description: Platform repository ID (from WORKSPACES_STORAGE_GIT_PLATFORM_* env vars)
+                groups:
+                  type: array
+                  items:
+                    type: string
+                  description: >
+                    Filter workspaces by group names. Only workspaces whose
+                    .import.yml groups field includes at least one of these values will be imported.
+                    Takes precedence over `group` when both are provided.
+                forceReimport:
+                  type: boolean
+                  default: false
+                  description: >
+                    When true, forces re-import of all workspaces regardless of
+                    version. By default, workspaces whose lastPull.version already
+                    matches the repository version are skipped.
+      responses:
+        '200':
+          description: Bulk import result
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - type: object
+                    description: Import still processing (HTTP timeout reached)
+                    properties:
+                      processing:
+                        type: boolean
+                      message:
+                        type: string
+                  - $ref: '#/components/schemas/BulkImportCompleted/properties/payload'
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadParametersError'
+        '401':
+          description: AuthenticationError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationError'
+        '403':
+          description: Bad permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Unknown platform repository
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+
+  /v2/workspaces/platform/versions:
+    post:
+      description: >
+        Trigger a bulk push of dirty workspaces to a platform repository.
+        Finds all dirty workspaces belonging to the given groups, categorizes
+        them by lock status (merge conflicts, in progress, candidates), then
+        pushes each candidate workspace sequentially. Groups are resolved via WORKSPACE_GROUPS configuration.
+      operationId: PushPlatformVersions
+      tags:
+        - 'Prisme.ai Workspaces'
+      parameters:
+        - name: 'sse'
+          in: 'query'
+          description: 'If true, streams progress as Server-Sent Events (text/event-stream) instead of returning a single JSON response.'
+          schema:
+            type: boolean
+        - name: 'timeout'
+          in: 'query'
+          description: 'HTTP timeout in seconds. If the push exceeds this, the response returns {processing: true} and the result is emitted as a workspaces.bulkExport.completed event.'
+          schema:
+            type: number
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                groups:
+                  type: array
+                  items:
+                    type: string
+                  minItems: 1
+                  description: Group names to push (must exist in WORKSPACE_GROUPS config)
+                repository:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      description: Platform repository ID (defaults to prismeai-workspaces)
+                name:
+                  type: string
+                  description: 'Version name. If left empty, will be auto generated'
+                createdAt:
+                  type: string
+                description:
+                  $ref: '#/components/schemas/LocalizedText'
+                dryRun:
+                  type: boolean
+                  default: false
+                  description: >
+                    When true, only returns workspace categorization without
+                    actually pushing any versions.
+                force:
+                  type: boolean
+                  default: false
+                  description: >
+                    When true, also pushes workspaces that are already up to date
+                    (not dirty), forcing a re-push of all matching workspaces.
+      responses:
+        '200':
+          description: Bulk push result or SSE stream
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - type: object
+                    description: Push still processing (HTTP timeout reached)
+                    properties:
+                      processing:
+                        type: boolean
+                      message:
+                        type: string
+                  - $ref: '#/components/schemas/BulkPushCompleted/properties/payload'
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events stream with progress updates
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadParametersError'
+        '401':
+          description: AuthenticationError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationError'
+        '403':
+          description: Bad permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Unknown platform repository or group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
 
   /v2/workspaces/{workspaceId}/versions/{versionId}/duplicate:
     post:
@@ -6054,6 +10740,97 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/workspaces/{workspaceId}/writeLock:
+    post:
+      description: Set a write lock on the workspace, preventing any modifications. Owner only.
+      operationId: setWriteLock
+      tags:
+        - 'Prisme.ai Workspaces'
+      parameters:
+        - name: 'workspaceId'
+          in: 'path'
+          description: 'Workspace id'
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: 'Reason for the lock (defaults to "manual")'
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  writeLock:
+                    $ref: '#/components/schemas/WorkspaceWriteLock'
+        '401':
+          description: AuthenticationError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationError'
+        '403':
+          description: Bad permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Object not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+    delete:
+      description: Clear the write lock on the workspace, allowing modifications again. Owner only.
+      operationId: clearWriteLock
+      tags:
+        - 'Prisme.ai Workspaces'
+      parameters:
+        - name: 'workspaceId'
+          in: 'path'
+          description: 'Workspace id'
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+        '401':
+          description: AuthenticationError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationError'
+        '403':
+          description: Bad permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Object not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
 
   /v2/workspaces/export:
     post:
@@ -6450,6 +11227,12 @@ paths:
                 properties:
                   slug:
                     type: string
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadParametersError'
         '404':
           description: Object not found
           content:
@@ -6485,6 +11268,11 @@ paths:
           in: 'path'
           description: 'Automation slug'
           required: true
+          schema:
+            type: string
+        - name: 'rebuild'
+          in: 'query'
+          description: 'Rebuild runtime model'
           schema:
             type: string
       requestBody:
@@ -6783,6 +11571,54 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/pages/{workspaceSlug}/_bundle:
+    get:
+      description: Get workspace bundle configuration by slug (public, no auth required)
+      operationId: getWorkspaceBundle
+      tags:
+        - 'Prisme.ai Workspaces'
+      parameters:
+        - name: 'workspaceSlug'
+          in: 'path'
+          description: 'Workspace slug'
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bundles:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        bundle:
+                          type: string
+                  workspace:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      slug:
+                        type: string
+                      name:
+                        oneOf:
+                          - type: string
+                          - type: object
+                            additionalProperties:
+                              type: string
+        '404':
+          description: Workspace not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
 
   /v2/pages/{workspaceSlug}/{pageSlug}:
     get:
@@ -7769,6 +12605,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ForbiddenError'
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadParametersError'
 
   # Files
   /v2/workspaces/{workspaceId}/files/{id}:
@@ -7891,14 +12733,20 @@ paths:
               additionalProperties: false
               properties:
                 expiresAfter:
-                  type: string
                   description: File expiration time in seconds. This is currently a best effort expiration as it will be deleted only upon the next restart after expiration
+                  oneOf:
+                    - type: string
+                    - type: number
                 public:
-                  type: string
                   description: 'Set to true to make uploaded file publicly available'
+                  oneOf:
+                    - type: string
+                    - type: boolean
                 shareToken:
-                  type: string
                   description: 'If enabled, return a share token that will allow anybody access the file'
+                  oneOf:
+                    - type: string
+                    - type: boolean
                 metadata:
                   type: object
                   additionalProperties: true
@@ -7912,6 +12760,68 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/File'
+        '401':
+          description: AuthenticationError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationError'
+        '403':
+          description: Bad permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadParametersError'
+
+    put:
+      description: Replace the content of an existing file. The file must belong to the specified workspace.
+      operationId: replaceFileContent
+      tags:
+        - 'Prisme.ai Workspaces'
+      parameters:
+        - name: 'workspaceId'
+          in: 'path'
+          description: 'Workspace id'
+          required: true
+          schema:
+            type: string
+        - name: 'id'
+          in: 'path'
+          description: 'File id'
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The new file content to replace the existing one
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/File'
+        '404':
+          description: Object not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
         '401':
           description: AuthenticationError
           content:
@@ -7966,6 +12876,9 @@ paths:
                 shareToken:
                   type: string
                   description: 'If enabled, return a share token that will allow anybody access the file'
+                id:
+                  type: string
+                  description: 'Optional custom file ID(s). Can be a single string (applied to first file) or an array (one per uploaded file). Files without a custom ID get a random one.'
 
       responses:
         '200':
@@ -7994,6 +12907,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BadParametersError'
+
     get:
       description: List workspace files
       operationId: listFiles
