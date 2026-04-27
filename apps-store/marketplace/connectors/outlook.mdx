@@ -17,18 +17,117 @@ The Outlook connector provides full access to Microsoft Outlook mailboxes via th
   </Card>
 </CardGroup>
 
+## Choose your authentication mode
+
+The connector supports two **mutually exclusive** authentication modes. Pick the one that matches your use case before configuring the connector.
+
+<CardGroup cols={2}>
+  <Card title="Application mode (app-only)" icon="building">
+    A single Azure AD app acts on behalf of the workspace. Can reach any mailbox in the tenant (restrictable). No per-user login. Best for back-office automations and service accounts.
+  </Card>
+  <Card title="Delegated mode (OAuth per-user)" icon="user-check">
+    Each end user signs into Microsoft once via an OAuth popup. Access is scoped to that user's own mailbox. Best for agents that act on behalf of the logged-in user.
+  </Card>
+</CardGroup>
+
+| Aspect | Application mode | Delegated (OAuth) mode |
+|---|---|---|
+| Azure permission type | Application | Delegated |
+| Admin consent | Required | Optional (user consent if tenant allows) |
+| Mailbox reach | All tenant mailboxes (restrictable) | Connected user's mailbox only |
+| Who authenticates | No end-user login | Each user signs in once |
+| `userId` tool argument | Required (target mailbox) | Ignored (always the connected user) |
+| Token acquisition | Client credentials per request | Authorization code + PKCE; refresh token stored |
+| Best for | Back-office / service automations | User-facing agents, per-user data |
+
+---
+
 ## Prerequisites
 
-- An **Azure AD Application** registered in your tenant
-- **Application permissions** granted (not Delegated):
-  - `Mail.Read` - Read mail in all mailboxes
-  - `Mail.ReadWrite` - Create drafts, update, delete, move, copy
-  - `Mail.Send` - Send, reply, reply-all, forward
-  - `MailboxSettings.Read` - Read mailbox settings
-- **Admin consent** granted for these permissions
+<Tabs>
+  <Tab title="Application mode">
+    - An **Azure AD Application** registered in your tenant
+    - **Application permissions** granted (not Delegated):
+      - `Mail.Read` — Read mail in all mailboxes
+      - `Mail.ReadWrite` — Create drafts, update, delete, move, copy
+      - `Mail.Send` — Send, reply, reply-all, forward
+      - `MailboxSettings.Read` — Read mailbox settings
+    - **Admin consent** granted for these permissions
+    - A **client secret** created on the app registration
+
+    <Note>
+      **Minimal permissions:** If you only need read access, `Mail.Read` and `MailboxSettings.Read` are sufficient. Add `Mail.Send` and/or `Mail.ReadWrite` only if you use write tools.
+    </Note>
+  </Tab>
+
+  <Tab title="Delegated (OAuth) mode">
+    - An **Azure AD Application** registered in your tenant with a **Web** platform configured
+    - A **Redirect URI** added to the app registration:
+
+      ```
+      {platformApiUrl}/workspaces/{workspaceId}/webhooks/oauthCallback
+      ```
+
+      Example (sandbox, workspace `oOFlMpO`):
+
+      ```
+      https://api.sandbox.prisme.ai/v2/workspaces/oOFlMpO/webhooks/oauthCallback
+      ```
+
+    - **Delegated permissions** granted (Microsoft Graph):
+      - `Mail.Read`
+      - `Mail.ReadWrite`
+      - `Mail.Send`
+      - `MailboxSettings.Read`
+      - `User.Read` — sign-in and profile
+      - `offline_access` — issue refresh tokens
+      - `openid`, `profile`, `email` — ID token / user identity
+    - A **client secret** (the connector uses the authorization code flow with PKCE as a **confidential client**, so "Allow public client flows" must stay **No**)
+    - Either the tenant allows end-user consent, or an admin grants consent once to the delegated scopes above
+
+    <Note>
+      You can reuse the same Azure app registration for both modes, but the **permission types differ**: Application permissions for app-only mode, Delegated permissions for OAuth mode.
+    </Note>
+  </Tab>
+</Tabs>
+
+---
+
+## OAuth flow (Delegated mode)
+
+When Delegated mode is enabled, end users connect their Microsoft account through a built-in flow implemented by the `outlook-mcp` workspace.
+
+<Steps>
+  <Step title="User opens the connect page">
+    The user visits `{pagesUrl}/connect-outlook`. The page shows a **Connect Outlook** button when OAuth is configured and the user has no active connection.
+  </Step>
+  <Step title="Initiate">
+    The page (or the `initiateOAuth` webhook) generates a PKCE **code verifier / code challenge (S256)** and a CSRF **state**, stores them in the user scope, and builds the Microsoft authorize URL.
+  </Step>
+  <Step title="Microsoft login & consent">
+    The user is redirected to `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize` and consents to the delegated scopes.
+  </Step>
+  <Step title="Callback & token exchange">
+    Microsoft redirects back to `/webhooks/oauthCallback?code=...&state=...`. The workspace validates the `state`, exchanges the code (with the PKCE `code_verifier`) for tokens at `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`, and stores:
+
+    - `outlook_delegated_token` — platform secret, user scope, TTL = `expires_in`
+    - `outlook_refresh_token` — platform secret, user scope, TTL = **90 days** (`7776000` s)
+    - `user.outlook.oauth` — metadata only (`expiresAt`, `scope`, `authMethod: delegated`)
+  </Step>
+  <Step title="Automatic refresh">
+    When the access token is about to expire, `refreshOAuthToken` silently exchanges the refresh token for a new access token (and rotates the refresh token if Microsoft returns a new one).
+  </Step>
+  <Step title="Disconnect">
+    Users can call the `disconnectOAuth` webhook (or trigger the `disconnectOAuth` event) to clear all stored tokens and metadata.
+  </Step>
+</Steps>
 
 <Note>
-  **Minimal permissions:** If you only need read access, `Mail.Read` and `MailboxSettings.Read` are sufficient. Add `Mail.Send` and/or `Mail.ReadWrite` only if you use write tools.
+  **Security properties:**
+  - PKCE (S256) protects the authorization code
+  - CSRF `state` is validated on callback
+  - Tokens are stored as **platform secrets** (opaque references), never as plain user metadata
+  - `redirectTo` is validated against the platform host to prevent open-redirect attacks
 </Note>
 
 ---
@@ -39,23 +138,39 @@ The Outlook connector provides full access to Microsoft Outlook mailboxes via th
 
     1. Go to **Apps** in your workspace
     2. Search for **Outlook App** and install it
-    3. Configure the app instance with your Azure AD credentials
+    3. Configure the app instance for your chosen mode (Application or Delegated)
 
     ## Configuration
 
-    | Field | Value |
-    |-------|-------|
-    | **Azure Client ID** | Application (client) ID from Azure AD |
-    | **Azure Client Secret** | Client secret value |
-    | **Azure Tenant ID** | Directory (tenant) ID |
-    | **Default User ID** | Email address or user object ID of the target mailbox |
+    <Tabs>
+      <Tab title="Application mode">
+        | Field | Value |
+        |-------|-------|
+        | **Azure Client ID** | Application (client) ID from Azure AD |
+        | **Azure Client Secret** | Client secret value |
+        | **Azure Tenant ID** | Directory (tenant) ID |
+        | **Default User ID** | Email address or user object ID of the target mailbox |
+      </Tab>
+      <Tab title="Delegated (OAuth) mode">
+        | Field | Value |
+        |-------|-------|
+        | **OAuth Client ID** (`oauth.clientId`) | Azure AD application (client) ID |
+        | **OAuth Client Secret** (`oauth.clientSecret`) | Azure AD client secret |
+        | **OAuth Tenant** (`oauth.tenant`) | Directory (tenant) ID, or `common` / `organizations` |
+        | **OAuth Scopes** (`oauth.scopes`) | Default: `openid profile email offline_access Mail.Read Mail.Send Mail.ReadWrite MailboxSettings.Read User.Read` |
+
+        `Default User ID` is **not used** in Delegated mode — each user operates on their own mailbox.
+      </Tab>
+    </Tabs>
 
     ## Available Automations
 
+    The automation names and Graph permissions below are identical in both modes; only the **permission type** (Application vs Delegated) granted in Azure AD differs.
+
     ### Read Operations
 
-    | Automation | Description | Permission |
-    |------------|-------------|------------|
+    | Automation | Description | Graph permission |
+    |------------|-------------|------------------|
     | `listMailFolders` | List all mail folders with message counts | Mail.Read |
     | `getMailFolder` | Get folder details by ID or well-known name | Mail.Read |
     | `listMessages` | List messages with filtering, pagination, sorting | Mail.Read |
@@ -67,8 +182,8 @@ The Outlook connector provides full access to Microsoft Outlook mailboxes via th
 
     ### Send Operations
 
-    | Automation | Description | Permission |
-    |------------|-------------|------------|
+    | Automation | Description | Graph permission |
+    |------------|-------------|------------------|
     | `sendMail` | Send an email (to/cc/bcc, HTML/text, importance) | Mail.Send |
     | `sendDraft` | Send an existing draft message | Mail.Send |
     | `replyMessage` | Reply to a message | Mail.Send |
@@ -77,8 +192,8 @@ The Outlook connector provides full access to Microsoft Outlook mailboxes via th
 
     ### Write Operations
 
-    | Automation | Description | Permission |
-    |------------|-------------|------------|
+    | Automation | Description | Graph permission |
+    |------------|-------------|------------------|
     | `createDraft` | Create a draft email in Drafts folder | Mail.ReadWrite |
     | `updateMessage` | Update properties (read status, importance) | Mail.ReadWrite |
     | `deleteMessage` | Soft-delete (move to Deleted Items) | Mail.ReadWrite |
@@ -91,7 +206,7 @@ The Outlook connector provides full access to Microsoft Outlook mailboxes via th
 
     ```yaml
     - Outlook App.listMessages:
-        userId: user@company.com
+        userId: user@company.com   # Application mode only; ignored in Delegated mode
         folderId: inbox
         top: 10
         filter: "isRead eq false"
@@ -138,16 +253,36 @@ The Outlook connector provides full access to Microsoft Outlook mailboxes via th
     2. Go to **Advanced > Tools**
     3. Click **Add** and select the **MCP** tab
     4. Enter the MCP endpoint URL
-    5. In the **Headers** field, add your credentials:
+    5. In the **Headers** field, add the credentials for your chosen mode
 
-    ```json
-    {
-      "mcp-api-key": "your-mcp-api-key",
-      "azure-client-id": "your-client-id",
-      "azure-client-secret": "your-client-secret",
-      "azure-tenant": "your-tenant-id"
-    }
-    ```
+    <Tabs>
+      <Tab title="Application mode headers">
+        ```json
+        {
+          "mcp-api-key": "your-mcp-api-key",
+          "azure-client-id": "your-client-id",
+          "azure-client-secret": "your-client-secret",
+          "azure-tenant": "your-tenant-id"
+        }
+        ```
+
+        The MCP server uses the client credentials flow against Microsoft Graph and targets the mailbox specified by `userId` (or the workspace default).
+      </Tab>
+      <Tab title="Delegated (OAuth) mode headers">
+        ```json
+        {
+          "mcp-api-key": "your-mcp-api-key",
+          "auth-mode": "oauth"
+        }
+        ```
+
+        No `azure-*` headers. The end user must have completed the OAuth flow once via `{pagesUrl}/connect-outlook`. If they haven't, the tool returns a structured error containing a `connectUrl` pointing to the connect page.
+
+        <Warning>
+          `auth-mode: oauth` **forces** Delegated mode and disables all fallbacks. If no valid delegated token is stored for the user, the request fails immediately with a `connectUrl` — it will not fall back to client credentials.
+        </Warning>
+      </Tab>
+    </Tabs>
 
     <Note>
       The `mcp-api-key` value must match the **MCP API Key** secret configured in the workspace secrets (`mcpApiKey`).
@@ -155,37 +290,40 @@ The Outlook connector provides full access to Microsoft Outlook mailboxes via th
 
     ## Authentication
 
-    The MCP server resolves credentials in priority order:
+    The MCP server resolves credentials in the following priority order (see `outlook-app/resolveAuth.yml`):
 
-    1. **Bearer token** in `Authorization` header (pre-resolved)
-    2. **Azure credentials** in custom headers (`azure-client-id`, `azure-client-secret`, `azure-tenant`)
-    3. **Workspace secrets** (`azureClientId`, `azureClientSecret`, `azureTenant`)
+    1. `auth-mode: oauth` header → **requires** a stored delegated token for the user; no fallback
+    2. `Authorization: Bearer <token>` header (pre-resolved Graph access token)
+    3. `azure-client-id` / `azure-client-secret` / `azure-tenant` custom headers (Application mode)
+    4. Stored OAuth delegated tokens (`user.outlook.oauth` + platform secrets), with automatic refresh
+    5. Per-user credentials from `configureOutlook` (`user.outlook.credentials`)
+    6. Workspace secrets client credentials (`azureClientId`, `azureClientSecret`, `azureTenant`)
 
     ### Workspace Secrets
 
-    | Secret | Description |
-    |--------|-------------|
-    | `azureClientId` | Azure AD client ID |
-    | `azureClientSecret` | Azure AD client secret |
-    | `azureTenant` | Azure AD tenant ID |
-    | `defaultUserId` | Default mailbox email or user object ID |
-    | `mcpApiKey` | API key for authenticating MCP requests |
+    | Secret | Used by | Description |
+    |--------|---------|-------------|
+    | `azureClientId` | Application mode | Azure AD client ID |
+    | `azureClientSecret` | Application mode | Azure AD client secret |
+    | `azureTenant` | Application mode | Azure AD tenant ID |
+    | `defaultUserId` | Application mode | Default mailbox email or user object ID |
+    | `mcpApiKey` | Both | API key for authenticating MCP requests |
+
+    Delegated mode reads its configuration from `config.oauth.*` (`clientId`, `clientSecret`, `tenant`, `scopes`), which by default resolves to the same Azure secrets above — the same app registration can serve both modes.
 
     ### Mailbox Targeting
 
-    The `userId` parameter identifies which mailbox to access:
-
-    - **User Principal Name**: `user@yourdomain.com`
-    - **User Object ID**: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
-
-    Resolved in order: tool argument `userId` > workspace secret `defaultUserId`. If neither is set, the request fails.
+    - **Application mode** — the `userId` tool argument (or `defaultUserId` workspace secret) selects which mailbox to act on. Resolution order: tool argument `userId` > workspace secret `defaultUserId`. If neither is set, the request fails.
+      - **User Principal Name**: `user@yourdomain.com`
+      - **User Object ID**: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
+    - **Delegated (OAuth) mode** — `userId` is **ignored**. All calls run against `/me` — the mailbox of the user whose OAuth token is used.
 
     ## Available Tools
 
     ### Read Operations
 
-    | Tool | Description | Permission |
-    |------|-------------|------------|
+    | Tool | Description | Graph permission |
+    |------|-------------|------------------|
     | `listMailFolders` | List all mail folders with message counts | Mail.Read |
     | `getMailFolder` | Get folder details by ID or well-known name | Mail.Read |
     | `listMessages` | List messages with filtering, pagination, sorting | Mail.Read |
@@ -197,8 +335,8 @@ The Outlook connector provides full access to Microsoft Outlook mailboxes via th
 
     ### Send Operations
 
-    | Tool | Description | Permission |
-    |------|-------------|------------|
+    | Tool | Description | Graph permission |
+    |------|-------------|------------------|
     | `sendMail` | Send an email (to/cc/bcc, HTML/text, importance) | Mail.Send |
     | `sendDraft` | Send an existing draft message | Mail.Send |
     | `replyMessage` | Reply to a message (comment or full body) | Mail.Send |
@@ -207,8 +345,8 @@ The Outlook connector provides full access to Microsoft Outlook mailboxes via th
 
     ### Write Operations
 
-    | Tool | Description | Permission |
-    |------|-------------|------------|
+    | Tool | Description | Graph permission |
+    |------|-------------|------------------|
     | `createDraft` | Create a draft email in Drafts folder | Mail.ReadWrite |
     | `updateMessage` | Update properties (read status, importance, categories) | Mail.ReadWrite |
     | `deleteMessage` | Soft-delete (move to Deleted Items) | Mail.ReadWrite |
@@ -263,15 +401,19 @@ The Outlook connector provides full access to Microsoft Outlook mailboxes via th
 
     All tools support an `outputFormat` parameter:
 
-    - **`verbose`** (default) - Human-readable text for LLM consumption
-    - **`structured`** - Machine-readable JSON in `structuredContent`
-    - **`both`** - Both text and structured content
+    - **`verbose`** (default) — Human-readable text for LLM consumption
+    - **`structured`** — Machine-readable JSON in `structuredContent`
+    - **`both`** — Both text and structured content
   </Tab>
 </Tabs>
 
 ---
 
-## Security: Restrict to One Mailbox
+## Security: Restrict to One Mailbox (Application mode only)
+
+<Note>
+  This section applies only to **Application mode**. Delegated (OAuth) mode is already restricted to the consenting user's own mailbox and does not need an Application Access Policy.
+</Note>
 
 Application permissions grant access to **all mailboxes** in the tenant by default. To restrict this connector to a single mailbox, use an **Application Access Policy** in Exchange Online:
 
@@ -303,18 +445,25 @@ Test-ApplicationAccessPolicy -AppId "<your-azure-client-id>" -Identity user@your
 
 | HTTP Status | Error | Solution |
 |-------------|-------|----------|
-| 401 | Unauthorized | Verify clientId, clientSecret, tenant |
+| 401 | Unauthorized (Application mode) | Verify `clientId`, `clientSecret`, `tenant` |
+| 401 | User not connected / expired refresh token (Delegated mode) | The response includes a `connectUrl` — the end user must (re)connect at `/connect-outlook` |
 | 403 | Forbidden | Grant admin consent or check Application Access Policy |
 | 404 | Not Found | Verify user email/ID exists in tenant |
 | 429 | Rate Limited | Wait and retry |
 
 ### Common Issues
 
-**`AADSTS700016`** - App not found in the directory. Check tenant ID matches the app registration.
+**`AADSTS700016`** — App not found in the directory. Check tenant ID matches the app registration.
 
-**`MailboxNotEnabledForRESTAPI`** - The user needs an Exchange Online license assigned.
+**`AADSTS65001`** — User has not consented to the required delegated scopes. Either enable user consent in the tenant or have an admin grant consent once.
 
-**`ErrorAccessDenied` with Application Access Policy** - The target mailbox is not in the allowed security group. Takes up to 30 minutes to propagate after policy changes.
+**`MailboxNotEnabledForRESTAPI`** — The user needs an Exchange Online license assigned.
+
+**`invalid_grant` on refresh** — The refresh token has expired (>90 days) or been revoked. The user must reconnect via `/connect-outlook`.
+
+**`invalid_client`** — The Azure AD client secret is wrong or has expired. Rotate the secret in Azure AD and update the workspace configuration.
+
+**`ErrorAccessDenied` with Application Access Policy** — The target mailbox is not in the allowed security group. Takes up to 30 minutes to propagate after policy changes.
 
 ## External Resources
 
@@ -322,8 +471,14 @@ Test-ApplicationAccessPolicy -AppId "<your-azure-client-id>" -Identity user@your
   <Card title="Microsoft Graph Mail API" icon="book" href="https://learn.microsoft.com/en-us/graph/api/resources/mail-api-overview">
     Official API documentation
   </Card>
+  <Card title="OAuth 2.0 authorization code flow" icon="key" href="https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow">
+    Microsoft identity platform — delegated auth code + PKCE
+  </Card>
+  <Card title="Delegated permissions reference" icon="user-shield" href="https://learn.microsoft.com/en-us/graph/permissions-reference">
+    Microsoft Graph — delegated vs application permissions
+  </Card>
   <Card title="Application Access Policies" icon="shield" href="https://learn.microsoft.com/en-us/graph/auth-limit-mailbox-access">
-    Restrict mailbox access per application
+    Restrict mailbox access per application (app-only mode)
   </Card>
   <Card title="Graph Explorer" icon="flask" href="https://developer.microsoft.com/en-us/graph/graph-explorer">
     Test API calls interactively
