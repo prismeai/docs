@@ -1,0 +1,368 @@
+---
+title: "Migration v27"
+description: "Step-by-step guide for migrating an existing Prisme.ai installation from legacy products (AI Knowledge, AI Store) to the new v27 platform products (Agent Factory, LLM Gateway, Storage)"
+---
+
+This guide walks you through migrating a self-hosted Prisme.ai installation from the **legacy AI products** (**AI Store**, **AI Knowledge**, ...) to the **new platform products** (**Agent Factory**, **LLM Gateway**, **Storage** - vector store, ...).
+
+The migration is split into four phases:
+
+<Steps>
+  <Step title="Infrastructure update">
+    Update Helm values, image tags, and environment variables.
+  </Step>
+  <Step title="First connection">
+    Log in as super admin and create your organization.
+  </Step>
+  <Step title="Products initialization">
+    Import the new platform workspaces in the correct order.
+  </Step>
+  <Step title="Post-import configuration">
+    Migrate providers, models, vector store and organization settings.
+  </Step>
+</Steps>
+
+## 1. Infrastructure update
+
+### 1.1 Update the Console image
+
+In your Helm `core-values.yaml`, update the `prismeai-console` block to use the unified platform image:
+
+<CodeGroup>
+```yaml Before
+prismeai-console:
+  enabled: true
+  image:
+    tag: ...
+```
+
+```yaml After
+prismeai-console:
+  enabled: true
+  image:
+    repository: registry.gitlab.com/prisme.ai/prisme.ai/prisme.ai-platform
+    tag: ...
+```
+</CodeGroup>
+
+### 1.2 Bump all service & app tags
+
+Update **all** core service and app image tags to the latest release. The available tags are listed on the [Prisme.ai releases page](https://gitlab.com/prisme.ai/prisme.ai/-/releases).
+
+### 1.3 Migrate LLM & vector store credentials
+
+If your LLM and vector store credentials are currently injected through environment variables on **prismeai-runtime**, you need to **duplicate** the existing AI Knowledge variables under the new LLM Gateway and Storage prefixes.
+
+<Info>
+  The string after `llm-gateway_` or `storage_` is the **secret name** as it will be consumed by the LLM Gateway and Storage workspaces. You can rename either side as long as the prefix matches.
+</Info>
+
+<Tabs>
+  <Tab title="LLM providers">
+    Duplicate every `WORKSPACE_CONFIG_ai-knowledge_*` variable related to LLM providers into a `WORKSPACE_SECRET_llm-gateway_*` equivalent.
+
+    **Examples:**
+
+    | Legacy variable | New variable |
+    | --- | --- |
+    | `WORKSPACE_CONFIG_ai-knowledge_awsBedrockAccessKey` | `WORKSPACE_SECRET_llm-gateway_awsBedrockAccessKey` |
+    | `WORKSPACE_CONFIG_ai-knowledge_openaiApiKey` | `WORKSPACE_SECRET_llm-gateway_openaiApiKey` |
+  </Tab>
+  <Tab title="Vector store">
+    Duplicate every `WORKSPACE_CONFIG_ai-knowledge_*` variable related to the vector store into a `WORKSPACE_SECRET_storage_*` equivalent.
+
+    **Examples:**
+
+    | Legacy variable | New variable |
+    | --- | --- |
+    | `WORKSPACE_CONFIG_ai-knowledge_opensearch_host` | `WORKSPACE_SECRET_storage_opensearch_host` |
+    | `WORKSPACE_CONFIG_ai-knowledge_opensearch_username` | `WORKSPACE_SECRET_storage_opensearch_username` |
+  </Tab>
+</Tabs>
+
+<Tip>
+  Alternatively, these secrets can be entered directly from the **Secrets** page of the **LLM Gateway** and **Storage** workspaces, without touching environment variables.
+</Tip>
+
+### 1.4 Deploy
+
+Deploy the updated Helm chart and wait for all pods to roll out successfully.
+
+```bash
+helm upgrade prisme-core prisme/prisme-core -f core-values.yaml -n prisme-system
+kubectl get pods -n prisme-system -w
+```
+
+---
+
+## 2. First connection
+
+<Steps>
+  <Step title="Log in as super admin">
+    Once all services are deployed, sign in to the platform with a super admin account — the accounts listed under `config.admins` in your Helm values.
+  </Step>
+  <Step title="Create your organization">
+    From the onboarding screen, create your organization:
+
+    - **Name** — the display name shown across the UI.
+    - **Technical name** — the unique identifier used throughout the platform. It **cannot be changed** after creation.
+  </Step>
+  <Step title="Open Builder">
+    After creation, you should be redirected to a near-empty platform with two links in the left menu: **Builder** and **Govern**. Open **Builder**.
+  </Step>
+</Steps>
+
+---
+
+## 3. Products initialization
+
+The new AI products are imported in **four sequential groups** via the **Platform** workspace bulk import:
+
+<CardGroup cols={2}>
+  <Card title="base1" icon="cube">
+    Foundation apps (Custom Code, Prisme.ai API, …).
+  </Card>
+  <Card title="base2" icon="cubes">
+    Extended base (Crawler, NLU, RedisSearch, …).
+  </Card>
+  <Card title="extended" icon="boxes-stacked">
+    Legacy AI products (AI Knowledge, AI Store, …), which will disappear in a future release.  
+  </Card>
+  <Card title="one-product" icon="box-archive">
+    Main AI products (LLM Gateway, Storage, AI Governance, …).
+  </Card>
+</CardGroup>
+
+For each group:
+
+<Steps>
+  <Step title="Open the Platform workspace">
+    The **Platform** workspace is only visible to super admins.
+  </Step>
+  <Step title="Trigger the bulk import">
+    Navigate to **Settings** → **Versions** → **Platform Pull**, then select the **Release vXXX** platform repository.
+  </Step>
+  <Step title="Select the group and start the import">
+    Pick the group, start the import, and close the modal.
+  </Step>
+  <Step title="Monitor progress">
+    From the **Activity** feed of the Platform workspace, wait for the `workspaces.bulkImport.completed` event before moving on.
+  </Step>
+  <Step title="Repeat for the next group">
+    Import the groups in order: `base1` → `base2` → `extended` → `one-product`.
+  </Step>
+</Steps>
+
+<Warning>
+  Always wait for `workspaces.bulkImport.completed` (with no errors) before importing the next group — each group depends on the previous one.
+</Warning>
+
+---
+
+## 4. Post-import configuration
+
+Once all groups are imported, configure each new workspace in the order below.
+
+### 4.1 AI Governance — bridge the legacy admin token
+
+The new **AI Governance** workspace needs the admin token from the legacy one to perform the migration.
+
+<Steps>
+  <Step title="Copy the legacy token">
+    In **Builder**, open the legacy **AI Governance** workspace → **Settings** → **Secrets** and copy the value of `adminAccessToken`.
+  </Step>
+  <Step title="Paste it into the new workspace">
+    Open the new **AI Governance** workspace → **Settings** → **Secrets**, paste the value into `adminAccessToken`, then **Save**.
+  </Step>
+</Steps>
+
+### 4.2 LLM providers
+
+<Steps>
+  <Step title="Open the Govern app">
+    From the left menu, open **Govern** → **Models** → **Providers** tab.
+  </Step>
+  <Step title="Import from AI Knowledge">
+    Open the **⋮** (three-dot) menu in the top-right corner and click **Import from AI Knowledge**.
+  </Step>
+  <Step title="Adjust default models and secret names">
+    First check that **default models** are correctly set.  
+
+    Then, for each imported provider, make sure:
+    - The **secret names** match the secrets you configured via `WORKSPACE_SECRET_llm-gateway_*` environment variables.
+
+    <Tip>
+      Hover the **(i)** icon next to a secret input to see the matching environment variable name.
+    </Tip>
+  </Step>
+  <Step title="(Optional) Configure secrets from the UI">
+    If you'd rather store the secrets on the platform itself instead of through env vars:
+
+    1. Open **Builder** in a new tab.
+    2. Open the **LLM Gateway** workspace → **Settings** → **Secrets**.
+    3. Add or update the secrets, using the **same names** as referenced by your providers.
+  </Step>
+  <Step title="Save">
+    Save the providers configuration.
+  </Step>
+</Steps>
+
+<Info>
+  All LLM providers can be **exported and re-imported** from the three-dot menu — useful for replicating configuration across environments.
+</Info>
+
+### 4.3 LLM models
+
+<Steps>
+  <Step title="Open the Models tab">
+    Still in **Govern** → **Models**, switch to the **Models** tab.
+  </Step>
+  <Step title="Import from AI Knowledge">
+    Open the **⋮** menu and click **Import from AI Knowledge**.
+  </Step>
+  <Step title="Verify each model">
+    For every imported model:
+
+    - Open it and click **Test** — the model response is shown below the button.
+    - For **embedding** models, ensure the **dimensions** option is properly set. This was often left undefined in legacy AI Knowledge and must now be explicit.
+  </Step>
+</Steps>
+
+<Info>
+  Models can also be exported / imported in bulk from the three-dot menu.
+</Info>
+
+### 4.4 Vector store
+
+<Steps>
+  <Step title="Open the Infrastructure page">
+    From the **Govern** menu, open **Infrastructure**.
+  </Step>
+  <Step title="Pick a driver">
+    Select your vector store driver: **Elasticsearch** or **OpenSearch**.
+  </Step>
+  <Step title="Adjust credential secret names">
+    Make sure the credential secret names match the values you exposed via `WORKSPACE_SECRET_storage_*` environment variables.
+
+    <Tip>
+      Hover the **(i)** icon next to a secret input to see the matching environment variable name.
+    </Tip>
+
+    To configure secrets directly from the UI instead:
+
+    1. Open **Builder** in a new tab.
+    2. Open the **Storage** workspace → **Settings** → **Secrets**.
+    3. Add or update the secrets.
+  </Step>
+  <Step title="Set the index prefix">
+    Replace `vector_store_index_prefix` with the prefix to use for your RAG indexes (e.g. `prod_rag`).
+  </Step>
+  <Step title="Save and Test">
+    **Save** the configuration, then click **Test**. If the test fails, review your environment variables, secrets, or database connectivity and try again.
+  </Step>
+</Steps>
+
+<Info>
+  The raw vector store configuration lives in **Storage** workspace settings — accessible via the **Edit** button at the top right of the Storage workspace.
+</Info>
+
+### 4.5 Infrastructure checkup
+
+While on the **Infrastructure** page, use the **Test** button at the bottom of the **Services** block to verify connectivity to all platform databases.
+
+---
+
+## 5. Organization configuration
+
+### 5.1 Allowed models
+
+<Steps>
+  <Step title="Open your organization">
+    Open **Organizations** and select the organization you just created.
+  </Step>
+  <Step title="Open Agent controls">
+    Navigate to **Agent controls**.
+  </Step>
+  <Step title="Pick allowed models">
+    Select all models you want to make available (you can use **Select all**). Models can be reordered by drag-and-drop.
+  </Step>
+  <Step title="Set defaults">
+    Choose the default **Completions** and **Embeddings** models for the organization.
+  </Step>
+  <Step title="Save">
+    Scroll to the bottom of the page and click **Save**.
+  </Step>
+</Steps>
+
+### 5.2 Join rules
+
+Join rules control which users automatically become members of your organization.
+
+<Steps>
+  <Step title="Open Join Rules">
+    Navigate to the **Join Rules** page.
+  </Step>
+  <Step title="Add a rule">
+    Add a rule with:
+
+    - **Field**: `Email`
+    - **Operator**: `matches (wildcard)`
+    - **Value**: `*` to match all authenticated users
+
+    Or configure a more specific filter if you only want a subset of users to join automatically. Other users can still join with an **invite code** or be invited manually by an org admin.
+  </Step>
+</Steps>
+
+#### Default role mapping
+
+When **Assign role** is left to **Default**, legacy users matched by your rule will be assigned an organization role based on their old **platform role**:
+
+| Legacy platform role | Assigned org role |
+| --- | --- |
+| `User` | `org:member` |
+| `KnowledgeAdmin`, `KnowledgeUser` | `agent-maker` |
+| `Builder` | `builder` |
+| `Admin` | `org:admin` |
+| `PlatformAdmin` | `org:owner` |
+
+#### Default group mapping
+
+When **Add to groups** is left empty, **any group a legacy user belonged to** will be automatically recreated in your organization, and the user will be added to it.
+
+<Tip>
+  For more advanced rules — assigning different roles or groups based on email or SSO metadata — see the [Join Rules documentation](https://prismeai-docs-next.mintlify.app/products/ai-governance/identity-access#join-rules).
+</Tip>
+
+### 5.3 Appearance
+
+Configure your platform branding: name, favicon, colors, terms of use, …
+
+<Info>
+  All appearance settings can be exported / imported via the three-dot menu in the top-right corner.
+</Info>
+
+### 5.4 Menu editor
+
+A default menu template is [available here](https://cdn.prisme.ai/templates/menu-builder-template.json).  
+
+<Steps>
+  <Step title="Download the template">
+    Download the JSON file from the URL above.
+  </Step>
+  <Step title="Import it">
+    Open the **Menu Editor**, click the three-dot menu in the top-right corner, and import the JSON file.
+  </Step>
+  <Step title="Save and refresh">
+    Save your changes and refresh the page — the left menu should now be populated.
+  </Step>
+</Steps>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}> 
+  <Card title="AI Governance" icon="shield-halved" href="/products/ai-governance/identity-access">
+    Deep-dive into identity, access, and join rules.
+  </Card>
+</CardGroup>
