@@ -1,0 +1,364 @@
+---
+title: "Install from scratch (v27)"
+description: "Step-by-step guide for installing the new v27 Prisme.ai platform products (Agent Creator, LLM Gateway, Storage, Governe) on a fresh self-hosted environment."
+---
+
+This guide walks you through a **fresh installation** of a self-hosted Prisme.ai platform on **v27**, configured directly with the new platform products (**Agent Creator**, **LLM Gateway**, **Storage** — vector store, **Governe**, …) — **without any legacy Knowledges / AI Store data to migrate**.
+
+If you are upgrading an existing instance from legacy products, follow [Migration v27](/self-hosting/operations/migration-v27) instead.
+
+The installation is split into four phases:
+
+<Steps>
+  <Step title="Infrastructure setup">
+    Deploy the platform with Helm, image tags, and environment variables.
+  </Step>
+  <Step title="First connection">
+    Log in as super admin and create your organization.
+  </Step>
+  <Step title="Products initialization">
+    Import the new platform workspaces in the correct order.
+  </Step>
+  <Step title="Post-install configuration">
+    Declare LLM providers, models, vector store and organization settings.
+  </Step>
+</Steps>
+
+<Info>
+  This page assumes the **platform itself** is already deployed (databases, ingress, secrets management, etc.). If you are not at that point yet, start from the [Self-Hosting Overview](/self-hosting/overview) and choose a deployment path: [Helm](/self-hosting/kubernetes/helm), [Docker](/self-hosting/kubernetes/docker), or a [cloud provider](/self-hosting/cloud/aws). For the broader product setup sequence (Governe, LLM Gateway, Storage, Agent Creator, Insights, Builder, Helper Agents), see [Configuring Products](/self-hosting/configuration/products-installation).
+</Info>
+
+## 1. Infrastructure setup
+
+### 1.1 Use the unified Console image
+
+In your Helm `core-values.yaml`, configure the `prismeai-console` block to use the unified platform image:
+
+```yaml
+prismeai-console:
+  enabled: true
+  image:
+    repository: registry.gitlab.com/prisme.ai/prisme.ai/prisme.ai-platform
+    tag: ...
+```
+
+### 1.2 Pin all service & app tags
+
+Pin **all** core service and app image tags to the same v27 release. The available tags are listed on the [Prisme.ai releases page](https://gitlab.com/prisme.ai/prisme.ai/-/releases).
+
+### 1.3 Configure LLM & vector store credentials
+
+LLM Gateway and Storage workspaces consume credentials through `WORKSPACE_SECRET_*` environment variables exposed on **prismeai-runtime**.
+
+<Info>
+  The string after `llm-gateway_` or `storage_` is the **secret name** as it will be consumed by the LLM Gateway and Storage workspaces. The names you choose here must match the secret names referenced from the workspace configuration in step 4.
+</Info>
+
+<Tabs>
+  <Tab title="LLM providers">
+    Declare every LLM provider credential as a `WORKSPACE_SECRET_llm-gateway_*` variable.
+
+    **Examples:**
+
+    | Provider | Variable |
+    | --- | --- |
+    | AWS Bedrock | `WORKSPACE_SECRET_llm-gateway_awsBedrockAccessKey` |
+    | OpenAI | `WORKSPACE_SECRET_llm-gateway_openaiApiKey` |
+    | Azure OpenAI | `WORKSPACE_SECRET_llm-gateway_azureOpenaiApiKey` |
+  </Tab>
+  <Tab title="Vector store">
+    Declare every vector store credential as a `WORKSPACE_SECRET_storage_*` variable.
+
+    **Examples:**
+
+    | Field | Variable |
+    | --- | --- |
+    | Host | `WORKSPACE_SECRET_storage_opensearch_host` |
+    | Username | `WORKSPACE_SECRET_storage_opensearch_username` |
+    | Password | `WORKSPACE_SECRET_storage_opensearch_password` |
+  </Tab>
+</Tabs>
+
+<Tip>
+  Alternatively, these secrets can be entered directly from the **Secrets** page of the **LLM Gateway** and **Storage** workspaces, without touching environment variables.
+</Tip>
+
+### 1.4 Deploy
+
+Deploy the Helm chart and wait for all pods to roll out successfully.
+
+```bash
+helm -n prismeai-core upgrade --install prismeai-core -f core-values.yaml prismeai/prismeai-core
+helm -n prismeai-apps upgrade --install prismeai-apps -f apps-values.yaml prismeai/prismeai-apps
+```
+
+Verify the platform is healthy via the [Readiness API](/self-hosting/operations/testing#platform-readiness-api) before continuing.
+
+---
+
+## 2. First connection
+
+<Steps>
+  <Step title="Log in as super admin">
+    Once all services are deployed, sign in to the platform with a super admin account — the accounts listed under `config.admins` in your Helm values.
+  </Step>
+  <Step title="Create your organization">
+    From the onboarding screen, create your organization:
+
+    - **Name** — the display name shown across the UI.
+    - **Technical name** — the unique identifier used throughout the platform. It **cannot be changed** after creation.
+  </Step>
+  <Step title="Open Builder">
+    After creation, you should be redirected to a near-empty platform with two links in the left menu: **Builder** and **Govern**. Open **Builder**.
+  </Step>
+</Steps>
+
+---
+
+## 3. Products initialization
+
+The v27 platform products are imported in **four sequential groups** via the **Platform** workspace bulk import:
+
+<CardGroup cols={2}>
+  <Card title="base1" icon="cube">
+    Foundation apps (Custom Code, Prisme.ai API, …).
+  </Card>
+  <Card title="base2" icon="cubes">
+    Extended base (Crawler, NLU, RedisSearch, …).
+  </Card>
+  <Card title="extended" icon="boxes-stacked">
+    Legacy AI products (Knowledges, AI Store, …) — still required as a dependency for the v27 platform products. They will disappear in a future release.
+  </Card>
+  <Card title="one-product" icon="box-archive">
+    Main v27 products (LLM Gateway, Storage, Governe, Agent Creator, …).
+  </Card>
+</CardGroup>
+
+For each group:
+
+<Steps>
+  <Step title="Open the Platform workspace">
+    The **Platform** workspace is only visible to super admins.
+  </Step>
+  <Step title="Trigger the bulk import">
+    Navigate to **Settings** → **Versions** → **Platform Pull**, then select the **Release vXXX** platform repository.
+  </Step>
+  <Step title="Select the group and start the import">
+    Pick the group, start the import, and close the modal.
+  </Step>
+  <Step title="Monitor progress">
+    From the **Activity** feed of the Platform workspace, wait for the `workspaces.bulkImport.completed` event before moving on.
+  </Step>
+  <Step title="Repeat for the next group">
+    Import the groups in order: `base1` → `base2` → `extended` → `one-product`.
+  </Step>
+</Steps>
+
+<Warning>
+  Always wait for `workspaces.bulkImport.completed` (with no errors) before importing the next group — each group depends on the previous one.
+</Warning>
+
+---
+
+## 4. Post-install configuration
+
+Once all groups are imported, configure each new workspace in the order below.
+
+### 4.1 Governe — set the admin token
+
+The **Governe** workspace needs an `adminAccessToken` to call platform APIs on behalf of administrators.
+
+<Steps>
+  <Step title="Generate a long-term token">
+    From your super admin account, generate a long-term API token (Settings → Account → API tokens).
+  </Step>
+  <Step title="Paste it into the workspace">
+    In **Builder**, open the **Governe** workspace → **Settings** → **Secrets**, paste the value into `adminAccessToken`, then **Save**.
+  </Step>
+</Steps>
+
+See [Configuring Governe](/self-hosting/configuration/ai-governance) for the full token command and workspace setup.
+
+### 4.2 LLM providers
+
+<Steps>
+  <Step title="Open the Govern app">
+    From the left menu, open **Govern** → **Models** → **Providers** tab.
+  </Step>
+  <Step title="Declare each provider">
+    Click **Add provider** and pick the provider type (OpenAI, Azure OpenAI, AWS Bedrock, …). For each provider:
+
+    - Set the **secret names** to match the secrets you exposed via `WORKSPACE_SECRET_llm-gateway_*` environment variables (or stored in the **LLM Gateway** workspace Secrets).
+    - Configure provider-specific options (region, endpoint, deployment name, …).
+
+    <Tip>
+      Hover the **(i)** icon next to a secret input to see the matching environment variable name.
+    </Tip>
+  </Step>
+  <Step title="(Optional) Configure secrets from the UI">
+    If you'd rather store the secrets on the platform itself instead of through env vars:
+
+    1. Open **Builder** in a new tab.
+    2. Open the **LLM Gateway** workspace → **Settings** → **Secrets**.
+    3. Add the secrets, using the **same names** as referenced by your providers.
+  </Step>
+  <Step title="Save">
+    Save the providers configuration.
+  </Step>
+</Steps>
+
+<Info>
+  All LLM providers can be **exported and re-imported** from the three-dot menu — useful for replicating configuration across environments.
+</Info>
+
+### 4.3 LLM models
+
+<Steps>
+  <Step title="Open the Models tab">
+    Still in **Govern** → **Models**, switch to the **Models** tab.
+  </Step>
+  <Step title="Declare each model">
+    Click **Add model** and select the provider, model identifier, capabilities (completion / embedding / vision), and any default parameters.
+  </Step>
+  <Step title="Verify with the Test button">
+    For every model:
+
+    - Open it and click **Test** — the model response is shown below the button.
+    - For **embedding** models, the **dimensions** option must be set explicitly.
+  </Step>
+</Steps>
+
+<Info>
+  Models can also be exported / imported in bulk from the three-dot menu.
+</Info>
+
+### 4.4 Vector store
+
+<Steps>
+  <Step title="Open the Infrastructure page">
+    From the **Govern** menu, open **Infrastructure**.
+  </Step>
+  <Step title="Pick a driver">
+    Select your vector store driver: **Elasticsearch** or **OpenSearch**.
+  </Step>
+  <Step title="Set credential secret names">
+    Make sure the credential secret names match the values you exposed via `WORKSPACE_SECRET_storage_*` environment variables.
+
+    <Tip>
+      Hover the **(i)** icon next to a secret input to see the matching environment variable name.
+    </Tip>
+
+    To configure secrets directly from the UI instead:
+
+    1. Open **Builder** in a new tab.
+    2. Open the **Storage** workspace → **Settings** → **Secrets**.
+    3. Add the secrets.
+  </Step>
+  <Step title="Set the index prefix">
+    Set `vector_store_index_prefix` to the prefix you want for your RAG indexes (e.g. `prod_rag`).
+  </Step>
+  <Step title="Save and Test">
+    **Save** the configuration, then click **Test**. If the test fails, review your environment variables, secrets, or database connectivity and try again.
+  </Step>
+</Steps>
+
+<Info>
+  The raw vector store configuration lives in **Storage** workspace settings — accessible via the **Edit** button at the top right of the Storage workspace.
+</Info>
+
+### 4.5 Infrastructure checkup
+
+While on the **Infrastructure** page, use the **Test** button at the bottom of the **Services** block to verify connectivity to all platform databases.
+
+---
+
+## 5. Organization configuration
+
+### 5.1 Allowed models
+
+<Steps>
+  <Step title="Open your organization">
+    Open **Organizations** and select the organization you created in step 2.
+  </Step>
+  <Step title="Open Agent controls">
+    Navigate to **Agent controls**.
+  </Step>
+  <Step title="Pick allowed models">
+    Select all models you want to make available (you can use **Select all**). Models can be reordered by drag-and-drop.
+  </Step>
+  <Step title="Set defaults">
+    Choose the default **Completions** and **Embeddings** models for the organization.
+  </Step>
+  <Step title="Save">
+    Scroll to the bottom of the page and click **Save**.
+  </Step>
+</Steps>
+
+### 5.2 Join rules
+
+Join rules control which users automatically become members of your organization.
+
+<Steps>
+  <Step title="Open Join Rules">
+    Navigate to the **Join Rules** page.
+  </Step>
+  <Step title="Add a rule">
+    Add a rule with:
+
+    - **Field**: `Email`
+    - **Operator**: `matches (wildcard)`
+    - **Value**: `*` to match all authenticated users
+
+    Or configure a more specific filter if you only want a subset of users to join automatically. Other users can still join with an **invite code** or be invited manually by an org admin.
+  </Step>
+  <Step title="Pick the assigned role">
+    On a fresh install there is no legacy role mapping to fall back on, so set **Assign role** explicitly — typically `org:member` for the default rule, and add stricter rules above it for admins / builders.
+  </Step>
+</Steps>
+
+<Tip>
+  For more advanced rules — assigning different roles or groups based on email or SSO metadata — see the [Join Rules documentation](/products/ai-governance/identity-access#join-rules).
+</Tip>
+
+### 5.3 Appearance
+
+Configure your platform branding: name, favicon, colors, terms of use, …
+
+<Info>
+  All appearance settings can be exported / imported via the three-dot menu in the top-right corner.
+</Info>
+
+### 5.4 Menu editor
+
+A default menu template is [available here](https://cdn.prisme.ai/templates/menu-builder-template.json).
+
+<Steps>
+  <Step title="Download the template">
+    Download the JSON file from the URL above.
+  </Step>
+  <Step title="Import it">
+    Open the **Menu Editor**, click the three-dot menu in the top-right corner, and import the JSON file.
+  </Step>
+  <Step title="Save and refresh">
+    Save your changes and refresh the page — the left menu should now be populated.
+  </Step>
+</Steps>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Configuring Products" icon="cogs" href="/self-hosting/configuration/products-installation">
+    Reference for the full product setup sequence and per-product details.
+  </Card>
+  <Card title="Migration v27" icon="arrow-right-arrow-left" href="/self-hosting/operations/migration-v27">
+    Already running an older version? Use the migration guide instead.
+  </Card>
+  <Card title="Updates" icon="arrow-up" href="/self-hosting/operations/updates">
+    Plan future upgrades and rollbacks.
+  </Card>
+  <Card title="Backups" icon="database" href="/self-hosting/operations/backup">
+    Configure backups before going to production.
+  </Card>
+</CardGroup>
