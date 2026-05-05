@@ -10,7 +10,7 @@ This tutorial shows you how to build powerful automations that combine webhooks,
 A complete API and webhook integration with:
 - A webhook endpoint to receive external data
 - Custom code processing for data transformation
-- AI-powered text summarization using Knowledge Client
+- AI-powered text summarization using an Agent Creator agent (called via the Agent Factory App)
 - Seamless event-driven communication between components
 
 <Note>
@@ -22,43 +22,55 @@ This solution demonstrates how Prisme.ai can transform simple API integrations i
 Before starting this tutorial, make sure you have:
 
 - An active Prisme.ai account
-- The Knowledge Client app installed in your workspace
+- The Agent Factory App installed in your workspace (search for "Agent Factory App" in the marketplace; its automation namespace is `Agents`)
+- An **Agent Factory API key** generated in Agent Creator (open any agent → **Settings** → **API Keys**) and pasted into the Agent Factory App's configuration field `apiKey` after installing it. This is required for the webhook to call the agent from an unauthenticated request — without it, `Agents.sendMessage` returns `401 UNAUTHORIZED`.
 - The Custom Code app installed in your workspace
+- An agent created in the [Agent Creator](/products/agent-factory/creating-agents) product, configured with the system instructions you want for the summary task
 
 ## Step 1: Creating Your Workspace
 
 Let's start by setting up a dedicated workspace for our webhook integrations:
 
 <Steps>
-  <Step title="Access Builder">
-    Log in to your Prisme.ai account and navigate to the Builder product
+  <Step title="Open Builder">
+    Log in to AI Studio and open the Builder product. Your workspaces list lives at `/builder`.
   </Step>
   <Step title="Create a New Workspace">
-    Click the "Create Workspace" button to start a new project
+    Click "+ Create new workspace", then on step 1 choose "From Scratch".
+
+    ![Builder Create Workspace wizard step 1: From Scratch / Import ZIP](/images/tutorials/builder-create-wizard-step1.png)
   </Step>
   <Step title="Configure Workspace Settings">
-    - Name your workspace "AI API Integrator" (or a name of your choice)
-    - Add an appropriate description and icon
-    - Configure any additional settings as needed
+    On step 2, fill in:
+    - Name: "AI API Integrator" (or a name of your choice)
+    - Description: a short summary of the workspace purpose
+
+    Click "Create Workspace" to land in the empty workspace.
+
+    ![Builder Create Workspace wizard step 2: name and description](/images/tutorials/builder-create-wizard-step2.png)
   </Step>
 </Steps>
 
+![Builder workspace Overview page with sidebar (Overview, Activity, Pages, Automations, Imports, Files, Settings) and Usage / Recent Changes / Quick Actions panels](/images/tutorials/builder-workspace-overview.png)
+
+_The screenshot shows an existing populated workspace; yours will start empty until you add automations and pages._
+
 ## Step 2: Creating the Summary Generation Automation
 
-First, let's create the automation that will use AI to generate summaries from JSON data:
+First, let's create the automation that will use AI to generate summaries from JSON data. The actual summarization prompt lives on the agent itself in Agent Creator — this automation only forwards the user message.
 
 <Steps>
   <Step title="Navigate to Automations">
-    In your workspace, go to the Automations section
+    In your workspace, go to the Automations section.
   </Step>
   <Step title="Create a New Automation">
-    Click "Create Automation" and configure the following:
+    Create a new automation with:
     - Name: "Generate Summary"
     - Slug: "generate-summary"
   </Step>
   <Step title="Configure the Automation">
     Use the following YAML configuration:
-    
+
     ```yaml
     slug: generate-summary
     name: Generate Summary
@@ -66,27 +78,37 @@ First, let's create the automation that will use AI to generate summaries from J
       - set:
           name: stringifiedData
           value: '{% json({{payload.data}}) %}'
-      - Knowledge Client.chat-completion:
-          messages:
-            - role: system
-              content: Create a brief summary from a JSON object, focusing on key details and overarching information contained within, ensuring clarity and conciseness in the summary.
-            - role: user
-              content: '{{stringifiedData}}'
-          output: genAIData
+      - Agents.sendMessage:
+          agent_id: '{{config.summaryAgentId}}'
+          message:
+            parts:
+              - type: text
+                text: '{{stringifiedData}}'
+          output: agentResponse
     when:
       events:
         - summary-event
-    output: '{{genAIData.response}}'
+    output: '{{agentResponse.task.output.messages[0].parts[0].text}}'
     ```
-    
+
   </Step>
   <Step title="Save the Automation">
-    Click "Save" to create your summary generation automation
+    Save the automation.
   </Step>
 </Steps>
 
+{/* TODO screenshot: Generate Summary automation in Builder editor showing the YAML */}
+
+<Tip>
+The instruction "Create a brief summary from a JSON object, focusing on key details and overarching information…" should be set as the **system instructions on the agent itself**, in Agent Creator — not in this YAML. The automation only sends the user message; the agent's behavior is fully owned by its configuration.
+
+Store the agent's ID under your workspace **Configuration** as `summaryAgentId` so it's easy to swap later. To get the ID, open the agent in Agent Creator and copy it from the URL. Make sure the agent uses a model your organization has enabled in **Governe** (e.g. `gpt-4o`); a disallowed model returns an error in the same response shape.
+</Tip>
+
 <Note>
-Notice that we first parse the JSON object as a string using the `json()` utility function. This is necessary because language models expect text input, not structured JSON. Learn more about this in the [condition documentation](https://docs.eda.prisme.ai/en/workspaces/conditions.md#conditions).
+We parse the JSON object as a string using the `json()` utility function because language models expect text input, not structured JSON.
+
+`Agents.sendMessage` returns an A2A task object. The model's reply is at `agentResponse.task.output.messages[0].parts[0].text` — that's the path used in the `output:` line above. The full task object also contains `usage` (tokens, cost), `task.id`, and `task.contextId` (useful if you want to continue the conversation by passing it back as `context_id` on the next call). Inspect the activity log to see the complete shape.
 </Note>
 
 ## Step 3: Creating the Webhook Automation
@@ -95,7 +117,7 @@ Now, let's create the webhook automation that will receive data and trigger the 
 
 <Steps>
   <Step title="Create Another Automation">
-    Back in the Automations section, click "Create Automation" again
+    Back in the Automations section, create another automation.
   </Step>
   <Step title="Configure the Webhook Automation">
     Use the following settings:
@@ -105,7 +127,7 @@ Now, let's create the webhook automation that will receive data and trigger the 
   </Step>
   <Step title="Set Up the Automation Logic">
     Configure the automation with this YAML:
-    
+
     ```yaml
     slug: webhook
     name: Webhook
@@ -126,19 +148,20 @@ Now, let's create the webhook automation that will receive data and trigger the 
     output:
       message: '{{cleanData}}'
     ```
-    
+
   </Step>
   <Step title="Save the Webhook Automation">
-    Click "Save" to create your webhook endpoint automation
+    Save the automation.
   </Step>
   <Step title="Get Your Webhook URL">
-    - Click on the "Triggered when" section of your automation
-    - Look for the blue "Get the link" button and click it
+    - Open the "Triggered when" section of your automation
+    - Click "Get the link"
     - Copy the displayed URL, which will look like: `https://api.studio.prisme.ai/v2/workspaces/YOUR-WorkspaceID/webhooks/webhook`
-    
 
   </Step>
 </Steps>
+
+{/* TODO screenshot: webhook endpoint "Get the link" panel with the URL visible */}
 
 ## Step 4: Configuring Custom Code
 
@@ -146,11 +169,11 @@ Now, let's set up the Custom Code app to process our incoming data:
 
 <Steps>
   <Step title="Access Custom Code App">
-    Navigate to the Apps section in your workspace and open the Custom Code app
+    Open the **Imports** section in your workspace sidebar and open the Custom Code app.
   </Step>
   <Step title="Create the CleanData Function">
     Configure the Custom Code app with the following YAML:
-    
+
     ```yaml
     appName: Custom Code
     slug: Custom Code
@@ -179,12 +202,14 @@ Now, let's set up the Custom Code app to process our incoming data:
                   }
                 ]
     ```
-    
+
   </Step>
   <Step title="Save the Custom Code Configuration">
-    Click "Save" to apply your Custom Code settings
+    Save your Custom Code settings.
   </Step>
 </Steps>
+
+{/* TODO screenshot: Custom Code app config page with CleanData function */}
 
 <Note>
 The Custom Code function includes a default value for testing purposes. In a real-world scenario, you would likely perform more complex data transformation operations here.
@@ -200,21 +225,24 @@ Let's test our webhook and see the AI summary generation in action:
     `https://api.studio.prisme.ai/v2/workspaces/YOUR-WorkspaceID/webhooks/webhook?city=Toulouse&country=France`
   </Step>
   <Step title="Send the Request">
-    Use a tool like curl, Postman, or simply enter the URL in your browser to trigger the webhook
+    Use a tool like curl, Postman, or simply enter the URL in your browser to trigger the webhook.
   </Step>
   <Step title="Check the Response">
-    The webhook should return a message containing the clean data
+    The webhook should return a message containing the clean data.
   </Step>
   <Step title="Verify Summary Generation">
-    Check your activity logs to confirm that the summary-event was triggered and the AI generated a summary of the data:
+    Check your activity logs to confirm that the `summary-event` was triggered and that an `Agents.sendMessage` call was made to your agent with payload data such as:
     ```json
     {
       "city": "Toulouse",
       "country": "France"
     }
     ```
+    Expand the `Agents.sendMessage` event in the activity log to see the full agent response captured in `agentResponse`.
   </Step>
 </Steps>
+
+![Builder workspace Activity log listing runtime.automations.executed events for generate-summary, sendMessage, _call, webhook, run function and the summary-event trigger](/images/tutorials/builder-workspace-activity.png)
 
 ## Understanding HTTP Variables in Webhooks
 
@@ -235,18 +263,18 @@ To manage your webhook integrations effectively:
 
 <Steps>
   <Step title="Save Your Current State">
-    Use the "Pull" button in your workspace to create a new version
-    
+    Use the **Push** button in your workspace to create a new version.
+
   </Step>
   <Step title="Create Additional Versions">
-    As you make changes and improvements, create new versions to maintain a history of your work
+    As you make changes and improvements, create new versions to maintain a history of your work.
   </Step>
   <Step title="Deploy Specific Versions">
-    Select which version to deploy in your workspace settings
+    Select which version to deploy in your workspace settings.
   </Step>
 </Steps>
 
-For more information, see the documentation on [Version Control](https://docs.eda.prisme.ai/en/workspaces/versioning/) and [RBAC](https://docs.eda.prisme.ai/en/workspaces/security/).
+For more information, see the documentation on [Version Control](/products/ai-builder/versioning) and [RBAC](/products/ai-builder/rbac).
 
 ## Monitoring and Logs
 
@@ -254,14 +282,14 @@ Keep track of your webhook activity and performance:
 
 <Steps>
   <Step title="Access Activity Logs">
-    Navigate to the Activity section of your workspace to view detailed records of webhook calls, automation triggers, and AI operations
-    
+    Open the Activity section from the Builder workspace sidebar to view detailed records of webhook calls, automation triggers, and AI operations.
+
   </Step>
   <Step title="Set Up Alerts">
-    Configure alerts for critical events or errors in your automations
+    Configure alerts for critical events or errors in your automations.
   </Step>
   <Step title="Analyze Performance">
-    Use logs to identify patterns, bottlenecks, or areas for improvement
+    Use logs to identify patterns, bottlenecks, or areas for improvement.
   </Step>
 </Steps>
 

@@ -9,7 +9,7 @@ This tutorial guides you through creating an intelligent contact form powered by
 
 A complete AI-powered contact routing system with:
 - A customizable contact form for your website or application
-- Intelligent content analysis using OpenAI
+- Intelligent content analysis using a governed agent
 - Automated routing to department-specific email addresses
 - Attachment handling capabilities
 - Easy maintenance and monitoring
@@ -24,6 +24,9 @@ Before starting this tutorial, make sure you have:
 
 - An active Prisme.ai account
 - The SendMail app installed in your workspace
+- The Agent Factory App installed in your workspace
+- An **Agent Factory API key** generated in Agent Creator (open any agent → **Settings** → **API Keys**) and pasted into the Agent Factory App's configuration field `apiKey` after installing it. This is required when the contact form is public — without it, `Agents.sendMessage` returns `401 UNAUTHORIZED` for unauthenticated submissions.
+- A routing agent created in Agent Creator with system instructions like: *Given the following customer inquiry, categorize it as either sales, support, or careers. Provide your categorization based on the content. Answer with the category only.*
 
 ## Step 1: Creating Your Workspace
 
@@ -31,131 +34,299 @@ First, let's set up a dedicated workspace for our contact routing system:
 
 <Steps>
   <Step title="Access Builder">
-    Log in to your Prisme.ai account and navigate to the Builder product
+    Log in to AI Studio and open **Builder**. Your workspaces list lives at `/builder`.
   </Step>
   <Step title="Create a New Workspace">
-    Click the "Create Workspace" button to start a new project
+    Click **+ Create new workspace** to start the creation wizard.
+  </Step>
+  <Step title="Choose a Starting Point">
+    In step 1 of the wizard, choose **From Scratch**.
   </Step>
   <Step title="Configure Workspace Settings">
-    - Name your workspace "AI Contact Routing" (or a name of your choice)
+    In step 2:
+    - Name your workspace **AI Contact Routing**
     - Add a description like "Intelligent contact form with AI-based routing"
-    - Select an appropriate icon for your workspace
-    - Configure any additional settings as needed
+    - Click **Create Workspace**
   </Step>
 </Steps>
+
+![Builder Create Workspace wizard step 2: name and description](/images/tutorials/builder-create-wizard-step2.png)
+
+_The wizard layout above is the same regardless of name — for this tutorial, fill in "AI Contact Routing"._
+
+{/* TODO screenshot: Builder Create Workspace wizard step 2 specifically for "AI Contact Routing" */}
 
 ## Step 2: Building the Contact Form
 
-Now, let's create a user-friendly contact form that will collect information from your visitors:
+Now, let's create a user-friendly contact form that will collect information from your visitors. In v27, each Builder workspace has a single editable page called `index` — a React + Vite + Tailwind + Radix SPA, not a block canvas.
+
+<Note>
+If you came from the legacy Pages model, the block YAML (`slug: Form`, `onSubmit: formSubmit`, etc.) is gone. Pages are now React SPA source trees; the platform compiles and previews them inside Builder. Form submission is done with `fetch` against a webhook automation, not by emitting a Prisme.ai event.
+</Note>
 
 <Steps>
-  <Step title="Create a New Page">
-    In your workspace, navigate to the Pages section and click "Create Page"
+  <Step title="Open Pages">
+    In your workspace, select **Pages** in the Builder sidebar. Open the editable `index` page — that's the workspace's React app.
   </Step>
-  <Step title="Configure Page Properties">
-    - Name your page "Contact Us Form"
-    - Set the slug to "contact-us" (this will be used in the URL)
-  </Step>
-  <Step title="Add a Form Block">
-    Add a Form block to your page for inquiries with the following configuration:
-    
-    ```yaml
-    slug: contact-us
-    name: Contact Us Form
-    blocks:
-      - slug: Form
-        schema:
-          type: object
-          properties:
-            name:
-              type: string
-              title: Name
-              description: Fill your first name please
-              placeholder: John doe
-            message:
-              type: string
-              title: Message
-              description: Fill your message
-              placeholder: your message
-              ui:widget: textarea
-            email:
-              type: string
-              placeholder: john.doe@example.com
-              description: your email
-            attachement:
-              type: string
-              ui:widget: upload
-              title: Attachement
-              description: Attach a file if needed
-              placeholder: Your file
-        onSubmit: formSubmit
-    ```
-  </Step>
-  <Step title="Set the Form Submission Event">
-    In the form configuration, set the "onSubmit" field to "formSubmit" - this event name will trigger our automation
-  </Step>
-  <Step title="Save Your Page">
-    Save your page configuration. Your form should now be ready to collect user inquiries
-  </Step>
-  <Step title="Get the Page URL">
-    Click the share icon to get your page's URL. The format will be: `workspace-slug.pages.host/lang/contact-us`
+  <Step title="Switch to Code mode">
+    Use the page toolbar to switch to **Code**. You should see the source tree with files such as:
 
+    - `src/App.tsx`
+    - `src/main.tsx`
+    - `src/styles/globals.css`
+    - `index.html`
+    - `package.json`
+    - `vite.config.ts`
+
+    If the workspace has no source yet, initialize the React/Vite/Tailwind/Radix starter from Code mode.
+  </Step>
+  <Step title="Replace src/App.tsx with the contact form">
+    Open `src/App.tsx` in the editor and replace its content with the SPA below. It renders a Tailwind-styled form with `name`, `email`, `message`, and an optional `attachment` file input. On submit, it reads the file as a base64 data URL (simple option for small attachments) and POSTs everything as JSON to a webhook automation called `submit-contact`.
+
+    ```tsx
+    import { useState } from 'react'
+
+    interface SDK {
+      host: string
+      token?: string
+      _csrfToken?: string
+    }
+
+    interface AppProps {
+      sdk: SDK
+      user: unknown
+      workspace: { id: string; slug: string; name: string }
+      backends?: Record<string, { slug: string }>
+    }
+
+    type Status =
+      | { kind: 'idle' }
+      | { kind: 'sending' }
+      | { kind: 'success'; routedTo: string; category: string }
+      | { kind: 'error'; message: string }
+
+    function readFileAsDataUrl(file: File): Promise<string> {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(String(reader.result))
+        reader.onerror = () => reject(reader.error)
+        reader.readAsDataURL(file)
+      })
+    }
+
+    export default function App({ sdk, workspace }: AppProps) {
+      const [name, setName] = useState('')
+      const [email, setEmail] = useState('')
+      const [message, setMessage] = useState('')
+      const [file, setFile] = useState<File | null>(null)
+      const [status, setStatus] = useState<Status>({ kind: 'idle' })
+
+      async function handleSubmit(e: React.FormEvent) {
+        e.preventDefault()
+        setStatus({ kind: 'sending' })
+
+        try {
+          let attachment: { name: string; type: string; dataUrl: string } | null = null
+          if (file) {
+            const dataUrl = await readFileAsDataUrl(file)
+            attachment = { name: file.name, type: file.type, dataUrl }
+          }
+
+          const response = await fetch(
+            `${sdk.host}/workspaces/slug:${workspace.slug}/webhooks/submit-contact`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                ...(sdk.token ? { Authorization: `Bearer ${sdk.token}` } : {}),
+                ...(sdk._csrfToken
+                  ? { 'x-prismeai-csrf-token': sdk._csrfToken }
+                  : {}),
+              },
+              body: JSON.stringify({ name, email, message, attachment }),
+            },
+          )
+
+          if (!response.ok) {
+            throw new Error(`Request failed with status ${response.status}`)
+          }
+
+          const data = (await response.json()) as {
+            routed_to?: string
+            category?: string
+          }
+
+          setStatus({
+            kind: 'success',
+            routedTo: data.routed_to ?? 'unknown',
+            category: data.category ?? 'unknown',
+          })
+          setName('')
+          setEmail('')
+          setMessage('')
+          setFile(null)
+        } catch (err) {
+          setStatus({
+            kind: 'error',
+            message: err instanceof Error ? err.message : 'Unknown error',
+          })
+        }
+      }
+
+      const isSubmitting = status.kind === 'sending'
+
+      return (
+        <main className="min-h-screen bg-slate-50 px-4 py-12">
+          <div className="mx-auto max-w-xl rounded-2xl bg-white p-8 shadow-sm ring-1 ring-slate-200">
+            <h1 className="text-2xl font-semibold text-slate-900">Contact us</h1>
+            <p className="mt-1 text-sm text-slate-600">
+              Tell us how we can help. Your message will be routed to the right team.
+            </p>
+
+            <form onSubmit={handleSubmit} className="mt-6 space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-700">Name</label>
+                <input
+                  type="text"
+                  required
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-slate-500 focus:outline-none"
+                  placeholder="Jane Doe"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700">Email</label>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-slate-500 focus:outline-none"
+                  placeholder="jane.doe@example.com"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700">Message</label>
+                <textarea
+                  required
+                  value={message}
+                  onChange={(e) => setMessage(e.target.value)}
+                  rows={5}
+                  className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-slate-500 focus:outline-none"
+                  placeholder="How can we help?"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700">
+                  Attachment (optional)
+                </label>
+                <input
+                  type="file"
+                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                  className="mt-1 block w-full text-sm text-slate-700 file:mr-3 file:rounded-md file:border-0 file:bg-slate-900 file:px-3 file:py-2 file:text-sm file:text-white hover:file:bg-slate-800"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="w-full rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isSubmitting ? 'Sending…' : 'Send message'}
+              </button>
+
+              {status.kind === 'success' && (
+                <p className="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800 ring-1 ring-emerald-200">
+                  Thanks — your message was routed to <strong>{status.routedTo}</strong>{' '}
+                  (category: {status.category}).
+                </p>
+              )}
+
+              {status.kind === 'error' && (
+                <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-800 ring-1 ring-red-200">
+                  Something went wrong: {status.message}
+                </p>
+              )}
+            </form>
+          </div>
+        </main>
+      )
+    }
+    ```
+
+    <Tip>
+      Reading the file as a base64 data URL is the simplest path and works fine for small attachments. For anything larger (or for binary attachments you want to keep separate from the routing payload), upload it via the platform `/files` upload endpoints first and pass only the resulting file URL or metadata in the JSON body — then reference that URL from the email step.
+    </Tip>
+  </Step>
+  <Step title="Save the page">
+    Click **Save**. Builder syncs the source files to the workspace.
+  </Step>
+  <Step title="Preview the form">
+    Switch back to **Preview** and try the form in the **Desktop**, **Tablet**, and **Mobile** viewports. The compiled SPA renders inside Builder — you don't need to deploy to test the layout.
   </Step>
 </Steps>
+
+![Builder Pages editor for the index page with Preview / Code toggle, device viewport selectors, and Save button](/images/tutorials/builder-workspace-pages.png)
+
+_The Preview pane renders the compiled SPA in Builder. Once `src/App.tsx` is in place, the contact form appears in the right pane._
 
 ## Step 3: Installing Required Apps
 
 Before creating our automation, we need to install the necessary apps from the Prisme.ai App Store:
 
 <Steps>
-  <Step title="Access the App Store">
-    Navigate to the "Apps" section in your workspace
+  <Step title="Open the Imports panel">
+    In your workspace sidebar, open **Imports** and click the **+** button to browse the marketplace.
   </Step>
   <Step title="Install the SendMail App">
-    - Click the "+" button to browse available apps
-    - Search for "SendMail" and click to install it
-    - Follow the on-screen instructions to complete the installation
-    
+    Search for "SendMail" and click to install it. Follow the on-screen instructions to complete the installation.
   </Step>
-  <Step title="Install the OpenAI App">
-    - Again, click the "+" button in the Apps section
-    - Search for "OpenAI" and click to install it
-    - During configuration, enter your OpenAI API key
+  <Step title="Install the Agent Factory App">
+    Search for "Agent Factory App" in the marketplace; once installed it exposes the `Agents` automation namespace.
   </Step>
 </Steps>
 
+{/* TODO screenshot: Imports panel in Builder showing SendMail and Agent Factory App installed */}
+
 ## Step 4: Creating the Form Submission Handler
 
-Now, let's build the automation that will process form submissions and route them based on AI analysis:
+Now, let's build the webhook automation that processes form submissions and routes them based on AI analysis. The page calls it via `fetch`, so we expose it as an HTTP endpoint and read the form fields from `body.*`.
 
 <Steps>
   <Step title="Create a New Automation">
     - Navigate to the "Automations" section of your workspace
     - Click "Create Automation"
-    - Name it "Form Submission Handler"
-    - Set the slug to "form-submission-handler"
+    - Name it "Submit Contact"
+    - Set the slug to **`submit-contact`** — it must match the URL the SPA POSTs to
   </Step>
-  <Step title="Configure the Event Trigger">
-    Set up the automation to trigger on the "formSubmit" event (the same event we configured in our form)
+  <Step title="Configure the Webhook Trigger">
+    Set the trigger to a webhook (HTTP endpoint) instead of an event. In YAML this is `when: { endpoint: true }`. The page reaches it at `${sdk.host}/workspaces/slug:${workspace.slug}/webhooks/submit-contact`.
   </Step>
   <Step title="Set Default Recipient">
     Add a "Set var" instruction:
     - Variable name: "recipient"
     - Value: "hello@example.com" (a default email in case routing fails)
   </Step>
-  <Step title="Add OpenAI Analysis">
-    Add an "OpenAI.chat-completion" instruction:
-    - Model: Select "gpt-4" (or another appropriate model)
-    - Messages:
-      - System role: "Given the following customer inquiry, categorize it as either sales, support, or careers. Provide your categorization based on the content. Answer only with category nothing else."
-      - User role: `"{{payload.message}}"`
-    - Output: "result"
-
+  <Step title="Call the Routing Agent">
+    Add an `Agents.sendMessage` instruction:
+    - `agent_id`: `{{config.routingAgentId}}` (set the agent ID under workspace **Configuration**)
+    - `message`: `{ parts: [{ type: text, text: '{{body.message}}' }] }`
+    - Output: `result`
   </Step>
-  <Step title="Extract AI Response">
+  <Step title="Extract Agent Response">
     Add another "Set var" instruction:
     - Variable name: "routingDecision"
-    - Value: `"{{result.choices[0].message.content}}"`
+    - Value: `'{{result.task.output.messages[0].parts[0].text}}'`
+
+    <Tip>
+      `Agents.sendMessage` returns an A2A task object. The agent's text reply is at `task.output.messages[0].parts[0].text`. Inspect the activity log after a first run to see the full shape (it also includes `task.id`, `task.contextId`, and `usage`).
+
+      Make sure the agent uses a model your organization has enabled in **Governe** (e.g. `gpt-4o`). A disallowed model returns an error in the same `parts[0]` shape with `metadata.error: true`.
+    </Tip>
   </Step>
   <Step title="Create Conditional Routing">
     Add a "conditions" instruction with the following branches:
@@ -169,23 +340,35 @@ Now, let's build the automation that will process form submissions and route the
   <Step title="Configure Email Notification">
     Add a "SendMail.sendMail" instruction:
     - To: `"{{recipient}}"` (the dynamically set department email)
-    - ReplyTo: `"{{payload.email}}"` (the submitter's email)
+    - ReplyTo: `"{{body.email}}"` (the submitter's email)
     - Subject: "New Contact Form Submission"
-    - Body: "Message: `{{payload.message}}`, Name: `{{payload.name}}`, Attachment: `{{payload.attachment}}`"
+    - Body: "Message: `{{body.message}}`, Name: `{{body.name}}`, Attachment: `{{body.attachment.name}}`"
   </Step>
-  <Step title="Set Output and Save">
-    - Set the automation output to `{{routingDecision}}`
-    - Save your automation
+  <Step title="Return a Confirmation to the SPA">
+    Set the automation output to an object the page can read:
+
+    ```yaml
+    output:
+      routed_to: '{{recipient}}'
+      category: '{{routingDecision}}'
+    ```
+
+    The SPA's `handleSubmit` reads `routed_to` and `category` from the response and shows them in the success banner. Save the automation.
   </Step>
 </Steps>
 
+{/* TODO screenshot: Form Submission Handler automation showing the conditions block routing to recipient emails */}
+
 ## Step 5: Testing Your Contact Routing System
 
-Now it's time to test your AI contact routing system:
+Now it's time to test your AI contact routing system. You have two ways to do it:
+
+- **In Builder Preview** — open the `index` page in **Preview** mode. The compiled SPA runs inside Builder with the workspace context already injected, so the `fetch` call to `submit-contact` works without deploying. This is the fastest first-run check.
+- **On the deployed page** — once the workspace is deployed, the public URL is `<workspace-slug>.pages.prisme.ai`.
 
 <Steps>
   <Step title="Access Your Contact Form">
-    Navigate to your contact form using the URL you obtained earlier
+    Open the form in Builder's Preview, or navigate to `<workspace-slug>.pages.prisme.ai` if the workspace is deployed.
   </Step>
   <Step title="Submit Test Inquiries">
     Fill out the form with different types of inquiries to test the routing:
@@ -194,24 +377,27 @@ Now it's time to test your AI contact routing system:
     - A careers-related inquiry (e.g., "I'd like to apply for the marketing position")
   </Step>
   <Step title="Verify Email Routing">
-    Check that each test inquiry is routed to the correct department email
+    Check that each test inquiry is routed to the correct department email. The success banner in the SPA also shows the resolved `routed_to` and `category` returned by the automation.
   </Step>
   <Step title="Test Attachment Handling">
-    Submit a form with an attachment to ensure files are properly included in the emails
+    Submit a form with a small attachment so the base64 data URL is included in the JSON payload, then verify the file metadata appears in the email.
   </Step>
 </Steps>
+
+![Builder workspace Activity log listing runtime.automations.executed events for the webhook and downstream calls](/images/tutorials/builder-workspace-activity.png)
+
+_Each request lands as a `runtime.automations.executed` event with a correlation ID — drill into one to see the `Agents.sendMessage` and `SendMail.sendMail` sub-calls._
 
 ## Step 6: Version Control and Deployment
 
 To finalize your contact routing system:
 
 <Steps>
-  <Step title="Pull Your Changes">
-    Use the "Pull" button in your workspace to create a new version
-
+  <Step title="Push Your Changes">
+    Use the **Push** button in your workspace to create a new version. See [Versioning](/products/ai-builder/versioning) for details.
   </Step>
   <Step title="Set Up Access Controls">
-    Configure Role-Based Access Control (RBAC) to determine who can access and modify your contact routing system
+    Configure Role-Based Access Control to determine who can access and modify your contact routing system. See [RBAC](/products/ai-builder/rbac) for details.
   </Step>
 </Steps>
 
@@ -227,8 +413,8 @@ After deployment, regularly check the system's performance:
   <Step title="Review Classification Accuracy">
     Periodically check if inquiries are being routed correctly and refine your system as needed
   </Step>
-  <Step title="Optimize the AI Prompt">
-    If necessary, adjust the OpenAI prompt to improve classification accuracy for your specific use case
+  <Step title="Optimize the Agent Instructions">
+    If necessary, adjust the routing agent's system instructions in Agent Creator to improve classification accuracy for your specific use case
   </Step>
 </Steps>
 
@@ -245,52 +431,49 @@ Consider these enhancements to make your system even more powerful:
 
 ## Complete YAML Configuration
 
-Here's the complete YAML for the Form Submission Handler automation:
+Here's the complete YAML for the `submit-contact` webhook automation:
 
 ```yaml
-slug: form-submission-handler
-name: Form Submission Handler
+slug: submit-contact
+name: Submit Contact
 do:
   - set:
       name: recipient
       value: hello@example.com
-  - OpenAI.chat-completion:
-      stream:
-        options:
-          persist: true
-      model: mistral-small
-      messages:
-        - role: user
-          content: '{{payload.message}}'
-        - role: system
-          content: Given the following customer inquiry, categorize it as either sales, support, or careers. Provide your categorization based on the content. Answer only with category nothing else.
+  - Agents.sendMessage:
+      agent_id: '{{config.routingAgentId}}'
+      message:
+        parts:
+          - type: text
+            text: '{{body.message}}'
       output: result
   - set:
       name: routingDecision
-      value: '{{result.choices[0].message.content}}'
+      value: '{{result.task.output.messages[0].parts[0].text}}'
   - conditions:
       '{{routingDecision}} = "sales"':
         - set:
             name: recipient
             value: sales@example.com
-      '"{{routingDecision}}" = "support"':
+      '{{routingDecision}} = "support"':
         - set:
             name: recipient
             value: support@example.com
-      '"{{routingDecision}}" = "careers"':
+      '{{routingDecision}} = "careers"':
         - set:
             name: recipient
             value: careers@example.com
       default: []
   - SendMail.sendMail:
       to: '{{recipient}}'
-      replyTo: '{{payload.email}}'
+      replyTo: '{{body.email}}'
       subject: New Contact Form Submission
-      body: 'Message: {{payload.message}}, Name: {{payload.name}}, Attachment: {{payload.attachment}}'
-output: '{{routingDecision}}'
+      body: 'Message: {{body.message}}, Name: {{body.name}}, Attachment: {{body.attachment.name}}'
+output:
+  routed_to: '{{recipient}}'
+  category: '{{routingDecision}}'
 when:
-  events:
-    - formSubmit
+  endpoint: true
 ```
 
 ## Next Steps
