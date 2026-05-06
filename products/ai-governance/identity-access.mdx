@@ -9,37 +9,147 @@ description: 'Manage members, roles, groups, SSO, API keys, and service accounts
 
 Governe provides comprehensive identity and access management (IAM) for your organization. This includes user management, role-based permissions, SSO configuration, and programmatic access through API keys and service accounts.
 
-## Members
+## Joining the Platform
 
-Members are users who belong to your organization. Each member has:
+Access to Prisme.ai is two-staged: a user must first have an account on the **platform**, and then become a member of one or more **organizations**. Platform access is the prerequisite — without it, organization invites and links cannot be redeemed.
 
-- A **role** that defines their permissions
-- Optional **group memberships** for bulk management
-- A **status** (active, invited, or suspended)
+A platform account is created in one of two ways:
 
-### Inviting Members
+- **Local signup** — the user signs up with an email and password. Local signup must be enabled at the platform level, and depending on configuration, new accounts may require **superadmin validation** before they become active.
+- **SSO login** — the user authenticates through a configured identity provider (OIDC or SAML). The account is created automatically on first login. If the SSO provider is attached to an organization, the user is also added to that organization (see [SSO auto-join](#joining-an-organization)).
+
+<Warning>
+A user without a platform account who clicks an organization **invitation link** will see an authentication error — they need to sign up or log in first. To onboard a user who has no account yet, send them an **email invite** instead (see below).
+</Warning>
+
+## Joining an Organization
+
+Once a user has a platform account, they can become a member of one or more organizations. Prisme.ai offers four distinct mechanisms, each with different trade-offs:
+
+| Mechanism | Trigger | Role | Groups | Re-evaluated | Works without a pre-existing platform account? |
+|-----------|---------|------|--------|--------------|------------------------------------------------|
+| **Email invite** | Admin invites a user by email; the user accepts on first login or signup | Admin-chosen role | No | No | **Yes** — the invitation prepares the membership for first connection |
+| **Invitation code (link)** | User opens a shared link while authenticated | Code's `roleSlug` | No | No | **No** — the user must already be logged in |
+| **Join rules** | Evaluated on every `/me` call after login | Rule's `role` | Rule's `groups` | Yes — members no longer matching are removed | Either |
+| **SSO auto-join** | SSO login from a domain configured on an organization | `defaultRole` | No | Once at first login | Either |
+
+### When to use each mechanism
+
+- **Email invite** — invite a specific person who may not yet have an account. The invitation prepares their membership with the right role; they automatically join the organization on their first login, whether through local signup or SSO.
+- **Invitation code (link)** — share a single link with a group of people so they can join the organization on their own with the right role. Invitation codes only work for users who **already have a platform account**. You can monitor the usage count and revoke a link at any time.
+- **Join rules** — automatically grant organization membership based on user attributes (email domain, SSO claims, custom metadata). Best when membership should be governed by conditions you control rather than per-user actions.
+- **SSO auto-join** — use when an organization has its own SSO provider; everyone authenticating via that provider becomes a member. Combine with join rules to assign granular roles or groups.
+
+<Note>
+**Sharing an invitation link with someone who isn't on the platform yet?** Invitation links require the recipient to be authenticated. Either send them an **email invite** (which works without a pre-existing account), or ask them to sign up first (local signup or SSO) before clicking the link.
+</Note>
+
+## Inviting Members
+
+To invite a specific user by email:
 
 1. Go to **Members** in the sidebar
 2. Click **Invite Member**
 3. Enter the user's email address
 4. Select a role to assign
-5. The user receives an invitation email
 
-Invited members appear with "Pending" status until they accept.
+What happens next depends on whether the user already has a platform account:
 
-### Member Status
+| Situation | Outcome |
+|-----------|---------|
+| The user **already has a platform account** | They are added to the organization immediately with **Active** status and the assigned role. No email is sent. |
+| The user **does not have a platform account yet** | An invitation email is sent. They appear with **Pending** status until their first login (via local signup or SSO), at which point the prepared membership is activated with the assigned role. |
+
+For sharing access with multiple people at once via a reusable link, use [Invitation Codes](#invitation-codes) instead.
+
+### Managing Existing Members
+
+From the **Members** list, you can:
+
+- **Change role** — click a member and select a new role
+- **Suspend** — temporarily disable access without removing membership
+- **Remove** — permanently remove the user from the organization
+
+## Join Rules
+
+Join rules allow automatic organization membership based on user attributes. Rules are evaluated dynamically and can assign both a role and group memberships.
+
+### Rule Structure
+
+Each join rule contains an array of conditions with AND logic — all conditions in a rule must match:
+
+```json
+{
+  "rules": [
+    { "field": "email", "operator": "endsWith", "value": "@acme.com" },
+    { "field": "authData.google.hd", "operator": "equals", "value": "acme.com" }
+  ],
+  "role": "member",
+  "groups": ["engineering", "default-access"]
+}
+```
+
+An organization can have multiple join rules — they use OR logic between entries (only one rule needs to match).
+
+### Condition Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `field` | string | Dot-notation path on the user object (e.g. `email`, `authData.google.hd`, `meta.department`) |
+| `operator` | string | `equals`, `startsWith`, or `endsWith` (case-insensitive) |
+| `value` | string | The value to match against |
+
+### Creating a Join Rule
+
+1. Go to **Join Rules** in the sidebar
+2. Click **Add Rule**
+3. Define conditions
+4. Select the role to assign
+5. Optionally select groups to add the user to
+
+### Rule Evaluation
+
+Join rules are evaluated on every `/me` API call (the first call the platform makes after authentication). A per-user version cache ensures rules are only re-evaluated when they change:
+
+1. Each org's join rules have a version counter (incremented when rules are updated)
+2. The gateway tracks which version was last evaluated for each user
+3. If the version matches, evaluation is skipped for that org
+
+### Re-evaluation on Rule Changes
+
+When an organization's join rules are updated, the platform re-evaluates all existing members who joined via join rules:
+
+- Members who **no longer match** any rule are automatically removed from the organization
+- New users who now match are **not** retroactively added — they join on their next `/me` call
+- Re-evaluation processes members in batches of 500
+
+## Invitation Codes
+
+Invitation codes let you share a link that grants access to your organization to anyone who already has a Prisme.ai account.
+
+### Creating an Invite
+
+1. Go to **Invites** in the sidebar
+2. Click **Generate Invite**
+3. Configure:
+   - **Role**: What role invitees receive
+   - **Max Uses**: Limit how many times the code can be used (optional)
+   - **Expiration**: When the code expires (optional)
+
+4. Share the generated link
+
+<Note>
+Recipients must be **authenticated on the platform** to redeem an invitation link. If a recipient does not have a platform account yet, use an [email invite](#inviting-members) instead, or ask them to sign up first (local signup or SSO).
+</Note>
+
+### Invite Status
 
 | Status | Description |
 |--------|-------------|
-| **Active** | Full access based on assigned role |
-| **Invited** | Invitation sent, waiting for acceptance |
-| **Suspended** | Access temporarily revoked |
-
-### Managing Members
-
-- **Change Role**: Click on a member, select a new role
-- **Suspend**: Temporarily disable access without removing membership
-- **Remove**: Permanently remove from the organization
+| **Active** | Can still be used |
+| **Expired** | Past expiration date |
+| **Exhausted** | Reached max uses |
+| **Revoked** | Manually disabled |
 
 ## Roles & Permissions
 
@@ -210,94 +320,6 @@ SSO provider secrets (OIDC `clientSecret`, SAML certificates) are encrypted at r
 - Wrapped DEKs are stored in MongoDB alongside the org; plaintext secrets are never persisted
 
 If `SECRETS_MASTER_KEYS` is not configured, SSO configs are stored in plaintext.
-
-## Join Rules
-
-Join rules allow automatic organization membership based on user attributes. Rules are evaluated dynamically and can assign both a role and group memberships.
-
-### Rule Structure
-
-Each join rule contains an array of conditions with AND logic — all conditions in a rule must match:
-
-```json
-{
-  "rules": [
-    { "field": "email", "operator": "endsWith", "value": "@acme.com" },
-    { "field": "authData.google.hd", "operator": "equals", "value": "acme.com" }
-  ],
-  "role": "member",
-  "groups": ["engineering", "default-access"]
-}
-```
-
-An organization can have multiple join rules — they use OR logic between entries (only one rule needs to match).
-
-### Condition Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `field` | string | Dot-notation path on the user object (e.g. `email`, `authData.google.hd`, `meta.department`) |
-| `operator` | string | `equals`, `startsWith`, or `endsWith` (case-insensitive) |
-| `value` | string | The value to match against |
-
-### Creating a Join Rule
-
-1. Go to **Join Rules** in the sidebar
-2. Click **Add Rule**
-3. Define conditions
-4. Select the role to assign
-5. Optionally select groups to add the user to
-
-### Rule Evaluation
-
-Join rules are evaluated on every `/me` API call (the first call the platform makes after authentication). A per-user version cache ensures rules are only re-evaluated when they change:
-
-1. Each org's join rules have a version counter (incremented when rules are updated)
-2. The gateway tracks which version was last evaluated for each user
-3. If the version matches, evaluation is skipped for that org
-
-### Re-evaluation on Rule Changes
-
-When an organization's join rules are updated, the platform re-evaluates all existing members who joined via join rules:
-
-- Members who **no longer match** any rule are automatically removed from the organization
-- New users who now match are **not** retroactively added — they join on their next `/me` call
-- Re-evaluation processes members in batches of 500
-
-## Joining Organizations — Comparison
-
-There are four mechanisms for users to join an organization:
-
-| Mechanism | Trigger | Role | Groups | Re-evaluation |
-|-----------|---------|------|--------|---------------|
-| SSO auto-join | SSO login | `defaultRole` | No | One-time |
-| Join rules | Every `/me` call | Rule's `role` | Rule's `groups` | Yes (removed if no longer matches) |
-| Invite code | User redeems link | Code's `roleSlug` | No | No |
-| Email invite | First login/signup | Admin-chosen role | No | No |
-
-## Invitation Codes
-
-Invitation codes let you share a link that grants access to your organization.
-
-### Creating an Invite
-
-1. Go to **Invites** in the sidebar
-2. Click **Generate Invite**
-3. Configure:
-   - **Role**: What role invitees receive
-   - **Max Uses**: Limit how many times the code can be used (optional)
-   - **Expiration**: When the code expires (optional)
-
-4. Share the generated link
-
-### Invite Status
-
-| Status | Description |
-|--------|-------------|
-| **Active** | Can still be used |
-| **Expired** | Past expiration date |
-| **Exhausted** | Reached max uses |
-| **Revoked** | Manually disabled |
 
 ## API Keys
 
