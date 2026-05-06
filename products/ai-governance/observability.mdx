@@ -1,309 +1,303 @@
 ---
 title: 'Observability'
-description: 'Monitor workspace performance, errors, costs, and request traces'
+description: 'Monitor workspace performance, errors, costs, dependencies and a real-time event feed'
 ---
 
 <Frame>
   <img src="/images/ai-governance-observability.png" alt="Observability Dashboard" />
 </Frame>
 
-Observability provides deep visibility into your AI workspaces, tracking performance metrics, error rates, LLM costs, and detailed request traces. Access it from **Observability** in the Governe sidebar.
+Observability gives you deep visibility into your AI workspaces: performance metrics, error rates, LLM costs, dependency graph and a real-time event feed. Open it from **Observability** in the Governance sidebar, then pick the workspace you want to inspect from the picker.
 
-## Dashboard Overview
+## How metrics are collected
 
-The observability dashboard shows key metrics at a glance:
+Metrics are computed **on demand** from raw platform events. When you open the dashboard, the backend either returns a cached summary (if recent enough) or runs a single Elasticsearch aggregation across the requested period and caches the result for the next viewer.
 
-| Metric | Description |
-|--------|-------------|
-| **Health Score** | 0-100 composite score based on errors, latency, and availability |
-| **Total Executions** | Number of automation runs in the selected period |
-| **Error Rate** | Percentage of executions that failed |
-| **P95 Latency** | 95th percentile response time |
-| **LLM Costs** | Total cost of LLM calls |
+| Source event | What it captures |
+|---|---|
+| `runtime.automations.executed` | Every automation execution — duration, automation slug, app instance, trigger type |
+| `runtime.interactions.triggered` | Every top-level user request — used for unique-user counts |
+| `error` + `runtime.fetch.failed` | All error events — error code, automation, correlation ID, originating app instance |
+| `analytics.llm.completion` | Every LLM API call — tokens, cost, model, provider, carbon |
 
-## Health Score
+### Granularity & cache TTL
 
-The health score combines multiple factors into a single 0-100 metric:
+Granularity is picked from the period length, with a couple of admissible overrides for power users (drag-to-select on a chart can lift the resolution).
 
-| Status | Score Range | Color |
-|--------|-------------|-------|
-| **Healthy** | 90-100 | Green |
-| **Degraded** | 70-89 | Yellow |
-| **Critical** | 0-69 | Red |
+| Period | Default granularity | Cache TTL | Allowed overrides |
+|---|---|---|---|
+| **1h** | 5-minute buckets | 5 min | hourly |
+| **24h** | hourly | 15 min | — |
+| **7d** | hourly | 15 min | daily |
+| **30d** | daily | 1 hour | — |
+| **Custom ≤ 2h** | 5-minute buckets | not cached | hourly |
+| **Custom ≤ 7d** | hourly | not cached | daily |
+| **Custom > 7d** | daily | not cached | — |
 
-### Factor Breakdown
+The current open interval is always re-aggregated on dashboard read when stale. Custom date ranges are computed live every time — they pay a slightly longer first load but always reflect the latest events.
 
-| Factor | Weight | Calculation |
-|--------|--------|-------------|
-| **Error Rate** | 40% | Lower error rate = higher score |
-| **Latency** | 30% | Lower latency = higher score |
-| **Availability** | 30% | Higher uptime = higher score |
+A small **Live** badge in the toolbar surfaces when the response includes the current open interval. Use the **Recalculate metrics** entry in the overflow menu to force a fresh re-aggregation across the full window (e.g. when you suspect the cache is stale).
 
-## Performance Metrics
+## Dashboard tabs
 
-### Latency Percentiles
+The dashboard is split across seven tabs (the **LLM Costs** tab is hidden when the workspace doesn't emit LLM events).
 
-Track response time distribution:
+### Overview
 
-| Percentile | Description |
-|------------|-------------|
-| **P50** | Median response time |
-| **P90** | 90% of requests faster than this |
-| **P95** | 95% of requests faster than this |
-| **P99** | 99% of requests faster than this |
+At-a-glance snapshot of the workspace's health.
 
-### Slowest Automations
+- **Health gauge** — composite 0–100 score with a status (Healthy / Degraded / Warning / Critical / Idle). See [Health score](#health-score) for the formula.
+- **Quick stats** — Total Interactions, Error Rate, P95 Latency, Average RPM.
+- **Latency distribution** — single card with four horizontal bars (P50, P90, P95, P99), each color-coded against the warning/danger thresholds. Bars are normalized against P99, so a tight workload shows four nearly-equal bars and a long-tail one shows P50 as a sliver with P99 maxed out.
+- **Recent Errors** — automations with the highest error count in the period, each row linking to the workspace activity feed pre-filtered to the matching error events.
+- **Top Automations** — automations ranked by execution count, with their P95 latency.
 
-Identify bottlenecks by viewing automations ranked by average execution time.
+### Metrics
 
-### Timeline View
+- **Latency percentile cards** — P50, P90, P95, P99 over the whole period.
+- **Slowest Automations** — top 20 automations ranked by P95 latency. The execution-count cell on each row is a deep-link to the **Feed** tab pre-scoped to the slowest 10 correlation IDs of that automation, so you can jump straight to the actual slow calls.
+- **Latency Timeline** — per-bucket P95 line chart with **interaction volume** overlaid as a second line on a right-hand axis (distinct color). Lets you tell apart load-driven latency spikes from genuine regressions at a glance. Drag-to-select on the chart to zoom into a custom range.
 
-Visualize performance over time with:
-- P95 latency trend (area chart)
-- Request volume (line overlay)
+### Errors
 
-This helps correlate load spikes with latency increases.
+- **Headline cards** — Total Interactions, Error Rate, Total Errors.
+- **Error Timeline** — error-event count per bucket.
+- **Errors by Type** — error codes (from `payload.error || payload.code || type`) bucketed alongside the **app instance** that emitted them. The same error code surfacing from two distinct app instances shows as two distinct rows (e.g. `FetchError · OpenAI.AWS` vs `FetchError · OpenAI.GoogleVertex`). Each row's badge deep-links to the activity feed with `source.appInstanceFullSlug` + a matching `source.appInstanceDepth`, so the activity page lands on the right nesting depth instead of defaulting to depth 0.
+- **Errors by Automation** — automations sorted by error count, with computed error rate. Same activity-feed deep-link with the right app/depth filters.
 
-## Error Tracking
+### Usage
 
-### Error Distribution
+- **Headline cards** — Unique Users, Total Interactions, Average per Day, Average RPM, Peak RPM.
+- **Top Entrypoints** — entry-point automations (HTTP webhooks + event listeners) ranked by call count.
+- **Activity Timeline** — per-bucket interactions and executions on a dual-axis chart. Drag-to-select supported.
+- **Unique Users Timeline** — distinct users per bucket.
 
-View errors grouped by:
-- **Type**: `InvalidExpressionSyntax`, `FetchError`, `TimeoutError`, etc.
-- **Automation**: Which automations generate the most errors
+### LLM Costs
 
-### Error Rate Trend
+Sourced from `analytics.llm.completion` events emitted by the **llm-gateway** workspace. Hidden when the selected workspace has no LLM activity in the period.
 
-Track error rate changes over time to identify:
-- New bugs introduced
-- External service outages
-- Configuration issues
+- **Headline cards** — Total Cost, Input Tokens, Output Tokens, LLM Calls, Carbon (kg CO₂eq).
+- **Cost by Model** — per-model breakdown with cost share, token count and call count.
+- **Cost by Provider** — call count and average latency per provider.
+- **Cost Timeline** — per-bucket cost trend.
 
-### Recent Errors
+### Dependencies
 
-View the latest errors with:
-- Timestamp
-- Error type and message
-- Automation name
-- Correlation ID (for tracing)
+Visualises how the workspace's own automations call **installed app instances** during the period. Scope is intentionally narrow:
 
-## LLM Costs
+- Edges are filtered to **direct** workspace → app calls (`source.appInstanceDepth = 1`). Nested app → app sub-calls (depth ≥ 2) are excluded — they don't fit the workspace-vs-app matrix shape.
+- Caller must be a workspace automation (`payload.trigger.type = automation`) calling an app-instance automation (`source.appInstanceFullSlug` set). Pure workspace → workspace internal calls are **not** graphed here, and app → workspace calls don't exist on the platform.
 
-Monitor AI model consumption and costs:
+What you see:
 
-### Cost Breakdown
+- **Summary cards** — Total Nodes, Total Edges, Automations (distinct workspace callers), Apps (distinct app instances called).
+- **Adjacency Matrix** — caller × callee matrix capped at 20×20 cells.
+  - Rows = workspace automations that called an app
+  - Columns = app-instance automations that were called (e.g. `OpenAI.chat-completion`, `models.find`)
+  - Cell color intensity scales with call count; hover shows the exact pair and count
+  - Intra-app calls (one automation in app X calling another in the same app X via dotted slug) are pruned client-side
 
-| Metric | Description |
-|--------|-------------|
-| **Total Calls** | Number of LLM API calls |
-| **Total Cost** | Estimated cost in USD |
-| **Total Tokens** | Input + output tokens consumed |
-| **Carbon Impact** | Estimated CO2 emissions (kg) |
+### Feed
 
-### By Model
+A near-real-time event feed for debugging and live monitoring. Bypasses the platform_metrics cache — every refresh queries Elasticsearch directly.
 
-See which models consume the most resources:
-- Model name
-- Number of calls
-- Cost percentage
-- Token count
+**Filter row:**
 
-### By Automation
+- **Search** — debounced free-text search forwarded to ES `simple_query_string`.
+- **Scopes** — multi-select between `interactions`, `errors`, `failed_fetches`. Defaults to all three. The `interactions` scope surfaces top-level executions (`runtime.automations.executed` filtered to entry-point trigger types) so each row carries duration metadata.
+- **Min / Max duration (ms)** — restrict to executions in a duration band. Events without `payload.duration` (e.g. plain errors) won't match when set.
+- **User** — typeahead combobox to filter on `source.userId`. 
+- **Correlation IDs chip** — appears when the URL carries a `correlationIds=` query (set by the Slowest Automations deep-link). Click to clear and broaden the view.
 
-Identify which automations drive LLM costs:
-- Automation name
-- Call count
-- Relative usage
+**Event rows** show the date (`dd/mm/yy`) + time, type badge, automation/trigger slug, optional resolved user name, optional duration pill, and a clickable arrow that opens the workspace activity feed pre-filtered to that event's correlation ID.
 
-### Cost Timeline
+## Health score
 
-Track daily cost trends to:
-- Forecast monthly spend
-- Identify cost anomalies
-- Plan capacity
+A composite 0–100 metric with a status (Healthy / Degraded / Warning / Critical / Idle). Workspaces with no interactions in the period return `null` and the status `Idle`.
 
-## Request Traces
+### Status thresholds
 
-Trace individual requests through the entire execution flow.
+| Status | Score range | Meaning |
+|---|---|---|
+| **Healthy** | 90–100 | All good |
+| **Degraded** | 70–89 | Some friction |
+| **Warning** | 50–69 | Significant issues |
+| **Critical** | 0–49 | Major problems |
+| **Idle** | n/a | No interactions in the period — health undefined |
 
-### Accessing Traces
+### Formula
 
-1. From the Observability dashboard, click **View Traces**
-2. Or click a correlation ID in the error list
+```
+if totalInteractions == 0:
+  score  = null
+  status = "idle"
+else:
+  errorScore   = max(0, 100 - errorRate × 500)                         # 0% → 100, 20%+ → 0
+  excess       = max(0, p95Ms - latency_floor_ms)                      # default floor: 500ms
+  latencyScore = max(0, 100 × (1 - excess / (latency_cap_ms - latency_floor_ms)))
+  score        = round((errorScore × 0.7) + (latencyScore × 0.3))      # default weights: 70/30
+```
 
-### Trace View
+`errorScore` is a linear function of error rate. `latencyScore` is **flat at 100 below `latency_floor_ms`** (any P95 ≤ floor is treated as perfect — no penalty), then declines linearly to 0 at `latency_cap_ms`.
 
-Each trace shows:
+Defaults: error 70% / latency 30%, floor 500ms, cap 5000ms, error saturation 500. All four are tunable globally via `config.health_score.*`.
 
-| Element | Description |
-|---------|-------------|
-| **Summary** | Event count, duration, user info |
-| **Timeline** | Waterfall view of all events |
-| **Automations** | List of automations executed |
-| **Errors** | Any errors encountered |
+### Per-workspace overrides
 
-### Timeline Visualization
+Some workspaces are legitimately slow — the LLM gateway baseline is around 10s because LLM completions are inherently slow. Setting a 500ms floor on it would peg the score at 0 on every read.
 
-The waterfall chart shows:
-- Each automation as a horizontal bar
-- Start time offset from request start
-- Duration of each step
-- Errors highlighted in red
+Per-workspace overrides live under `config.health_score.workspace_overrides.<slug>` and may set `latency_floor_ms` and/or `latency_cap_ms` independently:
 
-## Dependency Graph
+```yaml
+health_score:
+  error_weight: 0.7
+  latency_weight: 0.3
+  latency_cap_ms: 5000
+  workspace_overrides:
+    llm-gateway:
+      latency_floor_ms: 10000
+      latency_cap_ms: 30000
+```
 
-Visualize how automations call each other.
+The `(i)` tooltip next to the health gauge surfaces the active baseline.
 
-### Graph View
+<Accordion title="Example: 100 interactions, 2 failed (2% error rate), 800ms P95 — default workspace">
+  - errorRate = 0.02 → errorScore = `100 - 0.02 × 500 = 90`
+  - excess = `max(0, 800 - 500) = 300` → latencyScore = `100 × (1 - 300 / 4500) = 93`
+  - score = `round(90 × 0.7 + 93 × 0.3) = 91` → **Healthy**
+</Accordion>
 
-- **Nodes**: Automations and installed apps
-- **Edges**: Calls between components
-- **Edge weight**: Call frequency
+<Accordion title="Example: 100 interactions, 0 failed, 8 000ms P95 — llm-gateway">
+  - errorRate = 0 → errorScore = 100
+  - 8 000ms ≤ floor (10 000ms) → latencyScore = 100
+  - score = 100 → **Healthy**
 
-### Use Cases
+  Same workload on a default-config workspace would give latencyScore = 0 → score = 70 → Degraded. The override matches the LLM workload reality.
+</Accordion>
 
-- Understand system architecture
-- Identify critical paths
-- Find orphaned automations
+## Error rate calculation
 
-## Anomaly Detection
+Error rate is **interaction-based**, not raw-event-based. This matters because a single user request can fan out into many automation executions:
 
-Automatic detection of unusual patterns.
+```
+errorRate = (failed_interactions / total_interactions) × 100
+```
 
-### Anomaly Types
+Where:
+- **total_interactions** — `value_count` of `runtime.interactions.triggered` events
+- **failed_interactions** — distinct count of `source.correlationId` across `error` and `runtime.fetch.failed` events (one interaction with multiple errors counts once)
 
-| Type | Description |
-|------|-------------|
-| **Error Spike** | Sudden increase in error rate |
-| **Latency Spike** | Sudden increase in response time |
-| **Traffic Spike** | Unusual increase in request volume |
-| **Traffic Drop** | Unusual decrease in activity |
+This reflects the **user-perceived failure rate**. Dividing raw error events by automation executions would under-report failure rate by 100× when an interaction fans into many sub-executions.
 
-### Severity Levels
+## Latency percentiles
 
-| Severity | Threshold |
-|----------|-----------|
-| **Warning** | 2x baseline |
-| **Critical** | 3x baseline |
+Two scopes coexist on purpose, and each tooltip in the UI makes it explicit so you don't compare apples and oranges.
 
-### Configuration
+| Scope | Source | Where it shows |
+|---|---|---|
+| **Interaction-level** | `runtime.automations.executed` filtered to entry-point trigger types (`endpoint`, `event`) | Overview headline + Latency Distribution, Metrics percentile cards, Health Score |
+| **Per-automation** | All `runtime.automations.executed` events including sub-helpers and internal automations | Top Automations, Slowest Automations |
 
-Adjust detection sensitivity:
-- **Low**: Only alert on significant anomalies
-- **Medium**: Balanced detection (default)
-- **High**: Alert on minor deviations
+The interaction-level scope captures the **full lifecycle** of a user-facing request. The per-automation scope is what you want for debugging — to know which sub-helper inside an interaction is slow.
 
-## Period Comparison
+## Cross-tab deep links
 
-Compare metrics between two time periods.
+The dashboard is wired together by clickable shortcuts that pre-scope other tabs to the row you came from.
 
-### How to Compare
+| From | Click target | Lands on |
+|---|---|---|
+| Recent Errors row | "N errors" link | Workspace activity feed, filtered to `error` + `runtime.fetch.failed` events for that automation (with the right `source.appInstanceDepth` for app-instance automations) |
+| Errors by Type badge | "N (x.y%)" link | Same activity feed, filtered to that error code (text search) and originating app instance |
+| Errors by Automation badge | Same as Recent Errors | — |
+| Slowest Automations "calls" cell | The number itself | Feed tab pre-scoped to the slowest 10 correlation IDs of that automation, opens in a new tab |
+| Feed event row | Whole row | Activity feed pre-filtered to that event's `source.correlationId` |
 
-1. Select current period dates
-2. Select comparison period dates
-3. View side-by-side metrics
+The activity-feed deep links use both `source.appInstanceFullSlug` and a matching `source.appInstanceDepth` so app-instance events (e.g. `OpenAI.AWS.fetchAPI`) land at the right nesting depth — the activity feed defaults to depth 0 (workspace-only events) when no override is supplied.
 
-### Compared Metrics
+## Time range & filters
 
-- Execution count
-- Error count and rate
-- Average and P95 latency
-- Unique users
+Top-of-page filters apply to every tab.
 
-### Trend Indicators
+- **Workspace picker** — server-side searchable combobox, defaulting to the top-active workspaces ranking (refreshed daily).
+- **Time range select** — 1h, 24h, 7d, 30d.
+- **Custom date range** — explicit `from / to` with hour/minute precision (overrides the preset). Drag-to-select on any timeline chart fills the picker for you.
+- **Live badge** — shown when the current open interval is included.
+- **Recalculate metrics** — overflow menu action to force re-aggregation of the whole period (bypasses the cache for one read).
 
-- **Up**: Increase > 5%
-- **Down**: Decrease > 5%
-- **Stable**: Within ±5%
+The current state of every filter is mirrored to the URL (`?period=`, `?start=`, `?end=`, `?wsId=`, `?tab=`), so dashboard URLs are shareable.
 
-## Real-Time Feed
+<Info>
+  The first user opening a workspace's dashboard for a given period pays the cost of the Elasticsearch aggregation (~1–3s typically). Subsequent users within the cache TTL get an instant response — typically tens of ms.
+</Info>
 
-Monitor events as they happen.
-
-### Event Types
-
-| Type | Description |
-|------|-------------|
-| `runtime.automations.executed` | Automation completed |
-| `runtime.fetch.completed` | HTTP fetch succeeded |
-| `runtime.fetch.failed` | HTTP fetch failed |
-| `runtime.llm.completed` | LLM call completed |
-| `error` | General error event |
-
-### Filtering
-
-- **All**: Show all events
-- **Errors**: Only error events
-- **Executions**: Only completion events
-
-### Time Window
-
-Configure how far back to show events (default: 60 minutes).
-
-## Time Range Selection
-
-All views support time range selection:
-
-| Period | Description |
-|--------|-------------|
-| **1h** | Last hour |
-| **24h** | Last 24 hours |
-| **7d** | Last 7 days |
-| **30d** | Last 30 days |
-| **Custom** | Specific date range |
-
-## Platform Summary (Admin Only)
-
-Platform administrators see a platform-wide summary:
-
-- Aggregate health score across all workspaces
-- Total platform requests
-- Combined LLM costs
-- Peak capacity usage
-
-## Best Practices
+## Best practices
 
 <CardGroup cols={2}>
-  <Card title="Set Baselines" icon="chart-line">
-    Establish normal performance baselines for comparison
+  <Card title="Tune the health baseline" icon="sliders">
+    If a workspace is legitimately slow (LLM gateway, batch indexer, etc.) override `latency_floor_ms` so the score reflects reality instead of pegging at 0.
   </Card>
-  <Card title="Monitor Anomalies" icon="bell">
-    Enable anomaly detection for early warning
+  <Card title="Use Slowest → Feed" icon="bolt">
+    From the Metrics tab, click the calls count on a slow automation to land in the Feed already scoped to its 10 slowest calls — no manual correlation ID copy-paste.
   </Card>
-  <Card title="Track Costs" icon="dollar-sign">
-    Review LLM costs weekly to prevent surprises
+  <Card title="Track LLM cost weekly" icon="dollar-sign">
+    Review the LLM Costs tab over a 7d window using the by-Model breakdown to spot expensive routings.
   </Card>
-  <Card title="Use Traces" icon="magnifying-glass">
-    Investigate errors using correlation IDs
+  <Card title="Open errors in Activity" icon="magnifying-glass">
+    Use the deep-links on every error widget to land on the full event timeline (with the right app-instance depth) instead of grepping the activity feed by hand.
   </Card>
 </CardGroup>
 
 ## Troubleshooting
 
 <Tabs>
-  <Tab title="High Latency">
+  <Tab title="High latency">
     1. Check **Slowest Automations** for bottlenecks
-    2. Review the **Timeline** for load correlation
-    3. Examine traces for slow steps
-    4. Check external API response times
+    2. Click the calls cell to land on the feed scoped to the slowest correlation IDs
+    3. Open one of those rows in the workspace activity feed and switch to the **Timeline** or **Distribution** view (see the dedicated troubleshooting tab below) to see where the time was actually spent inside the interaction
+    4. Check external API response times via the **By Provider** breakdown on the LLM Costs tab
   </Tab>
-  
-  <Tab title="High Error Rate">
-    1. View **Error Distribution** by type
-    2. Check **Recent Errors** for patterns
-    3. Trace errors using correlation IDs
-    4. Review dependency health
+
+  <Tab title="Inspect a specific interaction">
+    Once you've drilled down to a single correlation ID (via Slowest Automations → Feed, an error-row deep link, or the trace icon on a feed row), open it in the workspace activity feed. The activity feed offers three complementary views of the same set of events, all driven off the same `?source.correlationId=` filter:
+
+    - **Graph** — node-link diagram of the call tree. Best for understanding *which* automation called *which*, especially when an interaction fans out into many sub-helpers and apps.
+    - **Timeline** — waterfall chart with one bar per execution, x-axis = wall-clock time, bar length = duration. Best for spotting **where the time goes** — long bars highlight the slow steps; gaps highlight wait time between steps.
+    - **Distribution** — aggregated time-spent breakdown across the interaction's executions, sorted from slowest to fastest. Best for answering "which automation accounts for most of this interaction's latency?" without manually summing bars on the timeline.
+
+    Use them in combination: Graph for structure, Timeline for sequence, Distribution for the latency budget.
   </Tab>
-  
-  <Tab title="Cost Spikes">
-    1. Check **By Model** breakdown
-    2. Identify expensive automations
-    3. Review **Cost Timeline** for anomalies
-    4. Check for loops or inefficient prompts
+
+  <Tab title="High error rate">
+    1. **Errors by Type** — narrow down the failure category. Same code from two apps shows as two rows so you can isolate which integration is failing.
+    2. **Errors by Automation** — find the automation responsible
+    3. Click any badge to open the activity feed already filtered to those events
+    4. From the activity feed, follow a correlation ID into the trace view
+  </Tab>
+
+  <Tab title="Cost spikes">
+    1. **By Model** — identify expensive models
+    2. **Cost Timeline** — pinpoint when the spike started
+    3. Cross-check against the **Top Entrypoints** on the same window — a single entrypoint dominating execution count usually points to a runaway loop
+    4. Check the LLM gateway workspace dashboard for upstream provider issues
+  </Tab>
+
+  <Tab title="Health score is 0 or low and shouldn't be">
+    1. Check the `(i)` tooltip on the gauge — it surfaces the active latency baseline
+    2. If the workspace is intrinsically slow (LLM gateway, batch jobs, etc.), define a per-workspace override under `config.health_score.workspace_overrides.<slug>` with a higher `latency_floor_ms`
+    3. Remember the score is 70% errors + 30% latency — even at perfect latency, a 20%+ error rate caps the score around 70
+  </Tab>
+
+  <Tab title="Metrics seem inconsistent">
+    Common reasons:
+
+    - **Headline vs per-automation latency**: headline percentiles cover entry-point executions only (interaction-level); the Top/Slowest Automations breakdown covers all executions (including sub-helpers). They measure different populations.
+    - **Idle workspaces**: a workspace with no interactions in the period shows "Idle" with no health score. Expected, not a bug.
+    - **Cache delay**: the latest interval is refreshed when stale (5 min for 5m, 15 min hourly, 1 h daily). For real-time monitoring use the **Feed** tab.
+    - **Custom range vs preset**: custom ranges always compute from raw events (slower first load). Predefined periods (1h/24h/7d/30d) hit the cache when fresh — use **Recalculate metrics** to force a fresh read.
   </Tab>
 </Tabs>
 
-## Next Steps
+## Next steps
 
 <CardGroup cols={2}>
   <Card
