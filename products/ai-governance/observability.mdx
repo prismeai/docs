@@ -29,12 +29,17 @@ Granularity is picked from the period length, with a couple of admissible overri
 | **1h** | 5-minute buckets | 5 min | hourly |
 | **24h** | hourly | 15 min | — |
 | **7d** | hourly | 15 min | daily |
-| **30d** | daily | 1 hour | — |
-| **Custom ≤ 2h** | 5-minute buckets | not cached | hourly |
-| **Custom ≤ 7d** | hourly | not cached | daily |
-| **Custom > 7d** | daily | not cached | — |
+| **30d** | daily | 1 h | — |
+| **Custom ≤ 2h** | 5-minute buckets | 5 min (intervals only) | hourly |
+| **Custom ≤ 7d** | hourly | 15 min (intervals only) | daily |
+| **Custom > 7d** | daily | 1 h (intervals only) | — |
 
-The current open interval is always re-aggregated on dashboard read when stale. Custom date ranges are computed live every time — they pay a slightly longer first load but always reflect the latest events.
+Two cache layers share the same TTL (the granularity's staleness):
+
+- **Per-bucket intervals** — populated by every read, preset or custom. Custom ranges produce buckets aligned to the same granularity boundaries a preset run would, so reads of overlapping windows reuse them.
+- **Summary** — populated by **preset reads only** (the cache key encodes the period name; arbitrary `start/end` pairs have no canonical key). Custom ranges always recompute the summary live; only the intervals are shared.
+
+The current open interval is always re-aggregated on dashboard read when stale. **Custom date ranges always recompute the summary** live (the summary cache key only knows about preset period names, not arbitrary start/end pairs), but the **per-bucket intervals are cached**: a custom range writes its hourly/daily/5m rows back to the cache exactly like a preset run does, so any future read — preset or custom — that overlaps the same window reuses them. The first time you scroll back to a given custom window you pay the full ES cost; the second time you only pay the summary recompute.
 
 A small **Live** badge in the toolbar surfaces when the response includes the current open interval. Use the **Recalculate metrics** entry in the overflow menu to force a fresh re-aggregation across the full window (e.g. when you suspect the cache is stale).
 
@@ -293,7 +298,7 @@ The current state of every filter is mirrored to the URL (`?period=`, `?start=`,
     - **Headline vs per-automation latency**: headline percentiles cover entry-point executions only (interaction-level); the Top/Slowest Automations breakdown covers all executions (including sub-helpers). They measure different populations.
     - **Idle workspaces**: a workspace with no interactions in the period shows "Idle" with no health score. Expected, not a bug.
     - **Cache delay**: the latest interval is refreshed when stale (5 min for 5m, 15 min hourly, 1 h daily). For real-time monitoring use the **Feed** tab.
-    - **Custom range vs preset**: custom ranges always compute from raw events (slower first load). Predefined periods (1h/24h/7d/30d) hit the cache when fresh — use **Recalculate metrics** to force a fresh read.
+    - **Custom range vs preset**: custom ranges always recompute the summary live (the summary cache key only knows preset period names), but per-bucket intervals get cached the same way preset runs do. Repeat reads of an overlapping custom window only pay the summary recompute — not the full window. Predefined periods (1h/24h/7d/30d) cache both summary and intervals; use **Recalculate metrics** to force a fresh read.
   </Tab>
 </Tabs>
 
