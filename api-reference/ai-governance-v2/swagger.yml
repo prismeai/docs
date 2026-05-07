@@ -1,0 +1,2087 @@
+openapi: '3.0.3'
+info:
+  version: 1.0.0
+  title: AI Governance API
+  description: |
+    Public REST API for the Prisme.ai AI Governance workspace -
+    announcements, legal documents, notifications, observability
+    dashboards, audit logs, and active-org listing.
+  contact:
+    name: Prisme.ai
+    url: https://prisme.ai
+servers:
+  - url: https://{host}/v2/workspaces/slug:ai-governance-v2/webhooks
+    description: Prisme.ai workspace webhooks
+    variables:
+      host:
+        default: api.studio.prisme.ai
+        description: API host (override for self-hosted or sandbox)
+security:
+  - BearerAuth: []
+  - WorkspaceApiKeyAuth: []
+tags:
+  - name: Announcements
+    description: Platform announcements (CRUD + audience targeting).
+  - name: Legal
+    description: Versioned legal documents (terms, privacy, etc.).
+  - name: Notifications
+    description: Per-user notifications derived from announcements.
+  - name: Observability
+    description: Cross-workspace and per-workspace observability dashboards, traces, and feeds.
+  - name: Orgs
+    description: Organization listing and audit logs.
+paths:
+  /v1/announcements:
+    get:
+      tags: [Announcements]
+      operationId: listAnnouncements
+      summary: List announcements for the current organization
+      description: |
+        Lists announcements scoped to the current organization (or
+        platform-wide entries with `orgSlug: null`). Excludes archived
+        items by default. Open to any authenticated user; rate-limited
+        to 100 calls per minute.
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, maxLength: 32 }
+          description: Filter by status (draft, active, archived).
+        - in: query
+          name: limit
+          schema: { type: string }
+          description: Max items per page (capped at 100, default 20).
+        - in: query
+          name: page
+          schema: { type: string }
+          description: Page index (0-based, default 0).
+      responses:
+        '200':
+          description: Paginated list of announcements.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AnnouncementListItem' }
+                  total: { type: integer }
+                  page: { type: integer }
+                  limit: { type: integer }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    post:
+      tags: [Announcements]
+      operationId: createAnnouncement
+      summary: Create an announcement
+      description: |
+        Creates an announcement with validated audience targets. When the
+        new announcement has `status: active`, a `notifications.new` event
+        is emitted to broadcast the message. Requires
+        `announcements:write` permission. Rate-limited to 50 calls per minute.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnnouncementCreateInput' }
+      responses:
+        '200':
+          description: Announcement created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnnouncementCreateResponse' }
+        '400':
+          description: Validation error (missing or invalid `targets`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `announcements:write` permission.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/announcements/{announcementId}:
+    parameters:
+      - in: path
+        name: announcementId
+        required: true
+        schema:
+          type: string
+          maxLength: 64
+          pattern: ^[a-zA-Z0-9_-]+$
+        description: Announcement identifier.
+    get:
+      tags: [Announcements]
+      operationId: getAnnouncement
+      summary: Get an announcement by id
+      description: |
+        Returns the full announcement record. Open to any authenticated
+        user; access is scoped to the caller's organization (or
+        platform-wide announcements with `orgSlug: null`).
+      responses:
+        '200':
+          description: Announcement details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Announcement' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - announcement belongs to a different org.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Announcement not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    patch:
+      tags: [Announcements]
+      operationId: updateAnnouncement
+      summary: Update an announcement
+      description: |
+        Partially updates an announcement. Only provided fields are
+        applied. When transitioning from `draft` to `active`, emits a
+        `notifications.new` event. Requires `announcements:write`
+        permission. Rate-limited to 50 calls per minute.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnnouncementUpdateInput' }
+      responses:
+        '200':
+          description: Announcement updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  updated: { type: boolean }
+        '400':
+          description: Validation error (e.g. invalid targets).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `announcements:write` permission or wrong org.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Announcement not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Announcements]
+      operationId: deleteAnnouncement
+      summary: Delete an announcement
+      description: |
+        Deletes the announcement and cascades to per-user
+        `user_announcement_state` rows. Requires `announcements:write`
+        permission. Rate-limited to 50 calls per minute.
+      responses:
+        '200':
+          description: Announcement deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: boolean }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `announcements:write` permission or wrong org.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Announcement not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/legal/{type}:
+    parameters:
+      - in: path
+        name: type
+        required: true
+        schema:
+          type: string
+          maxLength: 64
+          pattern: ^[a-z0-9-]+$
+        description: |
+          Legal document type slug (e.g. `cgu`, `privacy-policy`,
+          `secure-chat`).
+    get:
+      tags: [Legal]
+      operationId: getLegalDocument
+      summary: Read legal content for a type and the caller's organization
+      description: |
+        Returns the HTML legal content stored for the caller's
+        organization under the given type. Open to any authenticated
+        user; the content is read directly from the workspace's `/files`
+        API using the predictable id `legal-{orgSlug}-{type}`. Returns
+        an empty `content` when no document exists yet.
+      responses:
+        '200':
+          description: Legal document content (or empty when missing).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LegalDocument' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - organization context required.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    put:
+      tags: [Legal]
+      operationId: updateLegalDocument
+      summary: Upsert legal content for a type
+      description: |
+        Creates or replaces the legal document for the given type and
+        the caller's organization. Content is uploaded as an HTML file
+        via the workspace's `/files` API using the deterministic id
+        `legal-{orgSlug}-{type}`.
+
+        Requires the `announcements:write` permission (note: this
+        endpoint reuses the announcements auth resource - the field is
+        not specific to legal). Rate-limited to 50 calls per minute.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LegalDocumentInput' }
+      responses:
+        '200':
+          description: Legal document upserted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LegalDocumentUpsertResponse' }
+        '400':
+          description: Validation error (missing `content`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `announcements:write` permission or no org context.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Legal]
+      operationId: deleteLegalDocument
+      summary: Delete legal content for a type
+      description: |
+        Removes the legal document for the given type and the caller's
+        organization. Requires the `announcements:write` permission
+        (this endpoint reuses the announcements auth resource).
+        Rate-limited to 50 calls per minute.
+      responses:
+        '200':
+          description: Legal document deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  type: { type: string }
+                  orgSlug: { type: string }
+                  deleted: { type: boolean }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `announcements:write` permission or no org context.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/notifications:
+    get:
+      tags: [Notifications]
+      operationId: listNotifications
+      summary: List notifications for the current user
+      description: |
+        Returns the active announcements that target the current user
+        (lazy projection over `announcements` joined with
+        `user_announcement_state`). Filters out dismissed items.
+        Open to any authenticated user; rate-limited to 100 calls per minute.
+      parameters:
+        - in: query
+          name: product
+          schema: { type: string, maxLength: 64 }
+          description: Optional product filter.
+        - in: query
+          name: read
+          schema: { type: string, enum: ['true', 'false'], maxLength: 10 }
+          description: Filter by read flag.
+        - in: query
+          name: limit
+          schema: { type: string }
+          description: Max items per page (capped at 100, default 50).
+        - in: query
+          name: page
+          schema: { type: string }
+          description: Page index (0-based, default 0).
+      responses:
+        '200':
+          description: Notifications and unread counter.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationsListResponse' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/notifications/{notificationId}:
+    parameters:
+      - in: path
+        name: notificationId
+        required: true
+        schema:
+          type: string
+          maxLength: 64
+          pattern: ^[a-zA-Z0-9_-]+$
+        description: |
+          Notification identifier - equal to the underlying
+          announcement id (lazy model).
+    get:
+      tags: [Notifications]
+      operationId: markNotificationRead
+      summary: Get a notification and mark it as read
+      description: |
+        Returns the underlying announcement and upserts
+        `user_announcement_state.read = true` for the current user.
+        The first GET creates the per-user state row.
+        Open to any authenticated user; rate-limited to 100 calls per minute.
+      responses:
+        '200':
+          description: 'Notification details with `read: true`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationDetail' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Notification (announcement) not found, archived, or expired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/notifications/{notificationId}/dismiss:
+    parameters:
+      - in: path
+        name: notificationId
+        required: true
+        schema:
+          type: string
+          maxLength: 64
+          pattern: ^[a-zA-Z0-9_-]+$
+        description: |
+          Notification identifier - equal to the underlying
+          announcement id (lazy model).
+    post:
+      tags: [Notifications]
+      operationId: dismissNotification
+      summary: Dismiss a notification for the current user
+      description: |
+        Upserts `user_announcement_state.dismissed = true` for the
+        caller. The notification will no longer appear in
+        `GET /v1/notifications` results.
+        Open to any authenticated user; rate-limited to 50 calls per minute.
+      responses:
+        '200':
+          description: Notification dismissed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dismissed: { type: boolean }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/notifications/unread-count:
+    get:
+      tags: [Notifications]
+      operationId: getUnreadNotificationCount
+      summary: Get unread notifications count for a product
+      description: |
+        Returns the number of active, non-dismissed, unread
+        announcements that target the current user for the given
+        product. Open to any authenticated user; rate-limited to 100
+        calls per minute.
+      parameters:
+        - in: query
+          name: product
+          required: true
+          schema: { type: string, maxLength: 64 }
+          description: Product slug (required).
+      responses:
+        '200':
+          description: Unread count.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UnreadCountResponse' }
+        '400':
+          description: Validation error or missing `product`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/observability/platform/summary:
+    get:
+      tags: [Observability]
+      operationId: getPlatformObservabilitySummary
+      summary: Get a cross-organization platform observability summary
+      description: |
+        Aggregated view of platform health, performance, infrastructure,
+        and cost across every active workspace in the requested window.
+        Discovers active workspaces first, then runs the bulk aggregator
+        in `summary_only` mode.
+
+        Requires `observability_platform:read` permission. Rate-limited
+        to 100 calls per minute.
+      parameters:
+        - in: query
+          name: period
+          schema: { type: string, maxLength: 10, enum: [1h, 24h, 7d, 30d] }
+          description: Preset window (default `24h`).
+        - in: query
+          name: start
+          schema: { type: string, format: date-time }
+          description: Custom range start (overrides `period`; never cached).
+        - in: query
+          name: end
+          schema: { type: string, format: date-time }
+          description: Custom range end (overrides `period`; never cached).
+        - in: query
+          name: granularity
+          schema: { type: string, enum: [5m, hourly, daily] }
+          description: Granularity override.
+      responses:
+        '200':
+          description: Platform summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformObservabilitySummary' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `observability_platform:read` permission.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/observability/platform/top-workspaces:
+    get:
+      tags: [Observability]
+      operationId: getTopWorkspaces
+      summary: List the top N most active workspaces for a period
+      description: |
+        Returns the top N most active workspaces (by interaction count)
+        for the requested period. Reads from the daily-refreshed cache;
+        on first-ever call computes inline and seeds the cache.
+
+        Requires `observability:read` permission. Rate-limited to 100
+        calls per minute.
+      parameters:
+        - in: query
+          name: period
+          schema: { type: string, maxLength: 10, enum: [1h, 24h, 7d, 30d] }
+          description: Preset window (default `24h`).
+        - in: query
+          name: limit
+          schema: { type: string }
+          description: Max items (1..50, default 20).
+      responses:
+        '200':
+          description: Top workspaces list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TopWorkspacesResponse' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `observability:read` permission.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/observability/{workspaceId}/dashboard:
+    parameters:
+      - in: path
+        name: workspaceId
+        required: true
+        schema: { type: string, maxLength: 64, pattern: '^[a-zA-Z0-9_-]+$' }
+        description: Workspace identifier.
+    get:
+      tags: [Observability]
+      operationId: getWorkspaceDashboard
+      summary: Get the unified observability dashboard for a workspace
+      description: |
+        Returns the per-workspace dashboard in a single response: health,
+        metrics, errors, costs, and usage sections. Backed by the
+        per-interval `platform_metrics` rows plus a summary cache; refreshes
+        the current open interval on demand and self-heals gaps in closed
+        intervals.
+
+        Requires `observability:read` permission.
+      parameters:
+        - in: query
+          name: period
+          schema: { type: string, enum: [15m, 30m, 1h, 24h, 7d, 30d] }
+          description: Preset window (default `24h`).
+        - in: query
+          name: start
+          schema: { type: string, format: date-time }
+          description: Custom range start (overrides `period`; never cached).
+        - in: query
+          name: end
+          schema: { type: string, format: date-time }
+          description: Custom range end (overrides `period`; never cached).
+        - in: query
+          name: granularity
+          schema: { type: string, enum: [5m, hourly, daily] }
+          description: |
+            Granularity override (auto-picked from period; 5m windows
+            shorter than 1h are never cached).
+      responses:
+        '200':
+          description: Unified dashboard payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceDashboard' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `observability:read` permission.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/observability/{workspaceId}/dependencies:
+    parameters:
+      - in: path
+        name: workspaceId
+        required: true
+        schema: { type: string, maxLength: 64, pattern: '^[a-zA-Z0-9_-]+$' }
+        description: Workspace identifier.
+    get:
+      tags: [Observability]
+      operationId: getWorkspaceDependencies
+      summary: Get the workspace dependency graph
+      description: |
+        Returns the call graph between workspace automations and the
+        app-instance automations they invoke, computed from runtime
+        execution events for the requested window.
+
+        Requires `observability:read` permission. Rate-limited to 100
+        calls per minute.
+      parameters:
+        - in: query
+          name: period
+          schema: { type: string, maxLength: 8, enum: [1h, 24h, 7d, 30d] }
+          description: Preset window (default `7d`).
+        - in: query
+          name: start
+          schema: { type: string, format: date-time, maxLength: 64 }
+          description: Custom range start.
+        - in: query
+          name: end
+          schema: { type: string, format: date-time, maxLength: 64 }
+          description: Custom range end.
+        - in: query
+          name: dateStart
+          schema: { type: string, format: date-time, maxLength: 64 }
+          description: Legacy alias for `start`.
+        - in: query
+          name: dateEnd
+          schema: { type: string, format: date-time, maxLength: 64 }
+          description: Legacy alias for `end`.
+      responses:
+        '200':
+          description: Dependency graph.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceDependencies' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `observability:read` permission.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/observability/{workspaceId}/feed:
+    parameters:
+      - in: path
+        name: workspaceId
+        required: true
+        schema: { type: string, maxLength: 64, pattern: '^[a-zA-Z0-9_-]+$' }
+        description: Workspace identifier.
+    get:
+      tags: [Observability]
+      operationId: getWorkspaceFeed
+      summary: Get the real-time event feed for a workspace
+      description: |
+        Returns runtime events (interactions, errors, failed fetches,
+        executions) for the requested window with filtering, pagination,
+        and per-type breakdown.
+
+        Requires `observability:read` permission. Rate-limited to 100
+        calls per minute.
+      parameters:
+        - in: query
+          name: minutes
+          schema: { type: string }
+          description: How far back to look (default 5).
+        - in: query
+          name: period
+          schema: { type: string, maxLength: 8, enum: [1h, 24h, 7d, 30d] }
+          description: |
+            Preset window. Wins over `minutes`. Use `dateStart`/`dateEnd`
+            (or `start`/`end`) for explicit ranges.
+        - in: query
+          name: dateStart
+          schema: { type: string, format: date-time, maxLength: 32 }
+        - in: query
+          name: dateEnd
+          schema: { type: string, format: date-time, maxLength: 32 }
+        - in: query
+          name: filter
+          schema: { type: string, maxLength: 32 }
+          description: Legacy alias mapped to a single scope; ignored when `scopes` is set.
+        - in: query
+          name: scopes
+          schema: { type: string, maxLength: 128 }
+          description: |
+            Comma-separated scopes to surface. Supported values:
+            `interactions`, `errors`, `failed_fetches`, `executions`.
+            Default: `interactions,errors,failed_fetches`.
+        - in: query
+          name: text
+          schema: { type: string, maxLength: 256 }
+          description: Free-text search forwarded as `simple_query_string`.
+        - in: query
+          name: minDuration
+          schema: { type: string, maxLength: 16 }
+          description: Lower bound (ms, inclusive) on `payload.duration`.
+        - in: query
+          name: maxDuration
+          schema: { type: string, maxLength: 16 }
+          description: Upper bound (ms, inclusive) on `payload.duration`.
+        - in: query
+          name: userId
+          schema: { type: string, maxLength: 128 }
+          description: Filter on `source.userId` (single id).
+        - in: query
+          name: correlationIds
+          schema: { type: string, maxLength: 4096 }
+          description: Comma-separated list of correlation ids (terms filter).
+        - in: query
+          name: limit
+          schema: { type: string }
+          description: Max events (default 50).
+        - in: query
+          name: page
+          schema: { type: string }
+          description: Page index (0-based, default 0).
+        - in: query
+          name: automation
+          schema: { type: string, maxLength: 128 }
+          description: Filter by automation slug.
+      responses:
+        '200':
+          description: Feed payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceFeed' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `observability:read` permission.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/observability/{workspaceId}/issues:
+    parameters:
+      - in: path
+        name: workspaceId
+        required: true
+        schema: { type: string, maxLength: 64, pattern: '^[a-zA-Z0-9_-]+$' }
+        description: Workspace identifier.
+    get:
+      tags: [Observability]
+      operationId: getWorkspaceIssues
+      summary: Detect anomalies in errors, latency, and traffic
+      description: |
+        Compares the most recent hour against a 7-day rolling baseline
+        and surfaces alerts for error spikes, latency regressions, and
+        no-traffic conditions. Sensitivity controls the multiplier on
+        baseline thresholds.
+
+        Requires `observability:read` permission. Rate-limited to 100
+        calls per minute.
+      parameters:
+        - in: query
+          name: sensitivity
+          schema: { type: string, enum: [low, medium, high], maxLength: 10 }
+          description: Detection sensitivity (default `medium`).
+      responses:
+        '200':
+          description: Issue analysis.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceIssues' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `observability:read` permission.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/observability/{workspaceId}/traces/{correlationId}:
+    parameters:
+      - in: path
+        name: workspaceId
+        required: true
+        schema: { type: string, maxLength: 64, pattern: '^[a-zA-Z0-9_-]+$' }
+        description: Workspace identifier.
+      - in: path
+        name: correlationId
+        required: true
+        schema: { type: string, maxLength: 128, pattern: '^[a-zA-Z0-9_:-]+$' }
+        description: Correlation id of the trace to inspect.
+    get:
+      tags: [Observability]
+      operationId: getWorkspaceTrace
+      summary: Get the full trace timeline for a correlationId
+      description: |
+        Returns the timeline, automation summary, and error list for a
+        given correlation id. Returns 404 when no events exist for that
+        correlation id in the workspace.
+
+        Requires `observability:read` permission. Rate-limited to 100
+        calls per minute.
+      responses:
+        '200':
+          description: Trace details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Trace' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `observability:read` permission.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: No events found for this correlation id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/observability/workspaces:
+    get:
+      tags: [Observability]
+      operationId: listObservabilityWorkspaces
+      summary: List workspaces visible to observability users
+      description: |
+        Wraps the platform `/v2/workspaces` API using the workspace's
+        `superAdminToken` so any user with `observability:read` can list
+        every workspace, not only the ones they personally have access to.
+        Returns the raw shape forwarded from the platform API (an array
+        of workspace summaries).
+
+        Requires `observability:read` permission. Rate-limited to 100
+        calls per minute.
+      parameters:
+        - in: query
+          name: page
+          schema: { type: string }
+          description: Page index (forwarded as-is).
+        - in: query
+          name: limit
+          schema: { type: string }
+          description: Max items per page (forwarded as-is).
+        - in: query
+          name: sort
+          schema: { type: string, maxLength: 50 }
+          description: Sort expression (forwarded as-is).
+        - in: query
+          name: search
+          schema: { type: string, maxLength: 200 }
+          description: Free-text search (forwarded as-is).
+        - in: query
+          name: ids
+          schema: { type: string, maxLength: 2000 }
+          description: Comma-separated workspace ids (forwarded URL-encoded).
+      responses:
+        '200':
+          description: |
+            Platform workspaces response (forwarded shape - the raw array
+            returned by the platform `/v2/workspaces` API).
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/WorkspaceSummary' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `observability:read` permission.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: Platform `/v2/workspaces` API call failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/orgs/active:
+    get:
+      tags: [Orgs]
+      operationId: listActiveOrgs
+      summary: List active organizations (platform-wide)
+      description: |
+        Returns the list of active organizations by wrapping the
+        platform `GET /orgs?limit=200` call with the workspace's
+        `superAdminToken`. Used by `ai-insights-v2` cron jobs for
+        analytics aggregation; also callable cross-workspace from the
+        configured trusted source workspaces.
+
+        Requires `observability_platform:read` permission (or trusted
+        source workspace context). Rate-limited to 10 calls per hour.
+      responses:
+        '200':
+          description: Active organizations.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Organization' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `observability_platform:read` permission.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/orgs/{orgSlug}/audit:
+    parameters:
+      - in: path
+        name: orgSlug
+        required: true
+        schema: { type: string, maxLength: 64, pattern: '^[a-zA-Z0-9_-]+$' }
+        description: Organization slug.
+    get:
+      tags: [Orgs]
+      operationId: getOrgAuditLog
+      summary: List audit events for an organization
+      description: |
+        Returns audit events stored as `organizations.audit` events on the
+        platform topic. Filterable by category, action, and date range.
+
+        Requires `observability:read` permission scoped to the path
+        `orgSlug`. Rate-limited to 100 calls per minute.
+      parameters:
+        - in: query
+          name: category
+          schema: { type: string, maxLength: 32, enum: [member, role, org, sso, quota, apikey, auth] }
+          description: Filter by category.
+        - in: query
+          name: action
+          schema: { type: string, maxLength: 32 }
+          description: Filter by action (created, updated, deleted, etc.).
+        - in: query
+          name: dateStart
+          schema: { type: string, format: date-time, maxLength: 64 }
+          description: ISO start (default last 7 days).
+        - in: query
+          name: dateEnd
+          schema: { type: string, format: date-time, maxLength: 64 }
+          description: ISO end (default now).
+        - in: query
+          name: limit
+          schema: { type: string }
+          description: Max results (default 50).
+        - in: query
+          name: page
+          schema: { type: string }
+          description: Page number (default 1).
+      responses:
+        '200':
+          description: Audit log entries.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditLogResponse' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Forbidden - missing `observability:read` permission for this org.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405':
+          description: Method not allowed (use GET).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        User session JWT or instance API key (`iak_*`).
+        Send as `Authorization: Bearer <token>`.
+    WorkspaceApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-prismeai-api-key
+      description: Workspace-scoped API key.
+  schemas:
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Stable PascalCase error code (e.g. AnnouncementNotFound, ValidationError).
+        message:
+          type: string
+          description: Human-readable error message.
+        details:
+          type: object
+          description: Optional structured context.
+          additionalProperties: true
+
+    # ──────────────────────────────────────────────────────────────────
+    # Announcements
+    # ──────────────────────────────────────────────────────────────────
+    AnnouncementTargets:
+      type: object
+      additionalProperties: true
+      description: |
+        Audience targeting object - validated and normalized server-side
+        by `internal/validate-announcement-targets`. Common shape exposes
+        `roles`, `permissions`, `products`, `userIds`.
+
+    Announcement:
+      type: object
+      description: Full announcement record stored in the `announcements` collection.
+      properties:
+        id: { type: string }
+        orgSlug: { type: string, nullable: true }
+        title: { type: string }
+        summary: { type: string }
+        content: { type: string }
+        icon: { type: string }
+        link: { type: string }
+        targets: { $ref: '#/components/schemas/AnnouncementTargets' }
+        status: { type: string, enum: [draft, active, archived] }
+        expires_at: { type: string }
+        createdBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AnnouncementListItem:
+      type: object
+      description: Trimmed announcement record returned by the list endpoint.
+      properties:
+        id: { type: string }
+        orgSlug: { type: string, nullable: true }
+        title: { type: string }
+        summary: { type: string }
+        icon: { type: string }
+        status: { type: string, enum: [draft, active, archived] }
+        targets: { $ref: '#/components/schemas/AnnouncementTargets' }
+        expires_at: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    AnnouncementCreateInput:
+      type: object
+      required: [targets]
+      properties:
+        title: { type: string, maxLength: 500 }
+        summary: { type: string, maxLength: 2000 }
+        content: { type: string, maxLength: 50000 }
+        icon: { type: string, maxLength: 256 }
+        link: { type: string, maxLength: 2048 }
+        targets:
+          allOf:
+            - $ref: '#/components/schemas/AnnouncementTargets'
+          description: Audience targeting object - required, validated server-side.
+        status: { type: string, maxLength: 32, enum: [draft, active, archived] }
+        expires_at: { type: string, maxLength: 64, format: date-time }
+
+    AnnouncementUpdateInput:
+      type: object
+      properties:
+        title: { type: string, maxLength: 500 }
+        summary: { type: string, maxLength: 2000 }
+        content: { type: string, maxLength: 50000 }
+        icon: { type: string, maxLength: 256 }
+        link: { type: string, maxLength: 2048 }
+        targets:
+          allOf:
+            - $ref: '#/components/schemas/AnnouncementTargets'
+          description: Audience targeting object - re-validated when provided.
+        status: { type: string, maxLength: 32, enum: [draft, active, archived] }
+        expires_at: { type: string, maxLength: 64, format: date-time }
+
+    AnnouncementCreateResponse:
+      type: object
+      properties:
+        id: { type: string }
+        orgSlug: { type: string, nullable: true }
+        title: { type: string }
+        summary: { type: string }
+        targets: { $ref: '#/components/schemas/AnnouncementTargets' }
+        status: { type: string, enum: [draft, active, archived] }
+        expires_at: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Notifications
+    # ──────────────────────────────────────────────────────────────────
+    NotificationListItem:
+      type: object
+      description: |
+        Per-user notification projection - lazy join of an active
+        `Announcement` with the caller's `user_announcement_state` row.
+      properties:
+        id: { type: string, description: Equal to the underlying announcement id. }
+        type: { type: string, enum: [announcement] }
+        title: { type: string }
+        summary: { type: string }
+        icon: { type: string }
+        link: { type: string }
+        read: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    NotificationDetail:
+      type: object
+      description: Notification details returned by `markNotificationRead` (includes `content`).
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [announcement] }
+        title: { type: string }
+        summary: { type: string }
+        content: { type: string }
+        icon: { type: string }
+        link: { type: string }
+        read: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    NotificationsListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/NotificationListItem' }
+        total: { type: integer }
+        unread_count: { type: integer }
+        page: { type: integer }
+        limit: { type: integer }
+
+    UnreadCountResponse:
+      type: object
+      properties:
+        count: { type: integer }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Legal
+    # ──────────────────────────────────────────────────────────────────
+    LegalDocument:
+      type: object
+      description: |
+        Per-org legal document for a given type slug. Backed by the
+        platform `/files` API (file id `legal-{orgSlug}-{type}`).
+      properties:
+        type: { type: string }
+        orgSlug: { type: string }
+        content:
+          type: string
+          description: Raw HTML content; empty string when no document is stored.
+
+    LegalDocumentInput:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          maxLength: 500000
+          description: Raw HTML content of the legal document.
+
+    LegalDocumentUpsertResponse:
+      type: object
+      properties:
+        type: { type: string }
+        orgSlug: { type: string }
+        content: { type: string }
+        updatedBy: { type: string }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Observability - platform summary
+    # ──────────────────────────────────────────────────────────────────
+    PlatformObservabilitySummary:
+      type: object
+      properties:
+        meta:
+          type: object
+          properties:
+            period: { type: string }
+            period_start: { type: string, format: date-time }
+            generated_at: { type: string, format: date-time }
+            workspaces_discovered: { type: integer }
+        health:
+          type: object
+          properties:
+            score: { type: number }
+            status: { type: string }
+            uptime: { type: number }
+        performance:
+          type: object
+          properties:
+            total_interactions: { type: integer }
+            total_executions: { type: integer }
+            p50_ms: { type: number }
+            p95_ms: { type: number }
+            p99_ms: { type: number }
+            error_rate: { type: number }
+        infrastructure:
+          type: object
+          properties:
+            by_provider:
+              type: object
+              additionalProperties: true
+        cost:
+          type: object
+          properties:
+            total: { type: number }
+            total_tokens: { type: integer }
+            total_carbon_kgco2: { type: number }
+            by_model:
+              type: object
+              additionalProperties: true
+            forecast_monthly: { type: number }
+        alerts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    # ──────────────────────────────────────────────────────────────────
+    # Observability - workspace dashboard
+    # Sub-shapes built by internal/observability/build-{health,metrics,errors,costs,usage}.yml
+    # ──────────────────────────────────────────────────────────────────
+    DashboardHealthIssue:
+      type: object
+      description: Issue surfaced by the health builder (mutually-exclusive thresholds).
+      properties:
+        type:
+          type: string
+          enum: [high_error_rate, high_latency, low_activity]
+        message: { type: string }
+        impact:
+          type: string
+          enum: [info, medium, high]
+
+    DashboardHealthMetrics:
+      type: object
+      properties:
+        totalInteractions: { type: integer }
+        failedInteractions: { type: integer }
+        totalExecutions: { type: integer }
+        totalErrors: { type: integer }
+        errorRate:
+          type: number
+          description: Failed / total interactions, percentage rounded to 2 decimals.
+        successRate:
+          type: number
+          description: 1 - errorRate, percentage rounded to 2 decimals.
+        p95Ms: { type: number }
+        p50Ms: { type: number }
+
+    DashboardHealth:
+      type: object
+      description: |
+        `health` block - output of `internal/observability/build-health`.
+      properties:
+        score: { type: number }
+        status: { type: string }
+        metrics: { $ref: '#/components/schemas/DashboardHealthMetrics' }
+        breakdown:
+          type: object
+          additionalProperties: true
+          description: Per-component score breakdown produced by `compute-health-score`.
+        issues:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardHealthIssue' }
+
+    DashboardLatency:
+      type: object
+      properties:
+        p50Ms: { type: number }
+        p90Ms: { type: number }
+        p95Ms: { type: number }
+        p99Ms: { type: number }
+
+    DashboardSlowestAutomation:
+      type: object
+      properties:
+        automation: { type: string }
+        executions: { type: integer }
+        p95Ms: { type: number }
+        errorRate: { type: number }
+        correlationIds:
+          type: array
+          items: { type: string }
+
+    DashboardMetricsTimelinePoint:
+      type: object
+      properties:
+        date: { type: string, format: date-time }
+        p95Ms: { type: number }
+        count: { type: integer }
+        entryCount: { type: integer }
+        interactions: { type: integer }
+        status: { type: string }
+
+    DashboardMetrics:
+      type: object
+      description: |
+        `metrics` block - output of `internal/observability/build-metrics`.
+      properties:
+        totalExecutions: { type: integer }
+        totalEntryExecutions: { type: integer }
+        totalInteractions: { type: integer }
+        latency: { $ref: '#/components/schemas/DashboardLatency' }
+        slowestAutomations:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardSlowestAutomation' }
+        timeline:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardMetricsTimelinePoint' }
+
+    DashboardErrorByType:
+      type: object
+      properties:
+        type: { type: string }
+        appInstanceFullSlug:
+          type: string
+          description: Empty when the error came from a workspace automation rather than an installed app instance.
+        count: { type: integer }
+        percentage: { type: number }
+
+    DashboardErrorByAutomation:
+      type: object
+      properties:
+        automation: { type: string }
+        errorCount: { type: integer }
+        execCount: { type: integer }
+        errorRate: { type: number }
+
+    DashboardErrorsTimelinePoint:
+      type: object
+      properties:
+        date: { type: string, format: date-time }
+        count: { type: integer }
+        failedInteractions: { type: integer }
+        status: { type: string }
+
+    DashboardErrors:
+      type: object
+      description: |
+        `errors` block - output of `internal/observability/build-errors`.
+      properties:
+        totalErrors: { type: integer }
+        totalExecutions: { type: integer }
+        totalInteractions: { type: integer }
+        failedInteractions: { type: integer }
+        errorRate: { type: number }
+        byType:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardErrorByType' }
+        byAutomation:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardErrorByAutomation' }
+        timeline:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardErrorsTimelinePoint' }
+
+    DashboardCostsSummary:
+      type: object
+      properties:
+        totalCalls: { type: integer }
+        totalCostUsd: { type: number }
+        totalTokens: { type: integer }
+        inputTokens: { type: integer }
+        outputTokens: { type: integer }
+        totalCarbonKgco2: { type: number }
+
+    DashboardCostByModel:
+      type: object
+      properties:
+        model: { type: string }
+        calls: { type: integer }
+        cost: { type: number }
+        tokens: { type: integer }
+        percentage: { type: number }
+
+    DashboardCostByProvider:
+      type: object
+      properties:
+        provider: { type: string }
+        calls: { type: integer }
+        latencyMs: { type: number }
+
+    DashboardCostsTimelinePoint:
+      type: object
+      properties:
+        date: { type: string, format: date-time }
+        calls: { type: integer }
+        cost: { type: number }
+        tokens: { type: integer }
+        status: { type: string }
+
+    DashboardCosts:
+      type: object
+      description: |
+        `costs` block - output of `internal/observability/build-costs`.
+      properties:
+        summary: { $ref: '#/components/schemas/DashboardCostsSummary' }
+        byModel:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardCostByModel' }
+        byProvider:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardCostByProvider' }
+        timeline:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardCostsTimelinePoint' }
+
+    DashboardUsageSummary:
+      type: object
+      properties:
+        totalInteractions: { type: integer }
+        totalExecutions: { type: integer }
+        uniqueUsers: { type: integer }
+        avgInteractionsPerDay: { type: integer }
+        avgRpm: { type: number }
+        peakRpm: { type: number }
+
+    DashboardUsageIntervalStat:
+      type: object
+      properties:
+        date: { type: string, format: date-time }
+        interactions: { type: integer }
+        executions: { type: integer }
+        users: { type: integer }
+        status: { type: string }
+
+    DashboardUsageTopEntrypoint:
+      type: object
+      properties:
+        automation: { type: string }
+        count: { type: integer }
+        percentage: { type: number }
+
+    DashboardUsage:
+      type: object
+      description: |
+        `usage` block - output of `internal/observability/build-usage`.
+      properties:
+        summary: { $ref: '#/components/schemas/DashboardUsageSummary' }
+        intervalStats:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardUsageIntervalStat' }
+        topEntrypoints:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardUsageTopEntrypoint' }
+
+    WorkspaceDashboard:
+      type: object
+      description: Unified per-workspace observability dashboard.
+      properties:
+        workspaceId: { type: string }
+        period:
+          type: object
+          properties:
+            type: { type: string }
+            start: { type: string, format: date-time }
+            end: { type: string, format: date-time }
+            granularity: { type: string }
+        health: { $ref: '#/components/schemas/DashboardHealth' }
+        metrics: { $ref: '#/components/schemas/DashboardMetrics' }
+        errors: { $ref: '#/components/schemas/DashboardErrors' }
+        costs: { $ref: '#/components/schemas/DashboardCosts' }
+        usage: { $ref: '#/components/schemas/DashboardUsage' }
+        meta:
+          type: object
+          properties:
+            source: { type: string }
+            data_points: { type: integer }
+            includes_current_interval: { type: boolean }
+            summary_cached: { type: boolean }
+            granularity_override_applied: { type: boolean }
+            generated_at: { type: string, format: date-time }
+            data_computed_at: { type: string, format: date-time }
+            next_refresh_at: { type: string, format: date-time }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Observability - top workspaces
+    # ──────────────────────────────────────────────────────────────────
+    TopWorkspacesResponse:
+      type: object
+      properties:
+        period: { type: string }
+        workspaces:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            description: Workspace summary entry as produced by the cache helper.
+        cached: { type: boolean }
+        computed_at: { type: string, format: date-time }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Observability - dependencies graph
+    # ──────────────────────────────────────────────────────────────────
+    DependencyGraphNode:
+      type: object
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          enum: [automation, app_automation]
+        label: { type: string }
+        appInstance: { type: string }
+        automationSlug: { type: string }
+
+    DependencyGraphEdge:
+      type: object
+      properties:
+        source: { type: string }
+        target: { type: string }
+        type:
+          type: string
+          enum: [uses_app_automation]
+        calls: { type: integer }
+
+    WorkspaceDependencies:
+      type: object
+      properties:
+        workspaceId: { type: string }
+        period:
+          type: object
+          properties:
+            start: { type: string, format: date-time }
+            end: { type: string, format: date-time }
+        graph:
+          type: object
+          properties:
+            nodes:
+              type: array
+              items: { $ref: '#/components/schemas/DependencyGraphNode' }
+            edges:
+              type: array
+              items: { $ref: '#/components/schemas/DependencyGraphEdge' }
+        stats:
+          type: object
+          properties:
+            nodeCount: { type: integer }
+            edgeCount: { type: integer }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Observability - feed
+    # ──────────────────────────────────────────────────────────────────
+    FeedTypeBreakdown:
+      type: object
+      properties:
+        type: { type: string }
+        count: { type: integer }
+
+    FeedEvent:
+      type: object
+      properties:
+        id: { type: string }
+        timestamp: { type: string, format: date-time }
+        type: { type: string }
+        automation: { type: string }
+        correlationId: { type: string }
+        userId: { type: string }
+        category:
+          type: string
+          enum: [error, execution, interaction, event]
+        duration: { type: integer }
+        error:
+          type: object
+          additionalProperties: true
+        message: { type: string }
+        summary: { type: string }
+        trigger: { type: string }
+        emittedEvent: { type: string }
+
+    WorkspaceFeed:
+      type: object
+      properties:
+        workspaceId: { type: string }
+        filter: { type: string }
+        since: { type: string, format: date-time }
+        stats:
+          type: object
+          properties:
+            totalEvents: { type: integer }
+            uniqueUsers: { type: integer }
+            throughputPerMinute: { type: number }
+        typeBreakdown:
+          type: array
+          items: { $ref: '#/components/schemas/FeedTypeBreakdown' }
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/FeedEvent' }
+        page: { type: integer }
+        hasMore: { type: boolean }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Observability - issues
+    # ──────────────────────────────────────────────────────────────────
+    IssueAlert:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [error_spike, latency_issue, no_traffic]
+        severity:
+          type: string
+          enum: [warning, critical]
+        message: { type: string }
+        current: { type: number }
+        baseline: { type: number }
+        threshold: { type: number }
+
+    WorkspaceIssues:
+      type: object
+      properties:
+        workspaceId: { type: string }
+        analyzedAt: { type: string, format: date-time }
+        sensitivity:
+          type: string
+          enum: [low, medium, high]
+        baseline:
+          type: object
+          properties:
+            period: { type: string }
+            avgExecsPerHour: { type: number }
+            avgErrorsPerHour: { type: number }
+            avgLatencyMs: { type: number }
+        recent:
+          type: object
+          properties:
+            period: { type: string }
+            executions: { type: integer }
+            errors: { type: integer }
+            avgLatencyMs: { type: number }
+        issueCount: { type: integer }
+        issues:
+          type: array
+          items: { $ref: '#/components/schemas/IssueAlert' }
+        status:
+          type: string
+          enum: [alert, healthy]
+
+    # ──────────────────────────────────────────────────────────────────
+    # Observability - trace
+    # ──────────────────────────────────────────────────────────────────
+    TraceSummary:
+      type: object
+      properties:
+        eventCount: { type: integer }
+        automationCount: { type: integer }
+        errorCount: { type: integer }
+        totalDurationMs: { type: integer }
+        startTime: { type: string, format: date-time }
+        endTime: { type: string, format: date-time }
+
+    TraceUser:
+      type: object
+      properties:
+        id: { type: string, nullable: true }
+        sessionId: { type: string, nullable: true }
+
+    TraceTrigger:
+      type: object
+      properties:
+        type: { type: string }
+        value: { type: string }
+
+    TraceEventError:
+      type: object
+      properties:
+        code: { type: string }
+        message: { type: string }
+
+    TraceEvent:
+      type: object
+      properties:
+        timestamp: { type: string, format: date-time }
+        offsetMs: { type: integer }
+        type: { type: string }
+        automation: { type: string }
+        appInstance: { type: string }
+        duration: { type: integer }
+        trigger: { $ref: '#/components/schemas/TraceTrigger' }
+        error: { $ref: '#/components/schemas/TraceEventError' }
+        emittedEvent: { type: string }
+
+    TraceAutomation:
+      type: object
+      properties:
+        slug: { type: string }
+        duration: { type: integer }
+        startOffset: { type: integer }
+
+    TraceError:
+      type: object
+      properties:
+        automation: { type: string }
+        error: { type: string }
+        message: { type: string }
+        timestamp: { type: string, format: date-time }
+
+    Trace:
+      type: object
+      properties:
+        correlationId: { type: string }
+        workspaceId: { type: string }
+        summary: { $ref: '#/components/schemas/TraceSummary' }
+        user: { $ref: '#/components/schemas/TraceUser' }
+        timeline:
+          type: array
+          items: { $ref: '#/components/schemas/TraceEvent' }
+        automations:
+          type: array
+          items: { $ref: '#/components/schemas/TraceAutomation' }
+        errors:
+          type: array
+          items: { $ref: '#/components/schemas/TraceError' }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Observability - workspaces (forwarded from platform /v2/workspaces)
+    # ──────────────────────────────────────────────────────────────────
+    WorkspaceLastPush:
+      type: object
+      properties:
+        createdAt: { type: string }
+        createdBy: { type: string }
+        version: { type: string }
+        repositoryId: { type: string }
+
+    WorkspaceSummary:
+      type: object
+      description: |
+        Workspace summary as forwarded from the platform `/v2/workspaces`
+        API. Schema mirrors the platform spec - see
+        `prisme.ai/specifications/swagger.yml` (`getWorkspaces` response).
+      properties:
+        id: { type: string }
+        name: { type: string }
+        dirty: { type: boolean }
+        lastPush: { $ref: '#/components/schemas/WorkspaceLastPush' }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Orgs
+    # ──────────────────────────────────────────────────────────────────
+    Organization:
+      type: object
+      description: |
+        Organization summary as returned by the platform `/orgs` API.
+        Schema is forwarded - extra fields are passed through unchanged.
+      additionalProperties: true
+
+    AuditLogEntry:
+      type: object
+      description: |
+        Audit log entry built from `organizations.audit` events on the
+        platform topic.
+      properties:
+        timestamp: { type: string, format: date-time }
+        category: { type: string }
+        action: { type: string }
+        actor:
+          type: object
+          additionalProperties: true
+        target:
+          type: object
+          additionalProperties: true
+        changes:
+          type: object
+          additionalProperties: true
+        reason: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+        correlationId: { type: string }
+
+    AuditLogResponse:
+      type: object
+      properties:
+        orgSlug: { type: string }
+        period:
+          type: object
+          properties:
+            start: { type: integer, description: 'Epoch ms (server-resolved).' }
+            end: { type: integer, description: 'Epoch ms (server-resolved).' }
+        pagination:
+          type: object
+          properties:
+            page: { type: integer }
+            limit: { type: integer }
+            total: { type: integer }
+        count: { type: integer }
+        logs:
+          type: array
+          items: { $ref: '#/components/schemas/AuditLogEntry' }
