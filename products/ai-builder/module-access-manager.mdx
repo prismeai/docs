@@ -3,14 +3,15 @@ title: "Access Manager Module"
 description: "Manage service account tokens, product bindings, and access checks at runtime"
 ---
 
-The **access-manager** module provides three groups of functions :
+The **access-manager** module provides four groups of functions :
 
 1. **Service account management** — Create, rotate, delete service accounts and issue JWT tokens. Restricted to **privileged workspaces** defined via `PRIVILEGED_WORKSPACES`.
-2. **Product bindings** — CRUD operations on the `product_bindings` collection to link resources to users, orgs, or groups. Available to **any workspace**.
-3. **Access checking** — High-level `checkAccess` function that combines permissions, scopes, and bindings to determine if a caller can access a resource. Available to **any workspace**.
+2. **Org API key management** — Create, list, rotate, revoke org API keys scoped to the privileged workspace. Restricted to **privileged workspaces**.
+3. **Product bindings** — CRUD operations on the `product_bindings` collection to link resources to users, orgs, or groups. Available to **any workspace**.
+4. **Access checking** — High-level `checkAccess` function that combines permissions, scopes, and bindings to determine if a caller can access a resource. Available to **any workspace**.
 
 <Warning>
-Service account functions (`getServiceAccountToken`, `createServiceAccount`, `rotateServiceAccountSecret`, `deleteServiceAccount`) are only available to workspaces listed in the `PRIVILEGED_WORKSPACES` environment variable. Binding and access check functions are available to all workspaces.
+Service account and org API key functions (`getServiceAccountToken`, `createServiceAccount`, `rotateServiceAccountSecret`, `deleteServiceAccount`, `createOrgApiKey`, `listOrgApiKeys`, `rotateOrgApiKey`, `deleteOrgApiKey`) are only available to workspaces listed in the `PRIVILEGED_WORKSPACES` environment variable. Binding and access check functions are available to all workspaces.
 </Warning>
 
 ## Service Account Functions
@@ -133,6 +134,200 @@ do:
       headers:
         Authorization: "Bearer {{tokenResult.accessToken}}"
       output: resources
+```
+
+---
+
+## Org API Key Functions
+
+These functions let a privileged workspace mint and manage **org-level API keys** on behalf of its users — typically to expose a programmatic key tied to a single product resource (an agent, a workflow, etc.) without granting the user direct `orgs:apikeys:manage` permission.
+
+### Security model
+
+The runtime enforces strict isolation so a privileged workspace can only see and manage keys *it owns*:
+
+- **`ownerType` is force-prefixed** with the calling workspace slug (e.g. the DSUL passes `agent`, the runtime stores `agent-factory:agent`). The DSUL **cannot** spoof another workspace's `ownerType`.
+- **`listOrgApiKeys`** force-prefixes the `ownerType` filter the same way, so listings only ever return keys minted by the calling workspace.
+- **`rotateOrgApiKey` / `deleteOrgApiKey`** fetch the target key first via `GET /v2/orgs/:orgSlug/api-keys/:keyId` and refuse the operation unless the existing `ownerType` starts with `${workspaceSlug}:`.
+- **`permissions` and `scopes`** are forwarded verbatim to api-gateway. The DSUL is responsible for prefixing them; the runtime then validates each value against the privileged-workspace allowlist (see config below) — so a workspace can declare permissions/scopes of *other* workspaces only if the operator has explicitly listed them.
+
+### Configuration
+
+Add an `apiKeys` block to the workspace's entry in `PRIVILEGED_WORKSPACES`:
+
+```json
+{
+  "agent-factory": {
+    "defaultRoleSlug": "agent-standard",
+    "allowedRoleSlugs": ["agent-standard", "agent-admin"],
+    "apiKeys": {
+      "allowedPermissions": [
+        "agent-factory:agents:read",
+        "agent-factory:agents:write"
+      ],
+      "allowedScopes": ["agent-factory:agents:*"]
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `apiKeys.allowedPermissions` | `string[]` | Fully-qualified permission patterns the workspace may mint. Trailing `*` is supported (e.g. `agent-factory:agents:*`). The runtime rejects any permission not matching at least one pattern. |
+| `apiKeys.allowedScopes` | `string[]` | Fully-qualified scope patterns the workspace may attach to its API keys. Same glob semantics as `allowedPermissions`. |
+
+If `apiKeys` is omitted, the workspace cannot create API keys.
+
+### createOrgApiKey — Mint a new API key
+
+```yaml
+- run:
+    module: access-manager
+    function: createOrgApiKey
+    parameters:
+      orgSlug: "{{auth.orgSlug}}"
+      slug: "agent-{{agentId}}-{{run.correlationId}}"
+      name: "API Key – {{agent.name}}"
+      permissions:
+        - agent-factory:agents:read
+        - agent-factory:agents:write
+      scopes:
+        - agent-factory:agents:{{agentId}}
+      ownerType: agent
+      ownerId: "{{agentId}}"
+      expiresAt: "2026-12-31T23:59:59Z"
+    output: created
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `orgSlug` | string | yes | Organization slug owning the key |
+| `slug` | string | yes | Unique short id of the key within the org |
+| `name` | string | yes | Display name |
+| `permissions` | string[] | yes | Fully-qualified permissions (DSUL prefixes them; runtime validates against `allowedPermissions`) |
+| `scopes` | string[] | no | Fully-qualified scopes (validated against `allowedScopes`) |
+| `ownerType` | string | yes | **Bare** owner type (e.g. `agent`). The runtime force-prefixes it with the workspace slug. |
+| `ownerId` | string | no | Owner identifier (typically the resource id) |
+| `expiresAt` | string | no | ISO-8601 expiration date |
+
+Returns `{ id, slug, apiKey, name, permissions, expiresAt }`. **The raw `apiKey` is shown only on creation — store it immediately.**
+
+### listOrgApiKeys — List the workspace's API keys
+
+```yaml
+- run:
+    module: access-manager
+    function: listOrgApiKeys
+    parameters:
+      orgSlug: "{{auth.orgSlug}}"
+      ownerType: agent
+      ownerId: "{{agentId}}"
+      limit: 50
+    output: keys
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `orgSlug` | string | yes | Organization slug |
+| `ownerType` | string | yes | **Bare** owner type. The runtime force-prefixes with the workspace slug; api-gateway has no wildcard support, so this is an exact filter. |
+| `ownerId` | string | no | Restrict to keys for a single owner |
+| `limit` | number | no | Page size (default 50) |
+| `page` | number | no | Page index (1-based) |
+
+Returns `{ results: OrgApiKey[], total }`. Keys minted by *other* workspaces in the same org are never returned.
+
+### rotateOrgApiKey — Regenerate a key's secret
+
+```yaml
+- run:
+    module: access-manager
+    function: rotateOrgApiKey
+    parameters:
+      orgSlug: "{{auth.orgSlug}}"
+      keyId: "{{keyId}}"
+      expiresAt: "2027-01-01T00:00:00Z"
+    output: rotated
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `orgSlug` | string | yes | Organization slug |
+| `keyId` | string | yes | Slug/id of the key to rotate |
+| `expiresAt` | string | no | New expiration (keeps the previous one if omitted) |
+
+Returns the same shape as `createOrgApiKey` (with the **new** raw `apiKey`). Throws if the key's `ownerType` doesn't start with `${workspaceSlug}:`.
+
+### deleteOrgApiKey — Revoke a key
+
+```yaml
+- run:
+    module: access-manager
+    function: deleteOrgApiKey
+    parameters:
+      orgSlug: "{{auth.orgSlug}}"
+      keyId: "{{keyId}}"
+    output: deleted
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `orgSlug` | string | yes | Organization slug |
+| `keyId` | string | yes | Slug/id of the key to delete |
+
+Returns `{ success: true }`. Like `rotateOrgApiKey`, refuses if the key isn't owned by the calling workspace.
+
+### Org API Key Example
+
+End-to-end automation that mints, lists and revokes an API key tied to a specific agent (single endpoint exposed via webhook in the agent-factory workspace):
+
+```yaml
+slug: v1/agents/agent_id/api-keys
+name: API/v1/Agents/agent_id/Api-keys
+when:
+  endpoint: v1/agents/:agent_id/api-keys
+do:
+  - _auth:
+      agent_id: '{{pathParams.agent_id}}'
+      resource: agents
+      action: share
+      output: auth
+  - conditions:
+      '{{method}} = "POST"':
+        # Prefix each requested permission with this workspace's slug so the
+        # runtime allowlist (PRIVILEGED_WORKSPACES.agent-factory.apiKeys) accepts it.
+        - set:
+            name: _prefixed_permissions
+            value: []
+        - repeat:
+            'on': '{{body.permissions}}'
+            do:
+              - set:
+                  name: _prefixed_permissions[]
+                  value: agent-factory:{{item}}
+        - run:
+            module: access-manager
+            function: createOrgApiKey
+            parameters:
+              orgSlug: '{{auth.orgSlug}}'
+              slug: '{{body.slug}}'
+              name: '{{body.name}}'
+              permissions: '{{_prefixed_permissions}}'
+              scopes:
+                - agent-factory:agents:{{pathParams.agent_id}}
+              ownerType: agent
+              ownerId: '{{pathParams.agent_id}}'
+              expiresAt: '{{body.expiresAt}}'
+            output: result
+      '{{method}} = "GET"':
+        - run:
+            module: access-manager
+            function: listOrgApiKeys
+            parameters:
+              orgSlug: '{{auth.orgSlug}}'
+              ownerType: agent
+              ownerId: '{{pathParams.agent_id}}'
+            output: result
+output: '{{result}}'
 ```
 
 ---
