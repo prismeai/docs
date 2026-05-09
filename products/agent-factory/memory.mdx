@@ -1,0 +1,181 @@
+---
+title: "Agent Memory"
+description: "How working, session, and long-term memory work in Prisme.ai agents — the layers, the tools, and the data flow."
+---
+
+Prisme.ai agents have three layers of memory. Working memory is automatic, session memory persists during a conversation, and long-term memory persists across conversations and is the focus of this page.
+
+## The three layers
+
+| Layer | Lifetime | Profiles | What it stores |
+|---|---|---|---|
+| **Working memory** | Current LLM turn | All | The current message and immediate context already in the prompt |
+| **Session memory** | One conversation | Light Agent and above | Everything said earlier in the same conversation, even after it scrolls out of the context window |
+| **Long-term memory** | Across conversations, across sessions | Full Agent and Orchestrator | User-specific facts, preferences, relationships, and instructions deliberately stored by the agent |
+
+The rest of this page focuses on **long-term memory** — the layer that lets your agent remember a user's preferences from one week to the next.
+
+## How long-term memory works
+
+Long-term memory is provided by a dedicated memory service. The agent does not store memories itself: it calls three tools, and the service handles persistence and retrieval.
+
+```
+            ┌──────────────────────────────────────────────┐
+            │                Conversation                  │
+            │                                              │
+   user ─►  │  ┌─ pre-load ──────────────────────────┐    │
+            │  │ relevant past memories injected     │    │
+            │  └────────────────────────────────────-┘    │
+            │                  │                          │
+            │                  ▼                          │
+            │             [ Agent / LLM ]                 │
+            │            /     │      \                   │
+            │  remember()  recall()  forget()            │
+            │       │          │         │                │
+            └───────┼──────────┼─────────┼────────────────┘
+                    ▼          ▼         ▼
+                ┌──────────────────────────────┐
+                │      Memory service          │
+                │  (vector search + storage)   │
+                └──────────────────────────────┘
+```
+
+### Three tools the agent uses
+
+When long-term memory is enabled on an agent, three tools are injected into its toolkit. The agent decides on its own when to call each one.
+
+<CardGroup cols="3">
+  <Card title="memory_remember" icon="floppy-disk">
+    Store something worth keeping for next time.
+
+    Called when the user shares a preference, a fact, an ongoing instruction, or a relationship the agent should not forget.
+  </Card>
+  <Card title="memory_recall" icon="magnifying-glass">
+    Search past memories by meaning, not just keywords.
+
+    Called when the agent needs context that may have come from an earlier conversation.
+  </Card>
+  <Card title="memory_forget" icon="trash">
+    Delete a specific memory.
+
+    Called when the user asks to forget something or the information is outdated.
+  </Card>
+</CardGroup>
+
+### Automatic pre-load at conversation start
+
+Before the LLM even sees the user's message, the agent runs a similarity search against the user's stored memories using the new message as the query, and injects the top relevant ones into the prompt. The agent sees them as background context and can use them without explicitly calling `memory_recall`.
+
+This means the user often does not need to remind the agent of past preferences — the agent already has them in front of it.
+
+### Semantic recall via vector embeddings
+
+Memories are not stored as plain text alone. Each memory is also embedded as a vector. When the agent calls `memory_recall("what are my dietary restrictions?")`, the service:
+
+1. Embeds the query into the same vector space.
+2. Returns the top‑K most similar stored memories, ranked by semantic distance.
+3. The agent reads them and answers.
+
+This is why the user can ask the question in any wording — "what can't I eat?", "any food I avoid?" — and still get the right memories back.
+
+## Memory types
+
+Every memory has a `type` that helps the agent reason about its purpose.
+
+| Type | What it represents | Example |
+|---|---|---|
+| `fact` | A stable piece of information about the user | "User's company is Acme Corp." |
+| `preference` | A like, dislike, or stylistic choice | "Prefers concise answers over long ones." |
+| `relationship` | People, projects, or entities the user is connected to | "Works with Marie on the onboarding project." |
+| `instruction` | Standing rules the agent should follow | "Always reply in French unless asked otherwise." |
+
+The agent picks the type when calling `memory_remember`. You don't need to manage types yourself.
+
+## Scoping
+
+Memories are stored per **user**. They are also optionally scoped per **agent**:
+
+- **User-only memory** — visible to that user across all agents they interact with on the platform. Useful for general user preferences ("I prefer concise answers").
+- **User + agent memory** — visible only to one agent for that user. Useful for agent-specific context ("For this support agent, always start by checking ticket history").
+
+Two different users never see each other's memories. Two different agents within the same user account see each other's memories only if those memories were saved as user-only.
+
+## Tags
+
+When the agent stores a memory, it also attaches 1–5 short keywords describing the topic — for example `["python", "coding"]` or `["family", "children"]`. Tags help the agent group, filter, and recall related memories more precisely.
+
+## Configure long-term memory on an agent
+
+<Steps>
+  <Step title="Choose a profile that supports it">
+    Long-term memory is available on the **Full Agent** and **Orchestrator** profiles. Simpler profiles do not include the memory tools.
+  </Step>
+  <Step title="Enable it in Settings">
+    Go to **Settings → Memory** and turn on **Long-term memory**.
+  </Step>
+  <Step title="Set the recall budget">
+    Choose how many memories the agent can pull in per turn (default: 50). Higher values give the agent more context but consume more of the prompt window.
+  </Step>
+  <Step title="Tell the agent what's worth remembering">
+    Add explicit guidance in the agent's **Instructions**, for example:
+
+    ```
+    Memory guidelines:
+    - Remember the user's preferred tone, language, and reporting style.
+    - Remember names of people and projects they work with.
+    - Do not store sensitive personal data (health, finances) unless asked.
+    - When the user explicitly says "remember this", always store it.
+    ```
+
+    Without explicit guidance, an agent's use of memory tends to be inconsistent.
+  </Step>
+  <Step title="Test it across two conversations">
+    Open a conversation, share a preference, end the conversation. Open a new one and ask something that should trigger recall. Verify the agent already has the context.
+  </Step>
+</Steps>
+
+## Forgetting
+
+Three mechanisms remove memories:
+
+- **Explicit forget** — the agent calls `memory_forget(memory_id)` when the user asks ("forget what I told you about X").
+- **User-driven cleanup** — administrators can wipe a user's memories on request, supporting GDPR-style "right to be forgotten" workflows.
+- **Retention policy** — your workspace's general data retention settings also apply to memories.
+
+The agent never forgets silently: forgetting is always triggered by an action, not by passive decay.
+
+## Privacy and security
+
+Long-term memory is stored in a dedicated, secured service. Access is scoped to the user the memory belongs to: an agent only sees memories of the user it is currently talking to, and never memories of other users on the platform.
+
+You can review and clean a user's memories through the platform's admin tools, and the same retention and privacy policies that apply to conversations also apply to long-term memories.
+
+## When long-term memory is the wrong tool
+
+Long-term memory is designed for **stable, user-specific information** the agent should carry across conversations. It is not the right place for:
+
+| Use case | Use instead |
+|---|---|
+| Knowledge an agent should have about a domain (product manuals, policies) | A knowledge base / RAG, not memory |
+| Temporary state inside a single conversation | Session memory or working memory — already automatic |
+| Logs, audit trails, analytics | The platform's event system |
+| Large structured data (tables, full documents) | A collection or external database |
+
+A useful test: if the same content would apply to **every** user, it belongs in a knowledge base. If it only makes sense for **one** user, it belongs in long-term memory.
+
+## Next steps
+
+<CardGroup cols="2">
+  <Card title="Capabilities" icon="layer-group" href="/products/agent-factory/capabilities">
+    See which capabilities each agent profile includes
+  </Card>
+  <Card title="Settings" icon="sliders" href="/products/agent-factory/settings">
+    Configure retention, sharing, and memory limits
+  </Card>
+  <Card title="Instructions" icon="list-check" href="/products/agent-factory/instructions">
+    Write effective guidance, including memory rules
+  </Card>
+  <Card title="Analytics" icon="chart-line" href="/products/agent-factory/analytics">
+    Inspect tool calls, including memory_remember and memory_recall
+  </Card>
+</CardGroup>
