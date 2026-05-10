@@ -38,6 +38,152 @@ Automations are the core server-side processes that power your Builder applicati
   </Tab>
 </Tabs>
 
+## Automation YAML Syntax
+
+Every automation is a YAML file. The visual editor reads and writes that same file, so understanding the syntax is what unlocks the rest of the platform.
+
+### File anatomy
+
+A minimal automation:
+
+```yaml
+slug: hello
+name: Hello World
+when:
+  endpoint: true
+do:
+  - set:
+      name: greeting
+      value: "Hello, {{body.name}}"
+output: "{{greeting}}"
+```
+
+| Top-level key | Purpose |
+|---|---|
+| `slug` | URL-safe identifier. Must be unique inside the workspace. Used in API paths and event sources. |
+| `name` | Human-readable label shown in the sidebar. |
+| `description` | Optional free text shown in the workspace overview and app store. |
+| `arguments` | Schema for the inputs the automation expects when called directly (see [Arguments](#arguments)). |
+| `when` | Trigger configuration: `endpoint`, `events`, `schedules` (see [Triggers](#triggers)). |
+| `do` | Ordered list of instructions to execute. |
+| `output` | Expression returned to the caller after `do` completes. |
+| `validateArguments` | When `true`, the runtime rejects calls whose inputs do not match the `arguments` schema. |
+| `private` | When `true`, the automation cannot be called from outside the workspace (only via `runWorkflow` from another automation). |
+| `disabled` | When `true`, the automation is registered but never executes. |
+| `labels` | Free-form tags used for organization. |
+
+### Indentation and structure rules
+
+YAML structure is significant. Three rules cover 95 % of the mistakes the editor will surface.
+
+1. **Indentation is spaces, not tabs.** Two spaces per level is the convention used everywhere in this documentation. Mixing tabs and spaces fails parsing.
+2. **A list item starts with `- ` at the parent's indentation level.** The contents of the item are indented one more level.
+3. **A key always ends with `:` and a single space before its value** (except when the value is on the next line).
+
+```yaml
+do:                          # 0 spaces — top-level key
+  - set:                     # 2 spaces — list item, starts with "- "
+      name: counter          # 6 spaces — value of "set" (4 for the list item's indent + 2 more for the nested map)
+      value: 0
+  - emit:
+      event: started
+```
+
+If a value contains characters YAML would otherwise interpret (`:`, `#`, `{`, `[`, `&`, `*`, `!`, `|`, `>`, `'`, `"`, `%`, `@`, ` ``  ` `), wrap it in single or double quotes.
+
+```yaml
+- set:
+    name: message
+    value: "Status: ready"   # the colon forces quoting
+- set:
+    name: pattern
+    value: '^[A-Z]:.*'       # backslashes survive better in single quotes
+```
+
+### Naming and casing conventions
+
+| Element | Convention | Examples |
+|---|---|---|
+| `slug` | kebab-case or camelCase, no spaces | `send-welcome`, `sendWelcome` |
+| `name` | free text | `Send welcome email` |
+| Variable names (`set: name: …`) | camelCase | `userEmail`, `nextStep` |
+| Event names (`emit: event: …`) | dot-separated, lowercase | `app.greeting.requested` |
+| Module names in `run` | lowercase | `secrets`, `collections`, `accessManager`, `text` |
+
+The platform does not enforce most of these, but the visual editor, the Activity view, and the SDK all assume them — sticking to the conventions keeps tooling consistent.
+
+### Interpreted keywords
+
+Inside `do:` and other instruction lists, these keys are interpreted by the runtime. Any other key is treated as an app or workspace automation call (see [Visual Editor and YAML Mapping](#visual-editor-and-yaml-mapping)).
+
+| Keyword | Effect |
+|---|---|
+| `set` | Assign a variable. |
+| `delete` | Remove a variable. |
+| `emit` | Publish an event. |
+| `fetch` | Make an HTTP request. |
+| `wait` | Pause until an event arrives or a timeout elapses. |
+| `conditions` | Branch on expressions. The keys of the map are the conditions themselves; `default` runs if none match. |
+| `repeat` | Loop over a collection (`on:`) or a fixed count (`until:`). |
+| `break` | Exit the current loop or the whole automation. |
+| `all` | Execute child branches in parallel. |
+| `try` / `catch` | Catch errors raised by child instructions. |
+| `run` | Call a built-in runtime module function. |
+| `runWorkflow` | Call another automation in the workspace. |
+| `comment` | Free-form annotation, ignored at runtime. |
+| `rateLimit`, `auth`, `createUserTopic`, `joinUserTopic` | Specialized runtime instructions; see the table in [Visual Editor and YAML Mapping](#visual-editor-and-yaml-mapping). |
+
+### Expressions: `{{ … }}` and `{% … %}`
+
+Anywhere a value is expected, you can interpolate an expression.
+
+- `{{ … }}` evaluates and substitutes a single expression. The whole value is replaced by the result.
+- `{% … %}` evaluates an arithmetic or logical sub-expression while keeping the rest of the string.
+
+```yaml
+- set:
+    name: greeting
+    value: "Hello, {{body.name}}"          # → "Hello, Alice"
+
+- set:
+    name: nextIndex
+    value: "{% {{$index}} + 1 %}"          # → "3" when $index is 2
+
+- conditions:
+    "{{user.age}} >= 18":
+      - set: { name: status, value: adult }
+    default:
+      - set: { name: status, value: minor }
+```
+
+The full expression and condition grammar is documented in [Condition and Expression syntax](#condition-and-expression-syntax) — it covers comparison and logical operators, regular expressions, MongoDB-style matches, deep-merge, and the built-in helpers for dates, math, strings, and URL parsing.
+
+### Variable scopes
+
+Variables live in different scopes with different lifetimes. Each scope is exposed as a top-level object in expressions.
+
+| Scope | Prefix in expressions | Lifetime | Use it for |
+|---|---|---|---|
+| Run / temporary | none (`{{myVar}}`) | One automation run | Local working values inside `do`. |
+| Session | `{{session.x}}` | One user session | State shared across runs of the same user session. |
+| User | `{{user.x}}` | One user | Per-user persistent state. |
+| Global / workspace | `{{global.x}}` | Workspace, all users | Shared counters, caches, feature flags. |
+| Config | `{{config.x}}` | Workspace static config | Non-sensitive parameters defined in the workspace `index.yml`. |
+| Secret | `{{secret.x}}` | Workspace, encrypted | Sensitive values from Settings → Secrets. |
+| Trigger input | `{{body}}`, `{{headers}}`, `{{query}}`, `{{pathParams}}`, `{{method}}`, `{{event}}` | One run | Inputs from the request or event that triggered the automation. |
+
+See [Memory Architecture](#memory-architecture) for the full picture, including persistence guarantees.
+
+### What the YAML editor reports
+
+The Builder's Monaco editor validates the YAML as you type, using the same schema the runtime applies on save.
+
+- **Indentation / parsing errors** are flagged on the offending line. Fix them before save — the editor blocks the save button.
+- **Schema errors** (unknown keyword, wrong type for a field) are surfaced with the path of the offending field.
+- **Lint warnings** (e.g. an unused variable, a duplicate slug) appear inline but do not block saving.
+
+When in doubt, switch to the visual graph: nodes that the editor cannot render correspond to YAML the runtime would reject.
+
 ## Triggers
 
 Automations can be activated through different types of triggers, configured at the top of the automation graph:
@@ -373,6 +519,78 @@ For objects or arrays, you can access specific properties:
 ```
 
 If `session.myObjectVariable` equals `{"mickey": "house"}` and `item.field` equals `mickey`, the entire expression resolves to `house`.
+
+## Visual Editor and YAML Mapping
+
+Every automation has two equivalent representations:
+
+- **YAML** — the source of truth, stored in the workspace and synchronized with Git.
+- **Visual graph** — a node-based editor that reads and writes the same YAML.
+
+The visual editor never adds extra semantics: each node maps 1-to-1 to a DSUL instruction (or a trigger field). Switching between the two modes does not change the saved file.
+
+### Trigger nodes (Start)
+
+The single **Start** node represents the automation's `when` block. Its visual sub-labels reflect which trigger fields are populated.
+
+| Visual node | Sub-label | DSUL field | Notes |
+|---|---|---|---|
+| Start → Webhook | "Webhook" | `when.endpoint: true` (or a custom string slug) | Exposes the automation as `POST /webhooks/<slug>`. |
+| Start → Event | event names, comma-separated | `when.events: [eventName, ...]` | The automation runs whenever a matching event is emitted on the workspace bus. |
+| Start → Schedule | cron expression | `when.schedules: [cron, ...]` | Standard 5-field cron syntax. |
+
+Multiple triggers can coexist on the same Start node — e.g. an automation can be both a webhook *and* a scheduled job.
+
+### Instruction nodes
+
+Each instruction node serializes to a single DSUL key. The table below lists every node available in the editor's "Add instruction" panel and the YAML it produces.
+
+| Visual node | DSUL key | Main fields | Use it for |
+|---|---|---|---|
+| Set Variable | `set` | `name`, `value` | Assign or update a variable in any scope. |
+| Delete Variable | `delete` | `name` | Remove a variable from a scope. |
+| Emit Event | `emit` | `event`, `payload`, optional `target` | Publish an event on the workspace bus. |
+| HTTP Request | `fetch` | `url`, `method`, `headers`, `body`, `query`, `output` | Call any HTTP API. Resolves `$secret:` references automatically. |
+| Wait | `wait` | `timeout`, `oneOf` | Pause until an event arrives or a timeout elapses. |
+| Conditions | `conditions` | map of `expression: [instructions]` plus optional `default` | Branching. The visual editor renders one **Branch** node per key and a **Merge** node where branches reconverge. Full operator and helper grammar in [Condition and Expression syntax](#condition-and-expression-syntax). |
+| Repeat | `repeat` | `on` (collection) **or** `until` (count/expression), `do` | Iterate over a list or loop a fixed number of times. Inside the body, `{{item}}` and `{{$index}}` are available. |
+| Break | `break` | `scope` (`automation` \| `repeat`), optional `payload` | Exit early from the current loop or automation. |
+| Note (Comment) | `comment` | string | Documentation only — no runtime effect. |
+| Parallel (All) | `all` | `do: [instructions]` | Execute branches concurrently and wait for all of them. |
+| Try / Catch | `try` | `do`, `catch` | Recover from errors raised by inner instructions. |
+| Run Module | `run` | `module`, `function`, `parameters`, `output` | Call a built-in runtime module (e.g. `secrets`, `collections`). |
+| Run Workflow | `runWorkflow` | `workflow`, `parameters`, `output` | Call another automation in the same workspace. |
+| Rate Limit | `rateLimit` | `name`, `limit`, `window`, `output` | Enforce a sliding-window rate limit. |
+| Auth Token | `auth` | `workspace` (bool), `output` | Issue a short-lived JWT for the current user or workspace. |
+| Create User Topic | `createUserTopic` | `topic`, `userIds` | Create a multi-user real-time topic. |
+| Join User Topic | `joinUserTopic` | `topic` | Subscribe the current user to an existing topic. |
+| End | `output` (top-level key) | expression | The single End node maps to the automation's top-level `output` field — i.e. the value returned to the caller. |
+
+### App and workspace automation calls
+
+Beyond the built-in nodes above, the editor also lets you drop any **imported app action** or any **other automation in the same workspace**.
+
+- An imported app action is rendered as `<App name> → <action>` and serializes to the action's slug, e.g. `mySlackInstance.sendMessage`.
+- A workspace automation call uses its slug directly.
+
+In both cases the YAML is just the slug as a key, with parameters as the value:
+
+```yaml
+- mySlackInstance.sendMessage:
+    channel: "#general"
+    text: "Hello"
+```
+
+The catalog of available app actions is read from the workspace's installed imports; the catalog of workspace automations is read from the workspace itself.
+
+### Visual-only nodes
+
+A few nodes appear in the graph but have no DSUL counterpart — they exist purely to organize the canvas:
+
+- **Branch** — one per key inside a `conditions` block; renders the condition expression.
+- **Merge** — converges all branches of a `conditions` or `all` block.
+
+Switching to Code view is the only way to see these aren't separate keys: they are computed from the structure of `conditions` / `all`.
 
 ## Instructions
 
@@ -928,6 +1146,231 @@ Pure-JS text processing utilities for splitting text into chunks with configurab
 <Card title="Text Module Reference" icon="scissors" href="/products/ai-builder/module-text">
   Functions: `splitText`
 </Card>
+
+## Instruction Reference
+
+Quick lookup tables for every built-in instruction. For each one: the full parameter list (with type, default, and notes), the value left in `output` (when applicable), the errors it raises, and the related instructions you typically chain it with.
+
+### `set`
+
+Assigns a value to a variable in any scope.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `name` | string (required) | — | Target variable. Supports dotted paths (`user.profile.name`) and array append (`items[]`). |
+| `value` | any (required) | — | Value to assign. Expressions are evaluated. |
+| `type` | `replace` \| `merge` \| `push` | `replace` | `merge` deep-merges objects/arrays; `push` appends to an array. |
+| `lifespan` | number (seconds) | session/run lifetime | TTL for the variable. After expiry the variable is unset. |
+
+**Output:** none. **Raises:** none. **Often chained with:** `delete`, `conditions`, `emit`.
+
+### `delete`
+
+Removes a variable.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `name` | string (required) | — | Variable to remove. Dotted paths supported. |
+
+**Output:** none. **Raises:** none.
+
+### `emit`
+
+Publishes an event on the workspace event bus.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `event` | string (required) | — | Event name. Convention: `app.<thing>.<verb>` (dot-separated, lowercase). |
+| `payload` | object | `{}` | Event data. |
+| `target.userTopic` | string | — | Deliver only to the named user topic (see [`createUserTopic`](#createusertopic)). |
+| `target.sessionId` | string | — | Deliver only to events streams scoped to that session. |
+| `target.userId` | string | — | Deliver only to streams scoped to that user. |
+| `target.currentSocket` | boolean | `false` | Deliver only on the socket that triggered this run (useful for SSE replies). |
+| `options.persist` | boolean | `true` | When `false`, the event is broadcast but not stored — invisible in Activity. |
+
+**Output:** none. **Raises:** none. **Often chained with:** `wait`, `runWorkflow`.
+
+### `fetch`
+
+Calls an HTTP endpoint.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `url` | string (required) | — | Absolute or workspace-relative URL. `$secret:` references are resolved transparently. |
+| `method` | `GET` \| `POST` \| `PUT` \| `PATCH` \| `DELETE` | `GET` | HTTP method. |
+| `headers` | object | `{}` | Request headers. |
+| `query` | object | `{}` | Query string parameters. Merged with any present in `url`. |
+| `body` | any | — | Request body. Serialized as JSON unless `Content-Type` says otherwise. |
+| `multipart` | array | — | Multipart/form-data fields (file uploads). See the Fetch accordion above. |
+| `auth.basic.user` / `auth.basic.password` | string | — | HTTP Basic auth. |
+| `auth.awsv4` | object | — | AWS SigV4 signing. See the Fetch accordion above. |
+| `outputMode` | `body` \| `detailed_response` \| `base64` \| `data_url` | `body` | Shape of the value left in `output`. |
+| `stream` | object | — | Emit each SSE chunk as an event instead of buffering. See the Fetch accordion above. |
+| `emitErrors` | boolean | `false` | When `true`, HTTP errors are caught and emitted as `prismeai.fetch.error` events instead of aborting the run. |
+| `output` | string | — | Variable name receiving the response. |
+
+**Output:** the response body, or `{ body, headers, status }` if `outputMode: detailed_response`. **Raises:** network errors, timeout, non-2xx HTTP (unless `emitErrors`). **Often chained with:** `set`, `conditions`, `repeat` (for streams).
+
+### `wait`
+
+Blocks the automation until a matching event arrives or a timeout elapses.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `oneOf[].event` | string (required) | — | Event name to wait for. |
+| `oneOf[].filters` | object | `{}` | Match conditions on the event payload (dotted paths). |
+| `timeout` | number (seconds) | `20` | Maximum wait time. |
+| `output` | string | — | Variable receiving the matching event (`{ event, payload }`). |
+
+**Output:** the event, or `null` if the timeout elapsed. **Raises:** none. **Often chained with:** `emit` (initiate the request, then wait for the reply).
+
+### `conditions`
+
+Branches on expressions.
+
+Structure:
+
+```yaml
+- conditions:
+    '<expression>':
+      - <instructions>
+    '<other expression>':
+      - <instructions>
+    default:
+      - <instructions>
+```
+
+Branches are evaluated **in declaration order**. The first one whose expression is truthy runs; if none match, `default` runs (if present). See [Condition and Expression syntax](#condition-and-expression-syntax) for operators and helpers.
+
+**Output:** none. **Raises:** expression evaluation errors. **Often chained with:** `set`, `emit`, `break`.
+
+### `repeat`
+
+Iterates over a collection or repeats a fixed number of times.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `on` | expression | — | Collection to iterate. Exclusive with `until`. |
+| `until` | number \| expression | — | Number of iterations, or an expression that stops the loop when truthy. Exclusive with `on`. |
+| `do` | array (required) | — | Instructions to execute each iteration. |
+| `batch.size` | number | `1` | Items processed in parallel per batch. |
+| `batch.interval` | number (ms) | `0` | Pause between batches. |
+
+Inside `do`, `{{item}}` is the current element and `{{$index}}` the 0-based index. **Output:** none. **Raises:** none. **Often chained with:** `break`, `all`.
+
+### `break`
+
+Exits a loop or the whole automation.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `scope` | `repeat` \| `automation` \| `all` | `automation` | `repeat` exits the nearest loop; `automation` ends the current automation; `all` propagates to parent automations through `try/catch`. |
+| `payload` | object | — | Forwarded as the automation `output`. |
+
+### `all`
+
+Runs branches in parallel.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| (positional list) | array of instructions (required) | — | Each entry is an independent branch. Run concurrently. |
+
+`all` returns once every branch has completed. Errors in one branch do not cancel the others — wrap with `try/catch` if you need fail-fast.
+
+### `try` / `catch`
+
+Catches errors raised by inner instructions.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `do` | array (required) | — | Protected block. |
+| `catch` | array | — | Recovery block. Receives `{{$error}}` (`{ name, message, details }`). |
+
+If `catch` is omitted, the error is silently swallowed.
+
+### `run`
+
+Calls a built-in runtime module.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `module` | string (required) | — | `secrets`, `collections`, `accessManager`, `text`. See [Modules](#modules). |
+| `function` | string (required) | — | Module function name. |
+| `parameters` | object | `{}` | Function inputs. Shape depends on the function. |
+| `output` | string | — | Variable receiving the return value. |
+| `onError` | `throw` \| `continue` | `throw` | When `continue`, errors are returned in `output` as `{ error: '<code>' }` instead of aborting. |
+
+**Output:** the function's return value (varies). **Raises:** module-specific errors (`not_found`, `user_required`, …). See each module's reference page.
+
+### `runWorkflow`
+
+Calls another automation in the same workspace.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `workflow` | string (required) | — | Slug of the target automation. |
+| `parameters` | object | `{}` | Inputs passed to the target's `arguments`. |
+| `output` | string | — | Variable receiving the target's `output`. |
+| `wait` | boolean | `true` | When `false`, fire-and-forget — the parent continues without waiting. |
+
+**Output:** the target automation's `output`. **Raises:** propagates errors from the target (unless `wait: false`).
+
+### `rateLimit`
+
+Enforces a sliding-window rate limit.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `name` | string (required) | — | Identifier shared across automations that should share the limit. |
+| `limit` | number (required) | — | Maximum events in the window. |
+| `window` | number (seconds, required) | — | Sliding-window size. |
+| `consumer` | expression | global | Partition key (e.g. `"{{user.id}}"` for per-user limits). |
+| `output` | string | — | Variable receiving `{ ok, retryAfter, remaining, limit, window, consumer }`. |
+
+**Output:** the limit state. **Does not raise** — branch on `output.ok` to decide what to do.
+
+### `auth`
+
+Issues a short-lived JWT for internal calls.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `workspace` | boolean | `false` | When `true`, the JWT carries workspace identity. The receiving automation can read `{{run.authenticatedWorkspaceId}}`. |
+| `output` | string | — | Variable receiving `{ jwt: '<token>' }`. |
+
+The token is **only valid for `fetch` calls back to the platform** — it cannot authenticate against external systems.
+
+### `createUserTopic` / `joinUserTopic`
+
+Manage real-time delivery topics.
+
+| Instruction | Parameter | Type | Description |
+|---|---|---|---|
+| `createUserTopic` | `topic` | string | Topic name (workspace-scoped). |
+| `createUserTopic` | `userIds` | array of strings | Initial subscribers. |
+| `joinUserTopic` | `topic` | string | Topic name. The current user is added. |
+
+Once a user is subscribed, `emit … target: { userTopic: '<topic>' }` delivers events to all members in real time.
+
+### `comment`
+
+Free-form annotation. No runtime effect. Renders as a yellow sticky note in the visual editor.
+
+```yaml
+- comment: "Skip processing for test users — see Jira-1234"
+```
+
+### Errors raised by all instructions
+
+Any instruction can raise the following platform errors regardless of its own logic:
+
+| Error | When |
+|---|---|
+| `WorkspaceQuotaExceeded` | The workspace has hit its event/run quota. |
+| `WorkflowTimeoutError` | The whole automation run exceeded its max duration. |
+| `ConfigurationError` | An expression references a variable scope that is unavailable in the current trigger (e.g. `{{user}}` in a cron). |
+
+Wrap calls in `try/catch` to recover from these.
 
 ## Condition and Expression syntax
 

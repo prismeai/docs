@@ -11,6 +11,23 @@ Pages are the frontend part of a Builder workspace. In the current Builder, a pa
 
 Use pages when users need a custom interface around an agent, workflow, internal tool, dashboard, or integration.
 
+## Coming from the legacy block editor?
+
+If your workspace was originally built on the legacy YAML/block page editor, the new Builder treats those pages as **runtime-only**.
+
+- Existing legacy pages **keep running** after the upgrade — end users see no change at the URL they had bookmarked.
+- They are **not editable** in the new Builder UI. The block editor is gone; the page tab only opens React source trees.
+- To make a change, the page must be **rewritten** as a React/Vite app from a new page entry. There is no automatic conversion of legacy blocks to React components — the rendering model is different (server-rendered blocks vs client-rendered SPA).
+
+A practical migration path:
+1. Identify the page you want to change. Note its URL, the automations it calls, and the events it emits or listens to.
+2. Create a new page in the Builder and initialize the React/Vite template.
+3. Reproduce the UI with the components of your choice (Radix, the platform's design system, or anything else).
+4. Wire the new page to the same automations and events (see [Connect to Automations](#connect-to-automations)).
+5. Deploy the workspace and switch the public URL to the new page.
+
+The legacy page documentation is still available in the [Legacy documentation site](https://prismeai-legacy.mintlify.app/) (link in the footer) for as long as legacy pages remain in active workspaces.
+
 ## What Changed
 
 <CardGroup cols={2}>
@@ -166,6 +183,272 @@ Pages usually become useful when they call or listen to automations.
     Every automation run and event emission can be inspected from **Activity**. Use the generated correlation ID to follow the full trace from page action to backend execution.
   </Tab>
 </Tabs>
+
+## Build Locally: The `starter-spa` Reference App
+
+If you prefer to author the page in your own IDE and deploy with a script, use the **`starter-spa`** starter at [github.com/prismeai/starter-spa](https://github.com/prismeai/starter-spa). It is the **same React + Radix + Tailwind template** the in-Builder **+ Page → New SPA** action seeds, exported as a stand-alone repo you can clone, edit, and `npm run release` to your workspace.
+
+```bash
+git clone https://github.com/prismeai/starter-spa my-app
+cd my-app
+npm install
+cp .env.example .env       # PRISMEAI_API_URL + PRISMEAI_ACCESS_TOKEN + PRISMEAI_WORKSPACE_ID
+npm run dev                # local Vite dev server with a mocked host
+npm run release            # build + deploy to your workspace
+```
+
+The starter is the smallest possible example of the host contract:
+
+- `src/App.tsx` — the React entry point. **Its default export is what the platform renders.** Receives `{ sdk, user, workspace, backends, agents }` as props.
+- `automations/v1/status.yml` — a webhook endpoint, called from the REST tab of the demo.
+- `automations/on-app-greeting-requested.yml` — listens for `app.greeting.requested`, emits `app.greeting.completed`. Drives the WebSocket tab of the demo.
+- `scripts/deploy.mjs` — does the full sync (automations + source files + bundle + version snapshot) and patches `config.value.bundles[<slug>]` so `AppRenderer` picks up the new bundle on next load.
+
+The same loader and the same `AppProps` contract apply to **built-in apps shipped by the platform** and to **custom apps you build with this starter** — what you author here is loaded exactly like a first-party app.
+
+Use the starter when you want:
+- An IDE + Git workflow instead of the in-Builder editor.
+- A CI-friendly deploy path (`npm run release` from a pipeline).
+- A reproducible local dev loop with a mocked SDK (`src/lib/mockHost.ts`).
+
+The starter's `README.md` covers the full deploy script, externals policy (never bundle React or `@prisme.ai/sdk`), and the conflict-detection / safe-retry semantics in detail.
+
+## End-to-end Example: Page → Automation → Live Updates
+
+This walk-through wires a React page to a backend automation that does work asynchronously and streams progress back to the UI. It exercises the three integration patterns at once: HTTP request, event subscription, and Activity tracing.
+
+The use case: a user clicks **Generate report** in the page. The backend kicks off a long-running task that emits intermediate events (`report.generating`, `report.progress`, `report.ready`). The page reflects the progress in real time, then shows a download link when the report is ready.
+
+### 1. The automation
+
+Create an automation called `generate-report`:
+
+```yaml
+slug: generate-report
+name: Generate report
+when:
+  endpoint: true
+arguments:
+  parameters:
+    type: object
+    properties:
+      reportType:
+        type: string
+        enum: [weekly, monthly]
+    required: [reportType]
+do:
+  - emit:
+      event: report.generating
+      payload:
+        reportType: "{{body.reportType}}"
+        correlationId: "{{run.correlationId}}"
+
+  - repeat:
+      until: 5
+      do:
+        - wait:
+            timeout: 2          # Simulated work
+        - emit:
+            event: report.progress
+            payload:
+              correlationId: "{{run.correlationId}}"
+              percent: "{% ({{$index}} + 1) * 20 %}"
+
+  # ... actual report generation logic (fetch, run, etc.) ...
+
+  - set:
+      name: reportUrl
+      value: "https://files.example.com/{{run.correlationId}}.pdf"
+
+  - emit:
+      event: report.ready
+      payload:
+        correlationId: "{{run.correlationId}}"
+        url: "{{reportUrl}}"
+
+output:
+  correlationId: "{{run.correlationId}}"
+```
+
+Key points:
+
+- The automation **emits a correlation ID** in every event. The page uses it to filter the events it cares about (otherwise it would receive every `report.*` event in the workspace).
+- The HTTP response returns the correlation ID immediately. The actual work happens after the response is sent.
+- `report.progress` is fired N times during the work — these drive the UI progress bar.
+
+### 2. The page
+
+In the page source, call the webhook and subscribe to its events.
+
+```tsx
+import { useState, useEffect } from "react"
+
+interface AppProps {
+  sdk: SDK
+  user: unknown
+  workspace: { id: string; slug: string; name: string }
+}
+
+export default function App({ sdk, workspace }: AppProps) {
+  const [status, setStatus] = useState<"idle" | "running" | "ready" | "error">("idle")
+  const [progress, setProgress] = useState(0)
+  const [reportUrl, setReportUrl] = useState<string | null>(null)
+
+  async function generate() {
+    setStatus("running")
+    setProgress(0)
+    setReportUrl(null)
+
+    // 1) Start the automation. The response carries the correlation ID
+    //    we will filter events on.
+    const res = await fetch(
+      `${sdk.host}/workspaces/slug:${workspace.slug}/webhooks/generate-report`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(sdk.token ? { Authorization: `Bearer ${sdk.token}` } : {}),
+          ...(sdk._csrfToken ? { "x-prismeai-csrf-token": sdk._csrfToken } : {}),
+        },
+        body: JSON.stringify({ reportType: "weekly" }),
+      }
+    )
+    const { correlationId } = await res.json()
+
+    // 2) Subscribe to events that carry this correlation ID.
+    const events = await sdk.streamEvents(workspace.id, {
+      "payload.correlationId": correlationId,
+    })
+
+    events.on("report.progress", (e) => setProgress(e.payload.percent))
+    events.on("report.ready", (e) => {
+      setReportUrl(e.payload.url)
+      setStatus("ready")
+      events.destroy()              // 3) Clean up the subscription.
+    })
+    events.on("report.error", () => {
+      setStatus("error")
+      events.destroy()
+    })
+  }
+
+  return (
+    <div className="p-6 space-y-4">
+      <button
+        onClick={generate}
+        disabled={status === "running"}
+        className="px-4 py-2 bg-blue-600 text-white rounded"
+      >
+        Generate report
+      </button>
+
+      {status === "running" && (
+        <div className="w-full bg-gray-200 h-2 rounded">
+          <div
+            className="h-2 bg-blue-600 rounded transition-all"
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+      )}
+
+      {status === "ready" && reportUrl && (
+        <a href={reportUrl} className="text-blue-600 underline">
+          Download report
+        </a>
+      )}
+
+      {status === "error" && (
+        <p className="text-red-600">Something went wrong. Check Activity for details.</p>
+      )}
+    </div>
+  )
+}
+```
+
+What's happening:
+
+1. **HTTP call** — the page POSTs to the automation's webhook and receives the correlation ID synchronously.
+2. **Event subscription** — `sdk.streamEvents` opens a workspace-scoped event stream. The filter `"payload.correlationId": correlationId` narrows the stream to events from this specific run.
+3. **Cleanup** — the stream is closed as soon as the final event arrives or an error happens. Forgetting this leaks websockets.
+
+### 3. Tracing it in Activity
+
+Open the **Activity** tab while the page runs. Filter by `source.correlationId = <id>` (you can copy it from the network panel of the page, or have the page log it). You will see, in order:
+
+| Event | Source | Notes |
+|---|---|---|
+| `runtime.webhooks.calledStarted` | the user / page | The webhook hit. |
+| `runtime.automations.executed` | runtime | The automation run started. |
+| `report.generating` | `generate-report` | Emitted at the top of `do`. |
+| `report.progress` (×5) | `generate-report` | One per loop iteration. |
+| `report.ready` | `generate-report` | Final event. |
+| `runtime.automations.completed` | runtime | Run finished. |
+
+The correlation ID threads through the whole flow — this is the same trace the page receives over the websocket. See [Testing & Debugging → Activity](/products/ai-builder/testing-debugging) for the full filter grammar.
+
+### Patterns this example demonstrates
+
+| Pattern | Where it lives in the code |
+|---|---|
+| Fire-and-forget request with a correlation ID handle | `generate()` reads `correlationId` from the webhook response. |
+| Server-pushed progress | `sdk.streamEvents` + `events.on("report.progress")`. |
+| Driving UI state from events (show / hide / progress) | `setProgress`, `setStatus`, `setReportUrl`. |
+| Filtered subscription (one run, not the whole workspace) | `"payload.correlationId": correlationId` in the stream filter. |
+| Predictable Activity trace | The automation always emits the correlation ID; the Activity filter matches it. |
+
+For longer-running flows, the same scaffold works: emit `*.partial` events as data becomes available, end with a `*.ready` or `*.error`, and clean up the subscription when you receive a terminal event.
+
+## Page Styling
+
+The Builder page template ships with **Tailwind CSS**, configured the way most React/Vite projects use it. Anything you would normally do with Tailwind works as-is — utility classes, custom theme tokens in `tailwind.config.ts`, component classes via `@apply`, etc.
+
+The platform adds a few Prisme-specific bits on top of the standard Tailwind setup.
+
+### Theme handover from the embed
+
+When the page is rendered through `embed.js` (see [Deploy modal → Share tab](/products/ai-builder/deployment#share-tab)), the host script forwards optional theming attributes to the React app:
+
+| `data-*` on `<script>` | Forwarded as | Use in CSS |
+|---|---|---|
+| `data-theme="dark"` | `props.theme` *and* a `data-theme="dark"` attribute on the mount root | `[data-theme="dark"] .…` Tailwind variants or plain CSS selectors |
+| `data-primary-color="#0066ff"` | CSS variable `--prismeai-primary` on the mount root | `bg-[var(--prismeai-primary)]` |
+| `data-background-color="…"` | CSS variable `--prismeai-bg` on the mount root | `bg-[var(--prismeai-bg)]` |
+
+Wire the variables into your Tailwind theme once and every component picks them up:
+
+```ts
+// tailwind.config.ts
+export default {
+  theme: {
+    extend: {
+      colors: {
+        brand: "var(--prismeai-primary)",
+        canvas: "var(--prismeai-bg)",
+      },
+    },
+  },
+} satisfies Config
+```
+
+```tsx
+<button className="bg-brand text-white">Send</button>
+```
+
+### Globals and resets
+
+The starter ships a `src/styles/globals.css` with the Tailwind directives and a minimal reset:
+
+```css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+```
+
+Override or extend it like any Tailwind project. **Do not** import a second Tailwind CDN — `embed.js` already injects one for hosts that want a zero-config shell, and double-loading produces specificity surprises.
+
+### When in doubt
+
+For everything that is not Prisme-specific (utility classes, plugins, JIT options, dark mode strategy, etc.), the [Tailwind documentation](https://tailwindcss.com/docs) is the source of truth. The same applies to React, Vite, and Radix — Builder pages use them in the standard way.
 
 ## Deployed Bundles
 

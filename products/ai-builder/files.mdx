@@ -1,0 +1,132 @@
+---
+title: "Files"
+description: "Manage uploaded workspace assets from the Builder Files tab"
+---
+
+The **Files** tab in the Builder sidebar lists every file uploaded to the current workspace. It is the workspace-level equivalent of object storage: files sit next to (but separate from) the page source tree, automations, and apps.
+
+Use Files for runtime assets — PDFs ingested by automations, user-uploaded images, exports produced by a workflow, evidence stored for audit. For React source files that ship with a page, stay in the page editor; for app code, stay in **Imports → Custom Code**.
+
+## What you see
+
+| Column | Content |
+|---|---|
+| Icon | Type icon derived from the file's MIME type (image, PDF, Word, spreadsheet, archive, audio, video, code, generic). |
+| Filename | The original filename at upload time. |
+| Size | Human-readable size. |
+| Date | Upload timestamp. |
+| Type badge | Color-coded label (`Image`, `PDF`, `Word`, `Excel`, etc.). |
+| **Open** (external-link icon) | Opens the file in a new tab using its signed URL. |
+| **Download** (download icon) | Downloads the file under its original name. |
+| **Delete** (trash icon, double-click to confirm) | Calls `DELETE /workspaces/{id}/files/{fileId}` and removes the file from the list. |
+
+The header has a **Refresh** button that re-fetches the current page from the API, and a pagination control (`Previous` / `Next`) when the workspace has more files than fit in one page.
+
+## How files get there
+
+The Files tab is a **viewer**. There is no upload button inside the tab itself. Files appear there after one of the following:
+
+### From an automation
+
+Use a `fetch` instruction with `multipart/form-data` against the workspace files endpoint. The platform stores the file and returns its metadata (id, URL, mimetype, size).
+
+```yaml
+- fetch:
+    url: "{{$workspaceUrl}}/files"
+    method: POST
+    headers:
+      Content-Type: multipart/form-data
+    body:
+      file:
+        filename: report.pdf
+        content: "{{generatedPdf}}"
+    output: uploadedFile
+- emit:
+    event: report.uploaded
+    payload:
+      fileId: "{{uploadedFile.id}}"
+      url: "{{uploadedFile.url}}"
+```
+
+The trigger for the upload is typically a webhook receiving a `multipart/form-data` request from a page or external system — see [Triggers → URL](/products/ai-builder/automations#triggers) for the request-body shape exposed to the automation.
+
+### From a page
+
+A page can post directly to the workspace files endpoint using the injected SDK.
+
+```tsx
+async function upload(sdk: SDK, workspaceId: string, file: File) {
+  const form = new FormData()
+  form.append("file", file)
+
+  const response = await fetch(
+    `${sdk.host}/workspaces/${workspaceId}/files`,
+    {
+      method: "POST",
+      headers: {
+        ...(sdk.token ? { Authorization: `Bearer ${sdk.token}` } : {}),
+      },
+      body: form,
+    }
+  )
+
+  return response.json()
+}
+```
+
+### From the API directly
+
+`POST /v2/workspaces/{id}/files` with a `multipart/form-data` body. The endpoint is documented in the [Platform API reference](/api-reference/introduction).
+
+## File URLs
+
+Each file is served from a signed URL stored on the file record. The URL is what the **Open** and **Download** buttons use; it is also what `uploadedFile.url` returns to automations and pages.
+
+URLs are signed for the workspace's storage provider (S3-compatible by default in self-hosted deployments). They expire — re-fetch the file metadata if you need a fresh URL.
+
+## What's not in Files
+
+| Asset | Where it lives instead |
+|---|---|
+| Page source files (`src/App.tsx`, `package.json`, …) | Pages tab. They are part of the workspace bundle, not its file storage. |
+| Custom Code source | Imports → Custom Code. |
+| App configuration | Imports → `<app>` → Configure. |
+| Secrets | Settings → Secrets. |
+| Crawled documents and embeddings | Stored by the respective app (AI Knowledge, etc.), not in the workspace file list. |
+
+## Lifecycle
+
+- Files are **not** included in workspace exports or pushes to Git — versioning saves the static configuration but not runtime data. See [Versioning → What's Versioned](/products/ai-builder/versioning#whats-versioned).
+- Deleting a file is immediate and irreversible from the UI. If you need to retain history, archive the file in your own storage before deleting.
+- Per-file size limits and total quota are controlled by the platform deployment (see [Self-Hosting → Sizing](/self-hosting/sizing)).
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="My uploaded file does not appear in the list">
+    Click **Refresh** — the list shows the current page only and does not auto-update on every upload. If the file is still missing, check the workspace Activity for a `workspaces.files.error` event, which contains the underlying storage error.
+  </Accordion>
+
+  <Accordion title="The file URL returns 403 or 410">
+    Signed URLs expire. Re-fetch the file metadata (`GET /v2/workspaces/{id}/files/{fileId}`) to obtain a fresh URL, or rebuild the URL from a fresh `uploadedFile` payload returned by your automation.
+  </Accordion>
+
+  <Accordion title="Uploads fail from a page">
+    The page must include the platform's CSRF token in the request headers if the user is authenticated. See the [SDK reference](/api-reference/sdks) for the helper that injects it automatically.
+  </Accordion>
+
+  <Accordion title="I cannot delete a file">
+    Deletion requires the `ManageWorkspace` ability. Check your role in **Settings → Sharing** or with the workspace owner.
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Automations" icon="gears" href="/products/ai-builder/automations">
+    Upload, transform, and route files inside workflows.
+  </Card>
+  <Card title="Pages" icon="window" href="/products/ai-builder/pages">
+    Build interfaces that upload to and read from workspace files.
+  </Card>
+</CardGroup>
