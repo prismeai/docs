@@ -2680,6 +2680,27 @@ components:
             user:
               $ref: '#/components/schemas/User'
 
+    DeletedUser:
+      type: object
+      required:
+        - type
+        - payload
+      properties:
+        type:
+          type: string
+          example: gateway.users.deleted
+          enum:
+            - gateway.users.deleted
+        payload:
+          type: object
+          required:
+            - userId
+          properties:
+            userId:
+              type: string
+            ip:
+              type: string
+
     BulkUpdatedUsers:
       type: object
       required:
@@ -5071,7 +5092,6 @@ components:
             - slug
             - trigger
             - payload
-            - output
             - duration
             - startedAt
             - break
@@ -5097,6 +5117,22 @@ components:
               type: string
             break:
               type: boolean
+            error:
+              type: object
+              description: >-
+                Set when the automation execution failed with an uncaught error.
+                Only emitted by the innermost automation where the error
+                originated; parent automations do not emit an executed event in
+                this case.
+              required:
+                - error
+                - message
+              properties:
+                error:
+                  type: string
+                message:
+                  type: string
+                details: {}
 
     ScheduledAutomation:
       type: object
@@ -5489,7 +5525,7 @@ components:
       required:
         - name
         - slug
-      properties:
+      properties: &OrganizationProps
         id:
           type: string
         name:
@@ -5583,7 +5619,10 @@ components:
                         - equals
                         - startsWith
                         - endsWith
-                      description: Match operator
+                        - matches
+                      description: >-
+                        Match operator. "matches" supports wildcard patterns
+                        (e.g. "*@acme.com", "*" to match any value)
                     value:
                       type: string
                       description: Value to match against (case-insensitive)
@@ -5597,6 +5636,61 @@ components:
                   type: string
         defaultRole:
           type: string
+        auth:
+          type: object
+          description: Organization-scoped authentication settings
+          properties:
+            anonymous:
+              type: object
+              description: >-
+                Settings for anonymous sessions scoped to this organization.
+                When enabled, callers of POST /v2/login/anonymous can pass this
+                org's slug to receive a token bound to the configured role.
+              required:
+                - enabled
+              properties:
+                enabled:
+                  type: boolean
+                  description: Whether anonymous sessions are allowed for this org
+                role:
+                  type: string
+                  description: >-
+                    Org role slug (e.g. "org:member" or a custom role) applied
+                    to anonymous sessions targeting this org. Required when
+                    enabled is true. Owner/Admin and roles with wildcard
+                    permissions are forbidden.
+                allowedDomains:
+                  type: array
+                  description: >-
+                    Origin hostnames allowed to create anonymous sessions for
+                    this org. When non-empty, the gateway:
+                      1. Auto-resolves orgSlug from the request's Origin/Referer when
+                         the body field is omitted (single-org match per hostname).
+                      2. Rejects /login/anonymous calls whose Origin host does not match
+                         any entry — even when the body explicitly carries this orgSlug.
+                    Each entry is a hostname (e.g. "chat.acme.com") or a
+                    subdomain wildcard (e.g. "*.acme.com") with an optional
+                    per-domain role override. When `role` is set, it takes
+                    precedence over `auth.anonymous.role` for sessions opened
+                    from that domain. When empty/undefined, any Origin is
+                    accepted but auto-detection is disabled (the body must carry
+                    orgSlug).
+                  items:
+                    type: object
+                    required:
+                      - domain
+                    properties:
+                      domain:
+                        type: string
+                        description: Hostname (e.g. "chat.acme.com") or subdomain wildcard
+                          ("*.acme.com")
+                      role:
+                        type: string
+                        description: >-
+                          Optional org role slug applied to anonymous sessions
+                          opened from this specific domain. Falls back to the
+                          top-level auth.anonymous.role when omitted. Same
+                          Owner/Admin/wildcard restrictions apply.
         settings:
           type: object
           additionalProperties: true
@@ -5610,6 +5704,16 @@ components:
           type: string
         updatedAt:
           type: string
+
+    UpdateOrganization:
+      type: object
+      description: >-
+        PATCH body for /v2/orgs/{orgSlug}. Same shape as Organization but no
+        required fields — slug is taken from the URL path, name defaults to the
+        current value. Lets field-scoped roles (orgs:branding:manage,
+        orgs:auth:manage, etc.) PATCH without having to include name/slug.
+      properties:
+        <<: *OrganizationProps
 
     NavigationFeature:
       type: object
@@ -5873,6 +5977,16 @@ components:
             *
           items:
             type: string
+        ownerType:
+          type: string
+          description: >-
+            Optional owner type identifier for this API key (e.g. agent, user,
+            app). Indexed alongside ownerId for fast lookups.
+        ownerId:
+          type: string
+          description: >-
+            Optional owner ID for this API key. Indexed alongside ownerType for
+            fast lookups.
         expiresAt:
           type: string
           format: date-time
@@ -5899,6 +6013,16 @@ components:
         name:
           type: string
         permissions: *ORG_PERMISSIONS
+        scopes:
+          type: array
+          items:
+            type: string
+        ownerType:
+          type: string
+          description: Owner type (e.g. agent, vector_stores). Force-prefixed by the
+            runtime when minted via access-manager.
+        ownerId:
+          type: string
         expiresAt:
           type: string
           format: date-time
@@ -6070,7 +6194,7 @@ tags:
       roles or fine-grained rules.
   - name: Monitoring
     description: Platform readiness checks across services (SuperAdmin only).
-
+  - name: AuthProviders
 paths:
   ############################################# gateway
 
@@ -6138,6 +6262,13 @@ paths:
                 expiresAfter:
                   type: number
                   description: 'Optional session expiration in seconds'
+                orgSlug:
+                  type: string
+                  description: >-
+                    Optional organization slug. When provided, the org must have
+                    auth.anonymous.enabled = true. The resulting session will be
+                    scoped to that org with the role configured in
+                    org.auth.anonymous.role.
 
       responses:
         '200':
@@ -6155,6 +6286,18 @@ paths:
                         type: string
                       expires:
                         type: string
+        '403':
+          description: Anonymous sessions are not enabled for the requested org
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Requested org does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
         '401': &AuthenticationError
           description: AuthenticationError
           content:
@@ -6825,7 +6968,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Organization'
+              $ref: '#/components/schemas/UpdateOrganization'
       responses:
         '200':
           description: Success
@@ -6879,9 +7022,11 @@ paths:
   /v2/orgs/{orgSlug}/members:
     post:
       summary: Add Org Members
-      description: Add members to an organization in bulk. Provide userIds and/or
-        emails. Known emails are added as active members; unknown emails create
-        pending invitations with tokens.
+      description: >-
+        Add members to an organization in bulk. Each entry must carry exactly
+        one of `userId` or `email`, with optional per-entry `roleSlug` and
+        `groups[]`. Known emails become active members; unknown emails become
+        pending invites. Groups are auto-created if they don't exist yet.
       operationId: addOrgMembers
       tags:
         - Organizations
@@ -6897,17 +7042,38 @@ paths:
           application/json:
             schema:
               type: object
+              required:
+                - users
               properties:
-                userIds:
+                users:
                   type: array
+                  description: Members to add. Each entry carries its own role and groups.
                   items:
-                    type: string
-                emails:
-                  type: array
-                  items:
-                    type: string
-                roleSlug:
-                  type: string
+                    type: object
+                    properties:
+                      userId:
+                        type: string
+                        description: Existing platform user id. Mutually exclusive with `email`.
+                      email:
+                        type: string
+                        description: Email of the user to add. Mutually exclusive with `userId`. Unknown
+                          emails create a pending invite.
+                      roleSlug:
+                        type: string
+                        description: Role slug to assign. Defaults to the org `defaultRole` when
+                          omitted.
+                      groups:
+                        type: array
+                        description: Group slugs to add the user to. Groups are auto-created if missing.
+                        items:
+                          type: string
+                skipExisting:
+                  type: boolean
+                  description: >-
+                    When true, members already in the org are silently skipped
+                    instead of triggering a 409. Useful for idempotent bulk
+                    imports / round-tripping a CSV export. Returns only the
+                    actually created memberships.
       responses:
         '201':
           description: Members added
@@ -7016,6 +7182,40 @@ paths:
                 properties:
                   success:
                     type: boolean
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/orgs/{orgSlug}/members/export:
+    post:
+      summary: Export Org Members as CSV
+      description: >-
+        Streams the full members list of an organization as a CSV file. The
+        response is `text/csv` with `Content-Disposition: attachment` so the
+        browser triggers a download. Memory usage is bounded — the server
+        paginates `OrgMembership` and writes rows as it queries them. Same
+        permission as listing (`orgs:members:read`).
+      operationId: exportOrgMembers
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: CSV stream
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
         '401': *AuthenticationError
         '403':
           description: Forbidden
@@ -7397,6 +7597,11 @@ paths:
                       $ref: '#/components/schemas/OrgRole'
                   total:
                     type: number
+                  defaultRole:
+                    type: string
+                    description: >-
+                      Slug of the org's default role used when no role is
+                      specified at member invitation time.
         '401': *AuthenticationError
 
   /v2/orgs/{orgSlug}/roles/{roleSlug}:
@@ -7560,6 +7765,12 @@ paths:
                   description: >-
                     Optional resource patterns restricting where permissions
                     apply. Format: resourceType:resourceId
+                ownerType:
+                  type: string
+                  description: Optional owner type for this API key (e.g. agent, user, app).
+                ownerId:
+                  type: string
+                  description: Optional owner ID for this API key.
                 expiresAt:
                   type: string
                   format: date-time
@@ -7602,6 +7813,16 @@ paths:
           description: 'Sort field and direction, e.g. -createdAt'
           schema:
             type: string
+        - name: ownerType
+          in: query
+          description: Filter API keys by owner type (uses indexed lookup with ownerId).
+          schema:
+            type: string
+        - name: ownerId
+          in: query
+          description: Filter API keys by owner ID (uses indexed lookup with ownerType).
+          schema:
+            type: string
       responses:
         '200':
           description: Success
@@ -7619,6 +7840,43 @@ paths:
         '401': *AuthenticationError
 
   /v2/orgs/{orgSlug}/api-keys/{keyId}:
+    get:
+      summary: Get Org API Key
+      description: Fetch a single API key by id (raw key never returned).
+      operationId: getOrgApiKey
+      tags:
+        - Organizations
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: keyId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgApiKey'
+        '401': *AuthenticationError
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
     patch:
       summary: Update Org API Key
       description: Update an API key (name, permissions, expiration, disabled status)
@@ -7653,6 +7911,12 @@ paths:
                   description: >-
                     Optional resource patterns restricting where permissions
                     apply. Format: resourceType:resourceId
+                ownerType:
+                  type: string
+                  description: Optional owner type for this API key (e.g. agent, user, app).
+                ownerId:
+                  type: string
+                  description: Optional owner ID for this API key.
                 expiresAt:
                   type: string
                   format: date-time
@@ -10253,6 +10517,105 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ForbiddenError'
+
+  /v2/workspaces/{workspaceId}/config:
+    get:
+      summary: Get Workspace Config
+      description: Fetch a workspace's `config` field only. Lighter than getWorkspace,
+        which also returns the full DSUL index, automations and pages metadata.
+      operationId: getWorkspaceConfig
+      tags:
+        - 'Prisme.ai Workspaces'
+      parameters:
+        - name: 'workspaceId'
+          in: 'path'
+          description: 'Workspace id'
+          required: true
+          schema:
+            type: string
+        - name: 'version'
+          in: 'query'
+          description: 'Optional version'
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Config'
+        '404':
+          description: Object not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+        '401':
+          description: AuthenticationError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationError'
+        '403':
+          description: Bad permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+
+    patch:
+      summary: Update Workspace Config
+      description: Update a workspace's `config` field. Top-level keys (`schema`,
+        `block`, `value`) are merged shallowly with the current config; only the
+        keys present in the payload are replaced.
+      operationId: updateWorkspaceConfig
+      tags:
+        - 'Prisme.ai Workspaces'
+      parameters:
+        - name: 'workspaceId'
+          in: 'path'
+          description: 'Workspace id'
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Config'
+      responses:
+        '200':
+          description: Success Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Config'
+        '404':
+          description: Object not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectNotFoundError'
+        '401':
+          description: AuthenticationError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationError'
+        '403':
+          description: Bad permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForbiddenError'
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadParametersError'
 
   /v2/workspaces/import:
     post:
