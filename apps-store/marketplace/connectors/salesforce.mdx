@@ -1,0 +1,728 @@
+---
+title: 'Salesforce'
+description: 'Read/write Salesforce CRM data via REST API v62.0 from Prisme.ai workflows and AI agents'
+---
+
+The Salesforce app provides read/write access to a Salesforce org through the [Salesforce REST API v62.0](https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/). It can be used either as a Builder app (automations call Salesforce operations directly) or as a remote MCP server consumed by an AI agent — covering single-record CRUD on Accounts, Contacts, Leads and Opportunities, SOQL/SOSL queries, the Composite endpoints, Bulk API 2.0 ingest/query, the Tooling API (Apex + metadata records), Process rules and Approval submissions, Quick Actions, Reports & Dashboards and Metadata package deploys. Authentication is per-user via OAuth2 authorization-code (PKCE), with a service-to-service JWT Bearer fallback when configured.
+
+<CardGroup cols={3}>
+  <Card title="CRM Records" icon="address-card">
+    Create, read, update and delete sObjects (Accounts, Contacts, Leads, Opportunities, custom objects) and run SOQL / SOSL searches across them
+  </Card>
+  <Card title="Bulk & Composite" icon="database">
+    Bulk API 2.0 ingest/query jobs and Composite endpoints for high-volume, multi-record and atomic operations
+  </Card>
+  <Card title="Reports & Process" icon="chart-line">
+    Reports, dashboards, approval processes, quick actions, Tooling API and Metadata deploys
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- A **Salesforce** org with administrator access (Production, Developer Edition or Sandbox).
+- A **Connected App** created in *Setup > App Manager > New Connected App*. Enable **OAuth Settings**, paste the value of the auto-computed **OAuth Redirect URI** (visible in the app instance configuration after install) into the Connected App's *Callback URL* field, and select the OAuth scopes `api refresh_token offline_access`. See the [Salesforce Connected App docs](https://help.salesforce.com/s/articleView?id=sf.connected_app_create.htm&type=5).
+- The Connected App's **Consumer Key** and **Consumer Secret** to fill `oauthClientId` / `oauthClientSecret`.
+- The **Login Host** matching the org type: `https://login.salesforce.com` for production / Developer Edition, `https://test.salesforce.com` for sandbox, or a custom My Domain host like `https://<mydomain>.my.salesforce.com`.
+- *(Optional)* For service-to-service auth without a user session, configure **JWT Bearer**: enable *Use digital signatures* on the Connected App, upload the matching public certificate, pre-authorize the runtime user for the Connected App, and fill `jwtUsername` + `jwtPrivateKey` on the app instance.
+
+---
+
+<Tabs>
+  <Tab title="Usage as App">
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **Salesforce** and install it
+    3. Open the app instance configuration and fill in the required fields
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Salesforce Login Host** | OAuth host for this org (`https://login.salesforce.com`, `https://test.salesforce.com` or a custom `*.my.salesforce.com`). Used as the base for the OAuth authorize/token/revoke endpoints AND as the default fallback API base before the OAuth token returns the real `instance_url`. |
+    | **REST API Version** | Salesforce REST API version (path segment after `/services/data/`). Defaults to `v62.0`. Override per tenant if you need an older version. |
+    | **OAuth Client ID (Consumer Key)** | Connected App "Consumer Key". Stored as a workspace secret. |
+    | **OAuth Client Secret (Consumer Secret)** | Connected App "Consumer Secret". Stored as a workspace secret. |
+    | **OAuth Redirect URI** | Auto-populated on install. Copy this exact value into the Connected App's *Callback URL* field. |
+    | **OAuth Scopes** | Space-separated OAuth scopes requested at authorize time. Defaults to `api refresh_token offline_access`. |
+    | **JWT Bearer Username** | Salesforce username for the JWT Bearer flow (optional, service-to-service). Leave blank to disable. |
+    | **JWT Bearer Private Key (PEM)** | RSA private key (PEM) matching the public certificate uploaded to the Connected App. Stored as a workspace secret. |
+    | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this instance |
+    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header. Do not modify |
+
+    <Note>
+      `MCP Endpoint` and `MCP API Key` are generated automatically by the `onInstall` flow and are only needed to expose this instance as an MCP server (see the next tab).
+    </Note>
+
+    ### Connecting a user (OAuth)
+
+    The app supports two authentication modes that are tried in order on every call:
+
+    1. **Per-user OAuth session** — each end-user clicks through the Salesforce authorize page once, the tokens are stored in their personal `user.salesforce.oauth.*` namespace and auto-refreshed. To initiate the flow, call `Salesforce.connect` from a tenant automation — it returns a `connect_url` to surface to the user.
+    2. **Per-tenant JWT Bearer** (fallback) — used when no per-user session exists. The Connected App exchanges `jwtUsername` + `jwtPrivateKey` against `{loginHost}/services/oauth2/token` and caches the access token for ~30 minutes.
+
+    If neither is available the call returns `error: "Salesforce not authenticated"`.
+
+    ## Available Instructions
+
+    Every instruction resolves credentials from the workspace configuration through the `buildAppAuth` helper. Arguments correspond directly to the Salesforce REST API parameters — path params, query params and JSON `body` fields. Most write operations accept a free-form `body` object whose keys are Salesforce field API names (case-sensitive).
+
+    ### Discovery
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listVersions` | — |
+    | `listResources` | — |
+    | `getLimits` | — |
+    | `getRecentItems` | `limit` |
+
+    ### sObject Metadata
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `describeGlobal` | — |
+    | `describeSObject` | `sObjectName`* |
+    | `describeSObjectBasic` | `sObjectName`* |
+
+    ### Records (CRUD)
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `createRecord` | `sObjectName`*, `body`* (Salesforce field API names) |
+    | `getRecord` | `sObjectName`*, `recordId`*, `fields` |
+    | `getRecordField` | `sObjectName`*, `recordId`*, `fieldName`* |
+    | `updateRecord` | `sObjectName`*, `recordId`*, `body`* |
+    | `upsertRecord` | `sObjectName`*, `externalIdField`*, `externalIdValue`*, `body`* |
+    | `deleteRecord` | `sObjectName`*, `recordId`* |
+    | `getDeletedRecords` | `sObjectName`*, `start`*, `end`* |
+    | `getUpdatedRecords` | `sObjectName`*, `start`*, `end`* |
+
+    ### SOQL & SOSL Queries
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `runQuery` | `q`* (SOQL) |
+    | `runQueryAll` | `q`* (SOQL, includes deleted/archived) |
+    | `runSearch` | `q`* (SOSL) |
+    | `runParameterizedSearch` | `body`* (structured search request) |
+    | `getQueryNext` | `queryLocator`* |
+
+    ### Composite & Multi-Record
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `runComposite` | `body`* (`allOrNone`, `collateSubrequests`, `compositeRequest`) |
+    | `runCompositeBatch` | `body`* (`haltOnError`, `batchRequests`) |
+    | `runCompositeGraph` | `body`* (`graphs`) |
+    | `createSObjectTree` | `sObjectName`*, `body`* (`records`) |
+    | `createRecords` | `body`* (`allOrNone`, `records`) |
+    | `createRecordsForType` | `sObjectName`*, `body`* (`allOrNone`, `records`) |
+    | `updateRecords` | `body`* (`allOrNone`, `records`) |
+    | `deleteRecords` | `ids`*, `allOrNone` |
+    | `getRecordsCollection` | `sObjectName`*, `ids`*, `fields` |
+    | `upsertRecordsForType` | `sObjectName`*, `externalIdField`*, `body`* (`allOrNone`, `records`) |
+
+    ### Bulk API 2.0 — Ingest
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `createIngestJob` | `body`* (`object`*, `operation`*, `externalIdFieldName`, `contentType`, `lineEnding`, `columnDelimiter`, `assignmentRuleId`) |
+    | `uploadIngestData` | `jobId`*, `rawBody`* (CSV) |
+    | `updateIngestJob` | `jobId`*, `body`* (`state` — `UploadComplete` / `Aborted`) |
+    | `getIngestJob` | `jobId`* |
+    | `listIngestJobs` | `isPkChunkingEnabled`, `jobType`, `queryLocator` |
+    | `getIngestSuccessful` | `jobId`* |
+    | `getIngestFailed` | `jobId`* |
+    | `getIngestUnprocessed` | `jobId`* |
+    | `deleteIngestJob` | `jobId`* |
+
+    ### Bulk API 2.0 — Query
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `createQueryJob` | `body`* (`operation`*, `query`*, `contentType`, `lineEnding`, `columnDelimiter`) |
+    | `getQueryJob` | `jobId`* |
+    | `listQueryJobs` | `isPkChunkingEnabled`, `jobType`, `concurrencyMode` |
+    | `getQueryJobResults` | `jobId`*, `locator`, `maxRecords` |
+    | `updateQueryJob` | `jobId`*, `body`* (`state` — `Aborted`) |
+    | `deleteQueryJob` | `jobId`* |
+
+    ### Tooling API
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `runToolingQuery` | `q`* (SOQL on Tooling sObjects: `CustomField`, `ApexClass`, `FlexiPage`, …) |
+    | `describeToolingGlobal` | — |
+    | `describeToolingSObject` | `sObjectName`* |
+    | `createToolingRecord` | `sObjectName`*, `body`* |
+    | `getToolingRecord` | `sObjectName`*, `recordId`* |
+    | `updateToolingRecord` | `sObjectName`*, `recordId`*, `body`* |
+    | `deleteToolingRecord` | `sObjectName`*, `recordId`* |
+    | `executeAnonymousApex` | `anonymousBody`* |
+    | `getApexCompletions` | `type` (`apex` / `visualforce`) |
+    | `runApexTestsSync` | `body`* (`tests`) |
+    | `runApexTestsAsync` | `body`* (`classNames`, `classids`, `suiteNames`, `suiteids`, `maxFailedTests`, `testLevel`, `tests`) |
+
+    ### Process & Approvals
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listProcessRules` | — |
+    | `listProcessRulesForObject` | `sObjectName`* |
+    | `triggerProcessRule` | `sObjectName`*, `ruleId`*, `body`* (`contextIds`) |
+    | `listApprovals` | — |
+    | `submitApproval` | `body`* (`requests`) |
+
+    ### Quick Actions
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listQuickActions` | — |
+    | `describeQuickAction` | `actionName`* |
+    | `invokeQuickAction` | `actionName`*, `body` |
+
+    ### Analytics — Reports & Dashboards
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listReports` | — |
+    | `describeReport` | `reportId`*, `includeDetails` |
+    | `runReport` | `reportId`*, `includeDetails`, `body` |
+    | `getReportInstance` | `reportId`*, `instanceId`* |
+    | `listReportInstances` | `reportId`* |
+    | `listDashboards` | — |
+    | `describeDashboard` | `dashboardId`* |
+    | `runDashboard` | `dashboardId`* |
+    | `getDashboardStatus` | `dashboardId`* |
+
+    ### Metadata Deploy
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `deployMetadata` | `body`* (`deployOptions`, `file`) |
+    | `getMetadataDeployStatus` | `requestId`*, `includeDetails` |
+
+    ### OAuth Session
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `connect` | — (returns `connect_url` for the end-user to click) |
+    | `disconnect` | — (revokes the current OAuth session) |
+
+    <Note>
+      Arguments flagged with `*` are required.
+    </Note>
+
+    ## DSUL Examples
+
+    ### Search high-value Accounts (SOQL)
+
+    ```yaml
+    - Salesforce.runQuery:
+        q: "SELECT Id, Name, AnnualRevenue, Industry FROM Account WHERE AnnualRevenue > 1000000 ORDER BY AnnualRevenue DESC LIMIT 50"
+        output: accounts
+    ```
+
+    ### Create a Lead
+
+    ```yaml
+    - Salesforce.createRecord:
+        sObjectName: Lead
+        body:
+          FirstName: Georges
+          LastName: Abitbol
+          Company: La Classe Américaine
+          Email: georges.abitbol@example.com
+          LeadSource: Web
+        output: lead
+    ```
+
+    ### Update an Opportunity stage and amount
+
+    ```yaml
+    - Salesforce.updateRecord:
+        sObjectName: Opportunity
+        recordId: '{{opportunity_id}}'
+        body:
+          StageName: Closed Won
+          Amount: 250000
+        output: result
+    ```
+
+    ### Bulk insert Contacts via Bulk API 2.0
+
+    ```yaml
+    - Salesforce.createIngestJob:
+        body:
+          object: Contact
+          operation: insert
+          contentType: CSV
+          lineEnding: LF
+        output: job
+    - Salesforce.uploadIngestData:
+        jobId: '{{job.id}}'
+        rawBody: |
+          FirstName,LastName,Email
+          Jean,Dupont,jean.dupont@example.com
+          Marie,Martin,marie.martin@example.com
+        output: upload
+    - Salesforce.updateIngestJob:
+        jobId: '{{job.id}}'
+        body:
+          state: UploadComplete
+        output: launched
+    ```
+
+    ### Run a Report and download the results
+
+    ```yaml
+    - Salesforce.runReport:
+        reportId: '{{report_id}}'
+        includeDetails: true
+        output: report
+    ```
+  </Tab>
+
+  <Tab title="Usage as MCP">
+    The Salesforce app ships with a built-in MCP server. Each app instance gets its own signed `mcp-api-key` that encodes the workspace ID and a credentials lookup URL — the Salesforce OAuth credentials themselves are never passed through headers and are resolved server-side from the app configuration on every tool call.
+
+    MCP tools follow a **dispatcher pattern**: a single tool name (e.g. `records`, `query`, `bulkIngest`) covers several Salesforce operations selected through an `action` argument. This keeps the tool list short while still exposing the full surface of the Salesforce REST API.
+
+    ## Plug into an Agent Creator capability
+
+    Agents consume MCP servers directly through **Agent Creator** capabilities. This is the preferred way to expose Salesforce to an agent.
+
+    <Steps>
+      <Step title="Create or open a workspace">
+        From the Prisme.ai console, create a new workspace (or open the one that will host the connector).
+      </Step>
+      <Step title="Install the Salesforce app">
+        Open the workspace **Imports** panel, search for **Salesforce** and install it.
+      </Step>
+      <Step title="Configure the credentials">
+        Open the freshly installed app instance settings and fill in the required fields (see the *Usage as App* tab for the field-by-field reference). At minimum: `loginHost`, `oauthClientId`, `oauthClientSecret`.
+      </Step>
+      <Step title="Copy the MCP endpoint and API key">
+        Still on the app instance configuration page, copy the values of **MCP Endpoint** and **MCP API Key** — both are generated automatically on install.
+      </Step>
+      <Step title="Open Agent Creator">
+        Switch to **Agent Creator** and open the agent you want to extend.
+      </Step>
+      <Step title="Add a capability">
+        Add a new capability to the agent:
+
+        - **If a dedicated Salesforce capability exists** — select it and paste the **MCP API Key** into the `mcp-api-key` field. The server URL is already wired.
+        - **Otherwise** — select the generic **`custom_mcp`** capability, paste the **MCP Endpoint** into the *Server URL* field, then open the *Headers* field and add an `mcp-api-key` entry whose value is the **MCP API Key** copied earlier:
+
+          ```json
+          {
+            "mcp-api-key": "your-mcp-api-key"
+          }
+          ```
+      </Step>
+      <Step title="Save">
+        The agent now has access to every Salesforce tool exposed by the MCP server.
+      </Step>
+      <Step title="Brief the agent in its system prompt">
+        Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+
+        ```text
+        You have access to the Salesforce MCP server. Use it whenever the user asks something that maps to Salesforce data — listing, searching, reading, creating or updating records, running SOQL/SOSL queries, submitting approval requests, running reports or kicking off Bulk API jobs. Always prefer calling an MCP tool over guessing from prior context, and confirm with the user before any destructive action (delete, bulk update, metadata deploy).
+        ```
+
+        Refine the trigger keywords (sObject names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
+      </Step>
+    </Steps>
+
+    ## Legacy MCP Install (Advanced > Tools)
+
+    Use this flow to plug the Salesforce MCP into an AI Knowledge agent that does not yet support the native MCP picker.
+
+    <Steps>
+      <Step title="Install the Salesforce app">
+        Install and configure the app in the same workspace as your agent (see the *Usage as App* tab). Once configured, `mcpEndpoint` and `mcpApiKey` are auto-populated.
+      </Step>
+      <Step title="Copy the MCP credentials">
+        Open the app instance config and copy the values of **MCP Endpoint** and **MCP API Key**.
+      </Step>
+      <Step title="Open your AI Knowledge project">
+        Navigate to **Advanced > Tools**.
+      </Step>
+      <Step title="Add an MCP tool">
+        Click **Add** and select the **MCP** tab.
+      </Step>
+      <Step title="Fill in the endpoint">
+        Paste the **MCP Endpoint** URL copied from the app instance.
+      </Step>
+      <Step title="Add the auth header">
+        In the **Headers** field, add the signed API key:
+
+        ```json
+        {
+          "mcp-api-key": "your-mcp-api-key"
+        }
+        ```
+      </Step>
+      <Step title="Save">
+        The agent can now list and call Salesforce tools through the MCP endpoint.
+      </Step>
+    </Steps>
+
+    <Note>
+      The signed `mcp-api-key` encodes the workspace ID and the `getConfig` webhook URL. The MCP server validates the signature using the central app secret and transparently fetches the Salesforce OAuth tokens (or JWT Bearer fallback) for the calling user. Credentials are cached per tenant for 10 minutes.
+    </Note>
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` parameter that controls the MCP response shape:
+
+    - **`verbose`** (default) — human-readable text for LLM consumption
+    - **`structured`** — machine-readable JSON in `structuredContent`
+    - **`both`** — both text and structured content
+
+    ## Available Tools
+
+    Each dispatcher tool takes an `action` argument that selects the underlying Salesforce operation. Only the arguments relevant to the chosen action need to be passed.
+
+    ### OAuth Session
+
+    | Tool | Description |
+    |------|-------------|
+    | `connect` | Initiate an OAuth connection to Salesforce. Returns a `connect_url` for the user to click |
+    | `disconnect` | Disconnect the current Salesforce OAuth session and revoke the access token (RFC 7009) |
+
+    ### Discovery (`versions`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `listVersions` | List available REST API versions |
+    | `listResources` | List available resources for the current API version |
+    | `getLimits` | Get org limits (`DailyApiRequests`, `DataStorageMB`, …) |
+    | `getRecent` | Most recently viewed items (param: `limit`) |
+
+    ### sObject Metadata (`sobjects`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `describeGlobal` | List all available sObjects and basic metadata for each |
+    | `describe` | Full describe of a single sObject (fields, picklists, child relationships) |
+    | `describeBasic` | Basic metadata for a single sObject (URLs + recent items) |
+
+    ### Records (`records`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `create` | Create a new record — pass record fields inside `body` |
+    | `get` | Retrieve a single record by ID |
+    | `getField` | Get a single field on a record (including blob/document body) |
+    | `update` | Update fields on an existing record |
+    | `upsert` | Upsert a record by external ID field |
+    | `delete` | Delete a record by ID |
+    | `getDeleted` | Records deleted within a time window (recycle bin) |
+    | `getUpdated` | Records updated within a time window |
+
+    ### SOQL & SOSL (`query`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `soql` | Run a SOQL query (excludes deleted/archived) |
+    | `soqlAll` | Run a SOQL query including deleted/archived records |
+    | `sosl` | Run a SOSL search across multiple sObjects |
+    | `parameterizedSearch` | Structured parameterized search (richer than SOSL string) |
+    | `next` | Retrieve the next batch of a paginated SOQL query |
+
+    ### Composite (`composite`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `request` | Execute up to 25 sub-requests in order, with refs between them |
+    | `batch` | Execute up to 25 independent sub-requests (no refs) |
+    | `graph` | Execute multiple composite graphs in a single transaction |
+    | `tree` | Insert a parent record and related children in a single transaction |
+
+    ### Multi-Record (`compositeRecords`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `createMany` | Create up to 200 records (mixed sObjects) in one call |
+    | `createManyForType` | Create up to 200 records of the same sObject type |
+    | `updateMany` | Update up to 200 records (mixed sObjects) in one call |
+    | `upsertManyForType` | Upsert up to 200 records of the same sObject by external ID |
+    | `deleteMany` | Delete up to 200 records (mixed sObjects) in one call |
+    | `getMany` | Retrieve up to 2000 records of a given sObject type by IDs |
+
+    ### Bulk API 2.0 — Ingest (`bulkIngest`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `create` | Create a new bulk ingest job |
+    | `uploadData` | Upload CSV data to an Open ingest job (param: `rawBody`) |
+    | `update` | Update job state (`UploadComplete` to start processing, `Aborted` to stop) |
+    | `get` | Get bulk ingest job state and metrics |
+    | `list` | List bulk ingest jobs |
+    | `getSuccessful` | Download CSV of successfully processed rows |
+    | `getFailed` | Download CSV of failed rows with error messages |
+    | `getUnprocessed` | Download CSV of rows not processed (job aborted before completion) |
+    | `delete` | Delete a bulk ingest job (only after JobComplete/Aborted/Failed) |
+
+    ### Bulk API 2.0 — Query (`bulkQuery`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `create` | Create a bulk SOQL query job (returns `jobId` for polling) |
+    | `get` | Get bulk query job state and metrics |
+    | `list` | List bulk query jobs |
+    | `getResults` | Download CSV results of a completed bulk query job |
+    | `update` | Update query job state (`Aborted` only) |
+    | `delete` | Delete a bulk query job (only after completion/abort) |
+
+    ### Tooling API (`tooling`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `query` | Run a Tooling SOQL query (`CustomField`, `ApexClass`, `FlexiPage`, …) |
+    | `describeGlobal` | List Tooling API sObjects |
+    | `describeSObject` | Describe a Tooling API sObject |
+    | `createRecord` | Create a Tooling API record (e.g. `ApexClass`, `CustomField`) |
+    | `getRecord` | Retrieve a Tooling API record |
+    | `updateRecord` | Update a Tooling API record |
+    | `deleteRecord` | Delete a Tooling API record |
+    | `executeAnonymous` | Run a one-off Apex code block as the current user |
+    | `completions` | Apex / VisualForce code completions |
+    | `runTestsSync` | Run Apex tests synchronously (small scope only) |
+    | `runTestsAsync` | Schedule async Apex test execution |
+
+    ### Process & Approvals (`process`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `listRules` | List active process rules across the org |
+    | `listRulesForObject` | Process rules for a given sObject |
+    | `triggerRule` | Trigger a specific process rule against record IDs |
+    | `listApprovals` | List approval requests visible to the current user |
+    | `submitApproval` | Submit a record into an approval process or act on an existing one |
+
+    ### Quick Actions (`quickActions`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | Global quick actions |
+    | `describe` | Describe a specific quick action |
+    | `invoke` | Invoke a quick action with payload |
+
+    ### Analytics (`analytics`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `listReports` | List all reports accessible to the current user |
+    | `describeReport` | Describe a report (metadata + `reportFactWithDetails` when `includeDetails=true`) |
+    | `runReport` | Execute a report asynchronously and return a report instance |
+    | `getReportInstance` | Get the results of a specific report instance |
+    | `listReportInstances` | List async report instances for a report |
+    | `listDashboards` | List all dashboards accessible to the current user |
+    | `describeDashboard` | Describe a dashboard (components, filters, cache state) |
+    | `runDashboard` | Refresh a dashboard (async) |
+    | `getDashboardStatus` | Get the current refresh status of a dashboard |
+
+    ### Metadata Deploy (`metadata`)
+
+    | Action | Description |
+    |--------|-------------|
+    | `deploy` | Deploy a zipped metadata package (Metadata REST) |
+    | `getDeployStatus` | Get status + details of a metadata deploy request |
+
+    ## Tool Details
+
+    ### records
+
+    CRUD on individual Salesforce records. One record per call. Pick the operation via `action`; pass record fields nested inside `body` (Salesforce field API names are case-sensitive).
+
+    ```json
+    {
+      "name": "records",
+      "arguments": {
+        "action": "create",
+        "sObjectName": "Lead",
+        "body": {
+          "FirstName": "Georges",
+          "LastName": "Abitbol",
+          "Company": "La Classe Américaine",
+          "Email": "georges.abitbol@example.com"
+        }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `create`, `get`, `getField`, `update`, `upsert`, `delete`, `getDeleted`, `getUpdated` |
+    | `sObjectName` | Yes | API name of the sObject (`Account`, `Contact`, `Lead`, `Opportunity`, `My_Custom_Object__c`, …) |
+    | `recordId` | For `get`/`getField`/`update`/`delete` | Salesforce 15- or 18-char record ID |
+    | `body` | For `create`/`update`/`upsert` | Object whose keys are Salesforce field API names |
+    | `externalIdField`, `externalIdValue` | For `upsert` | External ID field API name and value |
+    | `fieldName` | For `getField` | API name of a single field to fetch |
+    | `fields` | For `get` | Comma-separated list of fields to return |
+    | `start`, `end` | For `getDeleted`/`getUpdated` | ISO 8601 time window |
+
+    ### query
+
+    Read with SOQL (database language), SOSL (cross-object text search) or a structured parameterized search. Use `next` with a `queryLocator` returned by a previous SOQL response to page through large result sets.
+
+    ```json
+    {
+      "name": "query",
+      "arguments": {
+        "action": "soql",
+        "q": "SELECT Id, Name, AnnualRevenue FROM Account WHERE Industry = 'Technology' ORDER BY AnnualRevenue DESC LIMIT 50"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `soql`, `soqlAll`, `sosl`, `parameterizedSearch`, `next` |
+    | `q` | For `soql`/`soqlAll`/`sosl` | SOQL or SOSL string |
+    | `queryLocator` | For `next` | Locator returned by the previous SOQL call (`nextRecordsUrl`) |
+    | `body` | For `parameterizedSearch` | Structured search request |
+
+    ### compositeRecords
+
+    Multi-record CRUD via the `composite/sobjects` collection — up to 200 records per call (2000 for reads), with optional `allOrNone` transactional semantics.
+
+    ```json
+    {
+      "name": "compositeRecords",
+      "arguments": {
+        "action": "createManyForType",
+        "sObjectName": "Contact",
+        "body": {
+          "allOrNone": true,
+          "records": [
+            { "attributes": { "type": "Contact" }, "FirstName": "Jean", "LastName": "Dupont", "Email": "jean.dupont@example.com" },
+            { "attributes": { "type": "Contact" }, "FirstName": "Marie", "LastName": "Martin", "Email": "marie.martin@example.com" }
+          ]
+        }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `createMany`, `createManyForType`, `updateMany`, `upsertManyForType`, `deleteMany`, `getMany` |
+    | `sObjectName` | For `createManyForType`/`upsertManyForType`/`getMany` | API name of the sObject |
+    | `body` | For all writes | `{ allOrNone, records, externalIdField? }` |
+    | `ids` | For `deleteMany`/`getMany` | Comma-separated record IDs |
+    | `fields` | For `getMany` | Comma-separated list of fields |
+
+    ### bulkIngest
+
+    Asynchronous high-volume writes via Bulk API 2.0. The typical lifecycle is `create` → `uploadData` (CSV) → `update` (`state: UploadComplete`) → poll `get` until `state=JobComplete` → `getSuccessful` / `getFailed`.
+
+    ```json
+    {
+      "name": "bulkIngest",
+      "arguments": {
+        "action": "create",
+        "body": {
+          "object": "Contact",
+          "operation": "insert",
+          "contentType": "CSV",
+          "lineEnding": "LF"
+        }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `create`, `uploadData`, `update`, `get`, `list`, `getSuccessful`, `getFailed`, `getUnprocessed`, `delete` |
+    | `jobId` | For everything but `create`/`list` | Job ID returned by `create` |
+    | `body` | For `create`/`update` | Create payload or `{ state: UploadComplete \| Aborted }` |
+    | `rawBody` | For `uploadData` | Raw CSV body (`Content-Type: text/csv`) |
+
+    ### analytics
+
+    Run reports and dashboards asynchronously, then fetch the resulting report instance. Reports return both the metadata and the row-level facts when `includeDetails=true`.
+
+    ```json
+    {
+      "name": "analytics",
+      "arguments": {
+        "action": "runReport",
+        "reportId": "00O5g00000F1234EAA",
+        "includeDetails": true
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `listReports`, `describeReport`, `runReport`, `getReportInstance`, `listReportInstances`, `listDashboards`, `describeDashboard`, `runDashboard`, `getDashboardStatus` |
+    | `reportId` | For report actions | Salesforce report ID |
+    | `dashboardId` | For dashboard actions | Salesforce dashboard ID |
+    | `instanceId` | For `getReportInstance` | Async report instance ID |
+    | `includeDetails` | No | Include row-level details in the response |
+
+    ### tooling
+
+    Tooling API for metadata-as-data: query/CRUD on `ApexClass`, `CustomField`, `FlexiPage`, `ValidationRule`, …, plus running Apex (sync, async tests, anonymous execution) and code completions.
+
+    ```json
+    {
+      "name": "tooling",
+      "arguments": {
+        "action": "executeAnonymous",
+        "anonymousBody": "System.debug('Hello from Apex anonymous');"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | See the Tooling API table above |
+    | `sObjectName` | For Tooling sObject ops | Tooling API sObject name |
+    | `recordId` | For `getRecord`/`updateRecord`/`deleteRecord` | Tooling record ID |
+    | `q` | For `query` | Tooling SOQL string |
+    | `anonymousBody` | For `executeAnonymous` | Apex source to execute as the current user |
+    | `body` | For test runs / record mutations | Operation payload (`tests`, `classNames`, …) |
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+| HTTP Status | Error | Solution |
+|-------------|-------|----------|
+| 400 | Bad Request | Malformed SOQL, invalid field API name, missing required field. Check the `fields` array returned by Salesforce for `formField` errors |
+| 401 | Unauthorized | Access token expired or revoked. Reconnect via the `connect` tool |
+| 403 | Forbidden | The Salesforce profile lacks API access or object/field-level permissions |
+| 404 | Not Found | sObject name or record ID does not exist. Note that sObject API names are case-sensitive |
+| 422 | Validation | Validation rules, picklist constraints or required-field errors on the sObject |
+| 429 | Rate Limited | Org API limit reached (`DailyApiRequests`). Inspect usage via `versions action=getLimits` and back off |
+| 500 | Server Error | Transient Salesforce error. Retry with exponential backoff |
+
+### Common Issues
+
+**"Not configured"** — The app instance has no Connected App credentials. Create a Connected App in *Salesforce Setup > App Manager*, then fill `oauthClientId` / `oauthClientSecret` on the app instance.
+
+**"Invalid API key" (MCP)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
+
+**"Credentials lookup failed"** — The MCP endpoint could not reach the `getConfig` webhook of the installed app. Verify that the app instance is still installed in the expected workspace.
+
+**"Salesforce not authenticated"** — Neither a per-user OAuth session nor a JWT Bearer fallback is available. Call `Salesforce.connect` (App mode) or the `connect` MCP tool to start the OAuth flow, or fill `jwtUsername` + `jwtPrivateKey` on the app instance.
+
+**`redirect_uri_mismatch` at callback time** — The `oauthCallbackUrl` value displayed in the app instance config must be pasted *verbatim* into the Connected App's *Callback URL* field, including the path. Sandbox vs production hosts also matter: use `https://test.salesforce.com` as `loginHost` for sandboxes.
+
+**`invalid_grant` on JWT Bearer** — The runtime user is not pre-authorized for the Connected App, the private key does not match the uploaded certificate, or *Use digital signatures* is not enabled on the Connected App.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="Salesforce REST API" icon="book" href="https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/">
+    Official Salesforce REST API documentation (v62.0)
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/create-agents/tool-agents/overview">
+    Plug MCP servers into AI Knowledge agents
+  </Card>
+</CardGroup>
