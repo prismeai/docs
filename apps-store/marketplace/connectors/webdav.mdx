@@ -1,0 +1,443 @@
+---
+title: 'WebDAV'
+description: 'Browse, read and write files on any WebDAV server (Nextcloud, ownCloud, generic HTTPS WebDAV) from Prisme.ai workflows and AI agents'
+---
+
+<img
+  src="/images/connectors/webdav.jpg"
+  alt="WebDAV"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The WebDAV app provides read/write access to any [WebDAV](https://datatracker.ietf.org/doc/html/rfc4918)-compatible file server — Nextcloud, ownCloud, a generic Apache `mod_dav` instance or any vendor-specific WebDAV endpoint. It can be used either as a Builder app (automations call WebDAV instructions directly) or as a remote MCP server consumed by an AI agent. Authentication supports HTTP Basic (username + password) and Bearer token. An optional `allowedPath` restricts every operation to a subtree of the server. The connector exposes a single `files` tool that dispatches across 10 file/directory operations: listing, reading, writing, copying, moving, deleting, recursive search, full directory trees and directory creation.
+
+<CardGroup cols={3}>
+  <Card title="Browse" icon="folder-tree">
+    List directories, fetch metadata, walk full nested trees, search by name and modification date
+  </Card>
+  <Card title="Read & Write" icon="file-pen">
+    Download file content, upload or overwrite files with a custom MIME type, create directories
+  </Card>
+  <Card title="Organize" icon="arrow-right-arrow-left">
+    Move, rename, copy or delete files and directories — with optional overwrite-on-target
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- A reachable **WebDAV server** with a stable base URL. Examples:
+  - **Nextcloud / ownCloud** — `https://cloud.example.com/remote.php/dav/files/<username>`
+  - **Generic Apache `mod_dav`** — `https://files.example.com/dav`
+  - **Vendor-specific** — refer to the provider's documentation for the WebDAV endpoint
+- Credentials matching the chosen authentication mode:
+  - **Basic** — a username + password (often an *app password* if the provider supports 2FA, e.g. Nextcloud)
+  - **Token** — a Bearer token issued by the provider
+- (Optional) An **allowed path** to restrict every operation to a single subtree — useful when the WebDAV user has access to more than you want to expose.
+
+<Warning>
+  When using `basic` auth against a Nextcloud or ownCloud instance with two-factor authentication enabled, create a dedicated **app password** in the user settings (*Security → Devices & sessions → Create new app password*) and use it as the password. The main account password will be rejected.
+</Warning>
+
+---
+
+<Tabs>
+  <Tab title="Usage as App">
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **WebDAV** and install it
+    3. Open the app instance configuration and fill in the required fields
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **WebDAV Base URL** | WebDAV server base URL — e.g. `https://cloud.example.com/remote.php/dav/files/user`. All paths in tool calls are resolved relative to this URL |
+    | **Authentication Type** | `basic` for username/password, `token` for Bearer token |
+    | **Username** | Username for Basic Auth (ignored in token mode) |
+    | **Password** | Password (or app password) for Basic Auth (stored as a workspace secret) |
+    | **Bearer Token** | Bearer token for token mode (stored as a workspace secret) |
+    | **Allowed path (optional)** | If set, every file operation is rejected when the resolved path falls outside this subtree. Leave empty to expose the full base URL |
+    | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this instance |
+    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header. Do not modify |
+
+    <Note>
+      `MCP Endpoint` and `MCP API Key` are generated automatically by the `onInstall` flow. The Basic / Bearer credentials are stored as workspace secrets.
+    </Note>
+
+    ## Available Instructions
+
+    Every instruction resolves credentials from the workspace configuration. All paths are interpreted relative to the `baseUrl`; leading `/` is allowed but optional.
+
+    ### Files & Directories
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listFiles` | `path`, `depth` |
+    | `getFile` | `path`* |
+    | `getFileProperties` | `path`* |
+    | `uploadFile` | `path`*, `content`*, `contentType` |
+    | `deleteFile` | `path`* |
+    | `moveFile` | `sourcePath`*, `destinationPath`*, `overwrite` |
+    | `copyFile` | `sourcePath`*, `destinationPath`*, `overwrite` |
+    | `getDirectoryTree` | `path`* |
+    | `searchFiles` | `path`, `dateFrom`, `dateTo`, `query`, `page`, `pageSize`, `sortOrder` |
+    | `createDirectory` | `path`* |
+
+    <Note>
+      Arguments flagged with `*` are required. `depth` accepts `0` (path info only) or `1` (immediate children, default). `deleteFile` deletes directories recursively.
+    </Note>
+
+    ## DSUL Examples
+
+    ### List the contents of a folder
+
+    ```yaml
+    - WebDAV.files:
+        action: list
+        path: '/Documents'
+        depth: 1
+        output: listing
+    ```
+
+    ### Download a file and decode its content
+
+    ```yaml
+    - WebDAV.files:
+        action: get
+        path: '/Reports/2026/q1-results.md'
+        output: report
+    - emit:
+        event: report.fetched
+        payload:
+          size: '{{report.size}}'
+          excerpt: '{% slice({{report.content}}, 0, 500) %}'
+    ```
+
+    ### Upload a generated PDF
+
+    ```yaml
+    - WebDAV.files:
+        action: upload
+        path: '/Generated/{{run.date}}-summary.md'
+        content: |
+          # Daily summary
+          
+          {{summary.body}}
+        contentType: 'text/markdown'
+    ```
+
+    ### Move yesterday's exports to an archive folder
+
+    ```yaml
+    - WebDAV.files:
+        action: move
+        sourcePath: '/Exports/{{yesterday}}.csv'
+        destinationPath: '/Archive/{{yesterday}}.csv'
+        overwrite: false
+    ```
+
+    ### Search for recent reports by name
+
+    ```yaml
+    - WebDAV.files:
+        action: search
+        path: '/Reports'
+        query: 'q2'
+        dateFrom: '2026-04-01T00:00:00Z'
+        dateTo: '2026-07-01T00:00:00Z'
+        sortOrder: desc
+        pageSize: 25
+        output: matches
+    ```
+
+    ### Walk a full directory tree
+
+    ```yaml
+    - WebDAV.files:
+        action: getTree
+        path: '/Projects/Acme'
+        output: tree
+    ```
+  </Tab>
+
+  <Tab title="Usage as MCP">
+    The WebDAV app ships with a built-in MCP server. Each app instance gets its own signed `mcp-api-key` that encodes the workspace ID and a credentials lookup URL — the WebDAV credentials themselves are never passed through headers and are resolved server-side from the app configuration.
+
+    ## Plug into an Agent Creator capability
+
+    Agents consume MCP servers directly through **Agent Creator** capabilities. This is the preferred way to expose WebDAV to an agent.
+
+    <Steps>
+      <Step title="Create or open a workspace">
+        From the Prisme.ai console, create a new workspace (or open the one that will host the connector).
+      </Step>
+      <Step title="Install the WebDAV app">
+        Open the workspace **Imports** panel, search for **WebDAV** and install it.
+      </Step>
+      <Step title="Configure the credentials">
+        Open the freshly installed app instance settings and fill in the base URL, authentication type and Basic / Bearer credentials (see the *Usage as App* tab for the field-by-field reference).
+      </Step>
+      <Step title="Copy the MCP endpoint and API key">
+        Still on the app instance configuration page, copy the values of **MCP Endpoint** and **MCP API Key** — both are generated automatically on install.
+      </Step>
+      <Step title="Open Agent Creator">
+        Switch to **Agent Creator** and open the agent you want to extend.
+      </Step>
+      <Step title="Add a capability">
+        Add a new capability to the agent:
+
+        - **If a dedicated WebDAV capability exists** — select it and paste the **MCP API Key** into the `mcp-api-key` field. The server URL is already wired.
+        - **Otherwise** — select the generic **`custom_mcp`** capability, paste the **MCP Endpoint** into the *Server URL* field, then open the *Headers* field and add an `mcp-api-key` entry whose value is the **MCP API Key** copied earlier:
+
+          ```json
+          {
+            "mcp-api-key": "your-mcp-api-key"
+          }
+          ```
+      </Step>
+      <Step title="Save">
+        The agent now has access to every WebDAV tool exposed by the MCP server.
+      </Step>
+      <Step title="Brief the agent in its system prompt">
+        Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+
+        ```text
+        You have access to the WebDAV MCP server (mapped to <provider, e.g. Nextcloud, ownCloud, a corporate file server>). Use it whenever the user asks to browse files, read a document, write or overwrite a file, move/copy/rename files, walk a directory tree, search by name or by modification date. Prefer `list` for one level of children and `getTree` only when the user explicitly asks for a recursive view (it can be expensive). Always confirm with the user before destructive actions (`delete`, `move` with `overwrite: true`, `upload` overwriting an existing file).
+        ```
+
+        Refine the trigger keywords (resource names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
+      </Step>
+    </Steps>
+
+    ## Legacy MCP Install (Advanced > Tools)
+
+    Use this flow to plug the WebDAV MCP into an AI Knowledge agent that does not yet support the native MCP picker.
+
+    <Steps>
+      <Step title="Install the WebDAV app">
+        Install and configure the app in the same workspace as your agent (see the *Usage as App* tab). Once configured, `mcpEndpoint` and `mcpApiKey` are auto-populated.
+      </Step>
+      <Step title="Copy the MCP credentials">
+        Open the app instance config and copy the values of **MCP Endpoint** and **MCP API Key**.
+      </Step>
+      <Step title="Open your AI Knowledge project">
+        Navigate to **Advanced > Tools**.
+      </Step>
+      <Step title="Add an MCP tool">
+        Click **Add** and select the **MCP** tab.
+      </Step>
+      <Step title="Fill in the endpoint">
+        Paste the **MCP Endpoint** URL copied from the app instance.
+      </Step>
+      <Step title="Add the auth header">
+        In the **Headers** field, add the signed API key:
+
+        ```json
+        {
+          "mcp-api-key": "your-mcp-api-key"
+        }
+        ```
+      </Step>
+      <Step title="Save">
+        The agent can now list and call WebDAV tools through the MCP endpoint.
+      </Step>
+    </Steps>
+
+    <Note>
+      The signed `mcp-api-key` encodes the workspace ID and the `getConfig` webhook URL. The MCP server validates the signature using the central app secret and transparently fetches the WebDAV base URL plus Basic / Bearer credentials from the installed app. Credentials are cached per tenant for 10 minutes.
+    </Note>
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` parameter that controls the MCP response shape:
+
+    - **`verbose`** (default) — human-readable text for LLM consumption
+    - **`structured`** — machine-readable JSON in `structuredContent`
+    - **`both`** — both text and structured content
+
+    ## Available Tools
+
+    The MCP server exposes a single entity-level tool, `files`, which dispatches across 10 actions through its `action` argument.
+
+    ### `files`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List files / directories at a given path (depth 0 or 1) |
+    | `get` | Download file content |
+    | `getProperties` | Get metadata of a file or directory without its content |
+    | `upload` | Upload or overwrite a file with a given MIME type |
+    | `delete` | Delete a file or a directory (recursive) |
+    | `move` | Move or rename a file or directory |
+    | `copy` | Copy a file or directory |
+    | `getTree` | Walk the full nested directory tree under a path |
+    | `search` | Search files recursively by name and modification date, with pagination |
+    | `createDir` | Create a new directory (parent must exist) |
+
+    ## Tool Details
+
+    ### `files` (action: `list`)
+
+    ```json
+    {
+      "name": "files",
+      "arguments": {
+        "action": "list",
+        "path": "/Documents",
+        "depth": 1
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `list` |
+    | `path` | – | Directory to list. Defaults to `/` |
+    | `depth` | – | `1` (default) for immediate children; `0` to return only the path's own info (akin to a stat) |
+
+    ### `files` (action: `upload`)
+
+    ```json
+    {
+      "name": "files",
+      "arguments": {
+        "action": "upload",
+        "path": "/Generated/2026-05-26-summary.md",
+        "content": "# Daily summary\n\n…",
+        "contentType": "text/markdown"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `upload` |
+    | `path` | ✓ | Target file path. Existing files at the same path are overwritten |
+    | `content` | ✓ | The file content (text). For binary uploads, prefer copying from an existing file via `copy` after staging the content elsewhere |
+    | `contentType` | – | MIME type of the content. Defaults to `text/plain`. Common values: `text/markdown`, `application/json`, `text/csv` |
+
+    ### `files` (action: `move`)
+
+    ```json
+    {
+      "name": "files",
+      "arguments": {
+        "action": "move",
+        "sourcePath": "/Exports/2026-05-25.csv",
+        "destinationPath": "/Archive/2026-05-25.csv",
+        "overwrite": false
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `move` |
+    | `sourcePath` | ✓ | Current path of the file or directory |
+    | `destinationPath` | ✓ | New path (must be inside `allowedPath` if configured) |
+    | `overwrite` | – | Whether to overwrite if the destination exists. Defaults to `true` |
+
+    ### `files` (action: `search`)
+
+    ```json
+    {
+      "name": "files",
+      "arguments": {
+        "action": "search",
+        "path": "/Reports",
+        "query": "q2",
+        "dateFrom": "2026-04-01T00:00:00Z",
+        "dateTo": "2026-07-01T00:00:00Z",
+        "sortOrder": "desc",
+        "page": 1,
+        "pageSize": 25
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `search` |
+    | `path` | – | Search root (defaults to `/`). The search is always recursive |
+    | `query` | – | Case-insensitive substring match on file names |
+    | `dateFrom` | – | RFC3339 / ISO 8601 — only files modified on or after this date |
+    | `dateTo` | – | RFC3339 / ISO 8601 — only files modified on or before this date |
+    | `sortOrder` | – | `desc` (default, newest first) or `asc` |
+    | `page` | – | Page number, 1-indexed. Default `1` |
+    | `pageSize` | – | Items per page. Default `50` |
+
+    ### `files` (action: `getTree`)
+
+    ```json
+    {
+      "name": "files",
+      "arguments": {
+        "action": "getTree",
+        "path": "/Projects/Acme"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `getTree` |
+    | `path` | ✓ | Root of the tree to walk |
+
+    <Warning>
+      `getTree` can return very large responses on deep directories. When the tree is large, prefer `list` with `depth: 1` and recurse client-side, or call `search` with a path filter.
+    </Warning>
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+WebDAV uses standard HTTP status codes plus a handful of WebDAV-specific ones (RFC 4918).
+
+| HTTP Status | Meaning | Typical Cause |
+|-------------|---------|----------------|
+| `400` | Bad Request | Malformed path, invalid `depth`, missing required parameter |
+| `401` | Unauthorized | Wrong username / password, expired or revoked Bearer token |
+| `403` | Forbidden | The configured user does not have the WebDAV permission required for the operation, or the path falls outside `allowedPath` |
+| `404` | Not Found | The path does not exist on the server |
+| `405` | Method Not Allowed | Calling a method (e.g. `MKCOL`) on a path that already exists |
+| `409` | Conflict | `createDirectory` called on a path whose parent does not exist (`MKCOL` parent missing) |
+| `412` | Precondition Failed | `move`/`copy` with `overwrite: false` but the destination already exists |
+| `423` | Locked | Another client holds a WebDAV lock on the resource — retry later |
+| `429` | Rate Limited | Provider throttling (Nextcloud rate limits, reverse-proxy WAF) |
+| `507` | Insufficient Storage | The user is over quota on the provider |
+| `500` / `502` / `503` | Server Error | Transient error from the upstream server or proxy. Retry with exponential backoff |
+
+### Common Issues
+
+**"Not configured"** — The app instance is missing either `baseUrl` or the credentials for the chosen `type` (Basic or token). Fill in the configuration.
+
+**"Invalid API key" (MCP)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
+
+**"Credentials lookup failed"** — The MCP endpoint could not reach the `getConfig` webhook of the installed app. Verify that the app instance is still installed in the expected workspace.
+
+**Nextcloud / ownCloud 401 with the right password** — Two-factor authentication on the account requires an **app password**. Create one in *Security → Devices & sessions* and use it as the `password`.
+
+**"Path outside allowed subtree" (403)** — The resolved path is not under the configured `allowedPath`. Either widen the allow-list or rewrite the call to a path within it.
+
+**`getTree` times out on a large folder** — Prefer `list` with `depth: 1` and recurse from the client, or use `search` with `dateFrom`/`dateTo` to scope the request.
+
+**`upload` with binary content fails** — The `content` parameter is a string. For binary payloads, stage the file elsewhere (a previously uploaded file in WebDAV, a public URL, etc.) and use `copy` or an out-of-band upload. The MCP server does not currently accept base64-encoded `content`.
+
+**Trailing slashes** — Some WebDAV servers are strict about trailing slashes on directories. If a directory listing returns 404, retry with a trailing `/`.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="WebDAV (RFC 4918)" icon="book" href="https://datatracker.ietf.org/doc/html/rfc4918">
+    Official WebDAV protocol specification
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/create-agents/tool-agents/overview">
+    Build AI agents that call MCP tools dynamically
+  </Card>
+</CardGroup>

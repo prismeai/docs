@@ -1,0 +1,653 @@
+---
+title: 'Google Docs'
+description: 'Create, read and edit Google Docs from Prisme.ai workflows and AI agents'
+---
+
+<img
+  src="/images/connectors/google-docs.svg"
+  alt="Google Docs"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The Google Docs app provides read/write access to a user's Google Docs documents through the [Docs API v1](https://developers.google.com/docs/api/reference/rest). It can be used either as a Builder app (automations call Docs instructions directly) or as a remote MCP server consumed by an AI agent. Each tenant configures its own Google OAuth Application; end-users sign in with their own Google account and tokens are stored per (user × tenant). The connector exposes 2 base Docs operations plus ~30 atomic editing operations — each wraps a single `batchUpdate` request — grouped into 9 entity tools covering documents, text, paragraphs, tables, document style, headers/footers, media, named ranges and raw batch.
+
+<CardGroup cols={3}>
+  <Card title="Documents & Text" icon="file-lines">
+    Create, retrieve, insert, delete, replace and style text across a Google Doc
+  </Card>
+  <Card title="Structure & Tables" icon="table">
+    Manage paragraphs, bullets, tables, columns/rows, headers, footers, footnotes and document style
+  </Card>
+  <Card title="Media & Named Ranges" icon="image">
+    Insert and replace inline images, manage positioned objects, page breaks and named ranges
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- A **Google account** with access to the documents you want to expose. For Google Workspace, the workspace admin may need to allow third-party OAuth apps.
+- A **Google Cloud project** with the **Google Docs API enabled** at [console.cloud.google.com/apis/library/docs.googleapis.com](https://console.cloud.google.com/apis/library/docs.googleapis.com). Enable the **Drive API** too if you plan to locate documents via the Google Drive connector.
+- A **Google OAuth 2.0 Client** of type **Web application**, created at [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials). The **Authorized redirect URIs** must contain the value shown in the `OAuth Callback URL` field of the installed app instance (auto-populated on install — copy it back into the Google Cloud Console after installation).
+- An **OAuth consent screen** configured in the Google Cloud project. While the app is in *Testing* state, add the end-user's email to **Test users**. The default scopes `documents` + `drive.file` go through Google's verification process when the consent screen moves to *Production*.
+- Base URL (default: `https://docs.googleapis.com/v1`)
+
+<Note>
+  The Google Docs API cannot list or search documents. To find documents or obtain a `documentId`, use the **Google Drive** connector — filter `mimeType = application/vnd.google-apps.document` — then call `documents.get` here.
+</Note>
+
+---
+
+<Tabs>
+  <Tab title="Usage as App">
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **Google Docs** and install it
+    3. Open the app instance configuration and fill in the required fields
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Google Docs API Base URL** | Base URL of the Docs API (default `https://docs.googleapis.com/v1`) |
+    | **Google OAuth Access Token (fallback)** | Optional static OAuth access token used as a shared fallback for all users of this tenant. Stored as a workspace secret. Most deployments leave this empty and rely on per-user OAuth instead. |
+    | **Google OAuth2 Client ID** | Google OAuth Application Client ID. Create an OAuth client of type *Web application* in the Google Cloud Console |
+    | **Google OAuth2 Client Secret** | Google OAuth Client Secret, stored as a workspace secret |
+    | **OAuth Callback URL** | Auto-populated on install — paste this value into the *Authorized redirect URIs* list of your Google OAuth client |
+    | **OAuth Authorize URL** | Default `https://accounts.google.com/o/oauth2/v2/auth` |
+    | **OAuth Token URL** | Default `https://oauth2.googleapis.com/token` |
+    | **OAuth Revoke URL** | Default `https://oauth2.googleapis.com/revoke` |
+    | **OAuth Scopes** | Space-separated Google API scopes. Default `https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file` |
+    | **Access Token TTL (seconds)** | Default 3600 (Google access tokens expire in 1h; refresh is automatic) |
+    | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this instance |
+    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header. Do not modify |
+
+    <Note>
+      `MCP Endpoint`, `MCP API Key` and `OAuth Callback URL` are generated automatically by the `onInstall` flow. The OAuth credentials (`Google OAuth2 Client ID`, `Google OAuth2 Client Secret`) must be filled in manually after creating the OAuth client in the Google Cloud Console.
+    </Note>
+
+    ### Authorize end-users
+
+    Once the app instance is configured, each end-user authorizes their own Google account through a browser-based consent screen:
+
+    <Steps>
+      <Step title="Trigger the connect flow">
+        From an MCP client (Agent Creator capability or any tool client), call any data tool. If no OAuth session exists for the current user × tenant, the MCP server returns a `connector_auth_required` payload with a `connect_url`. Alternatively, call the `connect` tool explicitly to receive the same payload.
+      </Step>
+      <Step title="Open the connect URL">
+        Open the returned URL in a browser tab where the user is already authenticated to Prisme.ai. The platform redirects to the Google OAuth consent screen.
+      </Step>
+      <Step title="Grant access">
+        The user reviews the requested scopes (default `documents` + `drive.file`) and clicks *Allow*. Google redirects back to the platform's `oauthCallback` webhook.
+      </Step>
+      <Step title="Confirmation">
+        The user sees a *Connection complete* page and can close the tab. The platform has stored an access token plus refresh token as user-scoped secrets — both are tenant-prefixed so they do not leak across app instances.
+      </Step>
+    </Steps>
+
+    <Warning>
+      Each user's OAuth tokens are scoped per (user × tenant). A user who has authorized in tenant A does not gain access in tenant B — they must run the connect flow again per app instance. Access tokens are refreshed automatically from the stored refresh token.
+    </Warning>
+
+    ## Available Instructions
+
+    Every instruction resolves credentials from the workspace configuration. All editing operations target a single `documentId` (obtained either from `createDocument` or via the Google Drive connector). Editing instructions internally wrap a single `batchUpdate` request; use `batchUpdate` directly to compose multiple changes in one atomic call.
+
+    ### Documents
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `createDocument` | `title`* |
+    | `getDocument` | `documentId`*, `suggestionsViewMode`, `includeTabsContent` |
+
+    ### Text
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `insertText` | `documentId`*, `text`*, `location`, `endOfSegmentLocation` |
+    | `deleteContentRange` | `documentId`*, `range`* |
+    | `replaceAllText` | `documentId`*, `containsText`*, `replaceText`*, `tabsCriteria` |
+    | `updateTextStyle` | `documentId`*, `textStyle`*, `fields`*, `range`* |
+
+    ### Paragraphs
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `createParagraphBullets` | `documentId`*, `range`*, `bulletPreset`* |
+    | `deleteParagraphBullets` | `documentId`*, `range`* |
+    | `updateParagraphStyle` | `documentId`*, `paragraphStyle`*, `fields`*, `range`* |
+
+    ### Tables
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `insertTable` | `documentId`*, `rows`*, `columns`*, `location`, `endOfSegmentLocation` |
+    | `insertTableRow` | `documentId`*, `tableCellLocation`*, `insertBelow` |
+    | `insertTableColumn` | `documentId`*, `tableCellLocation`*, `insertRight` |
+    | `deleteTableRow` | `documentId`*, `tableCellLocation`* |
+    | `deleteTableColumn` | `documentId`*, `tableCellLocation`* |
+    | `mergeTableCells` | `documentId`*, `tableRange`* |
+    | `unmergeTableCells` | `documentId`*, `tableRange`* |
+    | `pinTableHeaderRows` | `documentId`*, `tableStartLocation`*, `pinnedHeaderRowsCount`* |
+    | `updateTableCellStyle` | `documentId`*, `tableCellStyle`*, `fields`*, `tableRange`, `tableStartLocation` |
+    | `updateTableColumnProperties` | `documentId`*, `tableStartLocation`*, `columnIndices`*, `tableColumnProperties`*, `fields`* |
+    | `updateTableRowStyle` | `documentId`*, `tableStartLocation`*, `rowIndices`*, `tableRowStyle`*, `fields`* |
+
+    ### Document Style
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `updateDocumentStyle` | `documentId`*, `documentStyle`*, `fields`* |
+    | `updateSectionStyle` | `documentId`*, `range`*, `sectionStyle`*, `fields`* |
+
+    ### Headers, Footers & Footnotes
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `createHeader` | `documentId`*, `type`*, `sectionBreakLocation` |
+    | `createFooter` | `documentId`*, `type`*, `sectionBreakLocation` |
+    | `createFootnote` | `documentId`*, `location`, `endOfSegmentLocation` |
+    | `deleteHeader` | `documentId`*, `headerId`* |
+    | `deleteFooter` | `documentId`*, `footerId`* |
+
+    ### Media
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `insertInlineImage` | `documentId`*, `uri`*, `objectSize`, `location`, `endOfSegmentLocation` |
+    | `replaceImage` | `documentId`*, `imageObjectId`*, `uri`*, `imageReplaceMethod` |
+    | `insertPageBreak` | `documentId`*, `location`, `endOfSegmentLocation` |
+    | `deletePositionedObject` | `documentId`*, `objectId`* |
+    | `updateEmbeddedObjectPosition` | `documentId`*, `objectId`*, `newPosition`*, `fields`* |
+
+    ### Named Ranges
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `createNamedRange` | `documentId`*, `name`*, `range`* |
+    | `deleteNamedRange` | `documentId`*, `namedRangeId`, `name`, `tabsCriteria` |
+    | `replaceNamedRangeContent` | `documentId`*, `text`*, `namedRangeId`, `namedRangeName`, `tabsCriteria` |
+
+    ### Batch
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `batchUpdate` | `documentId`*, `requests`*, `writeControl` |
+
+    <Note>
+      Arguments flagged with `*` are required.
+    </Note>
+
+    ## DSUL Examples
+
+    ### Create a Doc and populate it with a title + intro
+
+    ```yaml
+    - Google Docs.documents:
+        action: create
+        title: '{{report.name}} — {{run.date}}'
+        output: created
+    - Google Docs.text:
+        action: insert
+        documentId: '{{created.documentId}}'
+        text: 'Executive summary'
+        location:
+          index: 1
+    - Google Docs.paragraphs:
+        action: updateStyle
+        documentId: '{{created.documentId}}'
+        paragraphStyle:
+          namedStyleType: HEADING_1
+        fields: namedStyleType
+        range:
+          startIndex: 1
+          endIndex: 18
+    ```
+
+    ### Replace placeholders across an existing template
+
+    ```yaml
+    - Google Docs.text:
+        action: replaceAll
+        documentId: '{{templateDocId}}'
+        containsText:
+          text: '{{{{customer_name}}}}'
+          matchCase: false
+        replaceText: '{{customer.name}}'
+    - Google Docs.text:
+        action: replaceAll
+        documentId: '{{templateDocId}}'
+        containsText:
+          text: '{{{{order_total}}}}'
+        replaceText: '{{order.total}} €'
+    ```
+
+    ### Insert a 3×4 table and merge the header row
+
+    ```yaml
+    - Google Docs.tables:
+        action: insert
+        documentId: '{{docId}}'
+        rows: 4
+        columns: 3
+        endOfSegmentLocation: {}
+    - Google Docs.tables:
+        action: merge
+        documentId: '{{docId}}'
+        tableRange:
+          tableCellLocation:
+            tableStartLocation:
+              index: 200
+            rowIndex: 0
+            columnIndex: 0
+          rowSpan: 1
+          columnSpan: 3
+    ```
+
+    ### Build a multi-step report atomically with `batchUpdate`
+
+    ```yaml
+    - Google Docs.batch:
+        action: update
+        documentId: '{{docId}}'
+        requests:
+          - insertText:
+              text: 'Q2 Results\n'
+              location:
+                index: 1
+          - updateParagraphStyle:
+              paragraphStyle:
+                namedStyleType: HEADING_1
+              fields: namedStyleType
+              range:
+                startIndex: 1
+                endIndex: 11
+          - insertPageBreak:
+              endOfSegmentLocation: {}
+    ```
+  </Tab>
+
+  <Tab title="Usage as MCP">
+    The Google Docs app ships with a built-in MCP server. Each app instance gets its own signed `mcp-api-key` that encodes the workspace ID and a credentials lookup URL — the Google Docs API token itself is never passed through headers and is resolved server-side from the app configuration plus the per-user OAuth session.
+
+    ## Plug into an Agent Creator capability
+
+    Agents consume MCP servers directly through **Agent Creator** capabilities. This is the preferred way to expose Google Docs to an agent.
+
+    <Steps>
+      <Step title="Create or open a workspace">
+        From the Prisme.ai console, create a new workspace (or open the one that will host the connector).
+      </Step>
+      <Step title="Install the Google Docs app">
+        Open the workspace **Imports** panel, search for **Google Docs** and install it.
+      </Step>
+      <Step title="Configure the credentials">
+        Open the freshly installed app instance settings and fill in the OAuth Client ID and Client Secret (see the *Usage as App* tab for the field-by-field reference).
+      </Step>
+      <Step title="Copy the MCP endpoint and API key">
+        Still on the app instance configuration page, copy the values of **MCP Endpoint** and **MCP API Key** — both are generated automatically on install.
+      </Step>
+      <Step title="Open Agent Creator">
+        Switch to **Agent Creator** and open the agent you want to extend.
+      </Step>
+      <Step title="Add a capability">
+        Add a new capability to the agent:
+
+        - **If a dedicated Google Docs capability exists** — select it and paste the **MCP API Key** into the `mcp-api-key` field. The server URL is already wired.
+        - **Otherwise** — select the generic **`custom_mcp`** capability, paste the **MCP Endpoint** into the *Server URL* field, then open the *Headers* field and add an `mcp-api-key` entry whose value is the **MCP API Key** copied earlier:
+
+          ```json
+          {
+            "mcp-api-key": "your-mcp-api-key"
+          }
+          ```
+      </Step>
+      <Step title="Save">
+        The agent now has access to every Google Docs tool exposed by the MCP server.
+      </Step>
+      <Step title="Brief the agent in its system prompt">
+        Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+
+        ```text
+        You have access to the Google Docs MCP server. Use it whenever the user asks you to write, edit or read a Google Doc — creating documents, inserting or replacing text, building tables, applying styles, adding headers/footers, or stamping templated reports. The first call may return a connect_url asking the user to authorize their Google account; relay it as-is. The Docs API cannot list documents — if the user references "their docs" without an ID, pair this with the Google Drive MCP. Always confirm with the user before any destructive change (delete content, replaceAll on a live doc, delete header/footer).
+        ```
+
+        Refine the trigger keywords (resource names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
+      </Step>
+    </Steps>
+
+    ## Legacy MCP Install (Advanced > Tools)
+
+    Use this flow to plug the Google Docs MCP into an AI Knowledge agent that does not yet support the native MCP picker.
+
+    <Steps>
+      <Step title="Install the Google Docs app">
+        Install and configure the app in the same workspace as your agent (see the *Usage as App* tab). Once configured, `mcpEndpoint` and `mcpApiKey` are auto-populated.
+      </Step>
+      <Step title="Copy the MCP credentials">
+        Open the app instance config and copy the values of **MCP Endpoint** and **MCP API Key**.
+      </Step>
+      <Step title="Open your AI Knowledge project">
+        Navigate to **Advanced > Tools**.
+      </Step>
+      <Step title="Add an MCP tool">
+        Click **Add** and select the **MCP** tab.
+      </Step>
+      <Step title="Fill in the endpoint">
+        Paste the **MCP Endpoint** URL copied from the app instance.
+      </Step>
+      <Step title="Add the auth header">
+        In the **Headers** field, add the signed API key:
+
+        ```json
+        {
+          "mcp-api-key": "your-mcp-api-key"
+        }
+        ```
+      </Step>
+      <Step title="Save">
+        The agent can now list and call Google Docs tools through the MCP endpoint.
+      </Step>
+    </Steps>
+
+    <Note>
+      The signed `mcp-api-key` encodes the workspace ID and the `getConfig` webhook URL. The MCP server validates the signature using the central app secret and transparently fetches the OAuth client credentials and base URL from the installed app, then resolves the calling user's stored Google access token. Credentials are cached per tenant for 10 minutes; user OAuth tokens are refreshed on demand.
+    </Note>
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` parameter that controls the MCP response shape:
+
+    - **`verbose`** (default) — human-readable text for LLM consumption
+    - **`structured`** — machine-readable JSON in `structuredContent`
+    - **`both`** — both text and structured content
+
+    ## Available Tools
+
+    The MCP server exposes 9 entity-level tools (each with an `action` argument to select the operation) plus the 2 generic OAuth tools.
+
+    ### `documents`
+
+    | Action | Description |
+    |--------|-------------|
+    | `create` | Create a blank Google Doc with a given title |
+    | `get` | Retrieve a Doc (body, styles, named ranges, tabs content) |
+
+    ### `text`
+
+    | Action | Description |
+    |--------|-------------|
+    | `insert` | Insert text at a location or at end of segment |
+    | `delete` | Delete content between two indexes |
+    | `replaceAll` | Replace every match of a string with a new value across the document |
+    | `updateStyle` | Update text style on a range (bold, italic, fontSize, color, link, …) |
+
+    ### `paragraphs`
+
+    | Action | Description |
+    |--------|-------------|
+    | `createBullets` | Add bullets to one or more paragraphs |
+    | `deleteBullets` | Remove bullets from paragraphs |
+    | `updateStyle` | Update paragraph-level style (alignment, headingId, indent, spacing) |
+
+    ### `tables`
+
+    | Action | Description |
+    |--------|-------------|
+    | `insert` | Insert a table with given rows and columns |
+    | `insertRow` | Insert a row above/below a table cell |
+    | `insertColumn` | Insert a column left/right of a table cell |
+    | `deleteRow` | Delete a table row |
+    | `deleteColumn` | Delete a table column |
+    | `merge` | Merge a rectangular range of table cells |
+    | `unmerge` | Unmerge previously merged table cells |
+    | `pinHeaderRows` | Configure how many header rows are pinned |
+    | `updateCellStyle` | Update style of one or more cells (background, borders, padding) |
+    | `updateColumnProperties` | Update table column properties (e.g. width) |
+    | `updateRowStyle` | Update style of one or more rows (min height, header rows) |
+
+    ### `documentStyle`
+
+    | Action | Description |
+    |--------|-------------|
+    | `update` | Update document-level style (page size, margins, page numbers) |
+    | `updateSection` | Update style of a section (columns, page size override) |
+
+    ### `headersFooters`
+
+    | Action | Description |
+    |--------|-------------|
+    | `createHeader` | Create a new header (default or first-page-header) |
+    | `createFooter` | Create a new footer (default or first-page-footer) |
+    | `createFootnote` | Create a footnote at a location |
+    | `deleteHeader` | Delete a header by ID |
+    | `deleteFooter` | Delete a footer by ID |
+
+    ### `media`
+
+    | Action | Description |
+    |--------|-------------|
+    | `insertImage` | Insert an inline image at a location from a public URL |
+    | `replaceImage` | Replace the source of an existing image by its `objectId` |
+    | `insertPageBreak` | Insert a page break at a location |
+    | `deletePositioned` | Delete a positioned object (floating image, drawing) |
+    | `updatePosition` | Move or resize a positioned object |
+
+    ### `namedRanges`
+
+    | Action | Description |
+    |--------|-------------|
+    | `create` | Create a named range over an existing text range |
+    | `delete` | Delete a named range by ID or by name |
+    | `replaceContent` | Replace the textual content within a named range |
+
+    ### `batch`
+
+    | Action | Description |
+    |--------|-------------|
+    | `update` | Apply multiple Doc updates in one atomic `batchUpdate` request |
+
+    ### OAuth Session
+
+    | Tool | Description |
+    |------|-------------|
+    | `connect` | Initiate an OAuth connection to Google Docs. Returns a `connect_url` for the user to click. Prefer calling data tools directly — they auto-handle authentication. |
+    | `disconnect` | Disconnect the current Google Docs OAuth session and revoke the access token (RFC 7009) |
+
+    ## Tool Details
+
+    ### `documents` (action: `create`)
+
+    ```json
+    {
+      "name": "documents",
+      "arguments": {
+        "action": "create",
+        "title": "Q2 financial report"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `create` |
+    | `title` | ✓ | Document title (max 255 chars) |
+
+    The response includes the newly-created `documentId`, which is then used by every editing tool.
+
+    ### `text` (action: `insert`)
+
+    ```json
+    {
+      "name": "text",
+      "arguments": {
+        "action": "insert",
+        "documentId": "1abcdEF...",
+        "text": "Executive summary\n",
+        "location": { "index": 1 }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `insert` |
+    | `documentId` | ✓ | Target document |
+    | `text` | ✓ | The text to insert |
+    | `location` | – | `{ index }` — character offset where the text is inserted |
+    | `endOfSegmentLocation` | – | Use to append to the end of the body, a header, footer or footnote |
+
+    <Warning>
+      Indexes in Google Docs are 1-based and refer to UTF-16 code units inside a segment. Inserting changes downstream indexes — when chaining multiple inserts, prefer `batchUpdate` with explicit indexes computed up-front, or insert in reverse order.
+    </Warning>
+
+    ### `text` (action: `replaceAll`)
+
+    ```json
+    {
+      "name": "text",
+      "arguments": {
+        "action": "replaceAll",
+        "documentId": "1abcdEF...",
+        "containsText": {
+          "text": "{{customer_name}}",
+          "matchCase": false
+        },
+        "replaceText": "Acme Corp"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `replaceAll` |
+    | `documentId` | ✓ | Target document |
+    | `containsText` | ✓ | `{ text, matchCase }` — the substring to match |
+    | `replaceText` | ✓ | The replacement value |
+    | `tabsCriteria` | – | Restrict the replacement to specific tab IDs |
+
+    ### `tables` (action: `insert`)
+
+    ```json
+    {
+      "name": "tables",
+      "arguments": {
+        "action": "insert",
+        "documentId": "1abcdEF...",
+        "rows": 4,
+        "columns": 3,
+        "endOfSegmentLocation": {}
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `insert` |
+    | `documentId` | ✓ | Target document |
+    | `rows` | ✓ | Number of rows (≥1) |
+    | `columns` | ✓ | Number of columns (≥1) |
+    | `location` | – | Insert at a specific index |
+    | `endOfSegmentLocation` | – | Insert at the end of the body / header / footer |
+
+    ### `media` (action: `insertImage`)
+
+    ```json
+    {
+      "name": "media",
+      "arguments": {
+        "action": "insertImage",
+        "documentId": "1abcdEF...",
+        "uri": "https://example.com/charts/q2.png",
+        "objectSize": {
+          "width":  { "magnitude": 400, "unit": "PT" },
+          "height": { "magnitude": 240, "unit": "PT" }
+        },
+        "endOfSegmentLocation": {}
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `insertImage` |
+    | `documentId` | ✓ | Target document |
+    | `uri` | ✓ | Publicly accessible image URL (Google fetches and re-hosts the image) |
+    | `objectSize` | – | `{ width, height }` with `magnitude` + `unit: PT` |
+    | `location` | – | Insert at a specific index |
+    | `endOfSegmentLocation` | – | Insert at the end of a segment |
+
+    ### `batch` (action: `update`)
+
+    ```json
+    {
+      "name": "batch",
+      "arguments": {
+        "action": "update",
+        "documentId": "1abcdEF...",
+        "requests": [
+          { "insertText": { "text": "Q2 results\n", "location": { "index": 1 } } },
+          { "updateParagraphStyle": {
+              "paragraphStyle": { "namedStyleType": "HEADING_1" },
+              "fields": "namedStyleType",
+              "range": { "startIndex": 1, "endIndex": 11 }
+            }
+          },
+          { "insertPageBreak": { "endOfSegmentLocation": {} } }
+        ]
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `update` |
+    | `documentId` | ✓ | Target document |
+    | `requests` | ✓ | Ordered list of [Docs `Request` objects](https://developers.google.com/docs/api/reference/rest/v1/documents/request) applied atomically |
+    | `writeControl` | – | `{ requiredRevisionId, targetRevisionId }` for optimistic concurrency |
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+| HTTP Status | Meaning | Typical Cause |
+|-------------|---------|----------------|
+| `400` | Bad Request | Malformed request, invalid `Range`/`Location`, conflicting `requests` in a batch |
+| `401` | Unauthorized | Missing / expired OAuth token, revoked refresh token, user has not connected yet |
+| `403` | Forbidden | Docs API disabled in the Google Cloud project, scope insufficient, user lost access to the document |
+| `404` | Not Found | Document does not exist or the user has no access (most often the latter) |
+| `409` | Conflict | Optimistic concurrency failure via `writeControl.requiredRevisionId` |
+| `429` | Rate Limited | Per-user or per-project quota exhausted. Back off and retry |
+| `500` / `503` | Server Error | Transient Google Docs API error. Retry with exponential backoff |
+
+### Common Issues
+
+**"Not configured"** — The app instance has no OAuth Client ID/Secret. Create an OAuth client in the Google Cloud Console and paste the credentials into the app configuration.
+
+**"Invalid API key" (MCP)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
+
+**"Credentials lookup failed"** — The MCP endpoint could not reach the `getConfig` webhook of the installed app. Verify that the app instance is still installed in the expected workspace.
+
+**`connector_auth_required`** — The calling user has no Google OAuth session yet for this tenant. The response payload includes a `connect_url`; relay it to the user so they can authorize their Google account.
+
+**`redirect_uri_mismatch`** during the OAuth dance — The value of `OAuth Callback URL` in the app config has not been added to the **Authorized redirect URIs** of the Google OAuth client. Copy it back into the Google Cloud Console and retry.
+
+**`The user does not have sufficient permissions for file …` (403)** — The default scope `drive.file` only grants access to files the user *created with the app* or *opened with the app*. To work with arbitrary user documents, broaden the scope to `https://www.googleapis.com/auth/documents.readonly` + `drive.readonly` (read-only) or `documents` + `drive` (full Drive). Broader scopes require Google verification before going to production.
+
+**"No documentId" / cannot list documents** — The Google Docs API does not expose a list/search endpoint. Pair this connector with the **Google Drive** connector to enumerate documents (`mimeType = application/vnd.google-apps.document`), then call `documents.get` with the returned IDs.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="Google Docs API v1" icon="book" href="https://developers.google.com/docs/api/reference/rest">
+    Official Google Docs REST API reference
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/create-agents/tool-agents/overview">
+    Build AI agents that call MCP tools dynamically
+  </Card>
+</CardGroup>

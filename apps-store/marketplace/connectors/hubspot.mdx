@@ -1,0 +1,732 @@
+---
+title: 'HubSpot'
+description: 'Manage HubSpot CRM and Marketing data from Prisme.ai workflows and AI agents'
+---
+
+<img
+  src="/images/connectors/hubspot.png"
+  alt="HubSpot"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The HubSpot app provides read/write access to a HubSpot portal through the [HubSpot REST API](https://developers.hubspot.com/docs/api/overview). It can be used either as a Builder app (automations call HubSpot instructions directly) or as a remote MCP server consumed by an AI agent. Each tenant authenticates either with a **Private App token (PAT)** — shared across all users of the tenant — or via **per-user OAuth 2.0** (authorization-code with PKCE). The connector exposes ~120 operations grouped into 18 entity tools covering the CRM (contacts, companies, deals, tickets, engagements, associations, pipelines, properties, owners, lists) and the Marketing layer (forms, marketing emails, workflows, files).
+
+<CardGroup cols={3}>
+  <Card title="CRM Records" icon="address-book">
+    Contacts, companies, deals and tickets with list/search/get/create/update/archive plus batch and merge operations
+  </Card>
+  <Card title="Engagements & Pipelines" icon="diagram-project">
+    Notes, tasks, calls, emails and meetings; pipelines and stages; properties and property groups; owners and lists
+  </Card>
+  <Card title="Marketing" icon="bullhorn">
+    Forms, transactional and marketing emails, workflows enrollment, and the Files Manager
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- A **HubSpot account** with access to the portal you want to expose, and an admin who can create Private Apps or OAuth applications.
+- One of:
+  - A **Private App token (PAT)** — created at *Settings → Integrations → Private Apps* (`https://app.hubspot.com/private-apps/<portal-id>`). Quickest setup, shared across all users of this tenant.
+  - A **HubSpot OAuth Application** — created at [app.hubspot.com/l/developer](https://app.hubspot.com/l/developer) (Developer account → *Create app* → *Auth*). The **Redirect URI** must match the value shown in the `OAuth Callback URL` field of the installed app instance (auto-populated on install — copy it back into the HubSpot developer console after installation). Per-user authorization; ideal when actions must be attributed to the end-user.
+- Whichever auth method you choose, make sure the **selected scopes** cover the resources you intend to read/write (`crm.objects.contacts.*`, `crm.objects.companies.*`, `tickets`, `content`, `automation`, `forms`, `files`, etc.).
+- Base URL (default: `https://api.hubapi.com`)
+
+<Note>
+  HubSpot has no standard RFC 7009 revocation endpoint. The `disconnect` tool deletes the platform-stored tokens but cannot revoke them at HubSpot — refresh tokens may still be valid until they naturally expire (typically 6 months idle).
+</Note>
+
+---
+
+<Tabs>
+  <Tab title="Usage as App">
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **HubSpot** and install it
+    3. Open the app instance configuration and fill in either the PAT or the OAuth client credentials
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **HubSpot API Base URL** | Base URL of the HubSpot API (default `https://api.hubapi.com`) |
+    | **HubSpot Private App Token (PAT)** | Private App access token. Optional when using OAuth. Stored as a workspace secret |
+    | **OAuth2 Client ID** | HubSpot OAuth Application Client ID, stored as a workspace secret |
+    | **OAuth2 Client Secret** | HubSpot OAuth Application Client Secret, stored as a workspace secret |
+    | **OAuth Callback URL** | Auto-populated on install — paste this value into the *Redirect URI* field of your HubSpot OAuth app |
+    | **OAuth Authorize URL** | Default `https://app.hubspot.com/oauth/authorize` |
+    | **OAuth Token URL** | Default `https://api.hubapi.com/oauth/v1/token` |
+    | **OAuth Revoke URL** | HubSpot does not expose RFC 7009 revocation. Leave empty |
+    | **OAuth Scopes** | Space-separated HubSpot scopes. Default covers CRM + Marketing read/write. See [HubSpot OAuth scopes](https://developers.hubspot.com/docs/api/working-with-oauth#scopes) |
+    | **Refresh Token TTL (seconds)** | How long the refresh token is kept in user-scoped secrets. Default 7200 (2h) |
+    | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this instance |
+    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header. Do not modify |
+
+    <Note>
+      `MCP Endpoint`, `MCP API Key` and `OAuth Callback URL` are generated automatically by the `onInstall` flow. Either fill in the PAT *or* the OAuth credentials — if both are present, the per-user OAuth session takes precedence and the PAT is used only as a fallback.
+    </Note>
+
+    ### Authorize end-users (OAuth mode)
+
+    When the tenant uses OAuth, each end-user authorizes their own HubSpot account through a browser-based consent screen:
+
+    <Steps>
+      <Step title="Trigger the connect flow">
+        From an MCP client (Agent Creator capability or any tool client), call any data tool. If no OAuth session exists for the current user × tenant, the MCP server returns a `connector_auth_required` payload with a `connect_url`. Alternatively, call the `connect` tool explicitly.
+      </Step>
+      <Step title="Open the connect URL">
+        Open the returned URL in a browser tab where the user is already authenticated to Prisme.ai. The platform redirects to the HubSpot consent screen.
+      </Step>
+      <Step title="Grant access">
+        The user reviews the requested scopes and clicks *Connect app*. HubSpot redirects back to the platform's `oauthCallback` webhook.
+      </Step>
+      <Step title="Confirmation">
+        The user sees a *Connection complete* page and can close the tab. The platform has stored an access token plus refresh token as user-scoped secrets — both are tenant-prefixed so they do not leak across app instances.
+      </Step>
+    </Steps>
+
+    <Warning>
+      Each user's OAuth tokens are scoped per (user × tenant). A user who has authorized in tenant A does not gain access in tenant B — they must run the connect flow again per app instance.
+    </Warning>
+
+    ## Available Instructions
+
+    Every instruction resolves credentials from the workspace configuration. CRM list operations accept `limit` (default 100) and `after` for cursor pagination, plus `properties` to request specific fields. Most CRM tools accept an optional `objectType` to override the default object type — useful for custom objects.
+
+    ### Contacts
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listContacts` | `limit`, `after`, `properties`, `propertiesWithHistory`, `associations`, `archived` |
+    | `getContact` | `contactId`*, `properties`, `propertiesWithHistory`, `associations`, `archived`, `idProperty` |
+    | `createContact` | `properties`*, `associations` |
+    | `updateContact` | `contactId`*, `properties`*, `idProperty` |
+    | `archiveContact` | `contactId`* |
+    | `searchContacts` | `filterGroups`, `sorts`, `query`, `properties`, `limit`, `after` |
+    | `mergeContacts` | `primaryObjectId`*, `objectIdToMerge`* |
+    | `batchReadContacts` | `inputs`*, `properties`, `propertiesWithHistory`, `idProperty` |
+    | `batchCreateContacts` | `inputs`* |
+    | `batchUpdateContacts` | `inputs`* |
+    | `batchArchiveContacts` | `inputs`* |
+
+    ### Companies
+
+    Same shape as contacts: `listCompanies`, `getCompany`, `createCompany`, `updateCompany`, `archiveCompany`, `searchCompanies`, `mergeCompanies`, `batchReadCompanies`, `batchCreateCompanies`, `batchUpdateCompanies`, `batchArchiveCompanies`.
+
+    ### Deals
+
+    Same shape as contacts: `listDeals`, `getDeal`, `createDeal`, `updateDeal`, `archiveDeal`, `searchDeals`, `mergeDeals`, `batchReadDeals`, `batchCreateDeals`, `batchUpdateDeals`, `batchArchiveDeals`.
+
+    ### Tickets
+
+    `listTickets`, `getTicket`, `createTicket`, `updateTicket`, `archiveTicket`, `searchTickets`, `batchReadTickets`, `batchCreateTickets`, `batchUpdateTickets`, `batchArchiveTickets` *(no merge)*.
+
+    ### Associations
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listAssociations` | `fromObjectType`*, `fromObjectId`*, `toObjectType`*, `after`, `limit` |
+    | `createAssociation` | `fromObjectType`*, `fromObjectId`*, `toObjectType`*, `toObjectId`*, `associationCategory`, `associationTypeId` |
+    | `archiveAssociation` | `fromObjectType`*, `fromObjectId`*, `toObjectType`*, `toObjectId`* |
+
+    ### Engagements
+
+    Notes, tasks, calls, emails and meetings share the same shape: `list`, `get`, `create`, `update`, `archive`.
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listNotes` / `listTasks` / `listCalls` / `listEmails` / `listMeetings` | `limit`, `after`, `properties`, `associations`, `archived` |
+    | `getNote` / `getTask` / `getCall` / `getEmail` / `getMeeting` | `engagementId`*, `properties`, `associations`, `archived` |
+    | `createNote` / `createTask` / `createCall` / `createEmail` / `createMeeting` | `properties`*, `associations` |
+    | `updateNote` / `updateTask` / `updateCall` / `updateEmail` / `updateMeeting` | `engagementId`*, `properties`* |
+    | `archiveNote` / `archiveTask` / `archiveCall` / `archiveEmail` / `archiveMeeting` | `engagementId`* |
+
+    ### Pipelines
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listPipelines` | `objectType`* |
+    | `getPipeline` | `objectType`*, `pipelineId`* |
+    | `createPipeline` | `objectType`*, `label`*, `stages`*, `displayOrder` |
+    | `updatePipeline` | `objectType`*, `pipelineId`*, `label`, `stages`, `displayOrder` |
+    | `archivePipeline` | `objectType`*, `pipelineId`* |
+    | `listPipelineStages` | `objectType`*, `pipelineId`* |
+    | `getPipelineStage` | `objectType`*, `pipelineId`*, `stageId`* |
+    | `createPipelineStage` | `objectType`*, `pipelineId`*, `label`*, `metadata`, `displayOrder` |
+    | `updatePipelineStage` | `objectType`*, `pipelineId`*, `stageId`*, `label`, `metadata`, `displayOrder` |
+    | `archivePipelineStage` | `objectType`*, `pipelineId`*, `stageId`* |
+
+    ### Properties
+
+    `listProperties`, `getProperty`, `createProperty`, `updateProperty`, `archiveProperty`, `listPropertyGroups`, `createPropertyGroup`, `updatePropertyGroup`, `archivePropertyGroup`.
+
+    ### Owners
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listOwners` | `email`, `after`, `limit`, `archived` |
+    | `getOwner` | `ownerId`*, `idProperty` |
+
+    ### Lists
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `createList` | `name`*, `objectTypeId`*, `processingType`*, `filterBranch` |
+    | `getList` | `listId`*, `includeFilters` |
+    | `updateList` | `listId`*, `name` |
+    | `deleteList` | `listId`* |
+    | `searchLists` | `query`, `count`, `offset`, `processingTypes`, `additionalProperties` |
+    | `addMembers` | `listId`*, `recordIds`* |
+    | `removeMembers` | `listId`*, `recordIds`* |
+    | `getMemberships` | `listId`*, `after`, `limit` |
+
+    ### Forms
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listForms` | `after`, `limit`, `archived`, `formTypes` |
+    | `getForm` | `formId`*, `archived` |
+    | `createForm` | `name`*, `formType`*, `fieldGroups`, `configuration` |
+    | `updateForm` | `formId`*, `name`, `fieldGroups`, `configuration` |
+    | `archiveForm` | `formId`* |
+    | `submitForm` | `portalId`*, `formGuid`*, `fields`*, `context`, `legalConsentOptions` |
+
+    ### Marketing Emails
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listMarketingEmails` | `after`, `limit`, `archived`, `sort`, `name` |
+    | `getMarketingEmail` | `emailId`* |
+    | `createMarketingEmail` | `name`*, `subject`, `subscription`, `content` |
+    | `updateMarketingEmail` | `emailId`*, `name`, `subject`, `subscription`, `content` |
+    | `archiveMarketingEmail` | `emailId`* |
+    | `sendTransactional` | `emailId`*, `message`*, `contactProperties`, `customProperties` |
+
+    ### Workflows
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listWorkflows` | `limit`, `offset` |
+    | `getWorkflow` | `workflowId`* |
+    | `enrollContactInWorkflow` | `workflowId`*, `email`* |
+    | `unenrollContactFromWorkflow` | `workflowId`*, `email`* |
+
+    ### Files
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listFiles` | `after`, `limit`, `parentFolderId`, `parentFolderPath`, `name`, `extension` |
+    | `getFile` | `fileId`* |
+    | `getSignedUrl` | `fileId`*, `expirationSeconds`, `upscale` |
+    | `archiveFile` | `fileId`* |
+    | `importFromUrl` | `name`*, `url`*, `folderId`, `folderPath`, `access`, `duplicateValidationStrategy` |
+    | `listFolders` | `after`, `limit`, `parentFolderId`, `name` |
+    | `createFolder` | `name`*, `parentFolderId`, `parentPath` |
+    | `archiveFolder` | `folderId`* |
+
+    <Note>
+      Arguments flagged with `*` are required.
+    </Note>
+
+    ## DSUL Examples
+
+    ### Look up a contact by email
+
+    ```yaml
+    - Hubspot.contacts:
+        action: search
+        filterGroups:
+          - filters:
+              - propertyName: email
+                operator: EQ
+                value: '{{lead.email}}'
+        properties:
+          - email
+          - firstname
+          - lastname
+          - lifecyclestage
+        limit: 1
+        output: matched
+    ```
+
+    ### Create a deal and associate it to a company
+
+    ```yaml
+    - Hubspot.deals:
+        action: create
+        properties:
+          dealname: '{{opportunity.name}}'
+          amount: '{{opportunity.amount}}'
+          dealstage: 'appointmentscheduled'
+          pipeline: 'default'
+          closedate: '{{opportunity.closeDate}}'
+        associations:
+          - to:
+              id: '{{companyId}}'
+            types:
+              - associationCategory: HUBSPOT_DEFINED
+                associationTypeId: 5
+        output: created
+    ```
+
+    ### Add a contact to a static list
+
+    ```yaml
+    - Hubspot.lists:
+        action: addMembers
+        listId: '{{leadsListId}}'
+        recordIds:
+          - '{{contactId}}'
+    ```
+
+    ### Send a transactional email
+
+    ```yaml
+    - Hubspot.marketingEmails:
+        action: sendTransactional
+        emailId: '{{templateId}}'
+        message:
+          to: '{{lead.email}}'
+          from: 'noreply@acme.com'
+        contactProperties:
+          firstname: '{{lead.firstName}}'
+        customProperties:
+          orderId: '{{order.id}}'
+          orderTotal: '{{order.total}}'
+    ```
+
+    ### Bulk-import contacts
+
+    ```yaml
+    - Hubspot.contacts:
+        action: batchCreate
+        inputs:
+          - properties:
+              email: 'alice@acme.com'
+              firstname: 'Alice'
+              lastname: 'Doe'
+          - properties:
+              email: 'bob@acme.com'
+              firstname: 'Bob'
+              lastname: 'Smith'
+        output: batchResult
+    ```
+  </Tab>
+
+  <Tab title="Usage as MCP">
+    The HubSpot app ships with a built-in MCP server. Each app instance gets its own signed `mcp-api-key` that encodes the workspace ID and a credentials lookup URL — the HubSpot token itself is never passed through headers and is resolved server-side from the app configuration plus the optional per-user OAuth session.
+
+    ## Plug into an Agent Creator capability
+
+    Agents consume MCP servers directly through **Agent Creator** capabilities. This is the preferred way to expose HubSpot to an agent.
+
+    <Steps>
+      <Step title="Create or open a workspace">
+        From the Prisme.ai console, create a new workspace (or open the one that will host the connector).
+      </Step>
+      <Step title="Install the HubSpot app">
+        Open the workspace **Imports** panel, search for **HubSpot** and install it.
+      </Step>
+      <Step title="Configure the credentials">
+        Open the freshly installed app instance settings and fill in either the **Private App Token** or the OAuth Client ID/Secret (see the *Usage as App* tab for the field-by-field reference).
+      </Step>
+      <Step title="Copy the MCP endpoint and API key">
+        Still on the app instance configuration page, copy the values of **MCP Endpoint** and **MCP API Key** — both are generated automatically on install.
+      </Step>
+      <Step title="Open Agent Creator">
+        Switch to **Agent Creator** and open the agent you want to extend.
+      </Step>
+      <Step title="Add a capability">
+        Add a new capability to the agent:
+
+        - **If a dedicated HubSpot capability exists** — select it and paste the **MCP API Key** into the `mcp-api-key` field. The server URL is already wired.
+        - **Otherwise** — select the generic **`custom_mcp`** capability, paste the **MCP Endpoint** into the *Server URL* field, then open the *Headers* field and add an `mcp-api-key` entry whose value is the **MCP API Key** copied earlier:
+
+          ```json
+          {
+            "mcp-api-key": "your-mcp-api-key"
+          }
+          ```
+      </Step>
+      <Step title="Save">
+        The agent now has access to every HubSpot tool exposed by the MCP server.
+      </Step>
+      <Step title="Brief the agent in its system prompt">
+        Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+
+        ```text
+        You have access to the HubSpot MCP server. Use it whenever the user asks about CRM data — contacts, companies, deals, tickets, engagements, pipelines or marketing assets (forms, emails, workflows). Always prefer `*.search` over `*.list` for filtered lookups. For batch work, use `batchRead/Create/Update/Archive` instead of looping individual calls. When OAuth is enabled, the first call may return a connect_url asking the user to authorize HubSpot; relay it as-is. Always confirm with the user before destructive actions (archive, delete, batchArchive, unenrollContact, removeMembers).
+        ```
+
+        Refine the trigger keywords (resource names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
+      </Step>
+    </Steps>
+
+    ## Legacy MCP Install (Advanced > Tools)
+
+    Use this flow to plug the HubSpot MCP into an AI Knowledge agent that does not yet support the native MCP picker.
+
+    <Steps>
+      <Step title="Install the HubSpot app">
+        Install and configure the app in the same workspace as your agent (see the *Usage as App* tab). Once configured, `mcpEndpoint` and `mcpApiKey` are auto-populated.
+      </Step>
+      <Step title="Copy the MCP credentials">
+        Open the app instance config and copy the values of **MCP Endpoint** and **MCP API Key**.
+      </Step>
+      <Step title="Open your AI Knowledge project">
+        Navigate to **Advanced > Tools**.
+      </Step>
+      <Step title="Add an MCP tool">
+        Click **Add** and select the **MCP** tab.
+      </Step>
+      <Step title="Fill in the endpoint">
+        Paste the **MCP Endpoint** URL copied from the app instance.
+      </Step>
+      <Step title="Add the auth header">
+        In the **Headers** field, add the signed API key:
+
+        ```json
+        {
+          "mcp-api-key": "your-mcp-api-key"
+        }
+        ```
+      </Step>
+      <Step title="Save">
+        The agent can now list and call HubSpot tools through the MCP endpoint.
+      </Step>
+    </Steps>
+
+    <Note>
+      The signed `mcp-api-key` encodes the workspace ID and the `getConfig` webhook URL. The MCP server validates the signature using the central app secret and transparently fetches the PAT or OAuth credentials from the installed app, then resolves the calling user's stored HubSpot access token (if OAuth) — otherwise it falls back to the tenant-wide PAT. Credentials are cached per tenant for 10 minutes.
+    </Note>
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` parameter that controls the MCP response shape:
+
+    - **`verbose`** (default) — human-readable text for LLM consumption
+    - **`structured`** — machine-readable JSON in `structuredContent`
+    - **`both`** — both text and structured content
+
+    ## Available Tools
+
+    The MCP server exposes 18 entity-level tools (each with an `action` argument to select the operation) plus the 2 generic OAuth tools.
+
+    ### `contacts` / `companies` / `deals`
+
+    These three CRM tools share the same set of actions.
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List records with pagination and property selection |
+    | `get` | Retrieve a single record by id (or by `idProperty`) |
+    | `create` | Create a record with properties and optional associations |
+    | `update` | Update a record by id |
+    | `archive` | Archive (soft-delete) a record |
+    | `search` | Full-text and structured search with filter groups, sorts and a `query` shortcut |
+    | `merge` | Merge two records into one (`primaryObjectId` ← `objectIdToMerge`) |
+    | `batchRead` | Read up to 100 records at once |
+    | `batchCreate` | Create up to 100 records in one call |
+    | `batchUpdate` | Update up to 100 records in one call |
+    | `batchArchive` | Archive up to 100 records in one call |
+
+    ### `tickets`
+
+    Same actions as the CRM trio above, minus `merge`.
+
+    ### `associations`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List associations from a record to a target object type |
+    | `create` | Create an association between two records |
+    | `archive` | Remove an association between two records |
+
+    ### `notes` / `tasks` / `calls` / `engagementEmails` / `meetings`
+
+    All five engagement tools share the same actions.
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List engagements |
+    | `get` | Retrieve a single engagement |
+    | `create` | Create an engagement, optionally with associations to CRM records |
+    | `update` | Update an engagement |
+    | `archive` | Archive an engagement |
+
+    ### `pipelines`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List pipelines for an object type |
+    | `get` | Retrieve a pipeline |
+    | `create` | Create a pipeline |
+    | `update` | Update a pipeline |
+    | `archive` | Archive a pipeline |
+    | `listStages` | List the stages of a pipeline |
+    | `getStage` | Retrieve a stage |
+    | `createStage` | Add a stage to a pipeline |
+    | `updateStage` | Update a stage |
+    | `archiveStage` | Archive a stage |
+
+    ### `properties`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List properties for an object type |
+    | `get` | Retrieve a property |
+    | `create` | Create a property |
+    | `update` | Update a property |
+    | `archive` | Archive a property |
+    | `listGroups` | List property groups for an object type |
+    | `createGroup` | Create a property group |
+    | `updateGroup` | Update a property group |
+    | `archiveGroup` | Archive a property group |
+
+    ### `owners`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List owners (optionally filter by email) |
+    | `get` | Retrieve an owner by id |
+
+    ### `lists`
+
+    | Action | Description |
+    |--------|-------------|
+    | `create` | Create a list |
+    | `get` | Retrieve a list (optionally with filters) |
+    | `update` | Rename a list |
+    | `delete` | Delete a list |
+    | `search` | Search lists by name and processing type |
+    | `addMembers` | Add records to a static list |
+    | `removeMembers` | Remove records from a static list |
+    | `getMemberships` | List the members of a list |
+
+    ### `forms`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List marketing forms |
+    | `get` | Retrieve a form |
+    | `create` | Create a form |
+    | `update` | Update a form |
+    | `archive` | Archive a form |
+    | `submit` | Submit values to a form on behalf of a visitor |
+
+    ### `marketingEmails`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List marketing emails |
+    | `get` | Retrieve a marketing email |
+    | `create` | Create a marketing email |
+    | `update` | Update a marketing email |
+    | `archive` | Archive a marketing email |
+    | `sendTransactional` | Send a transactional single-send email to a recipient |
+
+    ### `workflows`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List workflows |
+    | `get` | Retrieve a workflow |
+    | `enrollContact` | Enroll a contact in a workflow by email |
+    | `unenrollContact` | Unenroll a contact from a workflow by email |
+
+    ### `files`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List files |
+    | `get` | Retrieve file metadata |
+    | `getSignedUrl` | Create a signed URL to download a file |
+    | `archive` | Archive a file |
+    | `importFromUrl` | Import a file from a public URL |
+    | `listFolders` | List folders |
+    | `createFolder` | Create a folder |
+    | `archiveFolder` | Archive a folder |
+
+    ### OAuth Session
+
+    | Tool | Description |
+    |------|-------------|
+    | `connect` | Initiate an OAuth connection to HubSpot. Returns a `connect_url` for the user to click. Prefer calling data tools directly — they auto-handle authentication. |
+    | `disconnect` | Disconnect the current HubSpot OAuth session and delete the stored tokens (HubSpot has no RFC 7009 revocation endpoint) |
+
+    ## Tool Details
+
+    ### `contacts` (action: `search`)
+
+    ```json
+    {
+      "name": "contacts",
+      "arguments": {
+        "action": "search",
+        "filterGroups": [
+          {
+            "filters": [
+              { "propertyName": "email", "operator": "EQ", "value": "alice@acme.com" }
+            ]
+          }
+        ],
+        "properties": ["email", "firstname", "lastname", "lifecyclestage"],
+        "limit": 1
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `search` |
+    | `filterGroups` | – | Array of `{ filters: [{ propertyName, operator, value }] }`. Filters inside a group are AND'd; groups are OR'd |
+    | `sorts` | – | Array of `{ propertyName, direction }` |
+    | `query` | – | Free-text query alternative to `filterGroups` |
+    | `properties` | – | Properties to include in the response |
+    | `limit` | – | Page size (max 100) |
+    | `after` | – | Cursor from a previous response (`paging.next.after`) |
+
+    ### `deals` (action: `create`)
+
+    ```json
+    {
+      "name": "deals",
+      "arguments": {
+        "action": "create",
+        "properties": {
+          "dealname": "Acme — annual contract",
+          "amount": "120000",
+          "dealstage": "appointmentscheduled",
+          "pipeline": "default",
+          "closedate": "2026-09-30"
+        },
+        "associations": [
+          {
+            "to": { "id": "11223344" },
+            "types": [
+              { "associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 5 }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `create` |
+    | `properties` | ✓ | Map of HubSpot deal properties |
+    | `associations` | – | Optional list of association targets (`{ to.id, types: [{ associationCategory, associationTypeId }] }`) |
+
+    ### `lists` (action: `addMembers`)
+
+    ```json
+    {
+      "name": "lists",
+      "arguments": {
+        "action": "addMembers",
+        "listId": "12345",
+        "recordIds": ["1001", "1002", "1003"]
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `addMembers` |
+    | `listId` | ✓ | Target list ID |
+    | `recordIds` | ✓ | IDs of the records to add (only valid for static / `MANUAL` lists) |
+
+    ### `marketingEmails` (action: `sendTransactional`)
+
+    ```json
+    {
+      "name": "marketingEmails",
+      "arguments": {
+        "action": "sendTransactional",
+        "emailId": "67890",
+        "message": {
+          "to": "alice@acme.com",
+          "from": "noreply@acme.com"
+        },
+        "contactProperties": { "firstname": "Alice" },
+        "customProperties": { "orderId": "ORD-12345" }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `sendTransactional` |
+    | `emailId` | ✓ | The single-send email template ID |
+    | `message` | ✓ | `{ to, from, cc, bcc, replyTo }` |
+    | `contactProperties` | – | Properties to set on the contact for personalization |
+    | `customProperties` | – | Custom merge tags resolved inside the email body |
+
+    ### `workflows` (action: `enrollContact`)
+
+    ```json
+    {
+      "name": "workflows",
+      "arguments": {
+        "action": "enrollContact",
+        "workflowId": "98765",
+        "email": "alice@acme.com"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | ✓ | Must be `enrollContact` |
+    | `workflowId` | ✓ | Target workflow |
+    | `email` | ✓ | Email of the contact to enroll |
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+| HTTP Status | Meaning | Typical Cause |
+|-------------|---------|----------------|
+| `400` | Bad Request | Invalid property value, malformed `filterGroups`, missing required field |
+| `401` | Unauthorized | Missing / invalid PAT or OAuth token, revoked refresh token |
+| `403` | Forbidden | The token does not include the required scope, or the user/portal does not have the feature enabled (Marketing Hub Pro+, etc.) |
+| `404` | Not Found | Record / list / workflow / form does not exist (or was archived) |
+| `409` | Conflict | Unique-property collision (e.g. contact with the same email already exists) |
+| `429` | Rate Limited | Per-portal quota exceeded — back off based on the `X-HubSpot-RateLimit-Secondly-Remaining` headers |
+| `500` / `502` / `503` | Server Error | Transient HubSpot API error — retry with exponential backoff |
+
+### Common Issues
+
+**"Not configured"** — The app instance has neither a PAT nor OAuth credentials. Provide at least one.
+
+**"Invalid API key" (MCP)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
+
+**"Credentials lookup failed"** — The MCP endpoint could not reach the `getConfig` webhook of the installed app. Verify that the app instance is still installed in the expected workspace.
+
+**`connector_auth_required`** (OAuth tenants only) — The calling user has no HubSpot OAuth session yet for this tenant. The response payload includes a `connect_url`; relay it to the user so they can authorize their HubSpot account.
+
+**`redirect_uri_mismatch`** during the OAuth dance — The value of `OAuth Callback URL` in the app config has not been added to the **Redirect URLs** of your HubSpot OAuth application. Copy it back and retry.
+
+**`MISSING_SCOPES`** (403) — The PAT or OAuth token does not include the scopes required by the operation. Edit the Private App / OAuth scopes in the HubSpot UI and reinstall the app instance.
+
+**`OBJECT_ALREADY_EXISTS`** on contact create — A contact with the same email already exists. Either `update` the existing contact (use `email` as `idProperty`) or query first with `search`.
+
+**`Lists API: cannot add members to a dynamic list`** — Only static / `MANUAL` lists accept `addMembers` and `removeMembers`. Dynamic lists are managed by their filter criteria.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="HubSpot Developer Docs" icon="book" href="https://developers.hubspot.com/docs/api/overview">
+    Official HubSpot REST API reference
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/create-agents/tool-agents/overview">
+    Build AI agents that call MCP tools dynamically
+  </Card>
+</CardGroup>
