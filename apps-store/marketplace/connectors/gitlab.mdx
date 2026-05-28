@@ -12,7 +12,10 @@ description: 'Manage GitLab projects, issues, merge requests and CI/CD pipelines
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The GitLab app provides read/write access to the [GitLab](https://gitlab.com) DevOps platform via its REST v4 API. It can be used either as a Builder app (automations call GitLab instructions directly) or as a remote MCP server consumed by an Knowledges agent — covering projects, issues, merge requests, pipelines, branches, commits, releases, CI/CD variables, deploy keys, webhooks, wikis, groups and users. Supports both static Personal Access Tokens and OAuth2 authorization-code per-user delegation.
+The GitLab app provides read/write access to the [GitLab](https://gitlab.com) DevOps platform via its REST v4 API. It can be used either as a Builder app (automations call GitLab instructions directly) or as a remote MCP server consumed by an Knowledges agent — covering projects, issues, merge requests, pipelines, branches, commits, releases, CI/CD variables, deploy keys, webhooks, wikis, groups and users. Supports two authentication modes:
+
+- **Central OAuth2** (recommended) — one OAuth Application is registered once by the Prisme.ai workspace admin; every end user signs in with their own GitLab account. Nothing to install per tenant. Requires the platform admin to grant the GitLab capability in Prisme.ai Governance (see below).
+- **Tenant PAT** — install the GitLab app in your workspace and paste a Personal Access Token. Shared across the workspace's users; no per-user sign-in.
 
 <CardGroup cols={3}>
   <Card title="Project Management" icon="diagram-project">
@@ -21,16 +24,51 @@ The GitLab app provides read/write access to the [GitLab](https://gitlab.com) De
   <Card title="CI/CD & DevOps" icon="rocket">
     Pipelines, jobs, environments, CI variables, deploy keys and webhooks
   </Card>
-  <Card title="Flexible Auth" icon="key">
-    Static PAT shared across the tenant, or OAuth2 per-user delegation (each user signs in with their own GitLab account)
+  <Card title="Central OAuth or PAT" icon="key">
+    One shared OAuth Application with per-user sign-in, or a tenant-level static PAT — both modes coexist on the same MCP endpoint
   </Card>
 </CardGroup>
 
 ## Prerequisites
 
 - A **GitLab** account (gitlab.com or self-hosted)
-- **Either** a Personal Access Token with `api` scope (Preferences > Access Tokens), **or** an OAuth application registered at **User Settings > Applications** (`https://gitlab.com/-/user_settings/applications`) with `api` scope
+- **For the central OAuth mode** — the platform admin has registered ONE OAuth Application at **User Settings > Applications** (`https://gitlab.com/-/user_settings/applications`) with `api` scope and the callback URL `<api-url>/workspaces/slug:gitlab/webhooks/oauthCallback`, and has stored its `Client ID` + `Client Secret` in the Secrets of the central `gitlab` workspace. The end user only needs to click *Connect* once.
+- **For the tenant PAT mode** — a Personal Access Token with `api` scope (Preferences > Access Tokens), pasted into the installed app instance.
 - Base URL (default: `https://gitlab.com/api/v4` — override for self-hosted instances)
+
+<Note>
+  The two modes are mutually exclusive per MCP call: callers identify themselves either by being authenticated to Prisme.ai (central) or by sending the `mcp-api-key` header (tenant). The same workspace can serve both at the same time.
+</Note>
+
+## Setup (one-time, platform admin)
+
+The central OAuth flow is set up once per environment by the Prisme.ai workspace admin. End users never touch any of this.
+
+<Steps>
+  <Step title="Register the OAuth Application at GitLab">
+    Open `https://gitlab.com/-/user_settings/applications` and click **Add new application**. Use these values:
+
+    - **Name** — `Prisme.ai GitLab connector` (or whatever fits your branding)
+    - **Redirect URI** — `<api-url>/workspaces/slug:gitlab/webhooks/oauthCallback` (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:gitlab/webhooks/oauthCallback` for production, `https://api.sandbox.prisme.ai/v2/workspaces/slug:gitlab/webhooks/oauthCallback` for sandbox)
+    - **Scopes** — `api`
+
+    Save and copy the **Application ID** + **Secret** (the Secret is shown only once).
+  </Step>
+  <Step title="Store the credentials in the gitlab workspace secrets">
+    Open the central `gitlab` workspace in the Prisme.ai Builder (Studio), go to **Workspace settings > Secrets** and set:
+
+    - `gitlabOauthClientId` — the Application ID from GitLab
+    - `gitlabOauthClientSecret` — the Secret from GitLab
+
+    These secrets are scoped to the `gitlab` workspace itself — they are NOT exposed to the end users or to any tenant who installs the app.
+  </Step>
+  <Step title="Grant the GitLab capability in Governance">
+    Open **Prisme.ai Governance** and grant the **GitLab** capability to the roles or users who should be allowed to sign in with their own GitLab account through the central MCP. Without this capability, callers without an `mcp-api-key` header are rejected with `401 Authentication required`.
+  </Step>
+  <Step title="Test the flow">
+    From an Agent Creator agent with the GitLab capability enabled, call any tool (e.g. `getCurrentUser`). The agent receives a `connect_url` on the first call; opening it in a new window redirects the user to GitLab, then back to a callback page that closes itself after 5 seconds. Subsequent calls reuse the stored access token transparently.
+  </Step>
+</Steps>
 
 ---
 
@@ -44,19 +82,15 @@ The GitLab app provides read/write access to the [GitLab](https://gitlab.com) De
 
     ## Configuration
 
-        | Field | Description |
+    | Field | Description |
     |-------|-------------|
     | **GitLab API Base URL** | Base URL of the GitLab API (default `https://gitlab.com/api/v4`). Override for self-hosted instances. |
-    | **Personal Access Token** | GitLab PAT with `api` scope, stored as a workspace secret. Optional if OAuth2 is configured. Passed as `Authorization: Bearer <token>`. |
-    | **OAuth2 Client ID** | GitLab OAuth Application Client ID. Create an OAuth application at `https://gitlab.com/-/user_settings/applications`. |
-    | **OAuth2 Client Secret** | OAuth Application Client Secret (shown once on creation), stored as a workspace secret. |
-    | **OAuth Callback URL** | Auto-populated on install — paste this value into the OAuth application's *Redirect URI* at GitLab. |
-    | **OAuth Scopes** | Space-separated scopes (default: `api`). |
+    | **Personal Access Token** | GitLab PAT with `api` scope, stored as a workspace secret. Required when calling the MCP endpoint with the `mcp-api-key` header (tenant mode). Leave empty to use the central OAuth shared by the platform admin. |
     | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this instance. |
-    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header. Do not modify. |
+    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header for tenant PAT mode. Do not modify. |
 
     <Note>
-      `MCP Endpoint` and `MCP API Key` are generated automatically by the `onInstall` flow and are only needed to expose this instance as an MCP server (see the next tab).
+      OAuth credentials (Client ID / Client Secret / authorization URL / token URL / scopes) are NOT part of the app instance config anymore — they live in the Secrets of the central `gitlab` workspace and are shared by all callers in central mode. See the *Setup* section above.
     </Note>
 
     ## Available Instructions
@@ -308,33 +342,61 @@ The GitLab app provides read/write access to the [GitLab](https://gitlab.com) De
   </Tab>
 
   <Tab title="Usage as MCP">
-    The GitLab app ships with a built-in MCP server. Each app instance gets its own signed `mcp-api-key` that encodes the workspace ID and a credentials lookup URL — the GitLab API key itself is never passed through headers and is resolved server-side from the app configuration.
+    The GitLab connector ships with a built-in MCP server hosted at one stable URL per environment:
 
-    ## Plug into an Agent Creator capability
+    ```
+    <api-url>/workspaces/slug:gitlab/webhooks/mcp
+    ```
 
-    Agents consume MCP servers directly through **Agent Creator** capabilities. This is the preferred way to expose GitLab to an agent.
+    The same endpoint serves two authentication modes depending on whether the caller sends an `mcp-api-key` header.
+
+    ## Plug into an Agent Creator capability (central OAuth)
+
+    The preferred path for human-facing agents. End users sign in with their own GitLab account; tokens are stored against their Prisme.ai user identity, never shared with other users of the same workspace.
 
     <Steps>
-      <Step title="Create or open a workspace">
-        From the Prisme.ai console, create a new workspace (or open the one that will host the connector).
-      </Step>
-      <Step title="Install the GitLab app">
-        Open the workspace **Imports** panel, search for **GitLab** and install it.
-      </Step>
-      <Step title="Configure the credentials">
-        Open the freshly installed app instance settings and fill in the required fields (see the *Usage as App* tab for the field-by-field reference).
-      </Step>
-      <Step title="Copy the MCP endpoint and API key">
-        Still on the app instance configuration page, copy the values of **MCP Endpoint** and **MCP API Key** — both are generated automatically on install.
+      <Step title="Prerequisites">
+        The platform admin has completed the *Setup* section above: OAuth Application registered at GitLab, `gitlabOauthClientId` + `gitlabOauthClientSecret` stored in the `gitlab` workspace secrets, and the GitLab capability granted in Governance to the right roles.
       </Step>
       <Step title="Open Agent Creator">
         Switch to **Agent Creator** and open the agent you want to extend.
       </Step>
-      <Step title="Add a capability">
+      <Step title="Add the GitLab capability">
+        Add the **GitLab** capability to the agent. No URL, no `mcp-api-key` to paste — the central endpoint is pre-wired and the caller is identified by the Prisme.ai session of whoever is talking to the agent.
+      </Step>
+      <Step title="Brief the agent in its system prompt">
+        Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Copy-pasteable starter:
+
+        ```text
+        You have access to the GitLab MCP server. Use it whenever the user asks about GitLab content — projects, issues, merge requests, pipelines, jobs, branches, commits, tags, releases, milestones or members. Examples: "List my open merge requests", "What's failing in pipeline #1234?", "Create an issue in project X with label bug", "Show the latest release of my main project". If the user is not yet connected, call the `connect` tool to obtain a sign-in link; if they are already connected, call the relevant data tool directly. Prefer calling MCP tools directly over guessing, and confirm with the user before any destructive action (close an issue, merge or revert an MR, delete a branch, cancel a pipeline).
+        ```
+
+        Refine the trigger keywords (project names, group names, label conventions) so the agent reliably picks up the right intent in your context.
+      </Step>
+      <Step title="First call → sign-in">
+        On the first GitLab tool call, the agent receives a `connect_url`. Open it in a new window: GitLab asks the user to authorize the application, then redirects back to a callback page that closes itself after 5 seconds. The agent retries the same tool call automatically.
+      </Step>
+    </Steps>
+
+    ## Tenant PAT (shared token, no per-user sign-in)
+
+    Use this when one shared token is preferable to per-user OAuth — typical for service-account workflows, automations triggered by a non-interactive bot user, or environments where the central OAuth admin setup is not available.
+
+    <Steps>
+      <Step title="Install the GitLab app in your workspace">
+        Open the workspace **Imports** panel, search for **GitLab** and install it.
+      </Step>
+      <Step title="Paste a Personal Access Token">
+        Open the freshly installed app instance settings, set the **GitLab API Base URL** (if not gitlab.com) and the **Personal Access Token** (with `api` scope). Save.
+      </Step>
+      <Step title="Copy the MCP endpoint and API key">
+        Still on the app instance configuration page, copy the values of **MCP Endpoint** and **MCP API Key** — both are generated automatically on install. The endpoint is the same as the central one above; the `mcp-api-key` identifies your tenant.
+      </Step>
+      <Step title="Wire into Agent Creator">
         Add a new capability to the agent:
 
-        - **If a dedicated GitLab capability exists** — select it and paste the **MCP API Key** into the `mcp-api-key` field. The server URL is already wired.
-        - **Otherwise** — select the generic **`custom_mcp`** capability, paste the **MCP Endpoint** into the *Server URL* field, then open the *Headers* field and add an `mcp-api-key` entry whose value is the **MCP API Key** copied earlier:
+        - **If a dedicated GitLab tenant capability exists** — select it and paste the **MCP API Key** into the `mcp-api-key` field.
+        - **Otherwise** — select the generic **`custom_mcp`** capability, paste the **MCP Endpoint** into the *Server URL* field, then add an `mcp-api-key` entry to the *Headers* field:
 
           ```json
           {
@@ -343,55 +405,12 @@ The GitLab app provides read/write access to the [GitLab](https://gitlab.com) De
           ```
       </Step>
       <Step title="Save">
-        The agent now has access to every GitLab tool exposed by the MCP server.
-      </Step>
-      <Step title="Brief the agent in its system prompt">
-        Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
-
-        ```text
-        You have access to the GitLab MCP server. Use it whenever the user asks about GitLab content — projects, issues, merge requests, pipelines, jobs, branches, commits, tags, releases, milestones or members. Examples: "List my open merge requests", "What's failing in pipeline #1234?", "Create an issue in project X with label bug", "Show the latest release of my main project". Prefer calling MCP tools directly over guessing, and confirm with the user before any destructive action (close an issue, merge or revert an MR, delete a branch, cancel a pipeline).
-        ```
-
-        Refine the trigger keywords (project names, group names, label conventions) so the agent reliably picks up the right intent in your context.
-      </Step>
-    </Steps>
-
-    ## Legacy MCP Install (Advanced > Tools)
-
-    Use this flow to plug the GitLab MCP into an Knowledges agent that does not yet support the native MCP picker.
-
-    <Steps>
-      <Step title="Install the GitLab app">
-        Install and configure the app in the same workspace as your agent (see the *Usage as App* tab). Once configured, `mcpEndpoint` and `mcpApiKey` are auto-populated.
-      </Step>
-      <Step title="Copy the MCP credentials">
-        Open the app instance config and copy the values of **MCP Endpoint** and **MCP API Key**.
-      </Step>
-      <Step title="Open your Knowledges project">
-        Navigate to **Advanced > Tools**.
-      </Step>
-      <Step title="Add an MCP tool">
-        Click **Add** and select the **MCP** tab.
-      </Step>
-      <Step title="Fill in the endpoint">
-        Paste the **MCP Endpoint** URL copied from the app instance.
-      </Step>
-      <Step title="Add the auth header">
-        In the **Headers** field, add the signed API key:
-
-        ```json
-        {
-          "mcp-api-key": "your-mcp-api-key"
-        }
-        ```
-      </Step>
-      <Step title="Save">
-        The agent can now list and call GitLab tools through the MCP endpoint.
+        The agent now calls GitLab through the tenant PAT — every user of this agent shares the same GitLab identity (the owner of the PAT).
       </Step>
     </Steps>
 
     <Note>
-      The signed `mcp-api-key` encodes the workspace ID and the `getConfig` webhook URL. The MCP server validates the signature using the central app secret and transparently fetches the GitLab API key and base URL from the installed app. Credentials are cached per tenant for 10 minutes.
+      The signed `mcp-api-key` encodes the workspace ID and a `getConfig` webhook URL. The MCP server validates the signature and resolves the tenant PAT (`{{config.token}}` → `{{secret.gitlabToken}}`) server-side. The `connect` / `disconnect` tools are filtered out of `tools/list` in tenant mode — they only make sense for central OAuth.
     </Note>
 
     ## Output Formats
@@ -741,17 +760,21 @@ The GitLab app provides read/write access to the [GitLab](https://gitlab.com) De
 
 ### Common Issues
 
-**"Not configured"** — The app instance has no API key. Generate one at the provider and paste it in the app configuration.
+**"Authentication required: please sign in to Prisme.ai before calling the GitLab MCP without an `mcp-api-key` header"** — A caller hit the central endpoint without a valid Prisme.ai session AND without an `mcp-api-key`. Either sign in to Prisme.ai (central mode) or pass the tenant `mcp-api-key` (tenant mode).
 
-**"Invalid API key" (MCP)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
+**"Central OAuth config missing"** — The `gitlabOauthClientId` / `gitlabOauthClientSecret` secrets of the central `gitlab` workspace are empty. Ask the platform admin to complete the *Setup* section above.
 
-**"Credentials lookup failed"** — The MCP endpoint could not reach the `getConfig` webhook of the installed app. Verify that the app instance is still installed in the expected workspace.
+**"GitLab capability not granted"** — The current user is signed in to Prisme.ai but has not been granted the GitLab capability in Governance. Ask the platform admin.
+
+**"Invalid mcp-api-key" (tenant mode)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
+
+**"This GitLab tenant has no Personal Access Token configured"** — Tenant mode was used (`mcp-api-key` header present) but the app instance's `token` field is empty. Either fill the token or drop the header to fall back to central OAuth.
 
 **"Can't approve own MR"** — A GitLab project access token's bot user counts as the MR author and cannot approve its own merge requests. Use a different token (PAT for a human user) for the approval step.
 
 **"pipeline creation 404"** — The target ref has no `.gitlab-ci.yml` at its root. Either commit a CI config first or pick a ref that has one.
 
-**OAuth per-user delegation** — Each GitLab user must click the `connect` tool once (from the AI agent) to authorize; the agent stores a per-user refresh token. Use `disconnect` to revoke.
+**Central OAuth — disconnecting a user** — In central mode, the agent calls the `disconnect` tool (or the user opens `<api-url>/workspaces/slug:gitlab/webhooks/disconnectOAuth`) to revoke the access token at GitLab (RFC 7009) and delete the stored secrets. The next data tool call returns a fresh `connect_url`.
 
 ## External Resources
 
