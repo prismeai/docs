@@ -46,75 +46,6 @@ The connector exposes ~120 operations grouped into 18 entity tools covering the 
   HubSpot has no standard RFC 7009 revocation endpoint. The `disconnect` tool deletes the platform-stored tokens but cannot revoke them at HubSpot — refresh tokens may still be valid until they naturally expire (typically 6 months idle).
 </Note>
 
-## Setup (one-time, platform admin)
-
-The central OAuth flow is set up once per environment by the Prisme.ai workspace admin. End users never touch any of this. **HubSpot's Developer Platform 2025.2 has retired the legacy *Public Apps* UI**: the OAuth Public App config is now declared as code in a HubSpot project and deployed via the HubSpot CLI.
-
-<Steps>
-  <Step title="Prerequisites">
-    Create a free **HubSpot developer account** at [developers.hubspot.com](https://developers.hubspot.com/) (separate from any HubSpot CRM account), then install the CLI:
-
-    ```bash
-    npm install -g @hubspot/cli@latest
-    ```
-
-    The `hubspot` workspace ships with two ready-to-deploy projects under `workspaces/hubspot/project/` — one per environment (`sandbox/` and `prod/`). Each contains an `app-hsmeta.json` declaring the OAuth app's redirect URI, required scopes, optional scopes, and `permittedUrls`.
-  </Step>
-  <Step title="Authenticate the CLI to your developer account">
-    Run `hs init` from any of the project folders. It opens a browser to your developer account and writes a per-machine `hubspot.config.yml` (which is gitignored — it holds your personal access key).
-
-    ```bash
-    cd workspaces/hubspot/project/sandbox  # or prod
-    hs init
-    ```
-
-    This step authenticates the CLI for *you, the developer*. The end users' OAuth flow is independent of this key — it relies only on the Client ID / Client Secret HubSpot will generate after deploy.
-  </Step>
-  <Step title="Deploy the project">
-    ```bash
-    hs project upload
-    hs project deploy
-    ```
-
-    Repeat from `workspaces/hubspot/project/prod` when you're ready to ship to production. Each deploy creates one HubSpot Public App in your developer dashboard with `distribution: private` — useful and self-contained, capped at 10 allowlisted portals (or 100 if you're an HubSpot Solution Partner).
-  </Step>
-  <Step title="Allowlist the portals that may install the app">
-    Open the deployed app in the HubSpot developer dashboard (`https://app-eu1.hubspot.com/developer-projects/<accountId>` or `app.hubspot.com` on the US region) → *Auth* → **Allowlisted accounts**. Add the numeric **Hub IDs** of the HubSpot portals (CRM accounts) that should be able to OAuth into the connector. The Hub ID appears in the URL when you browse the portal (`app-eu1.hubspot.com/contacts/<HUB_ID>/...`) or under *Settings → Account*.
-  </Step>
-  <Step title="Store the OAuth credentials in the central workspace secrets">
-    Open the central `hubspot` workspace in the Prisme.ai Builder (Studio), go to **Workspace settings → Secrets** and set:
-
-    - `hubspotOauthClientId` — the Client ID from the *Auth* tab of the deployed app
-    - `hubspotOauthClientSecret` — the Client Secret matching it
-
-    These secrets are scoped to the `hubspot` workspace itself — they are NOT exposed to the end users or to any tenant who installs the app.
-  </Step>
-  <Step title="Declare the OAuth authentication in Governance">
-    Open **Prisme.ai Governance → Capabilities → HubSpot** (or whichever capability your agents will use to consume the connector) and attach an authentication configuration that points at the three central webhooks of the `hubspot` workspace:
-
-    ```json
-    {
-      "type": "oauth2",
-      "status_url": "<api-url>/workspaces/slug:hubspot/webhooks/checkAuthStatus",
-      "connect_url": "<api-url>/workspaces/slug:hubspot/webhooks/initiateOAuth",
-      "disconnect_url": "<api-url>/workspaces/slug:hubspot/webhooks/disconnectOAuth"
-    }
-    ```
-
-    Replace `<api-url>` with your environment's API URL (`https://api.studio.prisme.ai/v2` on production). Governance uses these URLs to (1) probe whether the calling user is already connected (`status_url`), (2) trigger the OAuth handshake when they are not (`connect_url`), and (3) revoke the session on demand (`disconnect_url`).
-  </Step>
-  <Step title="Grant the capability to the right roles">
-    Still in Governance, grant the **HubSpot** capability to the roles or users who should be allowed to sign in with their own HubSpot account through the central MCP. Without this grant, central-mode callers get `401 Authentication required`.
-  </Step>
-  <Step title="Test the flow">
-    From an Agent Creator agent that has the HubSpot capability enabled, call any tool (e.g. `contacts action=list`). The agent receives a `connect_url` on the first call; opening it lets the user pick their HubSpot portal and authorize the requested scopes, then returns to a callback page that closes itself after 5 seconds. Subsequent tool calls reuse the stored access token transparently.
-  </Step>
-</Steps>
-
-<Note>
-  **HubSpot scope handling has a strict OAuth-URL contract**: the connector lists required scopes in `scope=` and optional scopes in `optional_scope=`, and **every requested scope must already be declared in the HubSpot app's `requiredScopes` or `optionalScopes`**. Putting an optional-tier scope (Marketing Hub Pro+, CMS Hub, etc.) into `scope=` triggers a "domain mismatch" rejection. The shipped `app-hsmeta.json` keeps `requiredScopes` to the 9 free-tier essentials (oauth, contacts, companies, deals, owners, tickets); paid-tier scopes (lists, content, automation, forms, files, schemas, e-commerce) sit in `optionalScopes`. If you need to add a scope, edit BOTH `sandbox/src/app/app-hsmeta.json` AND `prod/src/app/app-hsmeta.json`, then re-run `hs project upload && hs project deploy` for each.
-</Note>
-
 ---
 
 <Tabs>
@@ -749,6 +680,75 @@ The central OAuth flow is set up once per environment by the Prisme.ai workspace
     | `action` | ✓ | Must be `enrollContact` |
     | `workflowId` | ✓ | Target workflow |
     | `email` | ✓ | Email of the contact to enroll |
+  </Tab>
+
+  <Tab title="Setup OAuth">
+    The central OAuth flow is set up once per environment by the Prisme.ai workspace admin. End users never touch any of this. **HubSpot's Developer Platform 2025.2 has retired the legacy *Public Apps* UI**: the OAuth Public App config is now declared as code in a HubSpot project and deployed via the HubSpot CLI.
+
+    <Steps>
+      <Step title="Prerequisites">
+        Create a free **HubSpot developer account** at [developers.hubspot.com](https://developers.hubspot.com/) (separate from any HubSpot CRM account), then install the CLI:
+
+        ```bash
+        npm install -g @hubspot/cli@latest
+        ```
+
+        The `hubspot` workspace ships with two ready-to-deploy projects under `workspaces/hubspot/project/` — one per environment (`sandbox/` and `prod/`). Each contains an `app-hsmeta.json` declaring the OAuth app's redirect URI, required scopes, optional scopes, and `permittedUrls`.
+      </Step>
+      <Step title="Authenticate the CLI to your developer account">
+        Run `hs init` from any of the project folders. It opens a browser to your developer account and writes a per-machine `hubspot.config.yml` (which is gitignored — it holds your personal access key).
+
+        ```bash
+        cd workspaces/hubspot/project/sandbox  # or prod
+        hs init
+        ```
+
+        This step authenticates the CLI for *you, the developer*. The end users' OAuth flow is independent of this key — it relies only on the Client ID / Client Secret HubSpot will generate after deploy.
+      </Step>
+      <Step title="Deploy the project">
+        ```bash
+        hs project upload
+        hs project deploy
+        ```
+
+        Repeat from `workspaces/hubspot/project/prod` when you're ready to ship to production. Each deploy creates one HubSpot Public App in your developer dashboard with `distribution: private` — useful and self-contained, capped at 10 allowlisted portals (or 100 if you're an HubSpot Solution Partner).
+      </Step>
+      <Step title="Allowlist the portals that may install the app">
+        Open the deployed app in the HubSpot developer dashboard (`https://app-eu1.hubspot.com/developer-projects/<accountId>` or `app.hubspot.com` on the US region) → *Auth* → **Allowlisted accounts**. Add the numeric **Hub IDs** of the HubSpot portals (CRM accounts) that should be able to OAuth into the connector. The Hub ID appears in the URL when you browse the portal (`app-eu1.hubspot.com/contacts/<HUB_ID>/...`) or under *Settings → Account*.
+      </Step>
+      <Step title="Store the OAuth credentials in the central workspace secrets">
+        Open the central `hubspot` workspace in the Prisme.ai Builder (Studio), go to **Workspace settings → Secrets** and set:
+
+        - `hubspotOauthClientId` — the Client ID from the *Auth* tab of the deployed app
+        - `hubspotOauthClientSecret` — the Client Secret matching it
+
+        These secrets are scoped to the `hubspot` workspace itself — they are NOT exposed to the end users or to any tenant who installs the app.
+      </Step>
+      <Step title="Declare the OAuth authentication in Governance">
+        Open **Prisme.ai Governance → Capabilities → HubSpot** (or whichever capability your agents will use to consume the connector) and attach an authentication configuration that points at the three central webhooks of the `hubspot` workspace:
+
+        ```json
+        {
+          "type": "oauth2",
+          "status_url": "<api-url>/workspaces/slug:hubspot/webhooks/checkAuthStatus",
+          "connect_url": "<api-url>/workspaces/slug:hubspot/webhooks/initiateOAuth",
+          "disconnect_url": "<api-url>/workspaces/slug:hubspot/webhooks/disconnectOAuth"
+        }
+        ```
+
+        Replace `<api-url>` with your environment's API URL (`https://api.studio.prisme.ai/v2` on production). Governance uses these URLs to (1) probe whether the calling user is already connected (`status_url`), (2) trigger the OAuth handshake when they are not (`connect_url`), and (3) revoke the session on demand (`disconnect_url`).
+      </Step>
+      <Step title="Grant the capability to the right roles">
+        Still in Governance, grant the **HubSpot** capability to the roles or users who should be allowed to sign in with their own HubSpot account through the central MCP. Without this grant, central-mode callers get `401 Authentication required`.
+      </Step>
+      <Step title="Test the flow">
+        From an Agent Creator agent that has the HubSpot capability enabled, call any tool (e.g. `contacts action=list`). The agent receives a `connect_url` on the first call; opening it lets the user pick their HubSpot portal and authorize the requested scopes, then returns to a callback page that closes itself after 5 seconds. Subsequent tool calls reuse the stored access token transparently.
+      </Step>
+    </Steps>
+
+    <Note>
+      **HubSpot scope handling has a strict OAuth-URL contract**: the connector lists required scopes in `scope=` and optional scopes in `optional_scope=`, and **every requested scope must already be declared in the HubSpot app's `requiredScopes` or `optionalScopes`**. Putting an optional-tier scope (Marketing Hub Pro+, CMS Hub, etc.) into `scope=` triggers a "domain mismatch" rejection. The shipped `app-hsmeta.json` keeps `requiredScopes` to the 9 free-tier essentials (oauth, contacts, companies, deals, owners, tickets); paid-tier scopes (lists, content, automation, forms, files, schemas, e-commerce) sit in `optionalScopes`. If you need to add a scope, edit BOTH `sandbox/src/app/app-hsmeta.json` AND `prod/src/app/app-hsmeta.json`, then re-run `hs project upload && hs project deploy` for each.
+    </Note>
   </Tab>
 </Tabs>
 
