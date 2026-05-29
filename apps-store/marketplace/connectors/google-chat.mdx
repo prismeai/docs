@@ -1,0 +1,146 @@
+---
+title: 'Google Chat'
+description: 'Bridge a Google Chat bot to a Prisme.ai AI Knowledge agent through an HTTPS webhook'
+---
+
+<img
+  src="/images/connectors/google-chat.png"
+  alt="Google Chat"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The Google Chat app turns a Google Chat bot into the user-facing interface of a Prisme.ai AI Knowledge agent. Unlike most connectors, the integration is reverse-direction: Google Chat is the *caller* and Prisme.ai is the *server*. Each tenant workspace installs the app, fills its own Google service account JSON, AI Knowledge project ID and API key, and pastes a generated HTTPS endpoint URL into the Google Chat app configuration. Incoming user messages are forwarded to the configured AI Knowledge project; the reply is posted back into the same Google Chat thread, with per-thread conversational context preserved.
+
+<CardGroup cols={3}>
+  <Card title="1:1 chats and spaces" icon="comments">
+    Receives direct messages and `ADDED_TO_SPACE` events, with configurable greetings and fallback texts.
+  </Card>
+  <Card title="Per-thread context" icon="message-lines">
+    A compact conversation history is kept per Google Chat thread and trimmed to a configurable number of turns.
+  </Card>
+  <Card title="Async acknowledgement" icon="bolt">
+    Optionally acknowledges Google Chat immediately and posts the final agent answer back to the thread asynchronously via the Google Chat REST API.
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- A **Google Workspace** account with admin-level access to publish a Chat app for at least one user (a regular Gmail account cannot host a Chat app).
+- A **Google Cloud project** with the **Google Chat API enabled** at [console.cloud.google.com/apis/library/chat.googleapis.com](https://console.cloud.google.com/apis/library/chat.googleapis.com).
+- A **Google service account** in the same project, with a **JSON key** downloaded. No IAM role is required — the OAuth scope `https://www.googleapis.com/auth/chat.bot` is what authorizes outbound calls to the Chat REST API. The full service account JSON (including `client_email`, `private_key`, `private_key_id`) is what you paste in the workspace secret.
+- An **AI Knowledge project** that the bot will query, plus its **API key** (created from the project settings).
+
+---
+
+## Installation
+
+1. Go to **Apps** in the workspace that will host the bot.
+2. Search for **Google Chat** and install it.
+3. Open the freshly installed app instance — `endpointToken` and `googleChatEndpointUrl` are auto-populated by the `onInstall` flow, and two empty workspace secrets are provisioned for you to fill (see below).
+
+### Configure the credentials
+
+The `googleChatServiceAccount` and `googleChatAgentApiKey` fields are wired to workspace secrets of the same name. Fill the values in the workspace **Secrets** section to keep them out of the app instance configuration.
+
+<Steps>
+  <Step title="Open workspace Secrets">
+    From Studio, open the workspace's **Secrets** panel.
+  </Step>
+  <Step title="Fill googleChatServiceAccount">
+    Paste the full service account JSON exported from Google Cloud Console (must contain `client_email`, `private_key`, `private_key_id`).
+  </Step>
+  <Step title="Fill googleChatAgentApiKey">
+    Paste the AI Knowledge project API key.
+  </Step>
+  <Step title="Fill the AI Knowledge project ID">
+    Back on the app instance configuration, set **AI Knowledge project ID** (`agent.projectId`) to the project the bot should query.
+  </Step>
+</Steps>
+
+### Wire the Google Chat side
+
+<Steps>
+  <Step title="Open the Chat API Configuration">
+    Open [Google Cloud Console → Google Chat API → Configuration](https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat). Fill the app name, avatar URL and description.
+  </Step>
+  <Step title="Pick the trigger surfaces">
+    Under **Functionality**, enable *Receive 1:1 messages* and *Join spaces and group conversations*.
+  </Step>
+  <Step title="Paste the endpoint URL">
+    Under **Connection settings**, select **HTTP endpoint URL** and paste the value of `googleChatEndpointUrl` from the app instance (it embeds the workspace ID, the app instance slug and a single-use token). Set **Authentication Audience** to the same URL.
+  </Step>
+  <Step title="Restrict the visibility">
+    Under **Visibility**, choose *Make this Chat app available to specific people and groups in `<your-domain>`* and add the test email addresses. Save.
+  </Step>
+  <Step title="Test the bot">
+    Open `chat.google.com`, search for the app under *Internal apps*, send a message and verify the acknowledgement text (`config.ackText`) appears immediately and the agent reply lands in the same thread.
+  </Step>
+</Steps>
+
+## Configuration
+
+| Field | Description |
+|-------|-------------|
+| **📖 Setup guide** | Read-only field whose description links to the in-app setup guide page hosted by the connector workspace |
+| **Google Chat endpoint URL** | Paste this value in the Google Chat app's *HTTP endpoint URL* field |
+| **Endpoint token** | Embedded in the endpoint URL query string and validated on every incoming Google Chat request |
+| **Send replies asynchronously** | When `true` (default), the connector immediately returns the acknowledgement text to Google Chat and posts the final agent reply later via the Google Chat REST API. When `false`, the synchronous reply path waits for the agent answer before returning |
+| **Acknowledgement text** | Immediate message returned to Google Chat in async mode (default `I am working on it.`) |
+| **Added to space text** | Text returned when the bot is added to a space (`ADDED_TO_SPACE` event) |
+| **Empty message text** | Text returned when no user text can be extracted from the incoming event |
+| **Error text** | Fallback message sent to users when the agent call fails |
+| **Google Chat API base URL** | Default `https://chat.googleapis.com/v1` |
+| **Google Chat OAuth scope** | OAuth scope used when minting the access token. Default `https://www.googleapis.com/auth/chat.bot` |
+| **Google service account JSON** | Auto-wired by `onInstall` to `{{config.googleChatServiceAccount}}`. The actual JSON value lives in the workspace secret `googleChatServiceAccount` |
+| **AI Knowledge API key** | Auto-wired by `onInstall` to `{{config.googleChatAgentApiKey}}`. The actual key lives in the workspace secret `googleChatAgentApiKey` |
+| **AI Knowledge project ID** | Identifier of the AI Knowledge project the bot should query |
+| **Optional model override** | Optional `chat-completion` model override |
+| **Max Google Chat history turns** | Number of user / assistant turns kept per Google Chat thread (default 12) |
+
+<Note>
+  `Google Chat endpoint URL` and `Endpoint token` are populated on install — do not edit them by hand. To rotate the service account JSON or the AI Knowledge API key, update the corresponding workspace secret; the app instance picks up the new value on the next call.
+</Note>
+
+## How it works
+
+1. Google Chat sends an interaction event (`MESSAGE`, `ADDED_TO_SPACE`, etc.) to the configured HTTP endpoint URL. The connector validates the query-string token against the configured `endpointToken` and rejects mismatches with `Unauthorized Google Chat request.`.
+2. For `MESSAGE` events, the incoming Google Chat payload is normalized into a compact internal shape (`chatEvent`) covering the text, the space name, the thread key and the sender identity.
+3. In **async mode** (default), the connector emits a `GoogleChat.message.received` event and immediately returns the acknowledgement text. The downstream `onGoogleChatMessage` handler:
+   - calls `askPrismeAgent`, which forwards the conversation (with the per-thread history kept in `global.googleChatThreads`) to the configured AI Knowledge project,
+   - posts the final reply back to the same Google Chat thread via the Chat REST API (`sendGoogleChatMessage`), using a JWT signed with the service account JSON (`getGoogleChatAccessToken`),
+   - emits `GoogleChat.reply.sent` or `GoogleChat.reply.failed` for observability.
+4. In **synchronous mode** (`asyncReplies: false`), the agent call happens inline and the response text is returned in the initial HTTP response.
+
+The conversation history is stored per `threadKey` (derived from `space.name` + `message.thread.name`) and trimmed to `maxHistoryTurns` × 2 messages.
+
+## Error Handling
+
+| Symptom | Cause | Resolution |
+|---------|-------|------------|
+| `Unauthorized Google Chat request.` returned to Google | The query-string `token` does not match the configured `endpointToken` | Re-copy the auto-populated `googleChatEndpointUrl` from the app instance into the Google Chat app HTTP endpoint URL field |
+| `I could not get an answer from the Prisme.ai agent.` posted in chat | The AI Knowledge call failed (invalid project ID, missing API key, quota exceeded, agent returned an empty response) | Check the workspace events for `GoogleChat.reply.failed` and the underlying `AgentRequestFailed` / `EmptyAgentResponse` payload |
+| `Missing client_email or private_key in service account.` in events | The `googleChatServiceAccount` secret is empty or malformed | Re-paste the full service account JSON in the workspace secret (must include `client_email`, `private_key`, `private_key_id`) |
+| Google Chat HTTP 401 on outbound reply | The minted access token was rejected by the Chat REST API (service account misconfigured or scope mismatch) | Verify the service account belongs to the same Google Cloud project as the Chat app and that the scope is `https://www.googleapis.com/auth/chat.bot` |
+| `Send-as the bot to space` step in Google Cloud rejects the endpoint | The endpoint URL is not HTTPS, missing the `?token=…` query string or unreachable | Re-check the URL is exactly the value of `googleChatEndpointUrl` from the installed app instance |
+
+### Common Issues
+
+**Bot does not appear in `chat.google.com`** — Verify the visibility section of the Google Chat app configuration lists your email (or a group you belong to), and that you searched the *Internal apps* tab rather than the public Marketplace.
+
+**Async reply never arrives** — Inspect the events emitted by `onGoogleChatMessage`. A missing `sendGoogleChatMessage` step usually means the service account JWT could not be signed (`createGoogleChatJWT` Custom Code error) or the Chat REST API rejected the outbound request.
+
+**Replies arrive in a new thread instead of the original one** — The Google Chat REST API was called with `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`; this is expected when the original `chatEvent.threadName` was not preserved (e.g. when the bot is added to a brand-new space).
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card icon="book" title="Google Chat API" href="https://developers.google.com/workspace/chat">
+    Official Google Chat REST API reference.
+  </Card>
+  <Card icon="screwdriver-wrench" title="In-app setup guide" href="https://sandbox.prisme.ai/apps/google-chat-app">
+    Interactive setup guide hosted inside the connector workspace, with an endpoint URL builder for tenant administrators.
+  </Card>
+</CardGroup>

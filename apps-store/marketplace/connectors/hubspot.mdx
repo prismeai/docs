@@ -12,7 +12,12 @@ description: 'Manage HubSpot CRM and Marketing data from Prisme.ai workflows and
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The HubSpot app provides read/write access to a HubSpot portal through the [HubSpot REST API](https://developers.hubspot.com/docs/api/overview). It can be used either as a Builder app (automations call HubSpot instructions directly) or as a remote MCP server consumed by an AI agent. Each tenant authenticates either with a **Private App token (PAT)** — shared across all users of the tenant — or via **per-user OAuth 2.0** (authorization-code with PKCE). The connector exposes ~120 operations grouped into 18 entity tools covering the CRM (contacts, companies, deals, tickets, engagements, associations, pipelines, properties, owners, lists) and the Marketing layer (forms, marketing emails, workflows, files).
+The HubSpot connector provides read/write access to a HubSpot portal through the [HubSpot REST API](https://developers.hubspot.com/docs/api/overview). It can be used either as a Builder app (automations call HubSpot instructions directly) or as a remote MCP server consumed by an AI agent. Two authentication modes coexist on the same MCP endpoint:
+
+- **Central OAuth2** (recommended) — one HubSpot Public App is registered once by the Prisme.ai workspace admin; every end user signs in with their own HubSpot portal. Nothing to install per tenant. Requires the platform admin to grant the HubSpot capability in Prisme.ai Governance (see below).
+- **Tenant PAT** — install the HubSpot app in your workspace and paste a **Private App access token**. Shared across the workspace's users; no per-user sign-in.
+
+The connector exposes ~120 operations grouped into 18 entity tools covering the CRM (contacts, companies, deals, tickets, engagements, associations, pipelines, properties, owners, lists) and the Marketing layer (forms, marketing emails, workflows, files).
 
 <CardGroup cols={3}>
   <Card title="CRM Records" icon="address-book">
@@ -21,22 +26,93 @@ The HubSpot app provides read/write access to a HubSpot portal through the [HubS
   <Card title="Engagements & Pipelines" icon="diagram-project">
     Notes, tasks, calls, emails and meetings; pipelines and stages; properties and property groups; owners and lists
   </Card>
-  <Card title="Marketing" icon="bullhorn">
-    Forms, transactional and marketing emails, workflows enrollment, and the Files Manager
+  <Card title="Central OAuth or PAT" icon="key">
+    One shared HubSpot Public App with per-user sign-in, or a tenant-level Private App Token — both modes coexist on the same MCP endpoint
   </Card>
 </CardGroup>
 
 ## Prerequisites
 
-- A **HubSpot account** with access to the portal you want to expose, and an admin who can create Private Apps or OAuth applications.
-- One of:
-  - A **Private App token (PAT)** — created at *Settings → Integrations → Private Apps* (`https://app.hubspot.com/private-apps/<portal-id>`). Quickest setup, shared across all users of this tenant.
-  - A **HubSpot OAuth Application** — created at [app.hubspot.com/l/developer](https://app.hubspot.com/l/developer) (Developer account → *Create app* → *Auth*). The **Redirect URI** must match the value shown in the `OAuth Callback URL` field of the installed app instance (auto-populated on install — copy it back into the HubSpot developer console after installation). Per-user authorization; ideal when actions must be attributed to the end-user.
-- Whichever auth method you choose, make sure the **selected scopes** cover the resources you intend to read/write (`crm.objects.contacts.*`, `crm.objects.companies.*`, `tickets`, `content`, `automation`, `forms`, `files`, etc.).
-- Base URL (default: `https://api.hubapi.com`)
+- A **HubSpot account** with access to the portal you want to expose.
+- **For the central OAuth mode** — the platform admin has registered ONE HubSpot Public App through the [HubSpot Developer Platform 2025.2](https://developers.hubspot.com/docs/apps/developer-platform/overview) (CLI Projects), declared the OAuth scopes the connector needs, allowlisted the portals that can install it (Private distribution caps at 10 portals; Solution Partners get 100), and stored its `Client ID` + `Client Secret` in the Secrets of the central `hubspot` workspace. The end user only needs to click *Connect* once and select their portal on the HubSpot consent screen.
+- **For the tenant PAT mode** — a **Private App access token** created at *HubSpot Settings → Integrations → Private Apps* (`https://app.hubspot.com/private-apps/<portal-id>`), with the scopes covering the resources you intend to read/write (`crm.objects.contacts.*`, `crm.objects.companies.*`, `tickets`, `content`, `automation`, `forms`, `files`, etc.), pasted into the installed app instance.
+- Base URL (default: `https://api.hubapi.com`).
+
+<Note>
+  The two modes are mutually exclusive per MCP call: callers identify themselves either by being authenticated to Prisme.ai (central) or by sending the `mcp-api-key` header (tenant). The same workspace can serve both at the same time.
+</Note>
 
 <Note>
   HubSpot has no standard RFC 7009 revocation endpoint. The `disconnect` tool deletes the platform-stored tokens but cannot revoke them at HubSpot — refresh tokens may still be valid until they naturally expire (typically 6 months idle).
+</Note>
+
+## Setup (one-time, platform admin)
+
+The central OAuth flow is set up once per environment by the Prisme.ai workspace admin. End users never touch any of this. **HubSpot's Developer Platform 2025.2 has retired the legacy *Public Apps* UI**: the OAuth Public App config is now declared as code in a HubSpot project and deployed via the HubSpot CLI.
+
+<Steps>
+  <Step title="Prerequisites">
+    Create a free **HubSpot developer account** at [developers.hubspot.com](https://developers.hubspot.com/) (separate from any HubSpot CRM account), then install the CLI:
+
+    ```bash
+    npm install -g @hubspot/cli@latest
+    ```
+
+    The `hubspot` workspace ships with two ready-to-deploy projects under `workspaces/hubspot/project/` — one per environment (`sandbox/` and `prod/`). Each contains an `app-hsmeta.json` declaring the OAuth app's redirect URI, required scopes, optional scopes, and `permittedUrls`.
+  </Step>
+  <Step title="Authenticate the CLI to your developer account">
+    Run `hs init` from any of the project folders. It opens a browser to your developer account and writes a per-machine `hubspot.config.yml` (which is gitignored — it holds your personal access key).
+
+    ```bash
+    cd workspaces/hubspot/project/sandbox  # or prod
+    hs init
+    ```
+
+    This step authenticates the CLI for *you, the developer*. The end users' OAuth flow is independent of this key — it relies only on the Client ID / Client Secret HubSpot will generate after deploy.
+  </Step>
+  <Step title="Deploy the project">
+    ```bash
+    hs project upload
+    hs project deploy
+    ```
+
+    Repeat from `workspaces/hubspot/project/prod` when you're ready to ship to production. Each deploy creates one HubSpot Public App in your developer dashboard with `distribution: private` — useful and self-contained, capped at 10 allowlisted portals (or 100 if you're an HubSpot Solution Partner).
+  </Step>
+  <Step title="Allowlist the portals that may install the app">
+    Open the deployed app in the HubSpot developer dashboard (`https://app-eu1.hubspot.com/developer-projects/<accountId>` or `app.hubspot.com` on the US region) → *Auth* → **Allowlisted accounts**. Add the numeric **Hub IDs** of the HubSpot portals (CRM accounts) that should be able to OAuth into the connector. The Hub ID appears in the URL when you browse the portal (`app-eu1.hubspot.com/contacts/<HUB_ID>/...`) or under *Settings → Account*.
+  </Step>
+  <Step title="Store the OAuth credentials in the central workspace secrets">
+    Open the central `hubspot` workspace in the Prisme.ai Builder (Studio), go to **Workspace settings → Secrets** and set:
+
+    - `hubspotOauthClientId` — the Client ID from the *Auth* tab of the deployed app
+    - `hubspotOauthClientSecret` — the Client Secret matching it
+
+    These secrets are scoped to the `hubspot` workspace itself — they are NOT exposed to the end users or to any tenant who installs the app.
+  </Step>
+  <Step title="Declare the OAuth authentication in Governance">
+    Open **Prisme.ai Governance → Capabilities → HubSpot** (or whichever capability your agents will use to consume the connector) and attach an authentication configuration that points at the three central webhooks of the `hubspot` workspace:
+
+    ```json
+    {
+      "type": "oauth2",
+      "status_url": "<api-url>/workspaces/slug:hubspot/webhooks/checkAuthStatus",
+      "connect_url": "<api-url>/workspaces/slug:hubspot/webhooks/initiateOAuth",
+      "disconnect_url": "<api-url>/workspaces/slug:hubspot/webhooks/disconnectOAuth"
+    }
+    ```
+
+    Replace `<api-url>` with your environment's API URL (`https://api.studio.prisme.ai/v2` on production). Governance uses these URLs to (1) probe whether the calling user is already connected (`status_url`), (2) trigger the OAuth handshake when they are not (`connect_url`), and (3) revoke the session on demand (`disconnect_url`).
+  </Step>
+  <Step title="Grant the capability to the right roles">
+    Still in Governance, grant the **HubSpot** capability to the roles or users who should be allowed to sign in with their own HubSpot account through the central MCP. Without this grant, central-mode callers get `401 Authentication required`.
+  </Step>
+  <Step title="Test the flow">
+    From an Agent Creator agent that has the HubSpot capability enabled, call any tool (e.g. `contacts action=list`). The agent receives a `connect_url` on the first call; opening it lets the user pick their HubSpot portal and authorize the requested scopes, then returns to a callback page that closes itself after 5 seconds. Subsequent tool calls reuse the stored access token transparently.
+  </Step>
+</Steps>
+
+<Note>
+  **HubSpot scope handling has a strict OAuth-URL contract**: the connector lists required scopes in `scope=` and optional scopes in `optional_scope=`, and **every requested scope must already be declared in the HubSpot app's `requiredScopes` or `optionalScopes`**. Putting an optional-tier scope (Marketing Hub Pro+, CMS Hub, etc.) into `scope=` triggers a "domain mismatch" rejection. The shipped `app-hsmeta.json` keeps `requiredScopes` to the 9 free-tier essentials (oauth, contacts, companies, deals, owners, tickets); paid-tier scopes (lists, content, automation, forms, files, schemas, e-commerce) sit in `optionalScopes`. If you need to add a scope, edit BOTH `sandbox/src/app/app-hsmeta.json` AND `prod/src/app/app-hsmeta.json`, then re-run `hs project upload && hs project deploy` for each.
 </Note>
 
 ---
@@ -54,44 +130,13 @@ The HubSpot app provides read/write access to a HubSpot portal through the [HubS
     | Field | Description |
     |-------|-------------|
     | **HubSpot API Base URL** | Base URL of the HubSpot API (default `https://api.hubapi.com`) |
-    | **HubSpot Private App Token (PAT)** | Private App access token. Optional when using OAuth. Stored as a workspace secret |
-    | **OAuth2 Client ID** | HubSpot OAuth Application Client ID, stored as a workspace secret |
-    | **OAuth2 Client Secret** | HubSpot OAuth Application Client Secret, stored as a workspace secret |
-    | **OAuth Callback URL** | Auto-populated on install — paste this value into the *Redirect URI* field of your HubSpot OAuth app |
-    | **OAuth Authorize URL** | Default `https://app.hubspot.com/oauth/authorize` |
-    | **OAuth Token URL** | Default `https://api.hubapi.com/oauth/v1/token` |
-    | **OAuth Revoke URL** | HubSpot does not expose RFC 7009 revocation. Leave empty |
-    | **OAuth Scopes** | Space-separated HubSpot scopes. Default covers CRM + Marketing read/write. See [HubSpot OAuth scopes](https://developers.hubspot.com/docs/api/working-with-oauth#scopes) |
-    | **Refresh Token TTL (seconds)** | How long the refresh token is kept in user-scoped secrets. Default 7200 (2h) |
-    | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this instance |
-    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header. Do not modify |
+    | **HubSpot Private App Token (PAT)** | Private App access token for this tenant — shared across the tenant's users. Required for tenant-mode access (header `mcp-api-key`). Leave empty to use the central OAuth shared by the platform admin. |
+    | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this instance. Pass header `mcp-api-key` to use tenant PAT mode; omit the header to use shared OAuth (user-delegated, central). |
+    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header (tenant PAT mode). Do not modify. |
 
     <Note>
-      `MCP Endpoint`, `MCP API Key` and `OAuth Callback URL` are generated automatically by the `onInstall` flow. Either fill in the PAT *or* the OAuth credentials — if both are present, the per-user OAuth session takes precedence and the PAT is used only as a fallback.
+      OAuth credentials (Client ID / Client Secret / authorization URL / token URL / scopes) are NOT part of the app instance config anymore — they live in the Secrets of the central `hubspot` workspace and are shared by all callers in central mode. See the *Setup (one-time, platform admin)* section above.
     </Note>
-
-    ### Authorize end-users (OAuth mode)
-
-    When the tenant uses OAuth, each end-user authorizes their own HubSpot account through a browser-based consent screen:
-
-    <Steps>
-      <Step title="Trigger the connect flow">
-        From an MCP client (Agent Creator capability or any tool client), call any data tool. If no OAuth session exists for the current user × tenant, the MCP server returns a `connector_auth_required` payload with a `connect_url`. Alternatively, call the `connect` tool explicitly.
-      </Step>
-      <Step title="Open the connect URL">
-        Open the returned URL in a browser tab where the user is already authenticated to Prisme.ai. The platform redirects to the HubSpot consent screen.
-      </Step>
-      <Step title="Grant access">
-        The user reviews the requested scopes and clicks *Connect app*. HubSpot redirects back to the platform's `oauthCallback` webhook.
-      </Step>
-      <Step title="Confirmation">
-        The user sees a *Connection complete* page and can close the tab. The platform has stored an access token plus refresh token as user-scoped secrets — both are tenant-prefixed so they do not leak across app instances.
-      </Step>
-    </Steps>
-
-    <Warning>
-      Each user's OAuth tokens are scoped per (user × tenant). A user who has authorized in tenant A does not gain access in tenant B — they must run the connect flow again per app instance.
-    </Warning>
 
     ## Available Instructions
 
@@ -318,33 +363,61 @@ The HubSpot app provides read/write access to a HubSpot portal through the [HubS
   </Tab>
 
   <Tab title="Usage as MCP">
-    The HubSpot app ships with a built-in MCP server. Each app instance gets its own signed `mcp-api-key` that encodes the workspace ID and a credentials lookup URL — the HubSpot token itself is never passed through headers and is resolved server-side from the app configuration plus the optional per-user OAuth session.
+    The HubSpot connector ships with a built-in MCP server hosted at one stable URL per environment:
 
-    ## Plug into an Agent Creator capability
+    ```
+    <api-url>/workspaces/slug:hubspot/webhooks/mcp
+    ```
 
-    Agents consume MCP servers directly through **Agent Creator** capabilities. This is the preferred way to expose HubSpot to an agent.
+    The same endpoint serves two authentication modes depending on whether the caller sends an `mcp-api-key` header.
+
+    ## Plug into an Agent Creator capability (central OAuth)
+
+    The preferred path for human-facing agents. End users sign in with their own HubSpot portal; tokens are stored against their Prisme.ai user identity, never shared with other users of the same workspace.
 
     <Steps>
-      <Step title="Create or open a workspace">
-        From the Prisme.ai console, create a new workspace (or open the one that will host the connector).
-      </Step>
-      <Step title="Install the HubSpot app">
-        Open the workspace **Imports** panel, search for **HubSpot** and install it.
-      </Step>
-      <Step title="Configure the credentials">
-        Open the freshly installed app instance settings and fill in either the **Private App Token** or the OAuth Client ID/Secret (see the *Usage as App* tab for the field-by-field reference).
-      </Step>
-      <Step title="Copy the MCP endpoint and API key">
-        Still on the app instance configuration page, copy the values of **MCP Endpoint** and **MCP API Key** — both are generated automatically on install.
+      <Step title="Prerequisites">
+        The platform admin has completed the *Setup (one-time, platform admin)* section above: HubSpot Public App deployed via the CLI, the calling user's portal allowlisted, `hubspotOauthClientId` + `hubspotOauthClientSecret` stored in the central workspace secrets, and the HubSpot capability granted in Governance to the right roles.
       </Step>
       <Step title="Open Agent Creator">
         Switch to **Agent Creator** and open the agent you want to extend.
       </Step>
-      <Step title="Add a capability">
+      <Step title="Add the HubSpot capability">
+        Add the **HubSpot** capability to the agent. No URL, no `mcp-api-key` to paste — the central endpoint is pre-wired and the caller is identified by the Prisme.ai session of whoever is talking to the agent.
+      </Step>
+      <Step title="Brief the agent in its system prompt">
+        Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Copy-pasteable starter:
+
+        ```text
+        You have access to the HubSpot MCP server. Use it whenever the user asks about CRM data — contacts, companies, deals, tickets, engagements, pipelines or marketing assets (forms, emails, workflows). Always prefer `*.search` over `*.list` for filtered lookups. For batch work, use `batchRead/Create/Update/Archive` instead of looping individual calls. If the user is not yet connected, call the `connect` tool to obtain a sign-in link; if they are already connected, call the relevant data tool directly. Always confirm with the user before destructive actions (archive, delete, batchArchive, unenrollContact, removeMembers).
+        ```
+
+        Refine the trigger keywords (resource names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
+      </Step>
+      <Step title="First call → sign-in">
+        On the first HubSpot tool call, the agent receives a `connect_url`. Open it in a new window: HubSpot lets the user pick the portal to authorize (from the allowlisted set) and review the requested scopes, then redirects back to a callback page that closes itself after 5 seconds. The agent retries the same tool call automatically.
+      </Step>
+    </Steps>
+
+    ## Tenant PAT (shared token, no per-user sign-in)
+
+    Use this when one shared token is preferable to per-user OAuth — typical for service-account workflows, automations triggered by a non-interactive bot user, or environments where the central OAuth admin setup is not available.
+
+    <Steps>
+      <Step title="Install the HubSpot app in your workspace">
+        Open the workspace **Imports** panel, search for **HubSpot** and install it.
+      </Step>
+      <Step title="Paste a Private App access token">
+        Open the freshly installed app instance settings, set the **HubSpot API Base URL** (if not `https://api.hubapi.com`) and the **HubSpot Private App Token (PAT)** (with the scopes covering the operations you intend to call). Save.
+      </Step>
+      <Step title="Copy the MCP endpoint and API key">
+        Still on the app instance configuration page, copy the values of **MCP Endpoint** and **MCP API Key** — both are generated automatically on install. The endpoint is the same as the central one above; the `mcp-api-key` identifies your tenant.
+      </Step>
+      <Step title="Wire into Agent Creator">
         Add a new capability to the agent:
 
-        - **If a dedicated HubSpot capability exists** — select it and paste the **MCP API Key** into the `mcp-api-key` field. The server URL is already wired.
-        - **Otherwise** — select the generic **`custom_mcp`** capability, paste the **MCP Endpoint** into the *Server URL* field, then open the *Headers* field and add an `mcp-api-key` entry whose value is the **MCP API Key** copied earlier:
+        - **If a dedicated HubSpot tenant capability exists** — select it and paste the **MCP API Key** into the `mcp-api-key` field.
+        - **Otherwise** — select the generic **`custom_mcp`** capability, paste the **MCP Endpoint** into the *Server URL* field, then add an `mcp-api-key` entry to the *Headers* field:
 
           ```json
           {
@@ -353,26 +426,17 @@ The HubSpot app provides read/write access to a HubSpot portal through the [HubS
           ```
       </Step>
       <Step title="Save">
-        The agent now has access to every HubSpot tool exposed by the MCP server.
-      </Step>
-      <Step title="Brief the agent in its system prompt">
-        Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
-
-        ```text
-        You have access to the HubSpot MCP server. Use it whenever the user asks about CRM data — contacts, companies, deals, tickets, engagements, pipelines or marketing assets (forms, emails, workflows). Always prefer `*.search` over `*.list` for filtered lookups. For batch work, use `batchRead/Create/Update/Archive` instead of looping individual calls. When OAuth is enabled, the first call may return a connect_url asking the user to authorize HubSpot; relay it as-is. Always confirm with the user before destructive actions (archive, delete, batchArchive, unenrollContact, removeMembers).
-        ```
-
-        Refine the trigger keywords (resource names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
+        The agent now calls HubSpot through the tenant PAT — every user of this agent shares the same HubSpot identity (the owner of the PAT).
       </Step>
     </Steps>
 
-    ## Legacy MCP Install (Advanced > Tools)
+    ## Legacy MCP install (Advanced → Tools)
 
-    Use this flow to plug the HubSpot MCP into an AI Knowledge agent that does not yet support the native MCP picker.
+    Use this flow to plug the HubSpot MCP into an AI Knowledge agent that does not yet support the native MCP picker. Always paired with **tenant PAT** mode — the Advanced → Tools picker only sends the header path, not the central OAuth session.
 
     <Steps>
       <Step title="Install the HubSpot app">
-        Install and configure the app in the same workspace as your agent (see the *Usage as App* tab). Once configured, `mcpEndpoint` and `mcpApiKey` are auto-populated.
+        Install and configure the app in the same workspace as your agent (see the *Tenant PAT* path above). Once configured, `mcpEndpoint` and `mcpApiKey` are auto-populated.
       </Step>
       <Step title="Copy the MCP credentials">
         Open the app instance config and copy the values of **MCP Endpoint** and **MCP API Key**.
@@ -401,7 +465,7 @@ The HubSpot app provides read/write access to a HubSpot portal through the [HubS
     </Steps>
 
     <Note>
-      The signed `mcp-api-key` encodes the workspace ID and the `getConfig` webhook URL. The MCP server validates the signature using the central app secret and transparently fetches the PAT or OAuth credentials from the installed app, then resolves the calling user's stored HubSpot access token (if OAuth) — otherwise it falls back to the tenant-wide PAT. Credentials are cached per tenant for 10 minutes.
+      The signed `mcp-api-key` encodes the workspace ID and a `getConfig` webhook URL. The MCP server validates the signature and resolves the tenant PAT server-side. The `connect` / `disconnect` tools are filtered out of `tools/list` in tenant mode — they only make sense for central OAuth.
     </Note>
 
     ## Output Formats
@@ -704,27 +768,41 @@ The HubSpot app provides read/write access to a HubSpot portal through the [HubS
 
 ### Common Issues
 
-**"Not configured"** — The app instance has neither a PAT nor OAuth credentials. Provide at least one.
+**"Authentication required: please sign in to Prisme.ai before calling the HubSpot MCP without an `mcp-api-key` header"** — A caller hit the central endpoint without a valid Prisme.ai session AND without an `mcp-api-key`. Either sign in to Prisme.ai (central mode) or pass the tenant `mcp-api-key` (tenant mode).
 
-**"Invalid API key" (MCP)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
+**"Central OAuth config missing"** — The `hubspotOauthClientId` / `hubspotOauthClientSecret` secrets of the central `hubspot` workspace are empty. Ask the platform admin to complete the *Setup (one-time, platform admin)* section above.
 
-**"Credentials lookup failed"** — The MCP endpoint could not reach the `getConfig` webhook of the installed app. Verify that the app instance is still installed in the expected workspace.
+**"HubSpot capability not granted"** — The current user is signed in to Prisme.ai but has not been granted the HubSpot capability in Governance. Ask the platform admin.
 
-**`connector_auth_required`** (OAuth tenants only) — The calling user has no HubSpot OAuth session yet for this tenant. The response payload includes a `connect_url`; relay it to the user so they can authorize their HubSpot account.
+**"Invalid mcp-api-key" (tenant mode)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
 
-**`redirect_uri_mismatch`** during the OAuth dance — The value of `OAuth Callback URL` in the app config has not been added to the **Redirect URLs** of your HubSpot OAuth application. Copy it back and retry.
+**"This HubSpot tenant has no Personal Access Token configured"** — Tenant mode was used (`mcp-api-key` header present) but the app instance's PAT field is empty. Either fill the token or drop the header to fall back to central OAuth.
 
-**`MISSING_SCOPES`** (403) — The PAT or OAuth token does not include the scopes required by the operation. Edit the Private App / OAuth scopes in the HubSpot UI and reinstall the app instance.
+**`invalid_scope` / "domain mismatch" during the OAuth dance** — The OAuth URL requests a scope that the deployed HubSpot Public App does not declare. HubSpot OAuth requires `scope=` (mandatory) and `optional_scope=` (best-effort) to be split, **and every requested scope to appear in either `requiredScopes` or `optionalScopes` of `app-hsmeta.json`**. Edit both `sandbox/src/app/app-hsmeta.json` AND `prod/src/app/app-hsmeta.json`, then `hs project upload && hs project deploy` for each.
 
-**`OBJECT_ALREADY_EXISTS`** on contact create — A contact with the same email already exists. Either `update` the existing contact (use `email` as `idProperty`) or query first with `search`.
+**`redirect_uri_mismatch` during the OAuth dance** — The redirect URI generated by the connector (`<api-url>/workspaces/slug:hubspot/webhooks/oauthCallback`) is not in the deployed HubSpot app's `redirectUrls`. Edit `app-hsmeta.json` and re-deploy.
+
+**"The app could not be installed because the app developer has not signed the acceptable use policy"** — Only happens with `distribution: marketplace` apps. The shipped projects use `distribution: private` to bypass this requirement (capped at 10 allowlisted portals). If you switch to marketplace later, sign the AUP from the HubSpot developer dashboard before the first install.
+
+**`MISSING_SCOPES` (403)** — The user's portal subscription does not include the feature the operation needs (Marketing Hub Pro+, CMS Hub, etc.), or the user did not grant the corresponding optional scope. Some scopes are only available on paid HubSpot tiers — the connector keeps them in `optionalScopes` so they degrade gracefully on Free / Starter portals.
+
+**`OBJECT_ALREADY_EXISTS` on contact create** — A contact with the same email already exists. Either `update` the existing contact (use `email` as `idProperty`) or query first with `search`.
 
 **`Lists API: cannot add members to a dynamic list`** — Only static / `MANUAL` lists accept `addMembers` and `removeMembers`. Dynamic lists are managed by their filter criteria.
+
+**Central OAuth — disconnecting a user** — In central mode, the agent calls the `disconnect` tool (or the user opens `<api-url>/workspaces/slug:hubspot/webhooks/disconnectOAuth`) to delete the stored tokens. HubSpot does not expose an RFC 7009 revocation endpoint, so the refresh tokens may still be valid at HubSpot until they naturally expire (typically 6 months idle).
 
 ## External Resources
 
 <CardGroup cols={2}>
   <Card title="HubSpot Developer Docs" icon="book" href="https://developers.hubspot.com/docs/api/overview">
     Official HubSpot REST API reference
+  </Card>
+  <Card title="HubSpot Developer Platform 2025.2" icon="hammer" href="https://developers.hubspot.com/docs/apps/developer-platform/overview">
+    Build, deploy and manage HubSpot Public Apps via the CLI Projects framework
+  </Card>
+  <Card title="HubSpot OAuth scopes" icon="key" href="https://developers.hubspot.com/docs/apps/developer-platform/build-apps/authentication/scopes">
+    Required vs optional scopes, scope-tier matrix, scope group reference
   </Card>
   <Card title="Tool Agents" icon="robot" href="/create-agents/tool-agents/overview">
     Build AI agents that call MCP tools dynamically
