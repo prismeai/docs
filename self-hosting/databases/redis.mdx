@@ -1,0 +1,132 @@
+---
+title: "Redis"
+description: "Role, configuration, backup, scaling, updates and module requirements for Redis in Prisme.ai self-hosted deployments."
+---
+
+## Role in the platform
+
+Redis serves multiple purposes:
+
+| Purpose | Service | Notes |
+|---------|---------|-------|
+| **Event broker** (Redis Streams) | All backend services | Backs the platform's event bus. |
+| **Contexts cache** | `prismeai-runtime` | Hot state for in-flight automations. |
+| **Sessions store** | `prismeai-api-gateway` | Login sessions. |
+| **Crawler search engine state** | `prismeai-crawler`, `prismeai-searchengine` | Per-engine queues and state. |
+| **AI Knowledge vector store** *(optional)* | AI Knowledge product | Requires **RedisJSON + RediSearch** modules. |
+
+By convention, each purpose uses a distinct logical Redis `db` number (or a dedicated cluster).
+
+## Version compatibility
+
+- **Minimum: Redis 6.2+**.
+- Redis 7.x supported and recommended.
+- **AI Knowledge** requires **RedisJSON** and **RediSearch** modules. Use one of:
+  - Redis Stack
+  - AWS ElastiCache + Redis Enterprise (or Memorystore Redis Cluster with modules)
+  - Azure Cache for Redis **Enterprise** tier
+  - Self-managed Redis with the modules loaded
+
+## Recommended deployment
+
+| Provider | Recommended service | Notes |
+|----------|--------------------|-------|
+| AWS | ElastiCache for Redis (cluster mode), Multi-AZ. Use Redis Enterprise for AI Knowledge. | |
+| Azure | Azure Cache for Redis Enterprise tier (RedisJSON + RediSearch available). | |
+| GCP | Memorystore Redis Cluster with modules. | |
+| OpenShift / on-prem | Redis Operator or Redis Stack StatefulSet. | At least 3 nodes for HA. |
+
+**Topology**: separate instances (or logical `db` numbers) for broker, cache, sessions, and AI Knowledge index. Multi-AZ for HA. Minimum: 3 GB RAM, 2 vCPU per instance.
+
+## Configuration
+
+Helm keys that point to Redis:
+
+```yaml
+global:
+  broker:
+    driver: redis
+    existingSecret: "core-broker"             # url, password
+
+prismeai-api-gateway:
+  storage:
+    sessions:
+      driver: redis
+      existingSecret: "core-prismeai-api-gateway-sessions-store"
+
+prismeai-runtime:
+  cache:
+    contexts:
+      driver: redis
+      existingSecret: "core-prismeai-runtime-cache"
+
+# Apps namespace
+global:
+  storage:
+    searchengines:
+      existingSecret: "apps-crawler-searchengines"  # Redis URL with `db` number
+```
+
+Each secret holds a `url` (e.g. `redis://user:password@host:6379/3`) and optionally `password`.
+
+By convention we allocate `db` numbers per service (e.g. 0 = broker, 2 = runtime cache, 3 = sessions, 4 = searchengines). Adjust when sharing a cluster.
+
+See [Helm install](/self-hosting/kubernetes/helm) for the full install context.
+
+## Backup & restore
+
+### RDB snapshots
+
+```conf
+# redis.conf
+save 900 1
+save 300 10
+save 60 10000
+```
+
+Trigger a snapshot manually and copy the dump file:
+
+```bash
+redis-cli -h <host> -a <password> SAVE
+cp /var/lib/redis/dump.rdb /backup/redis/dump_$(date +%Y%m%d).rdb
+```
+
+### AOF (append-only file)
+
+For lower RPO, enable AOF in addition to RDB:
+
+```conf
+appendonly yes
+appendfsync everysec
+```
+
+### Managed services
+
+- **ElastiCache**: enable automatic daily snapshots, retain ≥ 7 days.
+- **Azure Cache for Redis**: enable RDB persistence to a storage account.
+- **Memorystore**: enable scheduled exports to GCS.
+
+Operational strategy (RPO/RTO, retention) lives in [Operations / Backup](/self-hosting/operations/backup).
+
+### What's safe to lose
+
+- **Broker (Redis Streams)**: only contains in-flight events with a `maxLen` cap. Losing it triggers re-processing at worst.
+- **Runtime cache**: rebuildable on restart.
+- **Sessions store**: losing it logs every user out — annoying but recoverable.
+- **AI Knowledge search index**: re-index from the source documents on Elasticsearch / object storage.
+
+## Updates
+
+- Redis is forward-compatible across minor versions; the platform requires **6.2+**.
+- Cluster-mode support has been available in Prisme.ai since v3.2.
+- For major Redis upgrades (e.g. 6 → 7): plan a maintenance window, fail over the replica, verify the modules are still loaded after upgrade.
+
+See [Operations / Updates](/self-hosting/operations/updates).
+
+## Scaling
+
+- **Vertical**: increase memory and IOPS — Redis is memory-bound.
+- **Cluster mode**: shard the keyspace for horizontal scale. Useful when broker streams or AI Knowledge indices grow beyond a single node's RAM.
+- **Replicas**: add read replicas if you offload read-heavy queries.
+- **Eviction policy**: cache instances should use `allkeys-lru` or `volatile-lru`. The **broker** and **sessions** stores must use `noeviction`.
+- **Monitoring**: track memory usage, connected clients, command latency, evicted keys.

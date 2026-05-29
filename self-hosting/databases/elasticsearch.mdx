@@ -1,0 +1,548 @@
+---
+title: "Elasticsearch / OpenSearch"
+description: "Events store, crawler index, search engine. Configuration, backup, scaling, ILM, cleanup CronJobs and reindexing recipes."
+---
+
+## Role in the platform
+
+| Purpose | Service | Notes |
+|---------|---------|-------|
+| **Events storage** | `prismeai-events` | Activity log, analytics, audit. |
+| **Crawler index** | `prismeai-crawler` | Indexed web/document content. |
+| **Search engine** | `prismeai-searchengine` | Query routing on top of crawler indices. |
+| **AI Knowledge vector store** *(alternative to Redis)* | AI Knowledge product | Uses dense vector mappings. |
+
+Both Elasticsearch and OpenSearch are supported. The platform driver auto-detects the variant.
+
+## Version compatibility
+
+- **Minimum: Elasticsearch 8.x** or **OpenSearch 2.x**.
+- Cluster sharing between environments is supported via index prefixes:
+  - `EVENTS_STORAGE_NAMESPACE` for the events store.
+  - `ELASTIC_INDICES_PREFIX` for crawler and search engine.
+
+## Recommended deployment
+
+| Provider | Recommended service |
+|----------|--------------------|
+| AWS | OpenSearch Service (Multi-AZ, 3 data + 3 master nodes). |
+| Azure | Elastic Cloud on Azure, or self-managed Elasticsearch on AKS via ECK. |
+| GCP | Elastic Cloud on GCP, or self-managed via ECK. |
+| OpenShift | Elasticsearch Operator (ECK) or OpenSearch Operator. |
+
+**Sizing**: 3-node cluster, 16 GB RAM and 4 vCPU per node minimum, with dedicated master nodes for clusters > 5 data nodes.
+
+## Configuration
+
+```yaml
+global:
+  storage:
+    events:
+      driver: elasticsearch                 # or opensearch
+      existingSecret: "core-prismeai-events-store"
+      prefix: ""                            # Optional, set when sharing the cluster
+
+# Apps namespace
+global:
+  storage:
+    documents:
+      existingSecret: "apps-crawler-documents"    # Elasticsearch URL + credentials
+```
+
+`prismeai-crawler` and `prismeai-searchengine` consume `ELASTIC_INDICES_PREFIX` to namespace their indices when sharing a cluster.
+
+See [Helm install](/self-hosting/kubernetes/helm) for the full install context.
+
+## Least privileges
+
+### Cluster-level privileges
+
+Only these are required:
+
+- `manage_ilm`
+- `manage_index_templates`
+- `monitor`
+
+### Index-level patterns
+
+The user should only have access to these patterns:
+
+- `${eventsPrefix}-events-*`
+- `${crawlerPrefix}-searchengine-webpages-*`
+- `${aikPrefix}*`
+
+Where:
+
+- **`${eventsPrefix}`** corresponds to the `EVENTS_STORAGE_NAMESPACE` environment variable on `prismeai-events`.
+- **`${crawlerPrefix}`** corresponds to the `ELASTIC_INDICES_PREFIX` environment variable on `prismeai-searchengine` and `prismeai-crawler`.
+- **`${aikPrefix}`** corresponds to the `vectorStore.vectorIndexPrefix` key in the Knowledges workspace configuration (when ES/OS is used as the vector database).
+
+The `all` privilege can reasonably be granted on these three patterns, as the impact is necessarily limited to these three types of data.
+
+## Backup & restore
+
+### Snapshot API (recommended)
+
+Register an S3 / Azure Blob / GCS snapshot repository, then snapshot regularly.
+
+```bash
+# 1. Register repository (S3 example)
+curl -X PUT "https://es.example.com/_snapshot/backup_repository" \
+  -H "Content-Type: application/json" -d '{
+    "type": "s3",
+    "settings": {
+      "bucket": "your-backup-bucket",
+      "region": "eu-west-1",
+      "role_arn": "arn:aws:iam::123456789012:role/es-snapshot"
+    }
+  }'
+
+# 2. Create snapshot
+curl -X PUT "https://es.example.com/_snapshot/backup_repository/snapshot_$(date +%Y%m%d)" \
+  -H "Content-Type: application/json" -d '{
+    "indices": "*",
+    "ignore_unavailable": true,
+    "include_global_state": true
+  }'
+
+# 3. Check status
+curl -X GET "https://es.example.com/_snapshot/backup_repository/snapshot_$(date +%Y%m%d)/_status"
+```
+
+Operational strategy (RPO/RTO, retention) lives in [Operations / Backup](/self-hosting/operations/backup).
+
+## Updates
+
+- Check index mappings compatibility before a major upgrade.
+- Some upgrades require reindexing — plan a maintenance window.
+- For OpenSearch users, watch out for driver-specific differences around ILM and snapshot repositories.
+
+See [Operations / Updates](/self-hosting/operations/updates).
+
+## Scaling
+
+### Index Lifecycle Management (ILM) Policies
+
+Prismeai automatically configures ILM policies to automate index rollover + segments merging when their primary shard reach **40 GB**, as recommended by Elasticsearch/Opensearch.
+
+Our Elasticsearch driver also configures an ILM policy to automate the events deletion **30 days** (default, configurable with `EVENTS_SCHEDULED_DELETION_DAYS`) after workspace deletion.
+This is not yet supported by the Opensearch driver, which deletes events as soon as the workspace is deleted.
+
+Events expiration is not configured from ILM as they do not offer the precision needed to tune different expiration periods depending on the different kind of data.
+Instead, events expiration is enforced by `prismeai-events` `/sys/cleanup/*` APIs which are automatically called from a Kubernetes CronJob as described below.
+
+### Events automated cleanup
+
+In addition to ILM, we provide a lightweight Kubernetes-native cleaner service that automatically:
+
+1. Deletes expired events to enforce data retention regulation (i.e GDPR).
+2. Deletes datastreams from small & inactive workspaces to reduce shards usage and avoid reaching the **1000 shards** per node limit.
+3. Removes `payload` and `output` fields from `runtime.automations.executed` technical events to save disk space without compromising audit/debug capabilities in short term.
+
+These 3 tasks are configurable from helm values:
+
+```yaml
+prismeai-events:
+  ...
+  events:
+    cleanupjob: true # Create a cronjob to call /cleanup API in order to regularly apply retention, clean unused & inactive workspaces (see EVENTS_CLEANUP_* vars)...
+
+    # 1. Delete events older than 3 years
+    retention: 1080
+
+    # 2. delete all events from small AND inactive workspaces :
+    workspaceMaxEvents: 50 # with max N events
+    workspaceInactivityDays: 30 # & inactive for N days
+
+    # 3. Delete payload & output fields from all runtime.automations.executed events older than :
+    automationExecutedExpiration: '14d'
+```
+
+Step 1 and 2 are executed from a `cleanup-es-indices` Kubernetes CronJob scheduled every sunday at 0AM, while step 3 is executed from a `cleanup-exec-events` CronJob every night at 3:30AM.
+
+#### Troubleshooting cleanup jobs
+
+1. Create a manual cleanup job from the existing CronJob:
+
+```bash
+kubectl -n core create job manual-cleanup --from=cronjob/core-prismeai-events-cleanup-exec-events
+```
+
+2. Check the job logs:
+
+```bash
+kubectl -n core logs job/manual-cleanup
+```
+
+Example logs:
+
+```json
+{"result":{"task":"a3H0dnU3Sc2s66rwbmtCiQ:25814043"},"task":{ ...}}
+```
+
+3. Retrieve the task ID from the logs (e.g. `a3H0dnU3Sc2s66rwbmtCiQ:25814043` above) and check its status with an Elasticsearch request:
+
+```
+GET /_tasks/<taskId>
+```
+
+Example curl from the events container:
+
+```bash
+curl --user $EVENTS_STORAGE_ES_USER:$EVENTS_STORAGE_ES_PASSWORD $EVENTS_STORAGE_ES_HOST/_tasks/<taskId>
+```
+
+4. Key output fields:
+
+- **completed**: Whether the cleanup task is still running or not. If it is, wait and regularly check its status again.
+- **task.running_time_in_nanos**: Execution time.
+- **response.failures**: Errors.
+- **response.total**: Number of documents matching the query.
+- **response.updated**: Number of documents updated by the query (removing all big data without removing the event itself to keep metadata).
+- **task.description**: Request description.
+
+### Optimize index settings
+
+* Scale your search cluster by adding more nodes and optimizing node roles. Configure dedicated master nodes for cluster management and data nodes for storage and search operations.
+* Optimize index settings including primary shard count, replica count, and refresh intervals based on your data volume and query patterns.
+* Implement Index Lifecycle Management (ILM) policies to automatically manage index aging, including hot, warm, cold, and delete phases.
+
+Here's a typical configuration to apply to an index (or datastream, as for Knowledges) to improve write performance:
+
+1. Retrieve your Knowledges (or other) index template configuration:
+
+```json
+GET _index_template/index-template-events-<workspaceId>
+```
+
+2. Keep it, adjust existing configuration as needed and add the last template settings:
+
+```json
+PUT _index_template/index-template-events-<workspaceId>
+{
+  "index_patterns": [ ... ],
+  "composed_of": [ ... ],
+  "priority": 1,
+  "data_stream": {
+    "hidden": false,
+    "allow_custom_routing": false
+  },
+  "template": {
+    "settings": {
+      "index.number_of_shards": 3,
+      "index.number_of_replicas": 1,
+      "index.refresh_interval": "5s",
+      "index.translog.durability": "async"
+    }
+  }
+}
+```
+
+Here, we configure the index template with 3 primary shards and 1 replica per primary, allowing you to distribute write traffic to all of your 3 nodes.
+Decrease `index.number_of_shards` to 2 if you only have 2 nodes.
+`index.refresh_interval` configures how often Elasticsearch will make your freshly written data available for search.
+
+3. Rollover your datastream in order to create a new index with the updated template:
+
+```json
+POST /events-<workspaceId>/_rollover
+```
+
+### Elasticsearch Self-Hosted Considerations
+
+When running a self-hosted Elasticsearch or OpenSearch cluster, ensure nodes are distributed across different physical machines for proper redundancy. Use high-performance disks and monitor CPU iowait metrics to identify potential disk bottlenecks that could impact search performance.
+
+Pay attention to cluster health metrics and ensure adequate disk space for index growth and operations like merging and replication.
+
+### Shard accounting
+
+Elasticsearch limits each node to **1000 shards** by default. List your shards and count them with:
+
+```
+GET /_cat/shards
+```
+
+A 3-node cluster can therefore hold at most 3000 shards. The events cleanup CronJob keeps this under control; if you approach the limit on a tenant you may need to consolidate older data streams or raise the per-node cap.
+
+### Move an Elasticsearch node without losing redundancy
+
+When you need to migrate an Elasticsearch node to a different Kubernetes node without ever dropping below the original replica count (so shards keep two live copies at all times):
+
+1. Provision the new Kubernetes node.
+2. **Increase** the Elasticsearch `nodeSet.replicas` by one (e.g. `kubectl -n <ns> edit elasticsearch/core`).
+3. Wait for shards to rebalance onto the new ES node (`GET /_cat/allocation/?v` — relocating shards should drop to 0 for a few minutes).
+4. **Drain** the Kubernetes node you want to retire (`kubectl drain node/<name>`). The old ES pod terminates and shards relocate to the remaining nodes.
+5. The StatefulSet will try to recreate the missing pod elsewhere — it will stay `Pending` because no node has the resources requested.
+6. **Decrease** the Elasticsearch `nodeSet.replicas` back to the original count. The `Pending` pod is removed cleanly without disturbing the running ones.
+7. Delete the drained Kubernetes node.
+
+Relocating shards takes hours on a large cluster (ES processes them two at a time). If you don't need zero-downtime relocation, the simpler path is to delete the target node first and let the cluster rebalance with one fewer node — at the cost of a short window where some shards run on a single replica.
+
+## Operations & Troubleshooting
+
+### Volume formatting
+
+When formatting the Elasticsearch/Opensearch filesystem volume, it is important to first shutdown the `prismeai-events` microservice in core namespace. This can be easily done from Kubernetes by editing the deployment and setting `replicas: 0`.
+
+Index mappings are initialized when `prismeai-events` starts up. If indexes and index mappings are deleted (such as when formatting a volume) without first stopping `prismeai-events`, the next event persistence request sent to the cluster would cause it to automatically infer an incorrect index mapping, which would cause most other persistence requests to fail and result in data loss. This is because when Prisme.ai events mapping are not initialized before first events write requests, ES/OS automatically infer mappings for `payload.*` nested fields, making it incompatible with the needed `flattened` (ES) / `flat_object` (OS) mapping on the entire `payload` field.
+
+This situation causes errors like `Limit of total fields [1000] has been exceeded` as ES/OS tries to map every single `payload.*` nested field until reaching the 1000 fields maximum limit.
+
+**If it is possible to delete the events data** (includes workspaces debug events and AIK usage metrics), this can be easily solved by:
+
+1. Shutting down `prismeai-events` by editing the deployment and setting `replicas: 0`. **If a HorizontalPodAutoscaler exists for `prismeai-events`, first delete it or set its min/max replicas to 0**.
+2. Removing every failed index/datastream either from Kibana or curl:
+
+```
+DELETE /_data_stream/events-<id1>
+DELETE /_data_stream/events-<id2>
+...
+```
+
+Failed index names can be found in `_index` field of `prismeai-events` error logs.
+Names starting with `.ds-events-` are datastreams underlying indexes and can be renamed like this to delete all underlying indexes at once: `.ds-events-<id>-000001` -> `events-<id>`
+
+3. Restarting `prismeai-events` by editing the deployment and setting `replicas: 1`
+
+**If events data cannot be lost**, the [existing indexes must be manually reindexed with the appropriate mapping](#reindexing-events-with-default-mapping).
+
+### Reindexing events with default mapping
+
+Follow these steps in order to reindex a workspace events datastream with the default index settings & mappings initialized (or updated) by `prismeai-events`:
+
+1. Find the correct name for the datastream you want to reindex and make sure it exists:
+
+```
+GET /events-<id1>/_search
+```
+
+2. List existing index templates and make sure an index template exists for your `events-*` pattern:
+
+```
+GET /_index_template
+```
+
+Example:
+
+```json
+{
+  "index_templates": [
+    ...
+    {
+      "name": "index-template-events",
+      "index_template": {
+        "index_patterns": [
+          "events-*"
+        ],
+        "composed_of": [
+          "template-events"
+        ],
+        "priority": 1,
+        "data_stream": {
+          "timestamp_field": {
+            "name": "@timestamp"
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+<Info>
+Some workspaces like Knowledges have a custom specific index template tuned for their needs, with the workspace id included in their index & component template name.
+</Info>
+
+This index template automatically applies its configuration and **component templates** (`composed_of`) to all indices matching `index_patterns`.
+The **component template** is where Prisme.ai custom index settings & mappings are configured.
+
+3. **Create a temporary datastream:**
+
+```
+PUT _data_stream/events-<id1>-tmp
+```
+
+**Make sure your temporary index name matches the `index_patterns` seen above so this new datastream will inherit default index settings & mappings.**
+
+4. Reindex your data from the current to the temporary & remapped datastream:
+
+```
+POST _reindex
+{
+  "source": {
+    "index": "events-<id1>"
+  },
+  "dest": {
+    "index": "events-<id1>-tmp",
+    "op_type":"create"
+  }
+}
+```
+
+You can optionally add a query filter to the source, very useful if you want to drop all error & execution events (which can take lot of disk space & are only useful for debugging last few days activities):
+
+```
+POST _reindex
+{
+  "source": {
+    "index": "events-<id1>",
+    "query": {
+      "bool": {
+        "must_not": [
+          {
+            "terms": {
+              "type": [
+                "runtime.automations.executed",
+                "error"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "dest": {
+    "index": "events-<id1>-tmp",
+    "op_type":"create"
+  }
+}
+```
+
+When retrying this request multiple times (for example with different source query to drop documents incompatible with the new mapping), you can add an `"conflicts": "proceed"` option to the body in order to ignore documents already created in destination index.
+
+A response with `{"failures": []}` indicates all data have been reindexed & match the destination mapping.
+In case of a mismatch between source data and destination mapping, you can receive error response like this:
+
+```json
+{
+  "took": 79,
+  "timed_out": false,
+  "total": 12,
+  "updated": 0,
+  "created": 6,
+  "deleted": 0,
+  "batches": 1,
+  "version_conflicts": 0,
+  "noops": 0,
+  "retries": {
+    "bulk": 0,
+    "search": 0
+  },
+  "throttled_millis": 0,
+  "requests_per_second": -1,
+  "throttled_until_millis": 0,
+  "failures": [
+    {
+      "index": ".ds-test-events-test-000001",
+      "id": "1757668991388-0",
+      "cause": {
+        "type": "mapper_parsing_exception",
+        "reason": "failed to parse field [payload.output] of type [double] in document with id '1757668991388-0'. Preview of field's value: '{some={nested=field}, foo=bar}'",
+        "caused_by": {
+          "type": "json_parse_exception",
+          "reason": "Current token (START_OBJECT) not numeric, can not use numeric value accessors\n at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: 530]"
+        }
+      },
+      "status": 400
+    },
+    ...
+  ]
+}
+```
+
+Either adapt the destination mapping or filter out these documents using the source query.
+
+5. Delete the current datastream:
+
+```
+DELETE /_data_stream/events-<id1>
+```
+
+6. Clone our temporary datastream to the "current" datastream exactly like we previously did the other way around:
+
+```
+PUT _data_stream/events-<id1>
+POST _reindex
+{
+  "source": {
+    "index": "events-<id1>-tmp"
+  },
+  "dest": {
+    "index": "events-<id1>",
+    "op_type":"create"
+  }
+}
+```
+
+<Warning>
+Make sure the response `failures` is an empty `[]` and `total` is the same as the first _reindex `total`.
+</Warning>
+
+Optionally, check that some specific type of event has been recovered:
+
+```
+GET /events-<workspaceId>/_search
+{
+  "track_total_hits": true,
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "type": "usage"
+          }
+        }
+      ]
+    }
+  },
+  "aggs": {
+    "latestDate": {
+      "max": {
+        "field": "createdAt"
+      }
+    },
+    "oldestDate": {
+      "min": {
+        "field": "createdAt"
+      }
+    }
+  }
+}
+```
+
+Example response:
+
+```json
+{
+  "hits": {
+    "total": {
+      "value": 668177,
+      "relation": "eq"
+    },
+    "max_score": null,
+    "hits": []
+  },
+  "aggregations": {
+    "latestDate": {
+      "value": 1758017828520,
+      "value_as_string": "2025-09-16T10:17:08.520Z"
+    },
+    "oldestDate": {
+      "value": 1725905374947,
+      "value_as_string": "2024-09-09T18:09:34.947Z"
+    }
+  }
+}
+```
+
+* `hits.total.value`: the number of matching documents
+* `aggregations.latestDate.value_as_string`: the latest matching document date
+* `aggregations.oldestDate.value_as_string`: the oldest matching document date
+
+7. Check from your browser that the target workspace events feed is not empty and contains old data, and that events previously failing to persist are now persisted.
+If everything is fine, you can delete the temporary datastream:
+
+```
+DELETE /_data_stream/events-<id1>-tmp
+```

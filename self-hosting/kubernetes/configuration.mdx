@@ -1,0 +1,156 @@
+---
+title: 'Configuration'
+description: 'The most important post-install settings — auth, mail, event retention, upload limits, crawler, runtime — with the env var and Helm value path for each.'
+---
+
+This page documents the settings you'll most often tune **after** the basic install. The Helm-level wiring (DB URLs, secrets, ingress) lives in [Install with Helm](/self-hosting/kubernetes/helm); the exhaustive env-var dump lives in [Environment Variables](/self-hosting/kubernetes/environment-variables).
+
+For every setting below: the **env var name** and the **Helm values path** (when one exists).
+
+---
+
+## Accounts and authentication
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `ACCOUNT_VALIDATION_METHOD`<br/>Helm: `prismeai-api-gateway.env` | `email` | How new signups are validated. Set to `auto` for SSO-only deployments where every account is implicitly trusted. `manual` requires a super-admin to approve each signup. |
+| `DISABLE_LOCAL_SIGNIN`<br/>Helm: `prismeai-api-gateway.env` | `false` | Disable username/password sign-in. Only SSO providers remain available. |
+| `DISABLE_LOCAL_SIGNUP`<br/>Helm: `prismeai-api-gateway.env` | `false` | Disable local sign-up API. Existing local users can still sign in. |
+| `SUPER_ADMIN_EMAILS`<br/>Helm: `prismeai-api-gateway.config.admins` | — | Comma-separated emails granted super-admin rights across all workspaces. |
+| `PASSWORD_VALIDATION_REGEXP`<br/>Helm: `prismeai-api-gateway.env` | `.{8,32}` | Custom regex for password complexity. |
+
+### Sessions and tokens
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `SESSION_COOKIES_MAX_AGE`<br/>Helm: `prismeai-api-gateway.env` | `2592000` (30 d) | Auth-server session cookie lifetime, in seconds. |
+| `ACCESS_TOKENS_MAX_AGE`<br/>Helm: `prismeai-api-gateway.env` | `2592000` (30 d) | Access-token lifetime, in seconds. |
+| `SOCKETIO_COOKIE_MAX_AGE`<br/>Helm: `prismeai-events.env` | from `cookie` module | Sticky-session cookie for `prismeai-events`. Raise this if events sessions drop too aggressively. |
+
+---
+
+## Email provider
+
+Configure at least one provider to send signup-validation / password-reset emails.
+
+### Mailgun
+
+```yaml
+prismeai-api-gateway:
+  providers:
+    mailgun:
+      apiKey: ""                                # or use existingSecret
+      existingSecret: "core-prismeai-api-gateway-mailgun"
+      emailFrom: '"Prisme.ai" <no-reply@example.com>'
+  env:
+    - { name: EMAIL_DRIVER, value: "mailgun" }
+```
+
+### SMTP
+
+```yaml
+prismeai-api-gateway:
+  env:
+    - { name: EMAIL_DRIVER, value: "smtp" }
+    - { name: EMAIL_FROM, value: '"Prisme.ai" <no-reply@example.com>' }
+    - { name: SMTP_HOST, value: "smtp.example.com" }
+    - { name: SMTP_PORT, value: "587" }
+    - { name: SMTP_USER, value: "user" }
+    - { name: SMTP_PASS, value: "password" }    # prefer existingSecret
+    - { name: SMTP_SECURE, value: "false" }     # true for port 465
+```
+
+---
+
+## Upload and request limits
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `UPLOADS_MAX_SIZE`<br/>Helm: `prismeai-api-gateway.env`, `prismeai-workspaces.env`, `prismeai-runtime.env` | `1mb` (chart default) | Max user upload size in bytes. Set to `100000000` (100 MB) for typical document-heavy workloads. |
+| `UPLOADS_ALLOWED_MIMETYPES`<br/>Helm: `prismeai-workspaces.env` | — | Comma-separated MIME types accepted on upload. Recommended: `image/*,text/*,video/*,audio/*,application/*,font/*,message/rfc822`. |
+| `REQUEST_MAX_SIZE`<br/>Helm: `prismeai-functions.env`, `prismeai-api-gateway.env` | `1mb` | Max request body size accepted by the service. Raise `prismeai-functions` to `20mb` for code-heavy automation payloads. |
+
+---
+
+## Event retention and cleanup
+
+The platform produces a large volume of activity events. Tune retention or you'll outgrow your Elasticsearch / OpenSearch cluster.
+
+```yaml
+prismeai-events:
+  events:
+    cleanupjob: true                            # Enable CronJobs that prune events
+    retention: 1080                             # Days before events are deleted (~3 years)
+    workspaceMaxEvents: 50                      # Cap for small / inactive workspaces
+    workspaceInactivityDays: 30                 # Inactivity threshold for cleanup
+    automationExecutedExpiration: "14d"         # Strip payload+output from old execution traces
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `BROKER_EMIT_MAXLEN`<br/>Helm: `prismeai-runtime.env`, `prismeai-events.env` | `100000` chars | Max event payload size emitted to the broker. Default keeps the broker healthy; raise it only if you understand the disk impact. |
+| `BROKER_EMIT_EXECUTED_AUTOMATION_MAXLEN`<br/>Helm: `prismeai-runtime.env` | `10000` chars | Tighter limit for `runtime.automations.executed` (monitoring-only events). |
+| `EVENTS_BUFFER_FLUSH_EVERY`<br/>Helm: `prismeai-events.env` | `5000` ms | Persist events every N ms even if the buffer isn't full. |
+| `ELASTIC_SEARCH_TIMEOUT`<br/>Helm: `prismeai-events.env` | `2000ms` | Raise to `10000ms` to tolerate slow ES queries during peak load. |
+
+---
+
+## Workspaces and custom domains
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `CUSTOM_DOMAINS_CNAME`<br/>Helm: `prismeai-workspaces.env` | — | Public CNAME target advertised to workspace owners who configure a custom domain. |
+
+---
+
+## Runtime tuning
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `RUNNER_MAX_THREADS`<br/>Helm: `prismeai-runtime.env` | `1` | Number of execution threads per runtime pod. Raise to use multi-core nodes (e.g. `4`). |
+| `RUNTIME_THROTTLE_*`<br/>Helm: `prismeai-runtime.env` | varies | Rate-limit thresholds. See [Rate limits](/api-reference/rate-limits#configuration-options) for the full list and per-workspace overrides. |
+| Gateway timeout<br/>ConfigMap: `core-prismeai-api-gateway-config` | 60 s | Default API-gateway request timeout. Raise to **120 s** for LLM-heavy workloads. |
+
+---
+
+## Functions (custom code)
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `NODE_OPTIONS`<br/>Helm: `prismeai-functions.env` | — | Node.js memory cap. Set to `--max-old-space-size=2200` (or proportional to the pod memory limit). |
+| `KERNEL_POOL_SIZE`<br/>Helm: `prismeai-functions.env` | `2` | Python Jupyter kernels kept warm per pod. Raise to `10` for Python-heavy workloads. |
+| `TASKS_STORAGE_FILESYSTEM_DIRPATH`<br/>Helm: `prismeai-functions.env` | `/tmp/tasks` | Where execution tasks are written. Use a mounted RWX PVC if you need persistence across restarts. |
+
+---
+
+## Crawler
+
+For document-processing workloads, the crawler's polling tuning matters more than its raw resources.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `MAX_CONTENT_LEN`<br/>Helm: `prismeai-crawler.env` | `1500000` (2 M chars) | Max indexed document size. |
+| `DOWNLOAD_DELAY`<br/>Helm: `prismeai-crawler.env` | `0` | Seconds between requests to the same source. Set to `0.5` for typical sources to avoid rate-limiting. |
+| `REQUEST_QUEUES_POLLING_SIZE`<br/>Helm: `prismeai-crawler.env` | `1` | Concurrent requests per pod. `8` for typical document mix. |
+| `REQUEST_QUEUES_POLLING_INTERVAL`<br/>Helm: `prismeai-crawler.env` | `5` s | Queue poll frequency. |
+| `DEFAULT_ENGINE_WEBPAGES_LIMIT`<br/>Helm: `prismeai-crawler.env` | `30000` | Max pages indexed per search engine before crawling stops. |
+| `ELASTIC_INDICES_PREFIX`<br/>Helm: `prismeai-crawler.env`, `prismeai-searchengine.env` | — | Index name prefix. Set when sharing Elasticsearch with other tenants. |
+
+---
+
+## Cross-cluster optimizations
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `INTERNAL_API_URL`<br/>Helm: `global.internalApiUrl` | — | Force internal service-to-service traffic over a private URL (e.g. `http://prismeai-core-prismeai-api-gateway.prismeai-core/v2`). Avoids extra LB hops and saves significant CPU on internal HTTPS. |
+| `WEBSOCKETS_DEFAULT_TRANSPORTS`<br/>Helm: `prismeai-console.env` | `websocket,polling` | Socket.io transports. Keep both to support clients behind strict proxies. |
+| `EVENTS_STORAGE_NAMESPACE`<br/>Helm: `prismeai-events.env` | — | Per-tenant event index prefix when sharing an ES / OS cluster. |
+
+---
+
+## Where to go next
+
+- [Helm install](/self-hosting/kubernetes/helm) — wiring the platform to your databases and ingress.
+- [Resources & Autoscaling](/self-hosting/kubernetes/resources) — picking Balanced vs Production-ready, HPA targets.
+- [Environment Variables](/self-hosting/kubernetes/environment-variables) — exhaustive per-service reference.
+- [Operations / Scaling](/self-hosting/operations/scaling) — runtime tuning under load.

@@ -1,171 +1,230 @@
 ---
-title: 'Kubernetes Resource Management'
-description: 'Recommended Kubernetes resources configuration and management practices for deploying Prisme.ai.'
+title: 'Kubernetes Resources & Autoscaling'
+description: 'Resource requests/limits for the core and apps namespaces, HPA configuration, and troubleshooting.'
 ---
 
-
-Proper Kubernetes resource configuration ensures optimal performance, reliability, and cost-efficiency for your Prisme.ai deployment. This guide details best practices and recommended configurations.
-
----
-
-## Recommended Resource Configuration
-
-The following guidelines help ensure optimal performance for a standard Prisme.ai deployment:
-
-| Component                   | CPU Requests | CPU Limits | Memory Requests | Memory Limits |
-|-----------------------------|--------------|------------|-----------------|---------------|
-| API Gateway                 | 500m         | 1000m      | 512Mi           | 1Gi           |
-| Runtime                     | 1000m        | 2000m      | 1Gi             | 2Gi           |
-| Console (Studio)            | 250m         | 500m       | 256Mi           | 512Mi         |
-| Pages                       | 250m         | 500m       | 256Mi           | 512Mi         |
-| Events                      | 500m         | 1000m      | 512Mi           | 1Gi           |
-| MongoDB (per node)          | 1000m        | 2000m      | 2Gi             | 4Gi           |
-| Elasticsearch (per node)    | 1000m        | 2000m      | 4Gi             | 8Gi           |
-| Redis (per node)            | 500m         | 1000m      | 1Gi             | 2Gi           |
+This page tells you how much CPU and memory to give each Prisme.ai service, when to scale, and how to debug resource problems. Database resources are covered in [Databases](/self-hosting/databases/overview).
 
 ---
 
-## Best Practices for Resource Management
+## Two reference variants
 
-Implement these best practices to optimize Kubernetes resource usage:
+We ship two sets of resource defaults. Pick one based on how much you need to scale per pod.
 
-<CardGroup cols={2}>
+| Variant | Use when |
+|---------|----------|
+| **Balanced** | Up to a few hundred concurrent users, budget-sensitive. Each pod is sized for typical load, with HPA absorbing spikes. |
+| **Production-ready** | Thousands of concurrent users, max throughput per pod. Requests are sized at the maximum each service can actually use — these are the chart defaults. |
 
-<Card title="Resource Requests and Limits" icon="tachometer-alt">
-- Set accurate resource **requests** to inform Kubernetes scheduler for optimal pod placement.
-- Configure resource **limits** to prevent resource starvation.
-</Card>
+### Trade-off in plain English
 
-<Card title="Autoscaling" icon="arrows-alt-v">
-- Use Horizontal Pod Autoscaler (HPA) based on CPU/Memory utilization.
-- Set minimum and maximum replica counts for critical components like API Gateway and Runtime.
-</Card>
+- **High requests** → fewer pods per node → idle CPU/RAM is wasted when pods aren't busy.
+- **Low requests** → more pods per node → risk of a node being unable to provide CPU/RAM under load spikes.
 
-<Card title="Node Pool Optimization" icon="server">
-- Configure separate node pools for CPU-intensive (Runtime) and memory-intensive (Elasticsearch, MongoDB) workloads.
-- Regularly monitor resource usage and scale node pools accordingly.
-</Card>
-
-<Card title="Monitoring & Alerts" icon="chart-line">
-- Integrate resource monitoring with Prometheus/Grafana.
-- Configure alerts to notify resource constraints or spikes in utilization.
-</Card>
-
-</CardGroup>
+Pick **Balanced** if your traffic is mostly steady and budget matters. Pick **Production-ready** if you need each pod to absorb large bursts on its own.
 
 ---
 
-## Resource Quotas & Limit Ranges
+## Core namespace
 
-Apply resource quotas and limit ranges to manage resource consumption within Kubernetes namespaces effectively.
+### Variant A — Balanced
 
-<AccordionGroup>
+| Service       | CPU request | Memory request | Memory limit | HPA min / max |
+|---------------|-------------|----------------|--------------|---------------|
+| api-gateway   | 300m        | 200Mi          | 300Mi        | 2 / 4         |
+| workspaces    | 300m        | 200Mi          | 400Mi        | 2 / 4         |
+| runtime       | 2000m       | 2500Mi         | 2500Mi       | 2 / 4         |
+| events        | 500m        | 300Mi          | 500Mi        | 2 / 4         |
+| console       | 100m        | 300Mi          | 300Mi        | 2 / 4         |
 
-<Accordion title="Resource Quota Example">
-Set resource quotas at namespace level to prevent overconsumption:
+### Variant B — Production-ready
+
+| Service       | CPU request | Memory request | Memory limit | HPA min / max |
+|---------------|-------------|----------------|--------------|---------------|
+| api-gateway   | 2000m       | 600Mi          | 600Mi        | 2 / 5         |
+| workspaces    | 1250m       | 500Mi          | 500Mi        | 2 / 5         |
+| runtime       | 3800m       | 4000Mi         | 4Gi          | 2 / 5         |
+| events        | 1500m       | 600Mi          | 600Mi        | 2 / 5         |
+| console       | 1000m       | 300Mi          | 300Mi        | 2 / 5         |
+
+---
+
+## Apps namespace
+
+### Variant A — Balanced
+
+| Service       | CPU request | Memory request | Memory limit | HPA min / max |
+|---------------|-------------|----------------|--------------|---------------|
+| functions     | 400m        | 1.5Gi          | 2Gi          | 1 / 6         |
+| crawler       | 1500m       | 3Gi            | 3Gi          | 1 / 4         |
+| searchengine  | 100m        | 200Mi          | 400Mi        | 1 / 4         |
+
+### Variant B — Production-ready
+
+| Service       | CPU request | Memory request | Memory limit | HPA min / max |
+|---------------|-------------|----------------|--------------|---------------|
+| functions     | 1500m       | 1500Mi         | 3Gi          | 2 / 5         |
+| crawler       | 3000m       | 5Gi            | 5Gi          | 2 / 5         |
+| searchengine  | 1500m       | 500Mi          | 500Mi        | 2 / 5         |
+
+---
+
+## Why no CPU limit?
+
+You'll notice the tables above have no CPU limit. **Don't set one** on Prisme.ai services.
+
+- The Linux CFS scheduler already throttles pods that exceed their request when another pod on the same node needs that CPU.
+- A CPU limit on top of that wastes free CPU: when the node has spare cycles and a pod could use them, the limit blocks it for no reason.
+- In practice, CPU limits on Node.js workloads cause unnecessary tail-latency spikes and add zero protection.
+
+Memory limits stay — memory is not compressible, so a runaway pod must be capped before it triggers OOM on the whole node.
+
+---
+
+## Horizontal Pod Autoscaling (HPA)
+
+**Golden rule for production: at least 2 replicas of every core service**, and of `functions` and `crawler` in apps. Single-replica means a single bad pod, restart or node drain takes the service down.
+
+### Example HPA config
+
+```yaml
+prismeai-runtime:
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+```
+
+### Recommended targets
+
+| Service group       | Target CPU | Notes |
+|---------------------|------------|-------|
+| api-gateway, workspaces, runtime, console | 70% | Standard CPU-bound services |
+| events              | 70% CPU    | Pin clients via a consistent-hash header (or Istio `DestinationRule` on `user-agent`) — events benefit from sticky sessions |
+| functions           | 70% CPU    | Memory is the real constraint; over-provision memory before scaling |
+| crawler             | 80% CPU + 80% memory | Heavy memory pressure during indexing |
+| searchengine        | 70% CPU    | |
+
+---
+
+## Resource Quotas and Limit Ranges
+
+Apply quotas at the namespace level to prevent runaway consumption.
+
 ```yaml
 apiVersion: v1
 kind: ResourceQuota
 metadata:
-  name: prisme-quota
-  namespace: prisme-ai
+  name: prismeai-core-quota
+  namespace: prismeai-core
 spec:
   hard:
     requests.cpu: "16"
     requests.memory: "32Gi"
-    limits.cpu: "32"
     limits.memory: "64Gi"
     pods: "50"
 ```
-</Accordion>
 
-<Accordion title="LimitRange Example">
-Define limit ranges to enforce default limits for all pods:
 ```yaml
 apiVersion: v1
 kind: LimitRange
 metadata:
-  name: prisme-limit-range
-  namespace: prisme-ai
+  name: prismeai-core-limits
+  namespace: prismeai-core
 spec:
   limits:
-    - default:
-        cpu: "500m"
-        memory: "1Gi"
+    - type: Container
       defaultRequest:
         cpu: "250m"
         memory: "512Mi"
-      type: Container
-```
-</Accordion>
-
-</AccordionGroup>
-
----
-
-## Persistent Storage Recommendations
-
-Ensure reliability and durability by properly configuring persistent volumes (PVs):
-
-- Use **Persistent Volume Claims (PVCs)** with dynamically provisioned storage classes.
-- Recommended storage classes: SSD-backed storage (e.g., AWS EBS GP3, Azure Premium SSD, Google Persistent Disk SSD).
-- Regular backups and snapshotting via cloud provider capabilities or dedicated backup solutions.
-
----
-
-## Monitoring Kubernetes Resources
-
-Use Prometheus and Grafana to continuously monitor resources:
-
-- CPU and memory utilization dashboards.
-- Persistent storage performance metrics.
-- Alerting rules for resource exhaustion.
-
-Example Prometheus alert:
-```yaml
-groups:
-- name: resource-alerts
-  rules:
-  - alert: HighCpuUsage
-    expr: sum(rate(container_cpu_usage_seconds_total[5m])) by (pod) > 0.9
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: High CPU usage detected
+      default:
+        memory: "1Gi"
 ```
 
 ---
 
-## Troubleshooting Resource Issues
-
-Common issues and resolutions:
+## Troubleshooting
 
 <AccordionGroup>
 
-<Accordion title="Pod Scheduling Issues">
-- Verify sufficient cluster resources available:
+<Accordion title="Pods stuck Pending">
 ```bash
-kubectl describe pod <pod-name> -n prisme-ai
+kubectl describe pod <pod> -n <namespace> | tail -30
+kubectl describe nodes | grep -A 5 "Allocated resources"
 ```
-- Adjust resource requests if necessary.
+- "0/N nodes available: Insufficient cpu/memory" → reduce requests, increase node size, or scale the node pool.
+- "node(s) didn't match Pod's node affinity/selector" → check `tolerations` and `nodeSelector` against your node pool labels.
 </Accordion>
 
-<Accordion title="High CPU or Memory Usage">
-- Inspect pod-level resource usage:
+<Accordion title="HPA pinned at maxReplicas">
 ```bash
-kubectl top pods -n prisme-ai
+kubectl get hpa -n <namespace>
+kubectl describe hpa/<hpa> -n <namespace>
 ```
-- Scale horizontally or vertically as needed.
+- Sustained 100% CPU on max replicas → raise `maxReplicas`, or move from Balanced to Production-ready variant for the affected service.
+- Memory-bound service (e.g. `functions`) → raise memory request rather than replica count.
 </Accordion>
 
-<Accordion title="Persistent Storage Issues">
-- Check PVC and PV status:
+<Accordion title="Pod OOMKilled">
 ```bash
-kubectl get pvc -n prisme-ai
-kubectl describe pvc <pvc-name> -n prisme-ai
+kubectl logs <pod> -n <namespace> --previous
+kubectl describe pod <pod> -n <namespace> | grep -i oom
 ```
-- Ensure proper storage class configuration and available storage space.
+- For `runtime`, check `BROKER_EMIT_MAXLEN` — very large events can spike memory.
+- For `functions`, check `NODE_OPTIONS=--max-old-space-size=...` matches the container memory limit.
+- Raise the memory request **and** limit together.
+</Accordion>
+
+<Accordion title="CPU throttling under load">
+```bash
+kubectl top pods -n <namespace>
+```
+- High CPU usage approaching the request, with growing latency → raise the CPU request (not a limit).
+- Verify no CPU limit is set on Prisme.ai services.
+</Accordion>
+
+<Accordion title="Node saturation">
+```bash
+kubectl top nodes
+kubectl describe nodes/<node>
+```
+- One node carrying disproportionate load → check pod anti-affinity on critical services, or rebalance with a rolling restart.
+- Persistent saturation → scale the node pool or move to larger instances.
+</Accordion>
+
+<Accordion title="Frequent restarts after deployments">
+```bash
+kubectl get events -n <namespace> --sort-by=.lastTimestamp | tail -30
+```
+- Failing readiness probe right after rollout → check service dependencies (DB reachable, secrets mounted).
+- Crash loop → `kubectl logs <pod> -n <namespace> --previous`.
+- If the regression is in a new chart version, roll back: `helm rollback <release> <revision> -n <namespace>` — see [Helm install — Upgrade, rollback, uninstall](/self-hosting/kubernetes/helm#8-upgrade-rollback-uninstall).
+</Accordion>
+
+<Accordion title="Volume node affinity conflict">
+Symptom in `kubectl get events`:
+```
+FailedScheduling   0/3 nodes are available: 1 Insufficient memory, 2 node(s) had volume node affinity conflict.
+```
+A pod with a `ReadWriteOnce` PVC can only be scheduled on the node where the volume lives. If that node is full and the others can't mount the volume, scheduling fails.
+
+Fixes:
+- Free CPU/memory on the node that hosts the volume (delete idle pods, scale a noisy neighbor down).
+- Move to a **ReadWriteMany** storage class (EFS / Azure Files / Filestore / CephFS) for workloads that can be re-scheduled freely — see [Requirements](/self-hosting/requirements#storage-and-filesystems).
+- Add a node to the pool.
+</Accordion>
+
+<Accordion title="PersistentVolume nearly full">
+Alerts: `KubePersistentVolumeFillingUp`, `KubePersistentVolumeFull`.
+
+```bash
+kubectl get pvc -A
+kubectl describe pvc <pvc> -n <namespace>
+```
+- For Elasticsearch / OpenSearch, the most common cause is unbounded event growth — enable the `prismeai-events` cleanup job and tune retention. See [Elasticsearch — Events automated cleanup](/self-hosting/databases/elasticsearch#events-automated-cleanup).
+- Expand the PVC if the storage class supports it (`kubectl edit pvc <pvc>` → bump `spec.resources.requests.storage`).
+- Otherwise, snapshot + restore into a larger volume.
 </Accordion>
 
 </AccordionGroup>
@@ -175,24 +234,16 @@ kubectl describe pvc <pvc-name> -n prisme-ai
 ## Next Steps
 
 <CardGroup cols={2}>
-  <Card
-    title="High Availability"
-    icon="cloud"
-    href="/self-hosting/kubernetes/high-availability"
-  >
-    Configure high availability setups
+  <Card title="Helm install" icon="ship" href="/self-hosting/kubernetes/helm">
+    Configure values and deploy core + apps namespaces.
   </Card>
-  <Card
-    title="Prometheus & Grafana"
-    icon="chart-column"
-    href="/self-hosting/kubernetes/prometheus-grafana-operator"
-  >
-    Set up monitoring tools
+  <Card title="Databases" icon="database" href="/self-hosting/databases/overview">
+    MongoDB, Redis, Elasticsearch and PostgreSQL configuration.
   </Card>
-    <Card title="Products Configuration" icon="store" href="/self-hosting/configuration/products-installation">
-    Configure your Prisme.ai AI products
+  <Card title="Products Configuration" icon="store" href="/self-hosting/configuration/products-installation">
+    Configure your Prisme.ai AI products.
   </Card>
-  <Card title="Operations Management" icon="scale-unbalanced" href="/self-hosting/operations/scaling">
-    Learn about scaling operations efficiently
+  <Card title="Operations" icon="tools" href="/self-hosting/operations/scaling">
+    Scaling, updates and backups.
   </Card>
 </CardGroup>

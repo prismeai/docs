@@ -1,0 +1,108 @@
+---
+title: "PostgreSQL"
+description: "PostgreSQL as an alternative to MongoDB for permissions, users and collections storage."
+---
+
+## Role in the platform
+
+PostgreSQL is an alternative to MongoDB for the three structured-data stores: **users**, **permissions** and **collections**. The choice is per-deployment — you cannot mix Mongo and Postgres across these three.
+
+If you don't have a strong preference, MongoDB is the default — see [MongoDB](/self-hosting/databases/mongodb).
+
+## Version compatibility
+
+- **Minimum: PostgreSQL 12+** (14+ recommended).
+- `sslmode=require` is mandatory on all connection strings.
+
+## Recommended deployment
+
+| Provider | Recommended service |
+|----------|--------------------|
+| AWS | Amazon RDS for PostgreSQL, Multi-AZ. |
+| Azure | Azure Database for PostgreSQL — Flexible Server, with **Entra ID passwordless auth**. |
+| GCP | Cloud SQL for PostgreSQL, regional HA. |
+| OpenShift / on-prem | Crunchy Postgres for Kubernetes operator, or self-managed with streaming replication. |
+
+**Topology**: primary + at least one standby replica, multi-AZ.
+
+## Configuration
+
+Three Helm keys change compared to MongoDB. Each is marked with a `postgresql` comment in the chart `values.yaml`.
+
+### Permissions
+
+```yaml
+global:
+  storage:
+    permissions:
+      driver: postgresql
+      existingSecret: "core-permissions"     # `url` key
+```
+
+URL example: `postgres://user:password@db.example.com:5432/permissions?sslmode=require`.
+
+### Users
+
+```yaml
+prismeai-api-gateway:
+  storage:
+    users:
+      driver: postgresql
+      existingSecret: "core-prismeai-api-gateway-users"
+```
+
+### Collections
+
+```yaml
+prismeai-runtime:
+  storage:
+    collections:
+      driver: postgresql
+      existingSecret: "core-prismeai-runtime-collections"
+```
+
+See [Helm install — PostgreSQL](/self-hosting/kubernetes/helm#6-postgresql) for the full install context.
+
+## Backup & restore
+
+### Backup with `pg_dump`
+
+```bash
+pg_dump "postgres://user:password@host:5432/database?sslmode=require" \
+  --format=custom \
+  --file=/backup/pg/$(date +%Y-%m-%d)-database.dump
+```
+
+### Restore with `pg_restore`
+
+```bash
+pg_restore --clean --if-exists \
+  --dbname="postgres://user:password@host:5432/database?sslmode=require" \
+  /backup/pg/<date>-database.dump
+```
+
+### Managed services
+
+- **RDS**: automated daily snapshots + point-in-time recovery.
+- **Azure Flexible Server**: built-in backup with configurable retention.
+- **Cloud SQL**: automated backups with point-in-time recovery.
+
+Operational strategy (RPO/RTO, retention) lives in [Operations / Backup](/self-hosting/operations/backup).
+
+## Updates
+
+- Schema migrations run automatically on backend startup.
+- For major Postgres version jumps (e.g. 12 → 14), follow the cloud provider's blue/green or in-place upgrade procedure. Snapshot first.
+
+See [Operations / Updates](/self-hosting/operations/updates).
+
+## Scaling
+
+- **Vertical** first: PostgreSQL scales well on a single beefy primary up to most workloads.
+- **Read replicas** when read load is heavy and your application can tolerate stale reads.
+- **Connection pooling**: deploy **PgBouncer** in front of Postgres for high-concurrency workloads.
+- **Indexes**: monitor with `pg_stat_statements`. Common hot paths are user lookups and workspace-scoped queries.
+
+## Azure Entra ID passwordless auth
+
+On Azure DB for PostgreSQL Flexible Server, use Entra ID Workload Identity to inject short-lived tokens instead of static passwords. Configure `azureManagedIdentityClientId` on the relevant Helm storage blocks — see [Azure deployment notes](/self-hosting/cloud/azure).
