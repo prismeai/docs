@@ -1,13 +1,13 @@
 ---
-title: "Install from scratch (v27)"
-description: "Step-by-step guide for installing the new v27 Prisme.ai platform products (Agent Creator, LLM Gateway, Storage, Governe) on a fresh self-hosted environment."
+title: "Install products"
+description: "Step-by-step guide to initialize and configure the Prisme.ai platform products (Agent Creator, LLM Gateway, Storage, Governe, Insights, Builder, Helper Agents) on a self-hosted environment."
 ---
 
-This guide walks you through a **fresh installation** of a self-hosted Prisme.ai platform on **v27**, configured directly with the new platform products (**Agent Creator**, **LLM Gateway**, **Storage** — vector store, **Governe**, …) — **without any legacy Knowledges / AI Store data to migrate**.
+This guide walks you through installing and configuring the **platform products** on a self-hosted Prisme.ai deployment — **Agent Creator**, **LLM Gateway**, **Storage** (vector store), **Governe**, **Insights**, **Builder**, **Helper Agents** — once the platform itself is up and running.
 
 If you are upgrading an existing instance from legacy products, follow [Migration v27](/self-hosting/operations/migration-v27) instead.
 
-The installation is split into four phases:
+The installation is split into five phases:
 
 <Steps>
   <Step title="Infrastructure setup">
@@ -22,11 +22,48 @@ The installation is split into four phases:
   <Step title="Post-install configuration">
     Declare LLM providers, models, vector store and organization settings.
   </Step>
+  <Step title="Organization configuration">
+    Allowed models, join rules, appearance, menu.
+  </Step>
 </Steps>
 
 <Info>
-  This page assumes the **platform itself** is already deployed (databases, ingress, secrets management, etc.). If you are not at that point yet, start from the [Self-Hosting Overview](/self-hosting/overview) and follow the [Helm install guide](/self-hosting/kubernetes/helm) with the [provider-specific notes](/self-hosting/cloud/aws). For the broader product setup sequence (Governe, LLM Gateway, Storage, Agent Creator, Insights, Builder, Helper Agents), see [Configuring Products](/self-hosting/configuration/products-installation).
+  This page assumes the **platform itself** is already deployed (databases, ingress, secrets management, etc.). If you are not at that point yet, start from the [Self-Hosting Overview](/self-hosting/overview) and follow the [Helm install guide](/self-hosting/kubernetes/helm) with the [provider-specific notes](/self-hosting/cloud/aws).
 </Info>
+
+## Prerequisites
+
+Before starting product installation, make sure the base deployment is ready:
+
+- You can sign in as a **super admin** (configured under `config.admins` in your Helm values).
+- The **Platform** workspace is visible in Builder.
+- Core services are running: `prismeai-api-gateway`, `prismeai-console`, `prismeai-workspaces`, `prismeai-events`, and `prismeai-runtime`.
+- App services required by product workspaces are running: `prismeai-functions`, `prismeai-crawler`, and `prismeai-searchengine`.
+- Object storage, uploads storage, workspace storage, and databases are configured.
+- Elasticsearch or OpenSearch is available for the vector store.
+- LLM provider credentials are available as platform secrets or environment variables.
+
+### Readiness check
+
+Run the platform readiness endpoint before importing or configuring products:
+
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" https://api.your-domain.com/v2/readiness
+```
+
+You can also open the readiness URL from a browser already authenticated as a super admin. All required services should return a `ready` status. Resolve readiness errors before continuing.
+
+### Offline or private-network deployments
+
+For restricted environments, verify these points before product initialization:
+
+- `prismeai-functions` only needs an npm registry if you plan to write Custom Code that pulls in extra packages beyond the ones bundled in the image. See [Custom Code Functions — NPM Registry Access](/self-hosting/entreprise/functions#optional-npm-registry-access).
+- If internal or self-signed certificates are used, mount the CA bundle into every service that calls internal HTTPS endpoints:
+  - Python services such as `prismeai-crawler` and `prismeai-searchengine` use `REQUESTS_CA_BUNDLE`.
+  - Node.js services use `NODE_EXTRA_CA_CERTS`.
+- LLM providers, vector stores, and crawler targets must be reachable from the relevant pods.
+
+---
 
 ## 1. Infrastructure setup
 
@@ -51,7 +88,7 @@ Pin **all** core service and app image tags to the same v27 release. The availab
 LLM Gateway and Storage workspaces consume credentials through `WORKSPACE_SECRET_*` environment variables exposed on **prismeai-runtime**.
 
 <Info>
-  The string after `llm-gateway_` or `storage_` is the **secret name** as it will be consumed by the LLM Gateway and Storage workspaces. The names you choose here must match the secret names referenced from the workspace configuration in step 4.
+  The string after `llm-gateway_` or `storage_` is the **secret name** as it will be consumed by the LLM Gateway and Storage workspaces. The names you choose here must match the secret names referenced from the workspace configuration in phase 4.
 </Info>
 
 <Tabs>
@@ -83,7 +120,27 @@ LLM Gateway and Storage workspaces consume credentials through `WORKSPACE_SECRET
   Alternatively, these secrets can be entered directly from the **Secrets** page of the **LLM Gateway** and **Storage** workspaces, without touching environment variables.
 </Tip>
 
-### 1.4 Deploy
+### 1.4 Runtime app endpoints (custom deployments)
+
+With the standard Helm charts, runtime → app routing is wired automatically. If you run a custom deployment, verify that the runtime configuration points to the right hosts:
+
+```env
+APP_CONFIG_CustomCode_apiUrl=http://FUNCTIONS_HOST:80
+APP_CONFIG_Crawler_apiUrl=http://SEARCHENGINE_HOST:80
+```
+
+`FUNCTIONS_HOST` must be reachable from `prismeai-runtime` and should point to `prismeai-functions`. `SEARCHENGINE_HOST` must be reachable from `prismeai-runtime` and should point to `prismeai-searchengine`.
+
+If you use Collections from Builder apps, also verify the collection storage configuration:
+
+```env
+COLLECTIONS_STORAGE_DRIVER=mongodb
+COLLECTIONS_STORAGE_HOST=mongodb://MONGO_HOST/collections
+```
+
+For Helm deployments, prefer the chart values for runtime storage and secrets instead of hardcoding these values in manifests.
+
+### 1.5 Deploy
 
 Deploy the Helm chart and wait for all pods to roll out successfully.
 
@@ -91,8 +148,6 @@ Deploy the Helm chart and wait for all pods to roll out successfully.
 helm -n prismeai-core upgrade --install prismeai-core -f core-values.yaml prismeai/prismeai-core
 helm -n prismeai-apps upgrade --install prismeai-apps -f apps-values.yaml prismeai/prismeai-apps
 ```
-
-Verify the platform is healthy via the [Readiness API](/self-hosting/operations/testing#platform-readiness-api) before continuing.
 
 ---
 
@@ -108,6 +163,12 @@ Verify the platform is healthy via the [Readiness API](/self-hosting/operations/
     - **Name** — the display name shown across the UI.
     - **Technical name** — the unique identifier used throughout the platform. It **cannot be changed** after creation.
   </Step>
+  <Step title="Verify platform readiness">
+    Open the native **Govern** app from the left menu and open the **Infrastructure** page.
+    Verify the platform is healthy by testing **Vector Stores** and native **Services** connectivity with the Test buttons.
+
+    You can also manually call the [Readiness API](/self-hosting/operations/testing#platform-readiness-api) with shell commands.
+  </Step>
   <Step title="Open Builder">
     After creation, you should be redirected to a near-empty platform with two links in the left menu: **Builder** and **Govern**. Open **Builder**.
   </Step>
@@ -117,7 +178,7 @@ Verify the platform is healthy via the [Readiness API](/self-hosting/operations/
 
 ## 3. Products initialization
 
-The v27 platform products are imported in **four sequential groups** via the **Platform** workspace bulk import:
+The platform products are imported in **four sequential groups** via the **Platform** workspace bulk import:
 
 <CardGroup cols={2}>
   <Card title="base1" icon="cube">
@@ -127,14 +188,18 @@ The v27 platform products are imported in **four sequential groups** via the **P
     Extended base (Crawler, RedisSearch, …).
   </Card>
   <Card title="extended" icon="boxes-stacked">
-    Legacy AI products (Knowledges, AI Store, …) — still required as a dependency for the v27 platform products. They will disappear in a future release.
+    Legacy AI products (Knowledges, AI Store, …) — still required as a dependency for the platform products. They will disappear in a future release.
   </Card>
   <Card title="one-product" icon="box-archive">
-    Main v27 products (LLM Gateway, Storage, Governe, Agent Creator, …).
+    Main platform products (LLM Gateway, Storage, Governe, Agent Creator, …).
   </Card>
 </CardGroup>
 
-For each group:
+<Warning>
+  Always wait for `workspaces.bulkImport.completed` (with no errors) before importing the next group — each group depends on the previous one.
+</Warning>
+
+### Import from the UI
 
 <Steps>
   <Step title="Open the Platform workspace">
@@ -154,8 +219,21 @@ For each group:
   </Step>
 </Steps>
 
+### Import from the API
+
+You can trigger the same import through the API instead of the UI:
+
+```bash
+curl -X POST "${API_URL}/v2/workspaces/platform/versions/latest/pull" \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"repository": {"id": "release"}, "groups": ["base1"]}'
+```
+
+Repeat with `base2`, `extended`, then `one-product`.
+
 <Warning>
-  Always wait for `workspaces.bulkImport.completed` (with no errors) before importing the next group — each group depends on the previous one.
+  Re-importing a group can overwrite workspace changes made in Builder since the previous import. Use it intentionally.
 </Warning>
 
 ---
@@ -176,8 +254,6 @@ The **Governe** workspace needs an `adminAccessToken` to call platform APIs on b
     In **Builder**, open the **Governe** workspace → **Settings** → **Secrets**, paste the value into `adminAccessToken`, then **Save**.
   </Step>
 </Steps>
-
-See [Configuring Governe](/self-hosting/configuration/ai-governance) for the full token command and workspace setup.
 
 ### 4.2 LLM providers
 
@@ -270,6 +346,25 @@ See [Configuring Governe](/self-hosting/configuration/ai-governance) for the ful
 
 While on the **Infrastructure** page, use the **Test** button at the bottom of the **Services** block to verify connectivity to all platform databases.
 
+### 4.6 Helper agents (optional)
+
+Helper agents assist users while they fill forms in Prisme.ai products.
+
+<Steps>
+  <Step title="Configure HELPER_AGENT_ENDPOINT">
+    Set `HELPER_AGENT_ENDPOINT` on the relevant services.
+  </Step>
+  <Step title="Initialize">
+    Open the **Helper Agents** workspace and run the initialization automations.
+  </Step>
+  <Step title="Wire credentials in Governe">
+    Configure the generated helper credentials in Governe.
+  </Step>
+  <Step title="Test">
+    Open a product form and confirm helpers are available.
+  </Step>
+</Steps>
+
 ---
 
 ## 5. Organization configuration
@@ -346,19 +441,61 @@ A default menu template is [available here](https://cdn.prisme.ai/templates/menu
 
 ---
 
+## Validation checklist
+
+Before handing the platform to users, verify:
+
+- Readiness API returns `ready` for required services.
+- All product import groups completed without errors.
+- Governe has a valid `adminAccessToken`.
+- Organization join rules assign the expected roles and groups.
+- Menu entries point to the enabled products.
+- At least one completion model and one embedding model are tested and allowed.
+- Storage infrastructure test passes.
+- Agent Creator can create and run a test agent.
+- Insights access is restricted and dashboards load.
+- Custom Code and Crawler tests pass if those apps are enabled.
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="A product is missing from the menu">
+    Check the Governe menu editor and organization access rules. Also confirm the product workspace was imported by the `one-product` group.
+  </Accordion>
+  <Accordion title="Models do not appear in Agent Creator">
+    Confirm that the model exists in **Govern > Models**, the provider is saved, the model test succeeds, and the model is allowed for the user's organization.
+  </Accordion>
+  <Accordion title="Model tests fail">
+    Check provider secret names, network egress to the model provider, provider API versions, deployment names, and rate limits.
+  </Accordion>
+  <Accordion title="Storage test fails">
+    Check `WORKSPACE_SECRET_storage_*` secret names, vector store host reachability, credentials, TLS settings, and index permissions.
+  </Accordion>
+  <Accordion title="Bulk import reports errors">
+    Open the `workspaces.bulkImport.completed` event in the Platform workspace Activity feed. Check the `errors` payload, resolve missing dependencies or slug conflicts, then re-import the failed group.
+  </Accordion>
+  <Accordion title="Custom Code apps fail after import">
+    Check `prismeai-functions` logs for dependency installation errors. If dependencies are still installing or missing, re-save the affected Custom Code app to restart installation.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 ## Next steps
 
 <CardGroup cols={2}>
-  <Card title="Configuring Products" icon="cogs" href="/self-hosting/configuration/products-installation">
-    Reference for the full product setup sequence and per-product details.
-  </Card>
   <Card title="Migration v27" icon="arrow-right-arrow-left" href="/self-hosting/operations/migration-v27">
     Already running an older version? Use the migration guide instead.
   </Card>
-  <Card title="Updates" icon="arrow-up" href="/self-hosting/operations/updates">
-    Plan future upgrades and rollbacks.
+  <Card title="Model governance" icon="robot" href="/products/ai-governance/model-governance">
+    Manage providers, models, defaults, and routing behavior.
   </Card>
-  <Card title="Backups" icon="database" href="/self-hosting/operations/backup">
-    Configure backups before going to production.
+  <Card title="Agent Creator" icon="wand-magic-sparkles" href="/products/agent-factory/overview">
+    Create and test agents once models and storage are configured.
+  </Card>
+  <Card title="Operate" icon="tools" href="/self-hosting/operations/updates">
+    Updates, backups and scaling.
   </Card>
 </CardGroup>
