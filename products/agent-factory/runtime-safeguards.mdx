@@ -1,0 +1,145 @@
+---
+title: "Runtime Safeguards"
+description: "How the agentic loop prevents runaway behavior — budgets, cycle detection, and RAG deduplication"
+---
+
+When an agent runs, every turn goes through Agent Factory's **ReAct loop**: think (LLM call) → act (tool execution) → observe → repeat. Without guardrails, this loop could spin forever, burn through your budget, or repeatedly feed the model the same context. Agent Factory ships with built-in protections that handle these cases without you having to configure anything — and exposes a handful of knobs for the cases where you want tighter limits.
+
+This page explains **what stops the loop**, **why the agent decided to stop**, and **how the platform avoids context pollution from repeated RAG hits**.
+
+## When the loop stops
+
+Every turn, the loop checks termination conditions before calling the LLM. The first one that matches wins.
+
+### Built-in hard caps
+
+These apply to every agent, even if you don't configure budgets. They protect the platform from pathological runs.
+
+| Cap | Value | What it prevents |
+|---|---|---|
+| **Iteration ceiling** | 50 turns | Runaway loops on agents with no `max_turns` configured |
+| **Delegation depth** | 3 levels | Agent A calls Agent B calls Agent C calls Agent D… infinite chains |
+| **Stuck-LLM detection** | immediate | Model returns no text **and** no tool calls — exit and let the fallback synthesize a reply |
+
+When the iteration ceiling or stuck-LLM detection fires, the loop hands off to the **fallback path** (see below) so the user still gets a response.
+
+### Configurable budgets
+
+Set on each agent under **Settings → Model Settings → Budget Limits**:
+
+| Budget | Counts | Reached → |
+|---|---|---|
+| **Max Turns** | LLM round-trips | Stream `limits_reached: max_turns`, exit to fallback |
+| **Token Budget** | Cumulative input + output tokens | Stream `limits_reached: token_budget`, exit to fallback |
+| **Tool Call Budget** | Total tool invocations | Stream `limits_reached: tool_call_budget`, exit to fallback |
+
+<Note>
+Budgets are checked **at the start of each turn**, before the next LLM call. A turn that's already running won't be killed mid-flight — the loop stops cleanly at the next decision point.
+</Note>
+
+### Cycle and stagnation detection
+
+These trigger inside a run, regardless of budget:
+
+| Detector | Trigger | Reaction |
+|---|---|---|
+| **Consecutive errors** | 3 tool errors in a row | Inject a system message: *"REFLECTION REQUIRED: you've had 3 consecutive errors. Try a different approach."* Counter resets to zero on the next successful tool call. |
+| **Empty assistant reply** | LLM returns no text and no tool calls | Exit the loop and synthesize a fallback response from accumulated context. |
+| **Todo nudge cap** | 3 nudges | When the model says "done" but its todo list still has open items, the loop sends one nudge per attempt. After 3 nudges, the loop accepts the current answer rather than risk an infinite "please finish" cycle. |
+
+## Why the agent stopped — reading the signal
+
+When the loop exits abnormally, it streams a `status` event so the UI and analytics can show *why*:
+
+| Status reason | Meaning | Did the user get a reply? |
+|---|---|---|
+| `max_turns` | Hit the configured turn budget | Yes, via fallback |
+| `tool_call_budget` | Hit the configured tool budget | Yes, via fallback |
+| `token_budget` | Hit the configured token budget | Yes, via fallback |
+| (none — clean exit) | LLM said it's done | Yes, the model's own reply |
+
+You can see these in **Analytics → Conversations** as a column on the run row, or query them in the event log under `type: runtime.tasks.output.delta` filtered on `payload.part.status: limits_reached`.
+
+## The fallback path — making sure the user always gets a reply
+
+If the loop exits because of a budget or hard cap (not because the LLM said it was done), Agent Factory makes **one final forced LLM call** with:
+
+- `tool_choice: none` — no more tools, just text
+- A turn-level system instruction telling the model:
+  1. State clearly that the answer is **incomplete** because a budget was reached
+  2. Provide the partial result based **only** on what was already collected
+  3. Briefly indicate what's still missing
+  4. Do **not** announce future actions (*"I will search…", "Let me check…"*) — there is no follow-up turn
+
+This avoids the worst failure mode: a budget cap that leaves the user staring at an empty chat with no explanation.
+
+## Post-loop finalization runs once
+
+Guardrails, structured-output formatting, citation building, and artifact extraction all run **after** the main loop exits — not inside it. If a guardrail rejects the output, the platform returns the original content marked `moderated: true` rather than re-entering the loop to regenerate.
+
+This matches the pattern used by Bedrock Agents, OpenAI Agents SDK, and Vertex ADK: a rejected guardrail is a stop sign, not a retry signal.
+
+<Tip>
+If you need a regenerate-on-reject behavior, build it at the application layer (resubmit the user message with extra context) rather than expecting the runtime to loop on guardrail failures — that path is intentionally closed.
+</Tip>
+
+## RAG deduplication — same chunk, never twice
+
+When an agent uses a knowledge base, the same chunk often comes back across turns: a follow-up question hits the same passage as the original, or two different queries land on the same paragraph. Without deduplication, the model would see that chunk multiple times in its context window — costly and a known driver of repetitive answers.
+
+Agent Factory tracks every chunk surfaced to the model and **filters duplicates at the conversation level**.
+
+### How the dedup map works
+
+| Layer | Details |
+|---|---|
+| **Scope** | Conversation, not request — the dedup map persists across every turn of the same chat |
+| **Identity** | A chunk is keyed by `vector_store_id + file_id + chunk_index`, so the same passage is matched even if its relevance score reorders between queries |
+| **Action** | Already-seen chunk → silently dropped from the LLM's view, counted as a duplicate; new chunk → added to context and marked seen |
+| **Visibility** | Citations (`url_citation` annotations) are only emitted for chunks the model actually saw — never for filtered duplicates |
+
+<Note>
+Dedup is per **conversation**, not per organization. Two users asking the same question still each see the chunks once. A single user asking related follow-ups gets *new* information at each step instead of re-reading the first chunk.
+</Note>
+
+### Practical implications
+
+- A chatty agent that re-queries the knowledge base every turn no longer floods its own context with the same paragraphs.
+- The hallucination guardrail (when enabled) compares the response against the **deduplicated** RAG context — so a model that quotes a chunk introduced two turns ago is still validated correctly.
+- If you genuinely want the model to re-read a chunk (e.g. testing a prompt change), start a new conversation. A fresh conversation gets a fresh dedup map.
+
+## Tuning checklist
+
+When you publish a new agent, walk through these:
+
+<Steps>
+  <Step title="Set realistic budgets">
+    Open **Settings → Model Settings → Budget Limits**. For a chat agent, 10–20 turns and 50–100 tool calls are usually enough. Orchestrators that delegate to sub-agents need higher caps.
+  </Step>
+  <Step title="Verify your model fallback chain">
+    Budgets stopping the loop is fine. Provider errors stopping it isn't — set **Fallback Models** in Settings so a transient outage doesn't end the run.
+  </Step>
+  <Step title="Review the `limits_reached` rate">
+    In **Analytics**, filter runs that ended on `limits_reached`. If it's >5% of your traffic, either raise the budget or tighten your instructions — your agent is fighting the cap.
+  </Step>
+  <Step title="Test the fallback message">
+    In the **Playground**, force a low Max Turns (e.g. 3) and run a multi-step task. Confirm the fallback reply is intelligible and doesn't promise follow-up work.
+  </Step>
+</Steps>
+
+## Related
+
+<CardGroup cols="2">
+  <Card title="Agent Settings" icon="sliders" href="./settings">
+    Configure budgets, retention, and guardrails
+  </Card>
+  <Card title="Tool Permissions" icon="shield-check" href="./tool-permissions">
+    Human-in-the-loop approval policies
+  </Card>
+  <Card title="User-First Tools" icon="hand" href="./user-first-tools">
+    Tools the agent can't summon on its own
+  </Card>
+  <Card title="Analytics" icon="chart-line" href="./analytics">
+    Inspect `limits_reached` and error rates
+  </Card>
+</CardGroup>
