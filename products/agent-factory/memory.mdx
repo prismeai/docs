@@ -3,17 +3,54 @@ title: "Agent Memory"
 description: "How working, session, and long-term memory work in Prisme.ai agents — the layers, the tools, and the data flow."
 ---
 
-Prisme.ai agents have three layers of memory. Working memory is automatic, session memory persists during a conversation, and long-term memory persists across conversations and is the focus of this page.
+Prisme.ai agents have three independent memory layers. Each one answers a different question, runs on its own backend, and is toggled separately. The rest of this page focuses on **long-term memory**, but the table below makes the three layers explicit so you know which one to reach for.
 
 ## The three layers
 
-| Layer | Lifetime | Profiles | What it stores |
-|---|---|---|---|
-| **Working memory** | Current LLM turn | All | The current message and immediate context already in the prompt |
-| **Session memory** | One conversation | Light Agent and above | Everything said earlier in the same conversation, even after it scrolls out of the context window |
-| **Long-term memory** | Across conversations, across sessions | Full Agent and Orchestrator | User-specific facts, preferences, relationships, and instructions deliberately stored by the agent |
+| Layer | Question it answers | Scope | Backend | How it's updated |
+|---|---|---|---|---|
+| **Working memory** | *"Does my agent remember what we said 5 messages ago in this same conversation?"* | One conversation | Conversation database | Automatic — past turns of the current conversation are reloaded into the prompt at each turn |
+| **Session memory** | *"Does my agent remember what we discussed in a different conversation last week?"* | One user × one agent, across all their conversations | Fast in-memory session store | Automatic — at the end of each completed conversation, the platform asks an LLM to merge the new exchange into a rolling summary, which is reloaded into the next conversation's prompt |
+| **Long-term memory** | *"Can my agent save a specific preference I tell it to remember and recall it later by semantic search?"* | One user × one agent (or shared user-wide) | Dedicated memory service (vector search) | Tool-driven — the agent calls `memory_remember` when something is worth keeping; `memory_recall` (and an automatic pre-load) brings it back later |
 
-The rest of this page focuses on **long-term memory** — the layer that lets your agent remember a user's preferences from one week to the next.
+Practical consequences:
+
+- Without **working memory** an agent is effectively stateless between turns inside a single conversation.
+- **Session memory** is the only layer that bridges *separate* conversations automatically. It produces a compact LLM-written summary, not a verbatim transcript.
+- **Long-term memory** never saves silently. The agent must call `memory_remember` — that's why "Tell the agent what's worth remembering" in your Instructions matters.
+
+<Note>
+If you inspect an agent's raw memory config, the structure is:
+
+```json
+{
+  "session_memory": true,
+  "types": [
+    { "id": "working_memory", "enabled": true, "config": { "max_tokens": 4000, "compaction_strategy": "summarize" } },
+    { "id": "long_term",      "enabled": true, "config": { "max_memories": 50 } }
+  ]
+}
+```
+
+`session_memory` is a top-level toggle, separate from `types[]` which holds working memory and long-term memory side by side. The three are fully independent — you can enable any combination.
+</Note>
+
+The rest of this page focuses on **long-term memory** — the layer that lets your agent remember a user's preferences from one week to the next, on explicit cue.
+
+### Choosing which layers to enable
+
+A quick decision guide for new agents:
+
+| Agent style | Working memory | Session memory | Long-term memory |
+|---|---|---|---|
+| One-shot Q&A bot (each question is independent) | ✗ | ✗ | ✗ |
+| Multi-turn assistant inside a single chat | ✓ | ✗ | ✗ |
+| Recurring assistant the same user comes back to over days/weeks | ✓ | ✓ | optional |
+| Personal assistant that should remember explicit user preferences | ✓ | ✓ | ✓ |
+
+<Tip>
+Session memory's summary is generated **asynchronously** at the end of a conversation, so enabling it doesn't add latency to user-facing responses. The summary becomes available the *next* time the user opens a conversation with the same agent.
+</Tip>
 
 ## How long-term memory works
 
@@ -62,11 +99,11 @@ When long-term memory is enabled on an agent, three tools are injected into its 
   </Card>
 </CardGroup>
 
-### Automatic pre-load at conversation start
+### Automatic pre-load on every user message
 
-Before the LLM even sees the user's message, the agent runs a similarity search against the user's stored memories using the new message as the query, and injects the top relevant ones into the prompt. The agent sees them as background context and can use them without explicitly calling `memory_recall`.
+On **every** user turn, before the LLM is called, the agent runs a similarity search against the user's stored memories using the new message as the query and injects the top relevant ones into the prompt. The agent sees them as background context and can answer without explicitly calling `memory_recall`.
 
-This means the user often does not need to remind the agent of past preferences — the agent already has them in front of it.
+This means the user often does not need to remind the agent of past preferences — the agent already has them in front of it, fresh for each message.
 
 ### Semantic recall via vector embeddings
 
@@ -102,7 +139,7 @@ Two different users never see each other's memories. Two different agents within
 
 ## Tags
 
-When the agent stores a memory, it also attaches 1–5 short keywords describing the topic — for example `["python", "coding"]` or `["family", "children"]`. Tags help the agent group, filter, and recall related memories more precisely.
+When the agent stores a memory, it can attach a small set of short lowercase keywords describing the topic — for example `["python", "coding"]` or `["family", "children"]`. Tags help the agent group, filter, and recall related memories more precisely.
 
 ## Configure long-term memory on an agent
 
@@ -157,7 +194,8 @@ Long-term memory is designed for **stable, user-specific information** the agent
 | Use case | Use instead |
 |---|---|
 | Knowledge an agent should have about a domain (product manuals, policies) | A knowledge base / RAG, not memory |
-| Temporary state inside a single conversation | Session memory or working memory — already automatic |
+| Remembering the previous turns of the **current** conversation | Working memory — enable it on the agent |
+| Carrying a rolling summary from one conversation to the next, automatically | Session memory — enable it on the agent |
 | Logs, audit trails, analytics | The platform's event system |
 | Large structured data (tables, full documents) | A collection or external database |
 
