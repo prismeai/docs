@@ -1,0 +1,112 @@
+---
+title: "Knowledge & RAG Architecture"
+description: "How vector stores are scoped, how user uploads are handled, and how to change the embedding model without losing data"
+---
+
+When an agent uses retrieval-augmented generation (RAG), three things matter to the agent author: **which vector stores the agent can read**, **what happens when a user uploads a file mid-conversation**, and **what to do when you want to change the embedding model**. This page covers all three.
+
+## Mental model: three kinds of vector stores
+
+Under the hood, everything that powers RAG in Prisme.ai is a *vector store* — a named container with an embedding model, a vector dimensionality, and a physical index on a vector provider (Elasticsearch or OpenSearch). What differs is **who owns it** and **how it's referenced from the agent**.
+
+| Kind | Owner | Auto-created | Visible to other agents |
+|---|---|---|---|
+| **Knowledge base** | A user | No — you create it explicitly in Knowledges | If shared via bindings |
+| **Conversation file search** | An agent | Yes — on the first file uploaded into any of that agent's conversations | No |
+| **Shared knowledge base** | A user, shared with others | No | Yes, via RBAC bindings (reader / editor / admin) |
+
+The same underlying object backs all three. The difference is whether it's keyed by `user_id`, by `agent_id`, or made visible to additional principals via bindings.
+
+## Attaching knowledge bases to an agent
+
+You can attach **as many knowledge bases as you want** to a single agent. Each one becomes a separate tool the LLM can call, and the model reads each tool's description to decide which store to query. See [Capabilities → Knowledge Bases](./capabilities#knowledge-bases) for the click-path.
+
+Two things to keep in mind when attaching more than one:
+
+- **Disambiguate via the description**, not the display name. The LLM picks tools by reading their description text. For two KBs with overlapping topics, write descriptions like *"search the public product manual"* vs *"search internal engineering notes"* so the model knows which one applies.
+- **Agentic RAG kicks in on Full Agent and Orchestrator profiles.** The ReAct loop can call the same RAG tool multiple times in one turn — different queries, refinements, follow-ups. Chunk-level deduplication (see [Runtime Safeguards](./runtime-safeguards)) prevents the model from re-reading the same passage twice in a conversation.
+
+## Conversation file search — what happens when a user uploads a file
+
+When a user drops a file into the chat:
+
+1. The agent looks for an existing `conversation_file_search` tool in its capabilities
+2. If none exists, the platform **automatically creates a vector store dedicated to this agent** (named `"<Agent Name> Conversations"`, owned by the agent) and adds the `conversation_file_search` tool to the agent's capabilities
+3. The uploaded file is indexed into that store
+4. Every later conversation with the same agent **reuses the same store** — uploads accumulate across conversations
+
+Key properties:
+
+- **One conversation vector store per agent**, not per conversation
+- The conversation boundary is enforced **at query time** with a filter on `conversation_id` — when the user in conversation A asks the agent to search the file they just uploaded, the search only returns chunks from files uploaded in conversation A, never from conversation B
+- Removing the `conversation_file_search` capability from an agent does **not** delete the underlying vector store; the next upload re-adds the capability and re-uses the existing store
+
+<Note>
+This means conversation files persist beyond the conversation they were uploaded in (at the storage level), but they remain invisible to other conversations because of the query-time filter. This is by design: it lets you reactivate a conversation and have its attachments still searchable, while preventing cross-conversation leakage.
+</Note>
+
+## Scoping: knowledge bases vs conversation stores
+
+For **knowledge bases**, sharing is controlled through the standard Private / Organization / Public visibility levels plus the per-KB Sharing tab — see [Knowledges → Sharing](/products/ai-knowledge/sharing) for the full model.
+
+The case worth calling out here is the one that doesn't exist in Knowledges: an agent's `conversation_file_search` store is **always agent-scoped**. It has no Sharing tab, no visibility level, and is never readable from any other agent — even within the same org and by an admin. The only ways to reach its content are (a) the owning agent calling its `conversation_file_search` tool, or (b) deleting it through admin tooling. This is enforced at the storage layer by the `agent_id` field on the vector store record.
+
+## Changing the embedding model — the A/B pattern
+
+Every vector store records its embedding model and dimensions **at creation time** and physically allocates its provider index for those exact dimensions. This is a property of the vector index itself, not a Prisme.ai restriction — a 1536-dimension index physically cannot store 3072-dimension vectors. As a result, **you cannot switch a live vector store to a different embedding model or change its dimensions in place**.
+
+"Switching to a new embedding model" therefore means **creating a new vector store and migrating** what you want to keep. The platform supports this with a side-by-side pattern that lets you compare quality before committing.
+
+<Steps>
+  <Step title="Create a new knowledge base with the new model">
+    In Knowledges, create a new KB. In RAG Settings, choose the new embedding model. Re-upload (or re-crawl) the source documents into this new KB.
+  </Step>
+  <Step title="Attach both KBs to a test agent">
+    Clone the production agent (or create a test variant). Add **both** the old KB and the new KB as capabilities, with descriptions that make it explicit which is which — for example *"v1 corpus (legacy embedding)"* and *"v2 corpus (new embedding)"*. The agent can now query either store on demand.
+  </Step>
+  <Step title="Run a comparison harness">
+    Pick a list of representative user queries. Run them against the test agent, capturing which store the LLM picks and how good the answer is. The Playground and [Evaluations](./evaluations) let you script this for repeatable A/B comparison.
+  </Step>
+  <Step title="Decide and clean up">
+    Keep the winner. Replace the loser with the winner on your production agent. Optionally delete the loser KB from Knowledges to free storage and stop paying for its index.
+  </Step>
+</Steps>
+
+### Does this affect conversation files?
+
+**No.** The `conversation_file_search` store is fully **independent** of any knowledge base. It has its own embedding model, frozen at the moment the agent first received a file upload. Changing the embedding on a knowledge base does not touch conversation files, and migrating conversation files does not touch knowledge bases.
+
+If you also want to migrate the conversation store to a new embedding model, the path is heavier:
+
+1. Detach the `conversation_file_search` capability from the agent — the underlying store is preserved, just hidden
+2. The next user upload will re-create a fresh `conversation_file_search` store with the **current** default embedding model
+3. The previous store can be deleted manually once you no longer need its historical conversations
+
+This is heavier than swapping a KB because conversation stores accumulate files across users over time and the migration cannot be staged the same way (each user's old uploads live there).
+
+## Costs to consider
+
+Creating a new vector store is not free:
+
+- Every chunk re-ingested incurs an **embedding API call** — count chunks × your model's per-token price
+- The provider index consumes storage proportional to `chunk_count × dimension_count`
+- During an A/B comparison you temporarily hold two copies of the corpus
+
+Plan large re-embeddings during a low-traffic window and budget the embedding cost ahead of time. Use the Playground to test on a few representative queries before committing to a full corpus re-ingestion.
+
+## Related
+
+<CardGroup cols="2">
+  <Card title="Capabilities" icon="layer-group" href="./capabilities">
+    How to add knowledge bases and other capabilities to an agent
+  </Card>
+  <Card title="RAG Settings" icon="sliders" href="/products/ai-knowledge/rag-settings">
+    Chunking, embedding model choice, retrieval tuning
+  </Card>
+  <Card title="Evaluations" icon="flask" href="./evaluations">
+    Run repeatable comparisons between two RAG configurations
+  </Card>
+  <Card title="Runtime Safeguards" icon="shield-check" href="./runtime-safeguards">
+    Chunk dedup, budgets, loop limits that frame agentic RAG
+  </Card>
+</CardGroup>
