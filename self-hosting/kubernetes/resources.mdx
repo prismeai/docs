@@ -29,23 +29,23 @@ Pick **Balanced** if your traffic is mostly steady and budget matters. Pick **Pr
 
 ### Variant A — Balanced
 
-| Service       | CPU request | Memory request | Memory limit | HPA min / max |
-|---------------|-------------|----------------|--------------|---------------|
-| api-gateway   | 300m        | 200Mi          | 300Mi        | 2 / 4         |
-| workspaces    | 300m        | 200Mi          | 400Mi        | 2 / 4         |
-| runtime       | 2000m       | 2500Mi         | 2500Mi       | 2 / 4         |
-| events        | 500m        | 300Mi          | 500Mi        | 2 / 4         |
-| console       | 100m        | 300Mi          | 300Mi        | 2 / 4         |
+| Service                  | CPU request | Memory request | Memory limit | HPA min / max |
+|--------------------------|-------------|----------------|--------------|---------------|
+| api-gateway              | 300m        | 200Mi          | 300Mi        | 2 / 4         |
+| workspaces               | 300m        | 200Mi          | 400Mi        | 2 / 4         |
+| runtime *(3 workers)*    | 2000m       | 2500Mi         | 2500Mi       | 2 / 4         |
+| events                   | 500m        | 300Mi          | 500Mi        | 2 / 4         |
+| console                  | 100m        | 300Mi          | 300Mi        | 2 / 4         |
 
 ### Variant B — Production-ready
 
-| Service       | CPU request | Memory request | Memory limit | HPA min / max |
-|---------------|-------------|----------------|--------------|---------------|
-| api-gateway   | 2000m       | 600Mi          | 600Mi        | 2 / 5         |
-| workspaces    | 1250m       | 500Mi          | 500Mi        | 2 / 5         |
-| runtime       | 3800m       | 4000Mi         | 4Gi          | 2 / 5         |
-| events        | 1500m       | 600Mi          | 600Mi        | 2 / 5         |
-| console       | 1000m       | 300Mi          | 300Mi        | 2 / 5         |
+| Service                  | CPU request | Memory request | Memory limit | HPA min / max |
+|--------------------------|-------------|----------------|--------------|---------------|
+| api-gateway              | 2000m       | 600Mi          | 600Mi        | 2 / 5         |
+| workspaces               | 1250m       | 500Mi          | 500Mi        | 2 / 5         |
+| runtime *(4 workers)*    | 3800m       | 4000Mi         | 4Gi          | 2 / 5         |
+| events                   | 1500m       | 600Mi          | 600Mi        | 2 / 5         |
+| console                  | 1000m       | 300Mi          | 300Mi        | 2 / 5         |
 
 ---
 
@@ -109,6 +109,43 @@ prismeai-runtime:
 | functions           | 70% CPU    | Memory is the real constraint; over-provision memory before scaling |
 | crawler             | 80% CPU + 80% memory | Heavy memory pressure during indexing |
 | searchengine        | 70% CPU    | |
+
+---
+
+## Scaling `prismeai-runtime` workers
+
+`prismeai-runtime` is the only platform service that runs multiple workers inside the same pod. The pod runs a **main thread** that receives HTTP calls from api-gateway and events from the broker and dispatches them to **N worker threads** which actually execute the automations. Adding workers raises the per-pod parallelism without spinning up new pods.
+
+Configured via the **Helm value `prismeai-runtime.maxWorkers`** (which populates the `RUNNER_MAX_THREADS` env var inside the container). Default: `1`.
+
+<Note>
+The `runtime` resource numbers in the variant tables above are sized for a specific worker count: **3 workers** for Balanced, **4 workers** for Production-ready. If you change `maxWorkers`, re-derive the pod resources with the math below — keeping the defaults while bumping workers will starve each one.
+</Note>
+
+### Golden rule: scale workers and resources together
+
+A worker is a Node.js thread — it competes for the pod's CPU and memory budget alongside the main thread. **Doubling `maxWorkers` without raising `resources.requests` / `resources.limits` halves what each worker gets** and you'll see latency degrade or workers OOMKilled.
+
+The chart slices **75%** of `resources.limits.memory` across the workers (the other 25% goes to V8 metadata, native modules and the main thread). So sizing the pod is a two-step decision:
+
+1. Pick how much heap **each worker needs** based on the workload it will execute. For production workloads, plan **500 MiB to 1 GiB per worker** depending on the automations they run (heavier templating, large payloads or heavy in-flight contexts push it toward 1 GiB).
+2. Set `limits.memory` and `maxWorkers` together so the chart's auto-slice gives each worker that heap.
+
+In practice you have two equivalent ways to think about it:
+
+- **Top-down** — keep `limits.memory` fixed and lower `maxWorkers`: each worker's heap rises proportionally.
+- **Bottom-up** — target a per-worker heap and raise `limits.memory` to fit `maxWorkers` of them, plus the 25% main-thread overhead.
+
+Example: aiming for 4 workers at ~750 MiB heap each → `limits.memory ≈ 4 GiB`, `maxWorkers: 4` (this is the Production-ready default). For CPU, budget at least one core per worker plus a small share for the main thread (e.g. `requests.cpu: "4.5"` for 4 workers).
+
+### Node.js workers heap is auto-sized
+
+Each worker thread has its own heap memory hard limit, configured via Node.js's `--max-old-space-size` option. You don't need to set `NODE_OPTIONS` manually — the chart auto-derives each worker's heap from `resources.limits.memory` and `maxWorkers`:
+
+```text
+maxOldSpaceSize = floor( memory_limit_in_Mi / maxWorkers × 0.75 )
+```
+
 
 ---
 

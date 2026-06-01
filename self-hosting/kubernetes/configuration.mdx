@@ -21,11 +21,21 @@ For every setting below: the **env var name** and the **Helm values path** (when
 
 ### Sessions and tokens
 
+Prisme.ai follows the standard OIDC split between **session** (server-side, on the auth server) and **access token** (JWT, on the client):
+
+- The browser holds an **OIDC session cookie** issued by `prismeai-api-gateway`. As long as that cookie is valid, the gateway can silently mint a new JWT without prompting the user to log in again.
+- Clients (Studio, APIs, automations) hold an **access token JWT** and present it on every request. When the JWT expires, the client bounces through the gateway, which — if the session cookie is still alive — hands back a fresh JWT.
+- Expiring the session cookie is what actually forces a re-login, after the JWT expiration.
+
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `SESSION_COOKIES_MAX_AGE`<br/>Helm: `prismeai-api-gateway.env` | `2592000` (30 d) | Auth-server session cookie lifetime, in seconds. |
-| `ACCESS_TOKENS_MAX_AGE`<br/>Helm: `prismeai-api-gateway.env` | `2592000` (30 d) | Access-token lifetime, in seconds. |
+| `SESSION_COOKIES_MAX_AGE`<br/>Helm: `prismeai-api-gateway.env` | `2592000` (30 d) | Lifetime of the OIDC session cookie, in seconds. Controls **how long until the user is forced to re-authenticate**. |
+| `ACCESS_TOKENS_MAX_AGE`<br/>Helm: `prismeai-api-gateway.env` | `2592000` (30 d) | Lifetime of the access-token JWT, in seconds. Controls **how often a client silently refreshes** its token against the gateway. Lower it (e.g. `3600` for 1 h) to shrink the window of a leaked JWT. |
 | `SOCKETIO_COOKIE_MAX_AGE`<br/>Helm: `prismeai-events.env` | from `cookie` module | Sticky-session cookie for `prismeai-events`. Raise this if events sessions drop too aggressively. |
+
+<Tip>
+A common production setup is a long `SESSION_COOKIES_MAX_AGE` (days / weeks for user convenience) combined with a short `ACCESS_TOKENS_MAX_AGE` (1–4 h) so JWTs rotate frequently while users stay logged in.
+</Tip>
 
 ---
 
@@ -43,7 +53,8 @@ prismeai-api-gateway:
       existingSecret: "core-prismeai-api-gateway-mailgun"
       emailFrom: '"Prisme.ai" <no-reply@example.com>'
   env:
-    - { name: EMAIL_DRIVER, value: "mailgun" }
+    - name: EMAIL_DRIVER
+      value: "mailgun"
 ```
 
 ### SMTP
@@ -51,13 +62,20 @@ prismeai-api-gateway:
 ```yaml
 prismeai-api-gateway:
   env:
-    - { name: EMAIL_DRIVER, value: "smtp" }
-    - { name: EMAIL_FROM, value: '"Prisme.ai" <no-reply@example.com>' }
-    - { name: SMTP_HOST, value: "smtp.example.com" }
-    - { name: SMTP_PORT, value: "587" }
-    - { name: SMTP_USER, value: "user" }
-    - { name: SMTP_PASS, value: "password" }    # prefer existingSecret
-    - { name: SMTP_SECURE, value: "false" }     # true for port 465
+    - name: EMAIL_DRIVER
+      value: "smtp"
+    - name: EMAIL_FROM
+      value: '"Prisme.ai" <no-reply@example.com>'
+    - name: SMTP_HOST
+      value: "smtp.example.com"
+    - name: SMTP_PORT
+      value: "587"
+    - name: SMTP_USER
+      value: "user"
+    - name: SMTP_PASS
+      value: "password"      # prefer existingSecret
+    - name: SMTP_SECURE
+      value: "false"       # true for port 465
 ```
 
 ---
@@ -90,7 +108,8 @@ prismeai-events:
 |---------|---------|-------------|
 | `BROKER_EMIT_MAXLEN`<br/>Helm: `prismeai-runtime.env`, `prismeai-events.env` | `100000` chars | Max event payload size emitted to the broker. Default keeps the broker healthy; raise it only if you understand the disk impact. |
 | `BROKER_EMIT_EXECUTED_AUTOMATION_MAXLEN`<br/>Helm: `prismeai-runtime.env` | `10000` chars | Tighter limit for `runtime.automations.executed` (monitoring-only events). |
-| `EVENTS_BUFFER_FLUSH_EVERY`<br/>Helm: `prismeai-events.env` | `5000` ms | Persist events every N ms even if the buffer isn't full. |
+| `EVENTS_BUFFER_FLUSH_AT`<br/>Helm: `prismeai-events.env` | `128` | Flush the in-memory events buffer once it holds this many events. Pairs with `EVENTS_BUFFER_FLUSH_EVERY` — whichever threshold is hit first triggers a flush. Raise it on high-throughput deployments to reduce write amplification on Elasticsearch / OpenSearch. |
+| `EVENTS_BUFFER_FLUSH_EVERY`<br/>Helm: `prismeai-events.env` | `5000` ms | Flush the buffer every N milliseconds even if `EVENTS_BUFFER_FLUSH_AT` isn't reached. Lower it for fresher activity feeds, raise it to reduce ES write load. |
 | `ELASTIC_SEARCH_TIMEOUT`<br/>Helm: `prismeai-events.env` | `2000ms` | Raise to `10000ms` to tolerate slow ES queries during peak load. |
 
 ---
@@ -99,9 +118,10 @@ prismeai-events:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `RUNNER_MAX_THREADS`<br/>Helm: `prismeai-runtime.env` | `1` | Number of execution threads per runtime pod. Raise to use multi-core nodes (e.g. `4`). |
-| `RUNTIME_THROTTLE_*`<br/>Helm: `prismeai-runtime.env` | varies | Rate-limit thresholds. See [Rate limits](/api-reference/rate-limits#configuration-options) for the full list and per-workspace overrides. |
+| `RUNNER_MAX_THREADS`<br/>Helm: **`prismeai-runtime.maxWorkers`** | `1` | Number of execution workers (Node.js worker_threads) per runtime pod. Set via the `maxWorkers` Helm value, which populates this env var inside the container. When you raise it, **also raise `resources.requests` / `limits` proportionally** so each worker keeps the same budget — see [Scaling `prismeai-runtime` workers](/self-hosting/kubernetes/resources#scaling-prismeai-runtime-workers). |
 | Gateway timeout<br/>ConfigMap: `core-prismeai-api-gateway-config` | 60 s | Default API-gateway request timeout. Raise to **120 s** for LLM-heavy workloads. |
+
+For runtime-side rate limits (also `RATE_LIMIT_*`, but on `prismeai-runtime`), see the [Rate limiting](#rate-limiting) section below.
 
 ---
 
@@ -127,6 +147,39 @@ For document-processing workloads, the crawler's polling tuning matters more tha
 | `REQUEST_QUEUES_POLLING_INTERVAL`<br/>Helm: `prismeai-crawler.env` | `5` s | Queue poll frequency. |
 | `DEFAULT_ENGINE_WEBPAGES_LIMIT`<br/>Helm: `prismeai-crawler.env` | `30000` | Max pages indexed per search engine before crawling stops. |
 | `ELASTIC_INDICES_PREFIX`<br/>Helm: `prismeai-crawler.env`, `prismeai-searchengine.env` | — | Index name prefix. Set when sharing Elasticsearch with other tenants. |
+
+---
+
+## Rate limiting
+
+The platform enforces rate limits at three places, with different semantics:
+
+| Layer | Where it's configured | Behavior on excess |
+|-------|----------------------|--------------------|
+| **Authentication endpoints** | `RATE_LIMIT_*` env vars on `prismeai-api-gateway` | HTTP 429, request rejected |
+| **Sensitive workspace APIs** | `prismeai-api-gateway-config` ConfigMap in core k8s namespace | HTTP 429, request rejected |
+| **Automations** | `RATE_LIMIT_*` env vars on `prismeai-runtime` | Slowed down, execution continues |
+
+### Authentication endpoints (`prismeai-api-gateway`)
+
+`RATE_LIMIT_*` env vars protect signup, login and password reset. Requests above the threshold are **rejected** with HTTP 429. Tune these tighter for production to slow down credential-stuffing or signup abuse. See [Environment Variables — Rate Limiting](/self-hosting/kubernetes/environment-variables#rate-limiting).
+
+### Sensitive workspace APIs (gateway ConfigMap)
+
+In addition to the env-var-driven auth limits, the gateway applies four **per-user** rate limits on sensitive routes, defined in the `gateway.config.yml` of the `core-prismeai-api-gateway-config` ConfigMap. All four use `key: userId` and `window: 60s`.
+
+| Limit name | Routes | Default |
+|------------|--------|---------|
+| `searchEvents` | `GET /v2/workspaces/:workspaceId/events`, `/search`, `/usage` (and `/v2/search`) | **40 / min** |
+| `uploadFile` | `POST /v2/workspaces/:workspaceId/files` | **50 / min** |
+| `createWorkspace` | `POST /v2/workspaces/` | **3 / min** |
+| `importWorkspace` | `POST /v2/workspaces/import`, `/v2/workspaces/:workspaceId/import`, `/v2/workspaces/:workspaceId/versions/:versionId/pull`, `/v2/workspaces/:workspaceId/versions/:versionId/duplicate` | **3 / min** |
+
+Override by editing the ConfigMap directly. These are platform-level guardrails — they apply to every user, including super-admins, so raise them carefully when scripting bulk operations.
+
+### Automations (`prismeai-runtime`)
+
+`RATE_LIMIT_*` env vars on the runtime protect the automation engine. **Unlike the gateway, these do not break execution** — automations that exceed the threshold are deliberately **slowed down** rather than failed. The intent is fair-share execution under load, not to reject work. See [API Reference — Rate Limits](/api-reference/rate-limits#configuration-options) for the full list and per-workspace overrides.
 
 ---
 
