@@ -140,6 +140,16 @@ prismeai-api-gateway:
 
 ---
 
+## CORS
+
+By default, the API gateway only accepts cross-origin requests from `CONSOLE_URL` and from workspace custom domains. To embed agents or call the API from another origin (e.g. a public website hosting the chat widget), allowlist it explicitly:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `CORS_ADDITIONAL_ALLOWED_ORIGINS`<br/>Helm: `prismeai-api-gateway.env` | — | Comma-separated list of extra origins accepted for CORS, in addition to `CONSOLE_URL` and workspace custom domains. Each entry must include the scheme (e.g. `https://www.example.com,https://app.partner.com`). Required when embedding the chat widget or calling the API from a third-party site. |
+
+---
+
 ## Upload and request limits
 
 | Setting | Default | Description |
@@ -240,14 +250,102 @@ Override by editing the ConfigMap directly. These are platform-level guardrails 
 
 ---
 
+## Trusting an extra CA bundle
+
+When Prisme.ai services call an HTTPS endpoint signed by a private PKI or a self-signed certificate — an internal API, an on-prem LLM gateway, a Prisme.ai app behind an in-cluster TLS terminator — the calling runtime refuses the handshake unless the signing CA is in its trust store. `global.extraCABundle` lets you mount one PEM bundle into **every Prisme.ai pod in one shot**, on both the `prismeai-core` and `prismeai-apps` charts.
+
+The chart only references a Secret or ConfigMap that **you create out-of-band** — it never reads or writes the bundle itself, so rotations stay independent of helm upgrades.
+
+| Chart | Services covered | Env vars set on each pod |
+|-------|------------------|--------------------------|
+| `prismeai-core` | api-gateway, workspaces, runtime, events, console, pages (all Node.js) | `NODE_EXTRA_CA_CERTS` (additive) |
+| `prismeai-apps` | functions, crawler, searchengine, nlu, llm | `NODE_EXTRA_CA_CERTS` (additive — Node), `SSL_CERT_FILE` (OpenSSL — Python `ssl`, httpx, aiohttp, Scrapy, curl, Go), `REQUESTS_CA_BUNDLE` (Python `requests`, which ignores `SSL_CERT_FILE`) |
+
+<Info>
+  **`SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` replace** (not augment) the default trust store. To keep public TLS working out of the box, the `prismeai-apps` chart runs a tiny init container (`extra-ca-merge`, reusing the service's own image) that concatenates the system bundle with your custom one into an `emptyDir`, and points the env vars at the merged file. This is **enabled by default** via `global.extraCABundle.mergeWithSystem: true`. Your bundle can contain only your private CAs — public CAs come from the service's own distro.
+
+  Set `mergeWithSystem: false` if your bundle already contains the public CAs, or if you explicitly want to restrict the trust store to your private CAs only (no init container runs and the env vars point at the raw bundle).
+
+  On `prismeai-core`, `NODE_EXTRA_CA_CERTS` is additive natively, so there's no init container and no merge toggle.
+</Info>
+
+### Step 1 — Create the Secret (or ConfigMap) holding the bundle
+
+Concatenate every CA certificate you want to trust into a single PEM file, then create the Secret in **each namespace** where you install a Prisme.ai chart (typically `core` and `apps`):
+
+```bash
+kubectl -n core create secret generic prismeai-extra-ca \
+  --from-file=ca-bundle.crt=./bundle.crt
+
+kubectl -n apps create secret generic prismeai-extra-ca \
+  --from-file=ca-bundle.crt=./bundle.crt
+```
+
+A `ConfigMap` works equally well if the bundle is not sensitive:
+
+```bash
+kubectl -n core create configmap prismeai-extra-ca \
+  --from-file=ca-bundle.crt=./bundle.crt
+```
+
+The **key name inside the resource** (`ca-bundle.crt` above) is what the chart mounts — pick anything, just remember it for step 2.
+
+### Step 2 — Reference it from your values
+
+Identical block in both `prismeai-core` and `prismeai-apps` values files:
+
+```yaml
+global:
+  extraCABundle:
+    existingSecret: prismeai-extra-ca        # name of the Secret created at step 1
+    # existingConfigMap: prismeai-extra-ca   # OR a ConfigMap — set only one of the two
+    key: ca-bundle.crt                       # file name inside the Secret/ConfigMap
+    mountPath: /etc/ssl/prismeai-extra-ca    # where the file is mounted in each pod
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `global.extraCABundle.existingSecret` | `""` | Name of a Secret holding the bundle. Mutually exclusive with `existingConfigMap`. |
+| `global.extraCABundle.existingConfigMap` | `""` | Name of a ConfigMap holding the bundle. Mutually exclusive with `existingSecret`. |
+| `global.extraCABundle.key` | `ca-bundle.crt` | Key inside the Secret/ConfigMap holding the PEM-concatenated bundle. |
+| `global.extraCABundle.mountPath` | `/etc/ssl/prismeai-extra-ca` | Directory where the bundle is mounted inside each pod. The full file path becomes `<mountPath>/<key>`. |
+| `global.extraCABundle.mergeWithSystem` (apps only) | `true` | Run an init container that merges the service image's system CA bundle with yours. Disable to point env vars at the raw bundle (and skip the init container). |
+
+### Step 3 — Upgrade and verify
+
+```bash
+helm upgrade -n core core prismeai/prismeai-core -f core-values.yaml
+helm upgrade -n apps apps prismeai/prismeai-apps -f apps-values.yaml
+```
+
+Every deployment / statefulset is rolled out with the mount and env vars wired in. Confirm on one pod per chart:
+
+```bash
+# Core (Node.js)
+kubectl -n core exec deploy/core-prismeai-runtime -- \
+  sh -c 'echo $NODE_EXTRA_CA_CERTS && head -1 $NODE_EXTRA_CA_CERTS'
+# /etc/ssl/prismeai-extra-ca/ca-bundle.crt
+# -----BEGIN CERTIFICATE-----
+
+# Apps (Python)
+kubectl -n apps exec deploy/apps-prismeai-crawler -- \
+  sh -c 'echo $SSL_CERT_FILE && head -1 $SSL_CERT_FILE'
+```
+
+Then call your private HTTPS endpoint from an automation (`fetch` instruction or a Custom Code function) — it should succeed without `UNABLE_TO_VERIFY_LEAF_SIGNATURE` / `SELF_SIGNED_CERT_IN_CHAIN` / `CERTIFICATE_VERIFY_FAILED`.
+
+<Info>
+  Rotating the bundle is a `kubectl` operation on the Secret/ConfigMap you own — no helm upgrade required. Pods pick up the new file automatically (mounted secrets refresh within ~60s); restart the deployment if you need the change immediately.
+</Info>
+
+---
+
 ## Offline or private-network deployments
 
 For restricted environments, verify these points:
 
 - `prismeai-functions` only needs an npm registry if you plan to write Custom Code that pulls in extra packages beyond the ones bundled in the image. See [Custom Code Functions — NPM Registry Access](/self-hosting/entreprise/functions#optional-npm-registry-access).
-- If internal or self-signed certificates are used, mount the CA bundle into every service that calls internal HTTPS endpoints:
-  - Python services such as `prismeai-crawler` and `prismeai-searchengine` use `REQUESTS_CA_BUNDLE`.
-  - Node.js services use `NODE_EXTRA_CA_CERTS`.
+- If internal or self-signed certificates are used to sign HTTPS endpoints that the platform calls, propagate the CA bundle to every service via [Trusting an extra CA bundle](#trusting-an-extra-ca-bundle) — one helm value covers both `prismeai-core` and `prismeai-apps`.
 - LLM providers, vector stores, and crawler targets must be reachable from the relevant pods.
 
 ---
