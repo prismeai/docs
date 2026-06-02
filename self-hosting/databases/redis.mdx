@@ -1,0 +1,156 @@
+---
+title: "Redis"
+description: "Role, configuration, backup, scaling and updates for Redis in Prisme.ai self-hosted deployments."
+---
+
+## Role in the platform
+
+Redis serves multiple purposes:
+
+| Purpose | Service | Notes |
+|---------|---------|-------|
+| **Event broker** (Redis Streams) | All backend services | Backs the platform's event bus. |
+| **Contexts cache** | `prismeai-runtime` | Hot state for in-flight automations. |
+| **Sessions store** | `prismeai-api-gateway` | Login sessions. |
+| **Crawler search engine state** | `prismeai-crawler`, `prismeai-searchengine` | Per-engine queues and state. |
+
+By convention, each purpose uses a distinct logical Redis `db` number (or a dedicated cluster).
+
+<Note>
+Redis is no longer used as a vector database since the v27 platform. The Knowledges vector store now lives on [Elasticsearch / OpenSearch](/self-hosting/databases/elasticsearch). `RedisJSON` and `RediSearch` modules are not required.
+</Note>
+
+## Version compatibility
+
+- **Minimum: Redis 6.2+**.
+- Redis 7.x supported and recommended.
+- Standard Redis is sufficient — no special modules required.
+
+## Recommended deployment
+
+| Provider | Recommended service | Notes |
+|----------|--------------------|-------|
+| AWS | ElastiCache for Redis (cluster mode), Multi-AZ. | |
+| Azure | Azure Managed Redis. | |
+| GCP | Memorystore for Redis. | |
+| OpenShift / on-prem | Redis Operator or StatefulSet. | At least 3 nodes for HA. |
+
+**Topology**: Multi-AZ for HA. Minimum: 3 GB RAM, 2 vCPU per instance.  
+
+We recommand 2 separate instances : one dedicated to the event broker, and another for everything else (cache/sessions).  
+
+## Helm Configuration
+
+Helm keys that point to Redis:
+
+<CodeGroup>
+
+```yaml prismeai-core-values.yml
+global:
+  broker:
+    driver: redis
+    existingSecret: "core-broker"             # url, password
+
+prismeai-api-gateway:
+  storage:
+    sessions:
+      driver: redis
+      existingSecret: "core-prismeai-api-gateway-sessions-store"
+
+prismeai-runtime:
+  cache:
+    contexts:
+      driver: redis
+      existingSecret: "core-prismeai-runtime-cache"
+```
+
+```yaml prismeai-apps-values.yml
+global:
+  storage:
+    searchengines:
+      existingSecret: "apps-crawler-searchengines"  # Redis URL with `db` number
+```
+
+</CodeGroup>
+
+Each secret holds a `url` (e.g. `redis://user:password@host:6379/3`) and optionally `password`.
+
+By convention we allocate `db` numbers per service (e.g. 0 = broker, 2 = runtime cache, 3 = sessions, 4 = searchengines). Adjust when sharing a cluster.
+
+See [Helm install](/self-hosting/kubernetes/helm) for the full install context.
+
+
+## Redis configuration
+
+### `maxmemory-policy` per instance
+
+Despite the "cache" naming, the runtime contexts cache and the crawler search engine state are **not** LRU caches — both hold operational state that must not disappear mid-operation. Set the eviction policy per Redis instance:
+
+| Redis instance | Recommended `maxmemory-policy` | Why |
+|----------------|-------------------------------|-----|
+| **Runtime contexts cache** (`prismeai-runtime`) | **`noeviction`** | Evicting an in-flight automation context causes the automation to fail. Size the instance so memory is never the bottleneck — alert on `used_memory` instead. |
+| **Crawler search engine state** (`prismeai-crawler`, `prismeai-searchengine`) | **`noeviction`** | Holds queues and per-engine state. Eviction silently drops crawl progress. |
+| **Sessions store** (`prismeai-api-gateway`) | **`noeviction`** | Evicting a session logs the user out without warning. |
+| **Event broker** (Redis Streams, all services) | **`allkeys-lru`** | Stream lengths are already capped by `maxLen`, and unread messages can be re-emitted by upstream producers — LRU eviction is safe and protects the instance from runaway memory growth. |
+
+If you co-locate several of these on a single Redis instance (via distinct `db` numbers), the **strictest** policy wins — `noeviction` — so plan capacity accordingly. The recommended layout is 2 separate instances for broker & everything else.  
+
+## Backup & restore
+
+### RDB snapshots
+
+```conf
+# redis.conf
+save 900 1
+save 300 10
+save 60 10000
+```
+
+Trigger a snapshot manually and copy the dump file:
+
+```bash
+redis-cli -h <host> -a <password> SAVE
+cp /var/lib/redis/dump.rdb /backup/redis/dump_$(date +%Y%m%d).rdb
+```
+
+### AOF (append-only file)
+
+For lower RPO, enable AOF in addition to RDB:
+
+```conf
+appendonly yes
+appendfsync everysec
+```
+
+### Managed services
+
+- **ElastiCache**: enable automatic daily snapshots, retain ≥ 7 days.
+- **Azure Managed Redis**: enable RDB persistence to a storage account.
+- **Memorystore**: enable scheduled exports to GCS.
+
+Operational strategy (RPO/RTO, retention) lives in [Operations / Backup](/self-hosting/operations/backup).
+
+### What's safe to lose
+
+- **Broker (Redis Streams)**: only contains in-flight events with a `maxLen` cap. Losing it triggers re-processing at worst.
+- **Runtime **: active users encounter issues until runtime restart
+  * Contexts cache is rebuildable on prismeai-runtime restart
+  * Scheduled automations would also be lost until their next save (or a simple platform pull for Prisme.ai AI products)
+- **Sessions store**: users won't be disconnected as we use stateless JWK, no impact.  
+
+However and in case of a loss of the **Crawler dedicated redis**, the created crawlers would stop working. Their auto reconstruction still need some scipting/automation in Prismeai Platform
+
+## Updates
+
+- Redis is forward-compatible across minor versions; the platform requires **6.2+**.
+- Cluster-mode support has been available in Prisme.ai since v3.2.
+- For major Redis upgrades (e.g. 6 → 7): plan a maintenance window and fail over the replica.
+
+See [Operations / Updates](/self-hosting/operations/updates).
+
+## Scaling
+
+- **Vertical**: increase memory and IOPS — Redis is memory-bound.
+- **Cluster mode**: shard the keyspace for horizontal scale. Useful when broker streams grow beyond a single node's RAM.
+- **Replicas**: add read replicas if you offload read-heavy queries.
+- **Monitoring**: track memory usage, connected clients, command latency, evicted keys.

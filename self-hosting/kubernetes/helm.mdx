@@ -1,233 +1,383 @@
 ---
-title: 'Deploying Prisme.ai with Helm on Kubernetes'
-description: 'Complete guide for deploying Prisme.ai on Kubernetes using Helm charts.'
+title: 'Install Prisme.ai with Helm'
+description: 'Unified Helm install reference for the core and apps namespaces, with the values, env vars and ingress annotations you actually need to configure.'
 ---
 
-
-Helm simplifies managing Kubernetes applications, offering powerful templating and lifecycle management. This guide details how to deploy and manage Prisme.ai using Helm charts effectively.
+Prisme.ai is deployed with two Helm releases: **`prismeai-core`** (API gateway, console, runtime, workspaces, events) and **`prismeai-apps`** (functions, crawler, searchengine). This page is the single source of truth for installation — provider-specific notes live under [Cloud Providers](/self-hosting/cloud/aws).
 
 ---
 
 ## Prerequisites
 
-Before deploying Prisme.ai with Helm, ensure:
-
-- Kubernetes cluster (version 1.26+) ready.
-- Helm (version 3+) installed and configured.
-- Basic familiarity with Kubernetes commands (`kubectl`).
+- Kubernetes **1.26+** cluster on at least 3 nodes (multi-AZ recommended).
+- **Helm 3+**.
+- Databases provisioned and reachable from the cluster — see [Databases](/self-hosting/databases/overview).
+- Object storage (S3-compatible, Azure Blob, GCS)  — see [Requirements](/self-hosting/requirements#object-storage).
+- a **RWX persistent volume** — see [Requirements](/self-hosting/requirements#filesystems).
+- A way to inject secrets: Kubernetes Secrets, External Secrets Operator, Vault, AWS/Azure/GCP Secret Manager.
+- A TLS certificate covering `api.<your-domain>` and `studio.<your-domain>`.
+- Registry credentials for `registry.gitlab.com` (provided by Prisme.ai) — required for the `apps` namespace.
 
 ---
 
-## Step-by-Step Helm Deployment
+## 1. Add the Helm repository
 
-<Steps>
-
-<Step title="Add Helm Repository">
-Add the official Prisme.ai Helm repository:
 ```bash
 helm repo add prismeai https://helm.prisme.ai/charts
 helm repo update
 ```
-</Step>
-
-<Step title="Prepare the Configuration (`values.yaml`)">
-Download and customize the Helm chart configuration:
-```bash
-helm show values prismeai/prismeai-core > values.yaml
-```
-Customize `values.yaml` with your specific settings:
-- Database connections (MongoDB, Redis, Elasticsearch)
-- Object storage configurations (S3-compatible storage, Azure Blob, GCS)
-- Ingress settings, SSL certificates
-</Step>
-
-<Step title="Create Kubernetes Namespace">
-Create a dedicated namespace for Prisme.ai:
-```bash
-kubectl create namespace prisme-ai
-```
-</Step>
-
-<Step title="Install Prisme.ai via Helm">
-Deploy Prisme.ai using Helm into your cluster:
-```bash
-helm install prisme-core prismeai/prismeai-core \
-  --namespace prisme-ai -f values.yaml
-```
-</Step>
-
-<Step title="Verify the Deployment">
-Check pod status and ensure all components are running correctly:
-```bash
-kubectl get pods -n prisme-ai
-kubectl logs deployment/api-gateway -n prisme-ai
-```
-</Step>
-
-</Steps>
 
 ---
 
-## Configuration
+## 2. Configure the `core` namespace
 
-### PostgreSQL
+Create `prismeai-core-values.yaml`. The block below lists every **critical** key — see the chart `values.yaml` for the full reference.
 
-Compared to the MongoDB values, there are only 3 places to update for PostgreSQL, all of which are indicated by a comment including "postgresql":
+<Note>
+  **Self-signed TLS on your databases / Redis?**  
+  Mount the CA bundle as a `volume` / `volumeMounts` on the relevant services and point the matching `*_TLS_CA_FILE` env var (e.g. `BROKER_TLS_CA_FILE`, `PERMISSIONS_STORAGE_TLS_CA_FILE`, `SESSIONS_STORAGE_TLS_CA_FILE`, `CONTEXTS_CACHE_TLS_CA_FILE`, `USERS_STORAGE_TLS_CA_FILE`, `COLLECTIONS_STORAGE_TLS_CA_FILE`, `EVENTS_TOPICS_CACHE_TLS_CA_FILE`) at the mounted filepath. The full list is in [Environment Variables](/self-hosting/kubernetes/environment-variables).
+</Note>
+
+### Global configuration
+
+```yaml
+global:
+  # Public URLs — REQUIRED
+  apiUrl: "https://api.studio.example.com/v2"
+  consoleUrl: "https://studio.example.com"            # Comma-separated for multi-domain
+
+  # Optional: force internal traffic over a private URL (avoids egress + extra ingress hops)
+  internalApiUrl: "http://prismeai-core-prismeai-api-gateway.prismeai-core/v2"
+
+  # Event broker (Redis Streams)
+  broker:
+    driver: redis
+    existingSecret: "core-broker"                     # Must contain `url` and `password`
+    maxLen: "700"                                     # Events kept per stream
+
+  storage:
+    permissions:
+      driver: mongodb                                 # or postgresql — see PostgreSQL section
+      existingSecret: "core-permissions"
+
+    workspaces:
+      driver: S3_LIKE                                 # FILESYSTEM | S3_LIKE | AZURE_BLOB | GCS
+      s3_like_bucketName: "prismeai-models"
+      existingSecret: "core-workspaces"
+
+    uploads:
+      driver: S3_LIKE
+      s3_like_bucketName: "prismeai-uploads"          # Single bucket for both public and private uploads (default)
+      s3_like_baseUrl: ""                           # Leave unset → downloads are proxied by the api-gateway (no CDN, no public bucket needed)
+      s3_like_public_bucketName: ""  # Fill only if you want a separate bucket + CDN for direct public downloads
+      existingSecret: "core-uploads"
+
+    events:
+      driver: elasticsearch                           # or opensearch
+      existingSecret: "core-prismeai-events-store"
+      prefix: ""                                      # Set when sharing the cluster with other tenants
+```
+
+### `prismeai-api-gateway`
+
+Authentication, mail, sessions, super-admin emails.
+
+```yaml
+prismeai-api-gateway:
+  storage:
+    users:
+      driver: mongodb
+      existingSecret: "core-prismeai-api-gateway-users"
+    sessions:
+      driver: redis
+      existingSecret: "core-prismeai-api-gateway-sessions-store"
+
+  config:
+    admins: "admin@example.com"                       # Comma-separated super-admin emails, start with your own email
+```
+
+### `prismeai-workspaces`
+
+Workspace models, custom domains, upload limits.  No specific env vars required.
+
+### `prismeai-runtime`
+
+Automation engine — multi-threaded.
+
+```yaml
+prismeai-runtime:
+  storage:
+    collections:
+      driver: mongodb                                       # or postgresql
+      existingSecret: "core-prismeai-runtime-collections"
+
+  cache:
+    contexts:
+      driver: redis
+      existingSecret: "core-prismeai-runtime-cache"
+```
+
+### `prismeai-events`
+
+Activity log + retention.
+
+```yaml
+prismeai-events:
+  events:
+    cleanupjob: true                                        # Enable scheduled cleanup
+    retention: 1080                                         # Days before events are deleted (3 years)
+    workspaceMaxEvents: 5000                                # Cap for small/inactive workspaces
+    workspaceInactivityDays: 14                             # Inactivity threshold for cleanup
+    automationExecutedExpiration: "14d"                     # Retention for automation traces
+```
+
+---
+
+## 3. Install `core`
+
+```bash
+helm install prismeai-core prismeai/prismeai-core \
+  --namespace prismeai-core \
+  --create-namespace \
+  -f prismeai-core-values.yaml
+```
+
+---
+
+## 4. Configure the `apps` namespace
+
+Create `prismeai-apps-values.yaml`. The `apps` namespace pulls images from a private registry.
+
+<Note>
+  **License + registry credentials.** The `apps` chart (functions, crawler, searchengine) is gated by your subscription license. Credentials for `registry.gitlab.com` are issued as a GitLab Deploy Token — contact [support@prisme.ai](mailto:support@prisme.ai) if you don't have them yet.
+</Note>
+
+```yaml
+global:
+  repository:
+    host: registry.gitlab.com
+    username: ""                                            # Provided by Prisme.ai
+    token: ""                                               # Provided by Prisme.ai
+    create: true
+    imagePullSecretName: "registry-secret"
+
+  storage:
+    documents:
+      existingSecret: "apps-crawler-documents"              # Elasticsearch URL + credentials
+    searchengines:
+      existingSecret: "apps-crawler-searchengines"          # Redis URL with `db` number
+```
+
+### `prismeai-functions`
+
+Custom code execution (JavaScript / Python).
+
+```yaml
+prismeai-functions:
+  persistence:
+    existingClaim: "apps-prismeai-sfsturbo"                 # Shared RWX PVC (EFS / Azure Files / Filestore)
+```
+
+### `prismeai-crawler`
+
+Web crawler and document indexing.
+
+```yaml
+prismeai-crawler:
+  env:
+    - name: ELASTIC_INDICES_PREFIX
+      value: &ELASTIC_INDICES_PREFIX ""             # Set when sharing Elasticsearch
+```
+
+### `prismeai-searchengine`
+
+Query routing on top of crawled indices.  
+Make sure the `ELASTIC_INDICES_PREFIX` match the one in `prismeai-crawler` with a yaml anchor :  
+
+```yaml
+prismeai-searchengine:
+  env:
+    - name: ELASTIC_INDICES_PREFIX
+      value: *ELASTIC_INDICES_PREFIX
+```
+
+### Install `apps`
+
+```bash
+helm install prismeai-apps prismeai/prismeai-apps \
+  --namespace prismeai-apps \
+  --create-namespace \
+  -f prismeai-apps-values.yaml
+```
+
+<Accordion title="Troubleshooting: ImagePullBackOff on the apps namespace">
+  If pods stay in `ImagePullBackOff`, the registry secret was not created or doesn't carry the right credentials. The chart creates it automatically when `global.repository.create: true` — if you manage secrets externally, create it by hand:
+
+  ```bash
+  kubectl create secret docker-registry registry-secret \
+    --docker-server=registry.gitlab.com \
+    --docker-username=YOUR_USERNAME \
+    --docker-password=YOUR_TOKEN \
+    --namespace prismeai-apps
+  ```
+
+  Then set `global.repository.create: false` and keep `imagePullSecretName: "registry-secret"` so the chart references the existing secret.
+</Accordion>
+
+---
+
+## 5. Ingress and load balancer
+
+Use a single ingress for both hostnames. Below is an **AWS ALB** example — equivalent annotations exist for [Azure Application Gateway](/self-hosting/cloud/azure), [GKE Ingress](/self-hosting/cloud/gcp), [OpenShift Routes](/self-hosting/cloud/openshift).
+
+### Two timeouts to tune
+
+These are **two different settings** on the load balancer and they must both be set:
+
+- **`client_keep_alive`** — how long the LB keeps a client TCP connection open between requests so the browser can reuse the same socket. Set to **60 s** (must be **under** the api-gateway server keep-alive of **70 s**, otherwise the LB sends requests on a socket the gateway just closed and you get 502s).
+- **`idle_timeout`** — the longest period of inactivity allowed on an in-flight request before the LB cuts it. Set to **300 s** so server-sent events and long LLM streaming responses don't get killed mid-flight.
+
+### ALB example
+
+This **core-ingress** object should already be configured in prismeai-core Helm chart default values.  
+Make sure the annotations match the ones expected by your Ingress Controller.  
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: core-ingress
+  namespace: core
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": 443},{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/ssl-policy: "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:..."
+    alb.ingress.kubernetes.io/subnets: "subnet-a,subnet-b,subnet-c"
+    # Two distinct timeouts:
+    #   idle_timeout       — kill an in-flight request after N s of inactivity (raise it for SSE / long LLM streams)
+    #   client_keep_alive  — keep client TCP socket open across requests (must be < api-gateway server keep-alive of 70 s)
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300,client_keep_alive.seconds=60
+spec:
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: "/"
+            pathType: Prefix
+            backend:
+              service:
+                name: prismeai-core-prismeai-api-gateway
+                port:
+                  number: 80
+    - host: studio.example.com
+      http:
+        paths:
+          - path: "/"
+            pathType: Prefix
+            backend:
+              service:
+                name: prismeai-core-prismeai-console
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - api.example.com
+        - studio.example.com
+      secretName: prismeai-tls
+```
+
+
+`prismeai-events` benefits from sticky sessions — pin clients via a header (e.g. `user-agent` consistent hash) at the ingress or via an Istio `DestinationRule`.
+
+---
+
+## 6. PostgreSQL
+
+Compared to MongoDB, only three keys change. Each is marked with a `postgresql` comment in the values file.
 
 #### Database permissions
 
 **Key:** `global.storage.permissions`
 
-The `driver` must be set to `postgresql`, and the authentication URL including username and password must be provided in `url` (not recommended for production) or ideally in a `url` key (configurable via `secretKeys.url`) of the `existingSecret`.
+Set `driver: postgresql` and the connection URL in `url` (not recommended for production) or via the `existingSecret`.
 
-Example URL: `postgres://user:password@your-cluster.company.net:20184/permissions?sslmode=require`
+```
+postgres://user:password@db.example.com:5432/permissions?sslmode=require
+```
 
-<Note>
-The `sslmode=require` option is required to enforce SSL connection.
-</Note>
+<Note>`sslmode=require` is mandatory.</Note>
 
 #### Database users
 
-**Key:** `prismeai-api-gateway.storage.users`
-
-Same configuration structure as `global.storage.permissions` - set the `driver` to `postgresql` and configure the connection URL.
+**Key:** `prismeai-api-gateway.storage.users` — same structure.
 
 #### Database collections
 
-**Key:** `prismeai-runtime.storage.collections`
+**Key:** `prismeai-runtime.storage.collections` — same structure.
 
-Same configuration structure as above - set the `driver` to `postgresql` and configure the connection URL.
+See the [PostgreSQL page](/self-hosting/databases/postgresql) for version requirements and managed service recommendations.
 
 ---
 
-## Helm Best Practices
+## 7. Security context
 
-<CardGroup cols={2}>
-
-<Card title="Version Control" icon="code-branch">
-- Version your `values.yaml` using Git for better tracking.
-- Regularly upgrade Helm releases to latest stable charts.
-</Card>
-
-<Card title="Secrets Management" icon="key">
-- Store sensitive configurations securely using Kubernetes Secrets or external secret management solutions (e.g., HashiCorp Vault, AWS Secrets Manager).
-</Card>
-
-<Card title="Resource Optimization" icon="cogs">
-- Define clear resource requests and limits in your Helm chart configuration.
-- Regularly review and optimize these values according to observed resource usage.
-</Card>
-
-<Card title="Monitoring & Alerts" icon="chart-line">
-- Integrate Helm deployments with Prometheus & Grafana Operator.
-- Configure alerts for critical components of Prisme.ai.
-</Card>
-
-</CardGroup>
-
-### Security Context configuration
-
-The platform supports [Security Contexts](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)
-out of the box for every pod. 
-
-For each pod except `prismeai-functions` which runs its own isolation layer, you may uncomment or customize the following helm values snippet :
+The platform supports [Kubernetes Security Contexts](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/) on every pod. For each service except `prismeai-functions` (which runs its own isolation layer), customize:
 
 ```yaml
-  securityContext:
-    runAsUser: 1000
-  containerSecurityContext:
-    allowPrivilegeEscalation: false
-    privileged: false
-    capabilities:
-      drop:
-        - ALL
+securityContext:
+  runAsUser: 1000
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  capabilities:
+    drop:
+      - ALL
 ```
 
-* The `securityContext` from these values applies to the Deployment `spec.spec.securityContext`
-* The `containerSecurityContext` from these values applies to the Deployment `spec.spec.containers.securityContext`
-* Each section follows the same reference documentation for [Security Contexts](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)
-* Finally you may apply `securityContext` and `containerSecurityContext` to `prismeai-functions`, while being informed that this pod runs a root service which forks isolated execution environments, each with their own unix user.
+You may also apply these to `prismeai-functions` — the pod runs a root supervisor that forks isolated execution environments with their own UNIX user, so the parent security context does not restrict the sandboxes.
 
 ---
 
-## Common Helm Commands
+## 8. Upgrade, rollback, uninstall
 
-<AccordionGroup>
+```bash
+# Upgrade
+helm upgrade prismeai-core prismeai/prismeai-core \
+  --namespace prismeai-core -f prismeai-core-values.yaml
 
-<Accordion title="Useful Helm Commands">
-- **Update repository**:
-  ```bash
-  helm repo update
-  ```
-- **List releases**:
-  ```bash
-  helm list -n prisme-ai
-  ```
-- **Upgrade release**:
-  ```bash
-  helm upgrade prisme-core prismeai/prismeai-core -n prisme-ai -f values.yaml
-  ```
-- **Rollback**:
-  ```bash
-  helm rollback prisme-core [revision] -n prisme-ai
-  ```
-- **Delete release**:
-  ```bash
-  helm uninstall prisme-core -n prisme-ai
-  ```
-</Accordion>
+# Release history
+helm history prismeai-core -n prismeai-core
 
-<Accordion title="Troubleshooting Helm Releases">
-- **Check release history**:
-  ```bash
-  helm history prisme-core -n prisme-ai
-  ```
-- **Debug issues**:
-  ```bash
-  kubectl describe pod <pod-name> -n prisme-ai
-  kubectl logs <pod-name> -n prisme-ai
-  ```
-</Accordion>
+# Rollback to a previous revision
+helm rollback prismeai-core <revision> -n prismeai-core
 
-</AccordionGroup>
+# Uninstall
+helm uninstall prismeai-core -n prismeai-core
+```
 
 ---
 
 ## Next Steps
 
 <CardGroup cols={2}>
-  <Card
-    title="High Availability Setup"
-    icon="cloud"
-    href="/self-hosting/kubernetes/high-availability"
-  >
-    Configure high availability on Kubernetes
+  <Card title="Configuration" icon="sliders" href="/self-hosting/kubernetes/configuration">
+    Post-install settings: image tags, LLM / vector store credentials, auth, mail, retention, uploads, readiness check.
   </Card>
-  <Card
-    title="Prometheus & Grafana"
-    icon="chart-column"
-    href="/self-hosting/kubernetes/prometheus-grafana-operator"
-  >
-    Set up monitoring with Prometheus & Grafana
+  <Card title="Cloud Providers" icon="cloud" href="/self-hosting/cloud/aws">
+    Provider-specific managed services, IaC modules and ingress annotations.
   </Card>
-  <Card
-    title="Product Configuration"
-    icon="store"
-    href="/self-hosting/configuration/products-installation"
-  >
-    Configure Prisme.ai AI products
+  <Card title="Databases" icon="database" href="/self-hosting/databases/overview">
+    MongoDB, Redis, Elasticsearch and PostgreSQL configuration.
   </Card>
-  <Card title="Install from scratch (v27)" icon="rocket" href="/self-hosting/operations/install-v27">
-    Fresh-install walkthrough.
+  <Card title="Resources & HPA" icon="gauge-high" href="/self-hosting/kubernetes/resources">
+    Resource requests, limits and Horizontal Pod Autoscaling.
   </Card>
-  <Card title="Migration v27" icon="arrow-right-arrow-left" href="/self-hosting/operations/migration-v27">
-    Migrate an existing instance to v27.
+  <Card title="Environment Variables" icon="list" href="/self-hosting/kubernetes/environment-variables">
+    Full env-var reference per service.
   </Card>
-  <Card
-    title="Operations & Maintenance"
-    icon="tools"
-    href="/self-hosting/operations/scaling"
-  >
-    Manage operations efficiently
+  <Card title="Operations" icon="tools" href="/self-hosting/operations/scaling">
+    Scaling, updates and backups.
   </Card>
 </CardGroup>

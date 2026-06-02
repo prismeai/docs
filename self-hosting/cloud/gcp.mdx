@@ -1,182 +1,107 @@
 ---
-title: "Deploying Prisme.ai on Google Cloud (GCP)"
-description: "Step-by-step guide and recommendations for deploying Prisme.ai in a self-hosted environment on Google Cloud Platform (GCP)."
+title: "Deploying Prisme.ai on GCP"
+description: "GCP-specific managed services, persistent storage and ingress. The Helm install itself is documented under Installation."
 ---
 
-Google Cloud Platform provides powerful managed services ideal for deploying Prisme.ai. This guide covers recommended infrastructure, deployment steps, and best practices for self-hosting Prisme.ai on GCP.
-
----
-
-## GCP Prerequisites
-
-Before starting, ensure you have:
-
-- A **GCP account** with adequate permissions.
-- **Google Cloud SDK (gcloud CLI)** installed and authenticated.
-- Basic knowledge of Kubernetes and essential GCP services (GKE, Cloud SQL, Memorystore, Cloud Storage).
+This page covers the GCP-specific bits. The actual Helm install — values, ingress, env vars — lives in [Install with Helm](/self-hosting/kubernetes/helm).
 
 ---
 
-## Recommended GCP Infrastructure
+## Recommended managed services
 
-Deploy Prisme.ai leveraging these recommended GCP-managed services:
-
-<AccordionGroup>
-  <Accordion title="Kubernetes (GKE)">
-    - **Service**: Google Kubernetes Engine (GKE)
-    - **Recommended Configuration**:
-      - Node pool with 3-5 nodes (`e2-standard-4` or similar, 4 vCPU / 16GB RAM)
-      - Enable Autoscaling and Auto-upgrade
-    - **Best Practices**:
-      - Multi-zone clusters for high availability
-      - Enable Workload Identity for secure access to GCP resources
-    - **Deployment Command**:
-
-      ```bash
-      gcloud container clusters create prisme-ai-cluster \
-        --zone europe-west1-b --num-nodes 3 \
-        --machine-type e2-standard-4 --enable-autoscaling \
-        --min-nodes 3 --max-nodes 5
-      ```
-  </Accordion>
-  <Accordion title="Database (MongoDB or PostgreSQL)">
-    - **Service**: 
-      - Self-managed MongoDB on GKE or MongoDB Atlas integrated via VPC peering
-      - Or Cloud SQL for Postgre
-    - **Recommended Configuration**:
-      - 3-node replica set
-    - **Best Practices**:
-      - Automated backups and maintenance
-      - Use Cloud SQL Proxy or VPC peering for security and isolation
-  </Accordion>
-  <Accordion title="Search Engine (Elasticsearch)">
-    - **Service**: Elasticsearch on Elastic Cloud or deployed via GKE-managed containers
-    - **Recommended Configuration**:
-      - Elasticsearch cluster with at least 3 nodes (8GB RAM per node)
-    - **Best Practices**:
-      - Snapshot regularly to Cloud Storage
-      - Secure using private networking and access controls
-  </Accordion>
-  <Accordion title="Redis Cache (Memorystore)">
-    - **Service**: Google Cloud Memorystore for Redis
-    - **Recommended Configuration**:
-      - Standard tier, 3-node configuration
-      - High availability and auto-failover enabled
-    - **Best Practices**:
-      - Regular monitoring and alerting
-      - Set maintenance windows for updates
-  </Accordion>
-  <Accordion title="Object Storage (Cloud Storage)">
-    - **Service**: Google Cloud Storage
-    - **Recommended Configuration**:
-      - Buckets configured for private uploads, public assets, and model storage
-    - **Best Practices**:
-      - Lifecycle management rules
-      - CDN integration with Cloud CDN for public assets
-  </Accordion>
-  <Accordion title="File Storage (Filestore)">
-    - **Service**: Google Cloud Filestore
-    - **Recommended Configuration**:
-      - Standard or Premium tier based on performance needs
-    - **Best Practices**:
-      - Mount Filestore as a Persistent Volume Claim (PVC) in Kubernetes
-      - Regularly snapshot via scheduled tasks
-  </Accordion>
-</AccordionGroup>
+| Component | GCP service | Notes |
+|-----------|-------------|-------|
+| Kubernetes | **GKE** (Standard or Autopilot) | 3–5 nodes, ≥ `e2-standard-4` (4 vCPU / 16 GB), regional cluster for HA. |
+| MongoDB | **MongoDB Atlas** (preferred) | Available on GCP via Atlas. See [MongoDB](/self-hosting/databases/mongodb). |
+| PostgreSQL (alternative) | **Cloud SQL for PostgreSQL**, regional HA. See [PostgreSQL](/self-hosting/databases/postgresql). |
+| Elasticsearch | **Elastic Cloud on GCP**, or self-managed Elasticsearch on GKE via ECK. See [Elasticsearch](/self-hosting/databases/elasticsearch). |
+| Redis | **Memorystore for Redis**. Standard Redis is enough — no modules required. See [Redis](/self-hosting/databases/redis). |
+| Object storage | **Cloud Storage**. Two buckets are enough: `models` and `uploads` (the latter serves both public and private files, proxied by the api-gateway). Add a third public bucket fronted by **Cloud CDN** only if you want public assets served directly from a CDN. |
+| File storage (PVC RWX) | **Filestore** with **regional redundancy**, via the Filestore CSI driver. |
+| Ingress | **GKE Ingress** with **Google-managed certificates**, or NGINX. |
+| TLS / Certificates | **Google-managed SSL certificates** (via Ingress or Certificate Manager). |
+| Secrets | **Secret Manager** + Workload Identity, or External Secrets Operator. |
+| Identity | **Workload Identity** for GCS, Secret Manager and Cloud SQL access. |
 
 ---
 
-## GCP Deployment Steps
+## Persistent storage
 
-<Steps>
-  <Step title="Create Project & Enable APIs">
-    Create a GCP project and enable required APIs:
+The shared RWX PVC (used by `prismeai-functions`) can be backed by either:
 
-    ```bash
-    gcloud projects create prisme-ai
-    gcloud services enable container.googleapis.com \
-      sqladmin.googleapis.com redis.googleapis.com file.googleapis.com storage.googleapis.com
-    ```
-  </Step>
-  <Step title="Deploy GKE Cluster">
-    Provision a Kubernetes cluster with GKE:
+- **Filestore with regional redundancy** — managed NFS, lowest latency for the functions sandbox. Survives a zonal outage.
+- **Cloud Storage FUSE** (via the [GCS FUSE CSI driver](https://cloud.google.com/kubernetes-engine/docs/concepts/cloud-storage-fuse-csi-driver)) — mounts a GCS bucket as a filesystem. Cheaper at large scale and inherently regional / multi-region, with higher latency than Filestore — fine for the function code volume, less ideal for hot temp files.
 
-    ```bash
-    gcloud container clusters create prisme-ai-cluster --zone europe-west1-b
-    ```
-  </Step>
-  <Step title="Provision Databases & Storage">
-    - Deploy MongoDB via MongoDB Atlas or self-host on GKE or Cloud SQL for Postgre.
-    - Set up Redis via Memorystore.
-    - Provision Elasticsearch via Elastic Cloud or Kubernetes.
-    - Create Cloud Storage buckets and Filestore instances.
-  </Step>
-  <Step title="Configure DNS & Networking">
-    Set up Google Cloud DNS or external DNS:
-
-    - `api.yourdomain.com`
-    - `studio.yourdomain.com`
-    - `*.pages.yourdomain.com`
-  </Step>
-  <Step title="Deploy Prisme.ai via Helm">
-    Deploy Prisme.ai using Helm to your GKE cluster:
-
-    ```bash
-    helm repo add prismeai https://helm.prisme.ai/charts
-    helm install prisme-core prismeai/prismeai-core --namespace prisme -f values.yaml
-    ```
-  </Step>
-  <Step title="Ingress & SSL Setup">
-    Configure Kubernetes Ingress via GKE’s built-in Ingress Controller:
-
-    ```bash
-    kubectl apply -f ingress.yaml
-    ```
-
-    Use Google-managed SSL certificates for secure HTTPS access.
-  </Step>
-</Steps>
+Pick Filestore for hot workloads, GCS FUSE when storage cost dominates.
 
 ---
 
-## Security Best Practices
+## Infrastructure as Code
 
-<CardGroup cols={2}>
-  <Card title="Workload Identity" icon="shield-halved">
-    - Use GKE Workload Identity for secure and granular permissions between Kubernetes and Google Cloud services.
-  </Card>
-  <Card title="Private VPC" icon="network-wired">
-    - Configure a private VPC for your cluster.
-    - Use Cloud NAT for controlled egress internet access.
-  </Card>
-  <Card title="Secrets & Configuration" icon="key">
-    - Store sensitive configurations securely in Google Secret Manager.
-    - Implement regular key rotation policies.
-  </Card>
-  <Card title="Monitoring & Logging" icon="eye">
-    - Integrate with Google Cloud Operations Suite (Cloud Monitoring and Cloud Logging).
-    - Set alerts for abnormal resource usage.
-  </Card>
-</CardGroup>
+Use Terraform with the **Google provider** — Google's documentation is the canonical reference. Prisme.ai doesn't ship a dedicated GCP IaC bundle.
+
+---
+
+## DNS and TLS
+
+Create two records (Cloud DNS or your registrar):
+
+```
+api.<your-domain>     -> GKE Ingress external IP / Cloud Load Balancer
+studio.<your-domain>  -> same
+```
+
+For TLS, use **Google-managed certificates** declared on the Ingress resource. They auto-renew.
+
+---
+
+## Workload Identity
+
+For GCS, Secret Manager and Cloud SQL access without static credentials:
+
+1. Enable Workload Identity on the GKE cluster.
+2. Create a Kubernetes ServiceAccount per namespace (e.g. `prismeai-backends-sa`) and bind it to a Google ServiceAccount with the required IAM roles (`roles/storage.objectAdmin`, `roles/secretmanager.secretAccessor`, `roles/cloudsql.client`).
+3. Set `serviceAccount.name: prismeai-backends-sa` on every backend service in your Helm values.
+
+GCS can also be accessed via **HMAC keys** for S3-compatible drivers — useful if you want to keep your config identical to an AWS deployment.
+
+---
+
+## Ingress annotations
+
+GKE exposes two distinct LB settings:
+
+- **`connectionDraining.drainingTimeoutSec`** (≈ 60 s, under the api-gateway server keep-alive of 70 s) — socket reuse between client requests.
+- **`timeoutSec`** (≈ 300 s) — kill an in-flight request after this much inactivity, so SSE / long LLM streams aren't dropped.
+
+```yaml
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: prismeai-backend-config
+spec:
+  timeoutSec: 300
+  connectionDraining:
+    drainingTimeoutSec: 60
+```
+
+Reference the `BackendConfig` from the Service via the `cloud.google.com/backend-config` annotation. The full annotation reference lives in [Helm install — Ingress and load balancer](/self-hosting/kubernetes/helm#5-ingress-and-load-balancer).
 
 ---
 
 ## Next Steps
 
 <CardGroup cols={2}>
-  <Card title="Helm Deployment" icon="ship" href="/self-hosting/kubernetes/helm">
-    Deploy Prisme.ai using Helm on Kubernetes
+  <Card title="Install with Helm" icon="ship" href="/self-hosting/kubernetes/helm">
+    Configure values and deploy core + apps namespaces.
   </Card>
-  <Card title="Products Configuration" icon="store" href="/self-hosting/configuration/products-installation">
-    Configure your Prisme.ai AI products
+  <Card title="Databases" icon="database" href="/self-hosting/databases/overview">
+    MongoDB, Redis, Elasticsearch and PostgreSQL.
   </Card>
-  <Card title="Install from scratch (v27)" icon="rocket" href="/self-hosting/operations/install-v27">
+  <Card title="Install products" icon="rocket" href="/self-hosting/install-products">
     Fresh-install walkthrough.
   </Card>
   <Card title="Migration v27" icon="arrow-right-arrow-left" href="/self-hosting/operations/migration-v27">
     Migrate an existing instance to v27.
-  </Card>
-  <Card title="Operations Management" icon="scale-unbalanced" href="/self-hosting/operations/scaling">
-    Learn about scaling operations efficiently
   </Card>
 </CardGroup>

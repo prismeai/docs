@@ -1,0 +1,47 @@
+---
+title: "Databases Overview"
+description: "Databases used by Prisme.ai: roles, version requirements, recommended managed services."
+---
+
+Prisme.ai relies on 3 database engines. Each has a dedicated page covering role, version, configuration, backup, updates, scaling and least privileges.
+
+| Database | Role in the platform | Minimum version | Recommended managed |
+|----------|----------------------|-----------------|---------------------|
+| [MongoDB](/self-hosting/databases/mongodb) | Users, permissions, collections, workspace metadata | 6+ | MongoDB Atlas |
+| [Redis](/self-hosting/databases/redis) | Event broker, runtime cache, sessions, crawler engines state | 6.2+ | ElastiCache, Azure Managed Redis, Memorystore Redis |
+| [Elasticsearch / OpenSearch](/self-hosting/databases/elasticsearch) | Events storage, crawler index, search engine | 8.x / OpenSearch 2.x | OpenSearch Service, Elastic Cloud |
+| [PostgreSQL](/self-hosting/databases/postgresql) | Alternative to MongoDB for permissions / users / collections | 12+ | RDS, Azure DB for PostgreSQL, Cloud SQL |
+
+<Note>
+Detailed sizing, backup, scaling and updates for each engine live on the per-database pages. Operational strategy (when, how often, RPO/RTO) lives under [Operations](/self-hosting/operations/backup).
+</Note>
+
+## Production topology
+
+For production deployments we recommend the following per-engine topology. Versions live in the table above; sizing details and rationale live on the per-engine pages.
+
+### MongoDB or PostgreSQL
+
+- **Single shared cluster** for the three databases (`users`, `permissions`, `collections`) — keeps the initial deployment simple. 3-node replica set, ≥ 2 GB RAM, 2 vCPU and 1,000 IOPS per node.
+
+<Note>
+Under sustained high load, the auth path (`users` + `permissions`, critical on every request) can be impacted by `collections` growth — these have very different access patterns. If a single cluster proves insufficient, **split into two clusters**: one for `users` + `permissions`, one for `collections`. They can then be sized and backed up independently.
+</Note>
+
+### Redis
+
+- **2 separate instances**: one dedicated to the event broker (Redis Streams), one for everything else (runtime cache, sessions, crawler search engine state).
+The broker uses `allkeys-lru`; the other instance uses `noeviction` — co-locating them on a single instance forces `noeviction` everywhere and risks memory pressure from broker streams.  
+Each instance: ≥ 3 GB RAM, 2 vCPU.
+
+### Elasticsearch / OpenSearch
+
+- **3-node cluster**: 16 GB RAM and 4 vCPU per node. Can be shared with the vector store via distinct index prefixes (see below).
+
+### Vector store
+
+AI Products installation also requires a **vector database**, served by **Elasticsearch / OpenSearch** — it can share the same cluster as the events store or live on a separate one.
+
+<Note>
+Redis is no longer supported as a vector database since the v27 platform.
+</Note>

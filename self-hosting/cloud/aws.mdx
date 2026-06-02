@@ -1,191 +1,93 @@
 ---
 title: "Deploying Prisme.ai on AWS"
-description: "Step-by-step guide and best practices for deploying Prisme.ai in a self-hosted environment using AWS."
+description: "AWS-specific managed services, persistent storage, ingress and IaC pointers. The Helm install itself is documented under Installation."
 ---
 
-Prisme.ai can be effectively deployed on AWS, leveraging managed services to ensure scalability, high availability, and operational simplicity. This guide provides step-by-step instructions and best practices to deploy Prisme.ai on AWS infrastructure.
-
----
-
-## Prerequisites
-
-Before you begin deploying Prisme.ai on AWS, ensure you have the following:
-
-- **AWS Account** with sufficient permissions to create and manage cloud resources.
-- **AWS CLI** installed and configured on your local machine.
-- Basic familiarity with Kubernetes and AWS services (EKS, RDS, S3, Elasticache).
+This page covers the AWS-specific bits. The actual Helm install — values, ingress, env vars — lives in [Install with Helm](/self-hosting/kubernetes/helm).
 
 ---
 
-## AWS Resources Setup
+## Recommended managed services
 
-Deploy Prisme.ai using the following recommended AWS-managed resources:
-
-<AccordionGroup>
-  <Accordion title="Kubernetes (EKS)">
-    - **Service**: Amazon Elastic Kubernetes Service (EKS)
-    - **Recommended Configuration**:
-      - 3-5 nodes, each with at least **4 vCPUs and 16GB RAM**
-      - Autoscaling enabled for peak load management
-    - **Best Practices**:
-      - Use managed node groups for automated scaling and updates
-      - Ensure that your EKS cluster spans at least two availability zones for high availability
-    - **Deployment**:
-
-      ```bash
-      eksctl create cluster --name=prisme-ai-cluster \
-        --version=1.28 \
-        --nodegroup-name=standard-workers \
-        --nodes=3 \
-        --nodes-min=3 \
-        --nodes-max=5 \
-        --node-type=t3.xlarge \
-        --region=eu-west-1
-      ```
-  </Accordion>
-  <Accordion title="Database (Amazon RDS)">
-    - **Service**: Amazon RDS for MongoDB-compatible (DocumentDB) or PostgreSQL or self-managed MongoDB via EC2/EKS
-    - **Recommended Configuration**:
-      - 3-node cluster for high availability
-      - Instance type: `db.m5.large` minimum
-    - **Best Practices**:
-      - Enable automated backups and Multi-AZ deployments
-      - Secure access via VPC security groups
-    - **Note**: DocumentDB is AWS’s fully-managed MongoDB-compatible service. If your workload strictly requires MongoDB features unsupported by DocumentDB, deploy MongoDB manually or use AWS Marketplace AMIs.
-  </Accordion>
-  <Accordion title="Elasticsearch / OpenSearch">
-    - **Service**: Amazon OpenSearch Service
-    - **Recommended Configuration**:
-      - 3 nodes, instance type: `m6g.large.search`
-      - Dedicated master nodes for stability
-    - **Best Practices**:
-      - Enable encryption at rest and node-to-node encryption
-      - Regularly snapshot your data to Amazon S3
-  </Accordion>
-  <Accordion title="Redis (ElastiCache)">
-    - **Service**: Amazon ElastiCache for Redis
-    - **Recommended Configuration**:
-      - 3-node Redis Cluster (`cache.m6g.large` recommended)
-      - Multi-AZ for failover
-    - **Best Practices**:
-      - Regular maintenance windows for upgrades
-      - Use Redis with JSON and Search modules if required by your deployment (via Redis Stack on EKS if needed)
-  </Accordion>
-  <Accordion title="Object Storage (Amazon S3)">
-    - **Service**: Amazon S3
-    - **Configuration**:
-      - Create buckets for model storage, user uploads, and public assets
-      - Use AWS CloudFront CDN for public assets
-    - **Best Practices**:
-      - Enforce bucket versioning and lifecycle policies
-      - Apply least-privilege bucket policies
-  </Accordion>
-  <Accordion title="File System (Amazon EFS)">
-    - **Service**: Amazon Elastic File System (EFS)
-    - **Recommended Configuration**:
-      - Use for shared file storage in Kubernetes workloads (e.g., PVCs)
-      - Performance mode: General Purpose
-    - **Best Practices**:
-      - Regular backups via AWS Backup
-      - Security groups limiting access to your Kubernetes cluster nodes only
-  </Accordion>
-</AccordionGroup>
+| Component | AWS service | Notes |
+|-----------|-------------|-------|
+| Kubernetes | **EKS** | 3–5 nodes, ≥ `t3.xlarge` (4 vCPU / 16 GB), Multi-AZ, cluster autoscaler enabled. |
+| MongoDB | **MongoDB Atlas** (preferred) | Atlas runs in AWS too. See [MongoDB](/self-hosting/databases/mongodb). |
+| Elasticsearch | **OpenSearch Service** (Multi-AZ, 3 data + 3 dedicated master). See [Elasticsearch](/self-hosting/databases/elasticsearch). |
+| Redis | **ElastiCache for Redis** (cluster mode, Multi-AZ). Standard Redis is enough — no modules required. See [Redis](/self-hosting/databases/redis). |
+| PostgreSQL (optional) | **RDS for PostgreSQL** (Multi-AZ). See [PostgreSQL](/self-hosting/databases/postgresql). |
+| Object storage | **S3**. Two buckets are enough: `models` and `uploads` (the latter serves both public and private files, proxied by the api-gateway). Add a third `public` bucket fronted by **CloudFront** only if you need public assets served directly from a CDN. |
+| File storage (PVC RWX) | **EFS** (StorageClass `efs-sc`) or **FSx for NetApp ONTAP**, Multi-AZ. |
+| Ingress | **AWS Load Balancer Controller** with **ALB**. |
+| TLS / Certificates | **ACM** certificate covering `api.<domain>` and `studio.<domain>`. |
+| Secrets | **AWS Secrets Manager** + **External Secrets Operator**. |
+| Identity (S3 / SES) | **IRSA** (IAM Roles for Service Accounts) via the EKS OIDC provider. |
 
 ---
 
-## Step-by-Step Deployment Guide
+## Persistent storage
 
-<Steps>
-  <Step title="Set up EKS Cluster">
-    Set up a Kubernetes cluster using the EKS CLI or AWS Management Console:
-
-    ```bash
-    eksctl create cluster --name=prisme-ai --region=eu-west-1
-    ```
-  </Step>
-  <Step title="Deploy Managed Databases">
-    Provision databases and storage:
-
-    - RDS (DocumentDB or self-managed MongoDB/PostgreSQL)
-    - OpenSearch Cluster
-    - Redis via ElastiCache
-    - S3 buckets and EFS volumes
-  </Step>
-  <Step title="Configure DNS and Networking">
-    Configure your Route 53 domains for the following:
-
-    - API: `api.yourdomain.com`
-    - Console: `studio.yourdomain.com`
-    - Pages: `*.pages.yourdomain.com`
-  </Step>
-  <Step title="Deploy Prisme.ai via Helm">
-    Use Helm to deploy Prisme.ai into your Kubernetes cluster:
-
-    ```bash
-    helm repo add prismeai https://helm.prisme.ai/charts
-    helm install prisme-core prismeai/prismeai-core --namespace prisme -f values.yaml
-    ```
-
-    Ensure your `values.yaml` is correctly updated with your AWS resources' endpoints and credentials.
-  </Step>
-  <Step title="Configure Ingress and TLS">
-    Use AWS Load Balancer Controller and ACM for SSL/TLS certificates to secure your deployment and route external traffic:
-
-    ```bash
-    kubectl apply -f ingress.yaml
-    ```
-  </Step>
-  <Step title="Test and Validate">
-    Perform initial health checks:
-
-    ```bash
-    kubectl get pods -n prisme
-    kubectl logs <pod-name> -n prisme
-    ```
-  </Step>
-</Steps>
+The shared RWX PVC (used by `prismeai-functions`) must be backed by EFS or FSx for NetApp ONTAP, in **Multi-AZ** mode. EBS volumes are AZ-scoped and not suitable for the shared volume.
 
 ---
 
-## Security Best Practices
+## Infrastructure as Code
 
-<CardGroup cols={2}>
-  <Card title="IAM Role Management" icon="shield-halved">
-    - Use IAM roles for service accounts (IRSA) for secure, fine-grained Kubernetes-to-AWS permissions.
-    - Regularly audit roles and permissions.
-  </Card>
-  <Card title="Network Isolation" icon="network-wired">
-    - Deploy within private subnets and secure via VPC and security groups.
-    - Use NAT gateways for controlled internet access from private networks.
-  </Card>
-  <Card title="Secrets Management" icon="key">
-    - Leverage AWS Secrets Manager or HashiCorp Vault for managing sensitive configuration.
-    - Regular rotation of database passwords and API keys.
-  </Card>
-  <Card title="Monitoring and Auditing" icon="eye">
-    - Enable AWS CloudTrail, Amazon CloudWatch, and Prometheus/Grafana for comprehensive monitoring.
-    - Set up alerts for unusual activities or resource consumption.
-  </Card>
-</CardGroup>
+A reference Terraform bundle is available on request from Prisme.ai support. It provisions:
+
+| Module | What it provisions |
+|--------|--------------------|
+| `prismeai` | EKS cluster, IAM roles (IRSA), EFS file system, Secrets Manager wiring, Prometheus, Bedrock access. |
+| `elasticache` | ElastiCache clusters for broker, runtime cache and crawler. |
+| `opensearch` | OpenSearch domain for events and crawler indices. |
+| `s3` | Buckets for models and uploads, plus an optional public bucket fronted by CloudFront when direct CDN delivery is enabled. |
+
+The bundle also ships a reference deployment guide covering External Secrets Operator wiring, MongoDB Atlas user creation, and example Helm values.
+
+CLI commands like `eksctl create cluster …` aren't reproduced here on purpose: most customers use Terraform or CloudFormation, and the AWS docs are the source of truth for the CLI.
+
+---
+
+## DNS and CloudFront
+
+Create two CNAME records pointing to the shared ALB hostname:
+
+```
+api.<your-domain>     CNAME alb-host.elb.amazonaws.com
+studio.<your-domain>  CNAME alb-host.elb.amazonaws.com
+```
+
+CloudFront is **optional**. By default, public files in the `uploads` bucket are proxied by the api-gateway and need no CDN. Wire a separate public bucket → CloudFront distribution → custom domain via ACM only if you want public assets served directly from the CDN (see [`UPLOADS_PUBLIC_STORAGE_*`](/self-hosting/kubernetes/environment-variables#s3-compatible-storage-for-uploads)).
+
+---
+
+## Ingress annotations
+
+Full ALB ingress example, including the **two distinct LB timeouts** (`client_keep_alive=60s` < api-gateway server keep-alive of 70s for socket reuse; `idle_timeout=300s` for SSE / long LLM streams) lives in [Helm install — Ingress and load balancer](/self-hosting/kubernetes/helm#5-ingress-and-load-balancer).
+
+The non-negotiable annotations:
+
+```yaml
+alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300,client_keep_alive.seconds=60
+alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:...
+```
 
 ---
 
 ## Next Steps
 
 <CardGroup cols={2}>
-  <Card title="Kubernetes with Helm" icon="ship" href="/self-hosting/kubernetes/helm">
-    Deploy Prisme.ai with Helm on Kubernetes
+  <Card title="Install with Helm" icon="ship" href="/self-hosting/kubernetes/helm">
+    Configure values and deploy core + apps namespaces.
   </Card>
-  <Card title="Products Configuration" icon="cogs" href="/self-hosting/configuration/products-installation">
-    Configure Prisme.ai AI products
+  <Card title="Databases" icon="database" href="/self-hosting/databases/overview">
+    MongoDB, Redis, OpenSearch and PostgreSQL.
   </Card>
-  <Card title="Install from scratch (v27)" icon="rocket" href="/self-hosting/operations/install-v27">
+  <Card title="Install products" icon="rocket" href="/self-hosting/install-products">
     Fresh-install walkthrough.
   </Card>
   <Card title="Migration v27" icon="arrow-right-arrow-left" href="/self-hosting/operations/migration-v27">
     Migrate an existing instance to v27.
-  </Card>
-  <Card title="Operations" icon="tools" href="/self-hosting/operations/updates">
-    Learn how to manage operations efficiently
   </Card>
 </CardGroup>

@@ -1,5 +1,5 @@
 ---
-title: "Self-Hosting Requirements"
+title: "Requirements"
 description: "Infrastructure and prerequisites for successfully deploying Prisme.ai."
 ---
 
@@ -7,76 +7,91 @@ To successfully deploy and manage Prisme.ai within your infrastructure, you need
 
 ## Infrastructure Recommendations
 
-Prisme.ai recommends the following baseline infrastructure to ensure smooth operation:
+Prisme.ai's baseline assumes the **Balanced** resource profile documented in [Resources & Autoscaling](/self-hosting/kubernetes/resources). It's sized for up to a few hundred concurrent users, with HPA absorbing spikes. This is a **budget sensitive** sizing : Slowdowns may occur, since it does not take full advantage of the capabilities of Prisme.ai services and the HPA takes several seconds to activate.  
+If you need to support thousands of concurrent users, follow the **Production-ready** profile and scale node counts proportionally.
 
-- **Nodes**: At least 3 Kubernetes nodes with 4 vCPU and 16GB RAM each【40:1†source】.
-- **Disk Space**: Minimum 50GB recommended for persistent storage.
-- **High Availability**: Use managed services or clusters with redundancy capabilities.
-- **Load Balancer**: Ingress controller or cloud load balancer required for service routing.
+- **Kubernetes nodes (Balanced baseline)**: **5 nodes with 4 vCPU and 16 GB RAM each** — covers normal load (~8 vCPU / 14 GB across both namespaces) plus headroom for HPA peaks (~20 vCPU / 40 GB at max replicas).
+- **Minimum viable**: 3 nodes will run the platform at steady state but cannot absorb HPA peaks — only suitable for non-production environments.
+- **Production-ready profile**: start at 8 nodes and scale via cluster autoscaler.
+- **Disk space**: Minimum 50 GB per node for ephemeral storage.
+- **Load balancer**: Ingress controller or cloud load balancer required for service routing.
 
-## Database Requirements
+### Kubernetes Cluster Architecture
 
-Ensure the following database setups for optimal performance and reliability:
+- **Multi-zone clusters**: Spread nodes across at least 2 availability zones.
+- **Control plane resilience**: Managed services like EKS, GKE, AKS provide HA for control planes by default. For self-managed clusters, use at least 3 control plane nodes.
+- **Cluster autoscaling**: Enabled on node groups so capacity follows demand.
+- **PodDisruptionBudgets**: Recommended on stateful workloads to prevent multiple replicas from being evicted simultaneously during maintenance.
 
-- **MongoDB or PostgreSQL**:
-  - MongoDB Version: 6.x or newer; 
-  - Or PostgreSQL ≥ 10
-  - Configuration: 3-node replica set, each with at least 2GB RAM, 2 vCPU, and 1,000 IOPS【32:2†source】.
-- **Redis**:
-  - Version: 5.x or newer
-  - Configuration: Separate instances recommended for cache and broker, each with at least 3GB RAM and 2 vCPU【32:2†source】.
-- **Elasticsearch/OpenSearch**:
-  - Version: 8.x or newer
-  - Configuration: 3-node cluster, each node with 16GB RAM and 4 vCPU【32:3†source】.
+## Database requirements
 
-### AI Products requirements
+Versions, sizing baselines and the vector store requirement live on the [Databases overview](/self-hosting/databases/overview#database-requirements) page.
 
-AI Products installation also require a **vector Database** which can be :
+## Object Storage 
 
-- **Opensearch/ElasticSearch** : Can be the same cluster as above, or a separated one
-- **Redis Stack** : Redis 5.x+ with JSON and SEARCH modules, 3-node cluster with 5GB RAM and 2 vCPU each
+Prisme.ai requires object storage for models and file uploads:
 
-## Storage and Filesystems
-
-Prisme.ai requires either a file or object storage for models & file uploads :
-
-- **RWX Filesystem**: RWX volume with at least 50GB capacity, attached to a Kubernetes Persistent Volume Claims (PVC)
+- **RWX Filesystem**: RWX volume with at least 50GB capacity, attached to a Kubernetes Persistent Volume Claim (PVC).
 - **S3-Compatible Storage**
 - **Azure Blob Storage**
 - **Google Cloud Storage**
 
-### AI Products requirements
+If **no object storage solution is available**, a filesystem can be used instead.  
 
-AI Products installation also require a **RWX filesystem**
+## Filesystems
+
+AI Products also requires a **RWX filesystem** for `prismeai-functions` microservice.
+
+The RWX filesystem must be backed by a multi-AZ / zone-redundant solution:
+
+- **AWS**: EFS (or FSx for NetApp ONTAP), multi-AZ.
+- **Azure**: Azure Files with zone-redundant storage (ZRS).
+- **GCP**: Filestore with regional redundancy or Cloud Storage Fuse
+- **OpenShift**: OpenShift Data Foundation.
 
 ## Networking and DNS
 
-DNS configuration requirements:
+Two DNS records are required:
 
-- **Wildcard DNS**: Essential for workspace routing (e.g., `*.pages.yourdomain.com`).
-- **Dedicated DNS**: Required for API (`api.yourdomain.com`) and Studio (`studio.yourdomain.com`)【40:2†source】.
+- `api.<your-domain>` for the API.
+- `studio.<your-domain>` for the Studio.
 
-In case wildcards DNS can't be setup and **AI Products** need to be installed, the following DNS must be created :
+Both point to the cluster ingress (ALB / Application Gateway / GKE Ingress / Route).
 
-- ai-knowledge.pages.yourdomain.com
-- ai-knowledge-chat.pages.yourdomain.com
-- ops-manager.pages.yourdomain.com
-- teams-service.pages.yourdomain.com
-- ai-collection.pages.yourdomain.com
-- ai-insights.pages.yourdomain.com
+### Load Balancing & Ingress
 
-However, other custom workspaces won't be able to have their web pages reachable
+- **Ingress controllers**: Use a cloud-native ingress controller (AWS Load Balancer Controller / Application Gateway Ingress Controller / GKE Ingress / OpenShift Routes, or NGINX / Istio).
+- **TLS termination**: Terminate TLS at the ingress with a certificate covering API and Studio.
+- **DNS routing**: Route DNS to the ingress across healthy zones (e.g., Route 53 with latency-based routing for multi-region).
+- **Keep-alive timeouts**: Set both the LB **client keep-alive** (≈ 60s, under the api-gateway server keep-alive of 70s) and the LB **idle timeout** (≈ 300s for long-lived SSE / websocket connections). See [Helm install — Ingress](/self-hosting/kubernetes/helm#5-ingress-and-load-balancer) for provider-specific annotations.
+
+## Observability
+
+You need visibility on the cluster, the platform services and the underlying databases — both for day-to-day operations and for incident response. Plan for the following four pillars:
+
+- **Container logs** — collect stdout/stderr of every Prisme.ai pod. Mandatory for any non-trivial debugging session.
+- **Kubernetes metrics** — CPU, memory, HPA state, pod restarts, node pressure. Required to size resources, validate HPA targets and catch saturation early.
+- **Kubernetes events** — pod scheduling failures, OOMKilled, image pull errors, autoscaling decisions. Native `kubectl get events` is volatile; export them to keep history.
+- **Elasticsearch / OpenSearch UI** — direct access to the cluster that backs the events store, crawler indexes and vector store. Critical for shard accounting, ILM monitoring, reindex / cleanup recipes (see [Elasticsearch — Operations & Troubleshooting](/self-hosting/databases/elasticsearch#operations--troubleshooting)).
+
+### Recommended stack
+
+| Pillar | Recommended | Notes |
+|--------|-------------|-------|
+| Logs + metrics | **`kube-prometheus-stack`** (Prometheus + Grafana + Alertmanager) bundled with **Loki** for log aggregation | Single Helm chart for the bulk of cluster observability. Loki keeps log storage cheap (object storage backend). |
+| Kubernetes events | **`kubernetes-event-exporter`** | Streams cluster events to Loki / Elasticsearch / your alerting webhook. Without it, events are lost after the 1 h retention window. |
+| Elasticsearch / OpenSearch | **Kibana** (or **OpenSearch Dashboards**) | Mandatory in practice — index browsing, ILM status, reindex tasks, shard allocation, slow queries. The Prisme.ai troubleshooting recipes assume you have it. |
+
+This stack is independent of Prisme.ai; deploy and operate it alongside the platform.
 
 ## Offline environments
 
-### AI Products requirements
+AI Products and the platform run in offline / private-network environments out of the box. All dependencies needed by the v27 products are bundled into the service images. Additional considerations:
 
-AI Products installation in offline environments require  :
+- **TLS certificates**: if you use internal or self-signed certificates, the CA bundle must be mounted into every microservice calling internal HTTPS endpoints (Python services via `REQUESTS_CA_BUNDLE`, Node.js services via `NODE_EXTRA_CA_CERTS`).
+- **npm registry**: only required if you write Custom Code that pulls in extra JavaScript packages beyond the ones bundled in `prismeai-functions`. See [Custom Code Functions — NPM Registry Access](/self-hosting/entreprise/functions#optional-npm-registry-access).
 
-- A npm registry reachable from the cluster
-- If using internal / self-signed TLS certificates, they must be configured inside almost all microservices to avoid HTTPS errors
-
-See [AI Products requirements](https://docs.prisme.ai/self-hosting/configuration/products-installation#offline-environments) for more details
+See [Configuration — Offline or private-network deployments](/self-hosting/kubernetes/configuration#offline-or-private-network-deployments) for more details.
 
 ## Authentication (SSO)
 
@@ -84,34 +99,25 @@ Prisme.ai supports multiple Single Sign-On (SSO) options:
 
 - **OIDC Providers**: Compatible with Google, Azure, and other generic OIDC providers【35:1†source】.
 - **SAML Providers**: Supported with HTTP-POST binding (e.g., Okta).
-- **Configuration**: Managed via `authProviders.config.yml` for easy integration.
 
 See [SSO configuration documentation](/self-hosting/entreprise/authentication)
-
-## Recommended Load Testing
-
-Before going live, perform tailored load tests considering:
-
-- **Interactions per user**: 4-10 per session.
-- **Simultaneous users**: Support for 100 new users per second.
-- **API response time**: Target 478 ms P95 for the first token using OpenAI API【32:1†source】.
 
 ## Next Steps
 
 <CardGroup cols={2}>
-  <Card title="Architecture" icon="sitemap" href="/self-hosting/architecture">
-    Explore detailed architectural diagrams and service relationships.
+  <Card title="Installation Overview" icon="route" href="/self-hosting/kubernetes/overview">
+    The five-step install flow, from cloud provisioning to ops.
   </Card>
   <Card title="Cloud Providers" icon="cloud" href="/self-hosting/cloud/aws">
     Learn about deploying Prisme.ai on AWS, Azure, GCP, and OpenShift.
   </Card>
-  <Card title="Docker Deployment" icon="docker" href="/self-hosting/kubernetes/docker">
-    Set up and configure Docker-based deployments.
+  <Card title="Install with Helm" icon="ship" href="/self-hosting/kubernetes/helm">
+    Unified Helm install guide for core and apps namespaces.
   </Card>
-  <Card title="Kubernetes Deployment" icon="kubernetes" href="/self-hosting/kubernetes/helm">
-    Understand Kubernetes deployments using Helm and operators.
+  <Card title="Databases" icon="database" href="/self-hosting/databases/overview">
+    MongoDB, Redis, Elasticsearch and PostgreSQL configuration.
   </Card>
-  <Card title="Install from scratch (v27)" icon="rocket" href="/self-hosting/operations/install-v27">
+  <Card title="Install products" icon="rocket" href="/self-hosting/install-products">
     Fresh-install walkthrough once the platform is healthy.
   </Card>
   <Card title="Migration v27" icon="arrow-right-arrow-left" href="/self-hosting/operations/migration-v27">

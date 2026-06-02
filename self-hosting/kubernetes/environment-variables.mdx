@@ -54,8 +54,7 @@ Configure the URLs and domains used by Prisme.ai services.
 | ---------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
 | INTERNAL_API_URL | All services | api-gateway internal URL for internal requests ending with `/v2` version suffix (i.e., contact fetching, public JWKS, runtime fetches)                                                                                                                | http://localhost:3001/v2              |
 | API_URL          | All services | api-gateway public URL ending with `/v2` version suffix                                                                                                                                                                              | http://studio.local.prisme.ai:3001/v2 |
-| CONSOLE_URL      | api-gateway, console, pages, runtime | Studio URL, used for emails, auth redirections & runtime variable `{{global.studioUrl}}`                                                                                                            | http://studio.local.prisme.ai:3000    |
-| PAGES_HOST       | api-gateway, console, pages, runtime | Pages base domain starting with a '.', workspace slug will be prefixed as a subdomain. Used for pages builder, pages sign-in redirection from api gateway, & runtime variable `{{global.pagesUrl}}` | .pages.local.prisme.ai:3100           |
+| CONSOLE_URL      | api-gateway, console, runtime        | Studio URL, used for emails, auth redirections & runtime variable `{{global.studioUrl}}`                                                                                                            | http://studio.local.prisme.ai:3000    |
 
 ## Databases & Storage
 
@@ -174,7 +173,7 @@ If **WORKSPACES_STORAGE_GCS_KEYFILEPATH** or **GOOGLE_APPLICATION_CREDENTIALS** 
 | UPLOADS_STORAGE_S3_LIKE_SECRET_KEY     | workspaces | S3 secret key                                                        |               |
 | UPLOADS_STORAGE_S3_LIKE_ENDPOINT       | workspaces | S3 endpoint                                                          |               |
 | UPLOADS_STORAGE_S3_LIKE_BUCKET_NAME    | workspaces | S3 bucket name                                                       |               |
-| UPLOADS_PUBLIC_STORAGE_S3_LIKE_BUCKET_NAME  | workspaces | S3 bucket name for public assets (**required if the private uploads bucket does not support object level ACL**)                               |               
+| UPLOADS_PUBLIC_STORAGE_S3_LIKE_BUCKET_NAME  | workspaces | Optional. Separate bucket for public assets, used only if you want public files served directly by a CDN instead of being proxied by the api-gateway. |               
 | UPLOADS_STORAGE_S3_LIKE_REGION         | workspaces | S3 region                                                            |               |
 | STORAGE_S3_LIKE_MAX_RETRIES            | workspaces | Maximum retries on rate-limited S3 requests                          | 5             |
 | UPLOADS_STORAGE_S3_LIKE_BASE_URL       | workspaces | Base download URL (if omitted, workspaces API will be used as proxy) |               |
@@ -192,7 +191,7 @@ If **WORKSPACES_STORAGE_GCS_KEYFILEPATH** or **GOOGLE_APPLICATION_CREDENTIALS** 
 | Name                               | Service              | Description                                    | Default Value |
 | ---------------------------------- | -------------------- | ---------------------------------------------- | ------------- |
 | UPLOADS_STORAGE_GCS_BUCKET         | workspaces | GCS bucket name (**required**)                               |               |
-| UPLOADS_PUBLIC_STORAGE_GCS_BUCKET  | workspaces | GCS bucket name for public assets (**required if the private uploads bucket does not support object level ACL**)                               |               
+| UPLOADS_PUBLIC_STORAGE_GCS_BUCKET  | workspaces | Optional. Separate bucket for public assets, used only if you want public files served directly by a CDN instead of being proxied by the api-gateway. |               
 | UPLOADS_STORAGE_GCS_KEYFILEPATH    | workspaces | Service account configuration filepath         | `GOOGLE_APPLICATION_CREDENTIALS` environment variable |
 | UPLOADS_STORAGE_GCS_PROJECTID      | workspaces | GCS project id, only required when using apiKey|               |
 | UPLOADS_STORAGE_GCS_APIKEY         | workspaces | Api key                                        |               |     |     |
@@ -203,30 +202,29 @@ If **UPLOADS_STORAGE_GCS_KEYFILEPATH** or **GOOGLE_APPLICATION_CREDENTIALS** is 
 
 **Notes on uploads bucket:**
 
-By default, the driver stores all uploads inside the same bucket for both public and private files. This bucket must allow public access and enable object-level ACLs, letting the driver selectively set objects as public or private.
+By default, **a single private bucket** holds both public and private uploads. Every download is proxied by the api-gateway, which checks the file's visibility and serves public files without requiring authentication. **No CDN, no public bucket, and no object-level ACLs are required.** The default applies as long as `UPLOADS_STORAGE_*_BASE_URL` is left unset.
 
-If these options are restricted in your environment, you can configure two separate buckets for public/private objects:
+If you want public files to be served directly from a CDN instead of through the api-gateway, you can opt into a two-bucket setup:
 
-1.  Both buckets can maintain default settings (which prohibit public access and disable object-level ACLs)
-2.  The public bucket could be served through a CDN allowed to access all objects (or any more restrictive pattern you prefer)
+1. Keep the private bucket as-is (`UPLOADS_STORAGE_S3_*`).
+2. Add a second bucket dedicated to public assets (`UPLOADS_PUBLIC_STORAGE_S3_*`), exposed through a CDN.
+3. Set `UPLOADS_STORAGE_S3_LIKE_BASE_URL` (and/or `UPLOADS_PUBLIC_STORAGE_S3_LIKE_BASE_URL`) to the CDN's public base URL — that is what tells the platform to hand out direct CDN URLs instead of proxying through the api-gateway.
 
-In this setup, `UPLOADS_STORAGE_S3_*` variables configure the private bucket, while `UPLOADS_PUBLIC_STORAGE_S3_*` variables configure the "public" bucket (i.e dedicated to public assets, but not necessarily public itself).  
-
-You can provide separate credentials for the public bucket or simply set these two variables to use the same credentials:
+You can reuse the same credentials for both buckets or provide separate ones:
 
 ```
 UPLOADS_PUBLIC_STORAGE_S3_LIKE_BUCKET_NAME="your public uploads bucket name"
-UPLOADS_PUBLIC_STORAGE_S3_LIKE_BASE_URL="your OPTIONAL CDN public base URL" 
+UPLOADS_PUBLIC_STORAGE_S3_LIKE_BASE_URL="your CDN public base URL"
 ```
 
-Equivalent variables exist for **GCS** :
+Equivalent variables exist for **GCS**:
 
 ```
 UPLOADS_PUBLIC_STORAGE_GCS_BUCKET="your public uploads bucket name"
-UPLOADS_PUBLIC_STORAGE_GCS_BASE_URL="your OPTIONAL CDN public base URL"
+UPLOADS_PUBLIC_STORAGE_GCS_BASE_URL="your CDN public base URL"
 ```
 
-To avoid public buckets / CDN, you can force all file download requests to go through the Prisme.ai API by **not providing** the `UPLOADS_STORAGE_*_BASE_URL` environment variable.
+To switch back to "everything through the api-gateway", simply **unset** the `UPLOADS_STORAGE_*_BASE_URL` variables.
 
 ## Authentication & Security
 
@@ -234,7 +232,7 @@ To avoid public buckets / CDN, you can force all file download requests to go th
 
 | Name                           | Service                              | Description                                                             | Default Value                                                  |
 | ------------------------------ | ------------------------------------ | ----------------------------------------------------------------------- | -------------------------------------------------------------- |
-| OIDC_PROVIDER_URL              | api-gateway, pages, console, runtime | OIDC Authorization public server URL (rarely needs changing)            | API_URL without base path                                      |
+| OIDC_PROVIDER_URL              | api-gateway, console, runtime        | OIDC Authorization public server URL (rarely needs changing)            | API_URL without base path                                      |
 | OIDC_INTERNAL_PROVIDER_URL     | api-gateway                          | OIDC Authorization internal server URL (rarely needs changing)          | By precedence: INTERNAL_API_URL, OIDC_PROVIDER_URL, or API_URL |
 | OIDC_STUDIO_CLIENT_ID          | api-gateway, console                 | Studio OIDC client ID                                                   | local-client-id                                                |
 | OIDC_STUDIO_CLIENT_SECRET      | api-gateway                          | Studio OIDC client secret (known only by api-gateway)                   | local-client-id                                                |
@@ -255,10 +253,12 @@ To avoid public buckets / CDN, you can force all file download requests to go th
 
 | Name                            | Service        | Description                                                                                    | Default Value |
 | ------------------------------- | -------------- | ---------------------------------------------------------------------------------------------- | ------------- |
-| CORS_ADDITIONAL_ALLOWED_ORIGINS | api-gateway    | Additional allowed CORS origins (beyond STUDIO_URL, PAGES_HOST, and workspace custom domains)  |               |
-| CSP_HEADER                      | console, pages | Content Security Policy header for frontend services (if undefined, no CSP header is returned) |               |
+| CORS_ADDITIONAL_ALLOWED_ORIGINS | api-gateway    | Additional allowed CORS origins (beyond `CONSOLE_URL` and workspace custom domains)            |               |
+| CSP_HEADER                      | console        | Content Security Policy header for the frontend (if undefined, no CSP header is returned) |               |
 | PASSWORD_VALIDATION_REGEXP      | api-gateway    | Password validation regular expression                                                         | `.{8,32}`     |
 | ACCOUNT_VALIDATION_METHOD       | api-gateway    | Account validation method on signup: "auto", "email", or "manual"                              | email         |
+| DISABLE_LOCAL_SIGNIN            | api-gateway    | Disable local username/password sign-in API. Only SSO providers remain available. | false |
+| DISABLE_LOCAL_SIGNUP            | api-gateway    | Disable local sign-up API. | false |
 
 ## Service-Specific Configuration
 
@@ -289,15 +289,7 @@ To avoid public buckets / CDN, you can force all file download requests to go th
 | Name                          | Service        | Description                         | Default Value     |
 | ----------------------------- | -------------- | ----------------------------------- | ----------------- |
 | PORT                          | console        | Listening port number               | 3000              |
-| WORKSPACE_OPS_MANAGER         | console, page        | Public base url towards Governe workspace webhooks for automatically deducing below  endpoints (customization, suggestions, products, ...). Example: `https://<API_URL>/v2/workspaces/{AIG_WORKSPACE_ID}/webhooks/`
-| CUSTOMIZATION_ENDPOINT        | console, page        | Public url for `/customization` webhook  (retrieves platform theme settings)             |    $WORKSPACE_OPS_MANAGER/customization           |
-| TRACKING_WEBHOOK        | console, page        | url towards `/tracking` webhook (tracks builder activity)              |    $WORKSPACE_OPS_MANAGER/tracking           |
-| SUGGESTIONS_ENDPOINT        | console, page        | url towards `/suggestions` webhook (retrieves suggestions on builder left menu)              |    $WORKSPACE_OPS_MANAGER/suggestions           |
-| PRODUCTS_ENDPOINT        | console, page        | url towards `/products` webhook (retrieves products on left menu)               |    $WORKSPACE_OPS_MANAGER/products           |
-| TRANSLATIONS_OVERRIDE        | console, page        | url towards `/translations` webhook (retrieves platform custom translations)               |    $WORKSPACE_OPS_MANAGER/translations           |
-| WEBSOCKETS_DEFAULT_TRANSPORTS | console, pages | Default Socket.io transport methods | polling,websocket |
-
-**None of `*_ENDPOINT`, `*_WEBHOOK` or `*_OVERRIDE` should be configured if the generic `WORKSPACE_OPS_MANAGER` environment variable is set (recommended). In helm, it can be tuned from `prismeai-console.workspace_ops_manager` and `prismeai-pages.workspace_ops_manager` environment variables.**
+| WEBSOCKETS_DEFAULT_TRANSPORTS | console        | Default Socket.io transport methods | websocket,polling |
 
 ### Events Service
 
@@ -498,6 +490,10 @@ When multiple replicas start simultaneously (e.g., during a rollout), only one r
 ## Performance & Limits
 
 ### Rate Limiting
+
+The variables below are the **api-gateway-side** rate limits: requests above the threshold are rejected with HTTP 429.
+
+For **automation rate limits** (also `RATE_LIMIT_*` but on `prismeai-runtime`), see [API Reference — Rate Limits](/api-reference/rate-limits#configuration-options). Unlike the gateway limits, those don't break execution — they **deliberately slow automations down** instead of failing them.
 
 | Name                       | Service     | Description                                                | Default Value |
 | -------------------------- | ----------- | ---------------------------------------------------------- | ------------- |

@@ -1,0 +1,370 @@
+---
+title: 'Configuration'
+description: 'The most important post-install settings — auth, mail, event retention, upload limits, crawler, runtime — with the env var and Helm value path for each.'
+---
+
+This page documents the settings you'll most often tune **after** the basic install. The Helm-level wiring (DB URLs, secrets, ingress) lives in [Install with Helm](/self-hosting/kubernetes/helm); the exhaustive env-var dump lives in [Environment Variables](/self-hosting/kubernetes/environment-variables).
+
+<Info>
+  Every option on this page is **already wired in the Helm chart defaults** — either via a dedicated Helm value or as a direct environment variable on the relevant service.
+
+  Each setting is listed as the **env var name** with its **Helm values path** written right below it. **Always set the Helm value when one exists** rather than overriding the env var directly — they map to the same setting, but the Helm value is the supported, upgrade-safe path.
+</Info>
+
+---
+
+## Pin all service & app tags
+
+Pin **all** core service and app image tags to the desired tag. Available tags are listed on the [Prisme.ai releases page](https://gitlab.com/prisme.ai/prisme.ai/-/releases).
+
+## prismeai-runtime dependencies
+
+### LLM & vector store credentials
+
+LLM Gateway and Storage workspaces consume credentials through `WORKSPACE_SECRET_*` environment variables exposed on **prismeai-runtime**.
+
+<Info>
+  The string after `llm-gateway_` or `storage_` is the **secret name** as it will be consumed by the LLM Gateway and Storage workspaces. The names you choose here must match the secret names referenced from the products configuration at the later [products install](/self-hosting/install-products) step.
+</Info>
+
+<Tabs>
+  <Tab title="LLM providers">
+    Declare every LLM provider credential as a `WORKSPACE_SECRET_llm-gateway_*` variable.
+
+    **Examples:**
+
+    | Provider | Variable |
+    | --- | --- |
+    | AWS Bedrock | `WORKSPACE_SECRET_llm-gateway_awsBedrockAccessKey`<br/>`WORKSPACE_SECRET_llm-gateway_awsBedrockSecretAccessKey` |
+    | OpenAI | `WORKSPACE_SECRET_llm-gateway_openaiApiKey` |
+    | Azure OpenAI | `WORKSPACE_SECRET_llm-gateway_azureOpenaiApiKey` |
+  </Tab>
+  <Tab title="Vector store">
+    Declare every vector store credential as a `WORKSPACE_SECRET_storage_*` variable.
+
+    **Examples:**
+
+    | Field | Variable |
+    | --- | --- |
+    | Host | `WORKSPACE_SECRET_storage_opensearch_host` |
+    | Username | `WORKSPACE_SECRET_storage_opensearch_username` |
+    | Password | `WORKSPACE_SECRET_storage_opensearch_password` |
+  </Tab>
+</Tabs>
+
+<Tip>
+  Alternatively, these secrets can be entered directly from the **Secrets** page of the **LLM Gateway** and **Storage** workspaces (after they are imported during products installation), without touching environment variables.
+</Tip>
+
+### Runtime app endpoints (custom deployments)
+
+With the standard Helm charts, runtime → app routing is wired automatically. If you run a custom deployment, verify that the runtime configuration points to the right hosts:
+
+```env
+APP_CONFIG_CustomCode_apiUrl=http://FUNCTIONS_HOST:80
+APP_CONFIG_Crawler_apiUrl=http://SEARCHENGINE_HOST:80
+```
+
+`FUNCTIONS_HOST` must point to `prismeai-functions`, `SEARCHENGINE_HOST` to `prismeai-searchengine`, both reachable from `prismeai-runtime`.
+
+---
+
+## prismeai-api-gateway: Accounts and authentication
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `ACCOUNT_VALIDATION_METHOD`<br/>Helm: `prismeai-api-gateway.env` | `email` | How new signups are validated. Set to `auto` for SSO-only deployments where every account is implicitly trusted. `manual` requires a super-admin to approve each signup. |
+| `DISABLE_LOCAL_SIGNIN`<br/>Helm: `prismeai-api-gateway.env` | `false` | Disable username/password sign-in. Only SSO providers remain available. |
+| `DISABLE_LOCAL_SIGNUP`<br/>Helm: `prismeai-api-gateway.env` | `false` | Disable local sign-up API. Existing local users can still sign in. |
+| `SUPER_ADMIN_EMAILS`<br/>Helm: `prismeai-api-gateway.config.admins` | — | Comma-separated emails granted super-admin rights across all workspaces. |
+| `PASSWORD_VALIDATION_REGEXP`<br/>Helm: `prismeai-api-gateway.env` | `.{8,32}` | Custom regex for password complexity. |
+
+### Sessions and tokens
+
+Prisme.ai follows the standard OIDC split between **session** (server-side, on the auth server) and **access token** (JWT, on the client):
+
+- The browser holds an **OIDC session cookie** issued by `prismeai-api-gateway`. As long as that cookie is valid, the gateway can silently mint a new JWT without prompting the user to log in again.
+- Clients (Studio, APIs, automations) hold an **access token JWT** and present it on every request. When the JWT expires, the client bounces through the gateway, which — if the session cookie is still alive — hands back a fresh JWT.
+- Expiring the session cookie is what actually forces a re-login, after the JWT expiration.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `SESSION_COOKIES_MAX_AGE`<br/>Helm: `prismeai-api-gateway.env` | `2592000` (30 d) | Lifetime of the OIDC session cookie, in seconds. Controls **how long until the user is forced to re-authenticate**. |
+| `ACCESS_TOKENS_MAX_AGE`<br/>Helm: `prismeai-api-gateway.env` | `2592000` (30 d) | Lifetime of the access-token JWT, in seconds. Controls **how often a client silently refreshes** its token against the gateway. Lower it (e.g. `3600` for 1 h) to shrink the window of a leaked JWT. |
+| `SOCKETIO_COOKIE_MAX_AGE`<br/>Helm: `prismeai-events.env` | from `cookie` module | Sticky-session cookie for `prismeai-events`. Raise this if events sessions drop too aggressively. |
+
+<Tip>
+A common production setup is a long `SESSION_COOKIES_MAX_AGE` (days / weeks for user convenience) combined with a short `ACCESS_TOKENS_MAX_AGE` (1–4 h) so JWTs rotate frequently while users stay logged in.
+</Tip>
+
+---
+
+## Email provider
+
+Configure at least one provider to send signup-validation / password-reset emails.
+
+### Mailgun
+
+```yaml
+prismeai-api-gateway:
+  providers:
+    mailgun:
+      apiKey: ""                                # or use existingSecret
+      existingSecret: "core-prismeai-api-gateway-mailgun"
+      emailFrom: '"Prisme.ai" <no-reply@example.com>'
+  env:
+    - name: EMAIL_DRIVER
+      value: "mailgun"
+```
+
+### SMTP
+
+```yaml
+prismeai-api-gateway:
+  env:
+    - name: EMAIL_DRIVER
+      value: "smtp"
+    - name: EMAIL_FROM
+      value: '"Prisme.ai" <no-reply@example.com>'
+    - name: SMTP_HOST
+      value: "smtp.example.com"
+    - name: SMTP_PORT
+      value: "587"
+    - name: SMTP_USER
+      value: "user"
+    - name: SMTP_PASS
+      value: "password"      # prefer existingSecret
+    - name: SMTP_SECURE
+      value: "false"       # true for port 465
+```
+
+---
+
+## CORS
+
+By default, the API gateway only accepts cross-origin requests from `CONSOLE_URL` and from workspace custom domains. To embed agents or call the API from another origin (e.g. a public website hosting the chat widget), allowlist it explicitly:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `CORS_ADDITIONAL_ALLOWED_ORIGINS`<br/>Helm: `prismeai-api-gateway.env` | — | Comma-separated list of extra origins accepted for CORS, in addition to `CONSOLE_URL` and workspace custom domains. Each entry must include the scheme (e.g. `https://www.example.com,https://app.partner.com`). Required when embedding the chat widget or calling the API from a third-party site. |
+
+---
+
+## Upload and request limits
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `UPLOADS_MAX_SIZE`<br/>Helm: `prismeai-api-gateway.env`, `prismeai-workspaces.env`, `prismeai-runtime.env` | `100000000` (100 MB) | Max user upload size in bytes. The chart sets this on all three services; lower it if you want to clamp uploads further. |
+| `UPLOADS_ALLOWED_MIMETYPES`<br/>Helm: `prismeai-workspaces.env` | — | Comma-separated MIME types accepted on upload. Recommended: `image/*,text/*,video/*,audio/*,application/*,font/*,message/rfc822`. |
+| `REQUEST_MAX_SIZE`<br/>Helm: `prismeai-functions.env`, `prismeai-api-gateway.env` | `1mb` | Max request body size accepted by the service. Raise `prismeai-functions` to `20mb` for code-heavy automation payloads. |
+
+---
+
+## Event retention and cleanup
+
+The platform produces a large volume of activity events. Tune retention or you'll outgrow your Elasticsearch / OpenSearch cluster.
+
+```yaml
+prismeai-events:
+  events:
+    cleanupjob: true                            # Create a cronjob to call /cleanup API in order to regularly apply retention, clean unused & inactive workspaces
+
+    # 1. Delete events older than 3 years
+    retention: 1080
+
+    # 2. Delete all events from small & inactive workspaces:
+    workspaceMaxEvents: 5000                    # with max N events
+    workspaceInactivityDays: 14                 # & inactive for N days
+
+    # 3. Strip payload & output fields from runtime.automations.executed events older than:
+    automationExecutedExpiration: "14d"
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `EVENTS_STORAGE_NAMESPACE`<br/>Helm: `prismeai-events.env` | — | Per-tenant event index prefix when sharing an ES / OS cluster. |
+| `BROKER_EMIT_MAXLEN`<br/>Helm: `prismeai-runtime.env`, `prismeai-events.env` | `100000` chars | Max event payload size emitted to the broker. Default keeps the broker healthy; raise it only if you understand the disk impact. |
+| `BROKER_EMIT_EXECUTED_AUTOMATION_MAXLEN`<br/>Helm: `prismeai-runtime.env` | `10000` chars | Tighter limit for `runtime.automations.executed` (monitoring-only events). |
+| `EVENTS_BUFFER_FLUSH_AT`<br/>Helm: `prismeai-events.env` | `500` | Flush the in-memory events buffer once it holds this many events. Pairs with `EVENTS_BUFFER_FLUSH_EVERY` — whichever threshold is hit first triggers a flush. Raise it on high-throughput deployments to reduce write amplification on Elasticsearch / OpenSearch. |
+| `EVENTS_BUFFER_FLUSH_EVERY`<br/>Helm: `prismeai-events.env` | `1000` ms | Flush the buffer every N milliseconds even if `EVENTS_BUFFER_FLUSH_AT` isn't reached. Lower it for fresher activity feeds, raise it to reduce ES write load. |
+| `ELASTIC_SEARCH_TIMEOUT`<br/>Helm: `prismeai-events.env` | `20000ms` | Lower it to fail faster on slow ES queries, raise it to tolerate heavier load. |
+
+---
+
+## Functions (custom code)
+
+The two settings below are the most often tuned — see [Functions Microservice](/self-hosting/entreprise/functions) for the full env-var reference (task storage, memory caps, NPM registry, …).
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `REQUEST_MAX_SIZE`<br/>Helm: `prismeai-functions.env` | `20mb` | Max request body accepted by `prismeai-functions`.  |
+| `KERNEL_POOL_SIZE`<br/>Helm: `prismeai-functions.env` | `10` | Python Jupyter kernels kept warm per pod.  |
+
+---
+
+## Crawler & Searchengine
+
+The settings below are the most often tuned — see [Crawler & SearchEngine Microservices](/self-hosting/entreprise/crawler-searchengine) for the full env-var reference.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `ELASTIC_INDICES_PREFIX`<br/>Helm: `prismeai-crawler.env`, `prismeai-searchengine.env` | — | Index name prefix. Set when sharing Elasticsearch with other tenants. |
+| `MAX_CONTENT_LEN`<br/>Helm: `prismeai-crawler.env` | `1500000` (1.5 M chars) | Max indexed document size. |
+| `DOWNLOAD_DELAY`<br/>Helm: `prismeai-crawler.env` | `0` | Seconds between requests to the same source. Set to `0.5` for typical sources to avoid rate-limiting. |
+| `REQUEST_QUEUES_POLLING_SIZE`<br/>Helm: `prismeai-crawler.env` | `1` | Concurrent requests per pod. `8` for typical document mix. |
+| `REQUEST_QUEUES_POLLING_INTERVAL`<br/>Helm: `prismeai-crawler.env` | `2` s | Queue poll frequency. |
+| `DEFAULT_ENGINE_WEBPAGES_LIMIT`<br/>Helm: `prismeai-crawler.env` | `30000` | Max pages indexed per search engine before crawling stops. |
+
+---
+
+## Rate limiting
+
+The platform enforces rate limits at three places, with different semantics:
+
+| Layer | Where it's configured | Behavior on excess |
+|-------|----------------------|--------------------|
+| **Authentication endpoints** | `RATE_LIMIT_*` env vars on `prismeai-api-gateway` | HTTP 429, request rejected |
+| **Workspace APIs** | `prismeai-api-gateway-config` ConfigMap in core k8s namespace | HTTP 429, request rejected |
+| **Automations** | `RATE_LIMIT_*` env vars on `prismeai-runtime` | Slowed down, execution continues |
+
+### Authentication endpoints (`prismeai-api-gateway` env variables)
+
+`RATE_LIMIT_*` env vars protect signup, login and password reset. Requests above the threshold are **rejected** with HTTP 429. Tune these tighter for production to slow down credential-stuffing or signup abuse. See [Environment Variables — Rate Limiting](/self-hosting/kubernetes/environment-variables#rate-limiting).
+
+### Workspace APIs (gateway ConfigMap)
+
+In addition to the env-var-driven auth limits, the gateway applies four **per-user** rate limits on native workspaces routes, defined in the `gateway.config.yml` of the `core-prismeai-api-gateway-config` ConfigMap. All four use `key: userId` and `window: 60s`.
+
+| Limit name | Routes | Default |
+|------------|--------|---------|
+| `searchEvents` | `GET /v2/workspaces/:workspaceId/events`, `/search`, `/usage` (and `/v2/search`) | **40 / min** |
+| `uploadFile` | `POST /v2/workspaces/:workspaceId/files` | **50 / min** |
+| `createWorkspace` | `POST /v2/workspaces/` | **3 / min** |
+| `importWorkspace` | `POST /v2/workspaces/import`, `/v2/workspaces/:workspaceId/import`, `/v2/workspaces/:workspaceId/versions/:versionId/pull`, `/v2/workspaces/:workspaceId/versions/:versionId/duplicate` | **3 / min** |
+
+Override by editing the ConfigMap directly. These are platform-level guardrails — they apply to every user, including super-admins, so raise them carefully when scripting bulk operations.
+
+### Automations (`prismeai-runtime` env vars)
+
+`RATE_LIMIT_*` env vars on the runtime protect the automation engine. **Unlike the gateway, these do not break execution** — automations that exceed the threshold are deliberately **slowed down** rather than failed. The intent is fair-share execution under load, not to reject work. See [API Reference — Rate Limits](/api-reference/rate-limits#configuration-options) for the full list and per-workspace overrides.
+
+---
+
+## Trusting an extra CA bundle
+
+When Prisme.ai services call an HTTPS endpoint signed by a private PKI or a self-signed certificate — an internal API, an on-prem LLM gateway, a Prisme.ai app behind an in-cluster TLS terminator — the calling runtime refuses the handshake unless the signing CA is in its trust store. `global.extraCABundle` lets you mount one PEM bundle into **every Prisme.ai pod in one shot**, on both the `prismeai-core` and `prismeai-apps` charts.
+
+The chart only references a Secret or ConfigMap that **you create out-of-band** — it never reads or writes the bundle itself, so rotations stay independent of helm upgrades.
+
+| Chart | Services covered | Env vars set on each pod |
+|-------|------------------|--------------------------|
+| `prismeai-core` | api-gateway, workspaces, runtime, events, console, pages (all Node.js) | `NODE_EXTRA_CA_CERTS` (additive) |
+| `prismeai-apps` | functions, crawler, searchengine, nlu, llm | `NODE_EXTRA_CA_CERTS` (additive — Node), `SSL_CERT_FILE` (OpenSSL — Python `ssl`, httpx, aiohttp, Scrapy, curl, Go), `REQUESTS_CA_BUNDLE` (Python `requests`, which ignores `SSL_CERT_FILE`) |
+
+<Info>
+  **`SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` replace** (not augment) the default trust store. To keep public TLS working out of the box, the `prismeai-apps` chart runs a tiny init container (`extra-ca-merge`, reusing the service's own image) that concatenates the system bundle with your custom one into an `emptyDir`, and points the env vars at the merged file. This is **enabled by default** via `global.extraCABundle.mergeWithSystem: true`. Your bundle can contain only your private CAs — public CAs come from the service's own distro.
+
+  Set `mergeWithSystem: false` if your bundle already contains the public CAs, or if you explicitly want to restrict the trust store to your private CAs only (no init container runs and the env vars point at the raw bundle).
+
+  On `prismeai-core`, `NODE_EXTRA_CA_CERTS` is additive natively, so there's no init container and no merge toggle.
+</Info>
+
+### Step 1 — Create the Secret (or ConfigMap) holding the bundle
+
+Concatenate every CA certificate you want to trust into a single PEM file, then create the Secret in **each namespace** where you install a Prisme.ai chart (typically `core` and `apps`):
+
+```bash
+kubectl -n core create secret generic prismeai-extra-ca \
+  --from-file=ca-bundle.crt=./bundle.crt
+
+kubectl -n apps create secret generic prismeai-extra-ca \
+  --from-file=ca-bundle.crt=./bundle.crt
+```
+
+A `ConfigMap` works equally well if the bundle is not sensitive:
+
+```bash
+kubectl -n core create configmap prismeai-extra-ca \
+  --from-file=ca-bundle.crt=./bundle.crt
+```
+
+The **key name inside the resource** (`ca-bundle.crt` above) is what the chart mounts — pick anything, just remember it for step 2.
+
+### Step 2 — Reference it from your values
+
+Identical block in both `prismeai-core` and `prismeai-apps` values files:
+
+```yaml
+global:
+  extraCABundle:
+    existingSecret: prismeai-extra-ca        # name of the Secret created at step 1
+    # existingConfigMap: prismeai-extra-ca   # OR a ConfigMap — set only one of the two
+    key: ca-bundle.crt                       # file name inside the Secret/ConfigMap
+    mountPath: /etc/ssl/prismeai-extra-ca    # where the file is mounted in each pod
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `global.extraCABundle.existingSecret` | `""` | Name of a Secret holding the bundle. Mutually exclusive with `existingConfigMap`. |
+| `global.extraCABundle.existingConfigMap` | `""` | Name of a ConfigMap holding the bundle. Mutually exclusive with `existingSecret`. |
+| `global.extraCABundle.key` | `ca-bundle.crt` | Key inside the Secret/ConfigMap holding the PEM-concatenated bundle. |
+| `global.extraCABundle.mountPath` | `/etc/ssl/prismeai-extra-ca` | Directory where the bundle is mounted inside each pod. The full file path becomes `<mountPath>/<key>`. |
+| `global.extraCABundle.mergeWithSystem` (apps only) | `true` | Run an init container that merges the service image's system CA bundle with yours. Disable to point env vars at the raw bundle (and skip the init container). |
+
+### Step 3 — Upgrade and verify
+
+```bash
+helm upgrade -n core core prismeai/prismeai-core -f core-values.yaml
+helm upgrade -n apps apps prismeai/prismeai-apps -f apps-values.yaml
+```
+
+Every deployment / statefulset is rolled out with the mount and env vars wired in. Confirm on one pod per chart:
+
+```bash
+# Core (Node.js)
+kubectl -n core exec deploy/core-prismeai-runtime -- \
+  sh -c 'echo $NODE_EXTRA_CA_CERTS && head -1 $NODE_EXTRA_CA_CERTS'
+# /etc/ssl/prismeai-extra-ca/ca-bundle.crt
+# -----BEGIN CERTIFICATE-----
+
+# Apps (Python)
+kubectl -n apps exec deploy/apps-prismeai-crawler -- \
+  sh -c 'echo $SSL_CERT_FILE && head -1 $SSL_CERT_FILE'
+```
+
+Then call your private HTTPS endpoint from an automation (`fetch` instruction or a Custom Code function) — it should succeed without `UNABLE_TO_VERIFY_LEAF_SIGNATURE` / `SELF_SIGNED_CERT_IN_CHAIN` / `CERTIFICATE_VERIFY_FAILED`.
+
+<Info>
+  Rotating the bundle is a `kubectl` operation on the Secret/ConfigMap you own — no helm upgrade required. Pods pick up the new file automatically (mounted secrets refresh within ~60s); restart the deployment if you need the change immediately.
+</Info>
+
+---
+
+## Offline or private-network deployments
+
+For restricted environments, verify these points:
+
+- `prismeai-functions` only needs an npm registry if you plan to write Custom Code that pulls in extra packages beyond the ones bundled in the image. See [Custom Code Functions — NPM Registry Access](/self-hosting/entreprise/functions#optional-npm-registry-access).
+- If internal or self-signed certificates are used to sign HTTPS endpoints that the platform calls, propagate the CA bundle to every service via [Trusting an extra CA bundle](#trusting-an-extra-ca-bundle) — one helm value covers both `prismeai-core` and `prismeai-apps`.
+- LLM providers, vector stores, and crawler targets must be reachable from the relevant pods.
+
+---
+
+## Readiness check
+
+Open the platform in a browser, sign in as a super admin and open the readiness URL directly from your browser:
+
+```
+https://api.<your-domain>/v2/readiness
+```
+
+All required services should return a `ready` status. Resolve any errors before moving on to [Install products](/self-hosting/install-products).
+
+---
+
+## Where to go next
+
+- [Install products](/self-hosting/install-products) — once the readiness check is green, import the platform products (Agent Creator, LLM Gateway, Storage, Governe, …).
+- [Resources & Autoscaling](/self-hosting/kubernetes/resources) — picking Balanced vs Production-ready, HPA targets.
+- [Environment Variables](/self-hosting/kubernetes/environment-variables) — exhaustive per-service reference.
+- [Operations / Scaling](/self-hosting/operations/scaling) — runtime tuning under load.

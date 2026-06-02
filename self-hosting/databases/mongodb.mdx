@@ -1,0 +1,173 @@
+---
+title: "MongoDB"
+description: "Role, configuration, backup, scaling, updates and least privileges for MongoDB in Prisme.ai self-hosted deployments."
+---
+
+## Role in the platform
+
+MongoDB is Prisme.ai's primary structured-data store. It holds three logical databases:
+
+- **`users`** — user accounts, authentication metadata. Used by `prismeai-api-gateway`.
+- **`permissions`** — access-control rules, roles, workspace memberships. Used by every backend service via the permissions storage.
+- **`collections`** — workspace data, automation state and product collections. Used by `prismeai-runtime`.
+
+PostgreSQL can be used as an alternative — see [PostgreSQL](/self-hosting/databases/postgresql).
+
+## Version compatibility
+
+- **Minimum: MongoDB 6+**.
+- 6.x and 7.x are supported and recommended for new deployments.
+- Connection string format: `mongodb://user:password@host:port/database` or `mongodb+srv://...` for Atlas.
+
+## Recommended deployment
+
+| Provider | Recommended service | Notes |
+|----------|--------------------|-------|
+| AWS | MongoDB Atlas | Atlas runs on AWS. |
+| Azure | MongoDB Atlas, Cosmos DB API for MongoDB | Cosmos has feature/version limitations — validate first. |
+| GCP | MongoDB Atlas, Cloud SQL is **not** a substitute | |
+| OpenShift / on-prem | MongoDB Community Operator, MongoDB Enterprise | 3-node replica set across racks/zones. |
+
+**Topology**: 3-node replica set. Minimum hardware: 2 vCPU, 2 GB RAM, 1000 IOPS per node. Multi-AZ for HA.
+
+By default, the three databases (`users`, `permissions`, `collections`) live on a **single shared cluster** — keeps the initial deployment simple.
+
+<Note>
+Under sustained high load, the auth path (`users` + `permissions`, critical on every request) can be impacted by `collections` growth — these have very different access patterns. If a single cluster proves insufficient, **split into two MongoDB clusters**: one for `users` + `permissions`, one for `collections`. They can then be sized and backed up independently.
+</Note>
+
+## Helm Configuration
+
+Three Helm keys point to MongoDB in core helm values :
+
+```yaml title="prismeai-core-values.yml"
+global:
+  storage:
+    permissions:
+      driver: mongodb
+      existingSecret: "core-permissions"
+
+prismeai-api-gateway:
+  storage:
+    users:
+      driver: mongodb
+      existingSecret: "core-prismeai-api-gateway-users"
+
+prismeai-runtime:
+  storage:
+    collections:
+      driver: mongodb
+      existingSecret: "core-prismeai-runtime-collections"
+```
+
+Each secret must contain a `url` key with the MongoDB URI (ending with the database name, e.g. `/permissions`), and 2 optional fields `user` and `password`.  
+
+See [Helm install](/self-hosting/kubernetes/helm) for the full install context.
+
+## Least privileges
+
+Prisme.ai needs two custom roles. See the [MongoDB Atlas actions reference](https://www.mongodb.com/docs/atlas/reference/custom-role-actions/).
+
+### Core role — for `users` and `permissions`
+
+Required actions:
+
+- `FIND`, `INSERT`, `REMOVE`, `UPDATE`
+- `CREATE_COLLECTION`, `CREATE_INDEX`, `RE_INDEX`, `LIST_INDEXES`, `DROP_INDEX`, `DROP_COLLECTION`
+- `RENAME_COLLECTION_SAME_DB`, `LIST_COLLECTIONS`
+- `COLL_STATS`, `COLL_MOD`, `COMPACT`
+
+### Collections role — for `collections`
+
+Same action list as Core role. Restrict the role to the `collections` database only.
+
+## Backup & restore
+
+### Backup with `mongodump`
+
+```bash
+# Standalone or replica set
+mongodump --uri="mongodb://user:password@host:port/database" \
+  --out=/backup/mongo/$(date +%Y-%m-%d) --gzip
+
+# Atlas
+mongodump --uri="mongodb+srv://user:password@cluster.mongodb.net/database" \
+  --out=/backup/mongo/$(date +%Y-%m-%d) --gzip
+```
+
+For Atlas, prefer **continuous cloud backups** with point-in-time recovery rather than scheduled `mongodump`.
+
+### Restore with `mongorestore`
+
+```bash
+mongorestore --uri="mongodb://user:password@host:port/database" \
+  --gzip /backup/mongo/<date>
+```
+
+### Verify
+
+```bash
+mongorestore --uri="..." --nsInclude="<db>.<collection>" \
+  --dryRun /backup/mongo/<date> | grep "documents to restore"
+```
+
+Operational strategy (RPO/RTO, retention) lives in [Operations / Backup](/self-hosting/operations/backup).
+
+## Updates
+
+- Required indexes are created automatically on service startup.
+- Schema migrations run on backend startup — no manual step needed for minor upgrades.
+- For major version jumps (e.g. 5 → 7), run the upgrade per-replica via the MongoDB / Atlas upgrade procedure. Snapshot first.
+- Always back up before upgrading. See [Operations / Updates](/self-hosting/operations/updates).
+
+## Scaling
+
+- **Replica sets** for read scaling: Prisme.ai backend uses primary writes; read preference is `primary` by default. To offload analytics queries, route them through a separate secondary.
+- **Sharding**: only for very large `collections` datasets. Adds operational complexity; engage Prisme.ai support before sharding.
+- **Indexes**: monitor slow queries (`db.collection.explain('executionStats')`). The most common hotspots are user email lookups and per-workspace queries.
+- **Resources**: scale CPU and IOPS together — MongoDB is sensitive to disk latency.
+
+## MongoDB Atlas setup (AWS IRSA)
+
+If you run MongoDB Atlas and want service accounts to authenticate via AWS IAM rather than password, follow this flow per environment. Three Atlas users are created — one per Prisme.ai backend role — each tied to its own IAM role via IRSA.
+
+### 1. Create two custom roles in Atlas
+
+In **Security → Database Access → Custom Roles**:
+
+- **`<tenant>`** — `All collection actions` on databases `<tenant>-users` and `<tenant>-permissions`.
+- **`<tenant>-collections`** — `All collection actions` on database `<tenant>-collections`.
+
+### 2. Create three IRSA-backed Atlas users
+
+In **Database Access → Add new database user**, choose **AWS IAM → IAM Role** and paste the role ARN for each backend:
+
+- `<tenant>-workspaces` → assign role `<tenant>`.
+- `<tenant>-events` → assign role `<tenant>`.
+- `<tenant>-api-gateway` → assign role `<tenant>`.
+
+Restrict each user to the access-control cluster.
+
+If you provisioned the platform with Terraform, retrieve the role ARN with `terraform output --raw workspaces_iam_role_arn` (and the equivalent for events / api-gateway).
+
+### 3. Store the connection URLs
+
+In your secret manager (e.g. AWS Secrets Manager):
+
+- `<tenant>/permissions` → `url` = cluster URL with the `permissions` database name.
+- `<tenant>/api-gateway/users` → `url` = cluster URL with the `users` database name.
+
+**Do not include username/password in IRSA URLs.** Instead append:
+
+```
+?authSource=%24external&authMechanism=MONGODB-AWS
+```
+
+### 4. Collections user (username/password)
+
+The Collections app is hit by `apps-prismeai-functions` which is shared across tenants — IAM-per-pod isn't an option. Create a standard user:
+
+1. **Add new database user** with username `<tenant>-collections`, auto-generated password.
+2. Assign the `<tenant>-collections` custom role.
+3. Restrict access to the collections cluster.
+4. Store the credentials in your secret manager (e.g. `<tenant>/appstore/collections.mongoURI`) — full URL including username and password.
