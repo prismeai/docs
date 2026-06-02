@@ -340,6 +340,68 @@ Then call your private HTTPS endpoint from an automation (`fetch` instruction or
 
 ---
 
+## HTTP/HTTPS Proxy
+
+When the cluster has no direct egress to the internet — or when corporate policy forces every external call through a forward proxy — `global.proxy` propagates the standard env vars (`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` plus lowercase variants) to every Prisme.ai pod, on both `prismeai-core` and `prismeai-apps`.
+
+| Chart | Services impacted | What honors the env vars |
+|-------|-------------------|--------------------------|
+| `prismeai-core` | api-gateway, workspaces, runtime, events, console, pages | Node.js (with `NODE_USE_ENV_PROXY=1`, set by the chart for Node 24+) |
+| `prismeai-apps` | functions (Node.js), crawler, searchengine, nlu, llm | Python (`requests`, `httpx`, `aiohttp`, `urllib`, Scrapy) honors them natively; Node functions same as core |
+
+
+### Step 1 — Configure the proxy values
+
+Identical block on both charts:
+
+```yaml
+global:
+  proxy:
+    httpProxy:  "http://proxy.corp.example.com:8080"
+    httpsProxy: "http://proxy.corp.example.com:8080"   # usually same as httpProxy
+    # Comma-separated. Chart defaults already include cluster-internal services —
+    # APPEND every external host that must skip the proxy (managed DBs,
+    # internal LLM endpoint, OIDC IdP, …).
+    noProxy: "localhost,127.0.0.1,.cluster.local,mongo.corp.example.com,oidc.corp.example.com"
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `global.proxy.httpProxy` | `""` | HTTP proxy URL (`http://host:port`, optionally `http://user:pass@host:port`). Sets `HTTP_PROXY` + `http_proxy`. |
+| `global.proxy.httpsProxy` | `""` | HTTPS proxy URL — almost always the same value as `httpProxy` since a single forward proxy handles both. Sets `HTTPS_PROXY` + `https_proxy`. |
+| `global.proxy.noProxy` | `"localhost,127.0.0.1,.cluster.local"` | Comma-separated host/CIDR list that bypasses the proxy. Keep the cluster defaults and append your own. |
+
+<Warning>
+  `HTTP_PROXY` only affects HTTP/HTTPS clients. **Binary-protocol stores (MongoDB, PostgreSQL, Redis) bypass it natively** — no need to add them to `noProxy`. But the chart also talks HTTP to several externally-reachable services that the proxy *will* try to intercept; if they're directly reachable from the cluster, add them to `noProxy` explicitly:
+
+  - **Elasticsearch / OpenSearch** (`storage.events.url`, crawler's `storage.documents.url`) — Python ES clients honor `HTTPS_PROXY`.
+  - **S3 / Azure Blob / GCS** (`storage.workspaces.*`, `storage.uploads.*`) — SDKs honor `HTTPS_PROXY`.
+  - **OIDC IdP, LLM gateway, internal HTTP APIs** reached from `prismeai-runtime` / `prismeai-api-gateway`.
+
+  Intra-cluster traffic addressed by FQDN (`*.svc.cluster.local`) and `localhost` is already covered by the chart's default `noProxy`. **`NO_PROXY` matching is suffix-based** (curl/Go/Python/Node all behave the same way: "host ENDS WITH entry"), so short-form service names like `core-prismeai-api-gateway.core` will NOT match `.cluster.local` — either use FQDN in your internal URLs (e.g. `internalApiUrl: "http://core-prismeai-api-gateway.core.svc.cluster.local/v2"`), or append the short forms to `noProxy` explicitly.
+</Warning>
+
+### Step 2 — Upgrade and verify
+
+```bash
+helm upgrade -n core core prismeai/prismeai-core -f core-values.yaml
+helm upgrade -n apps apps prismeai/prismeai-apps -f apps-values.yaml
+```
+
+Confirm the env vars are wired in:
+
+```bash
+kubectl -n core exec deploy/core-prismeai-runtime -- printenv | grep -i proxy
+```
+
+Then trigger an outbound call from an automation (a `fetch` instruction to a public URL) and watch your proxy access logs — the request should appear there.
+
+<Info>
+  Proxy auth credentials embedded in `httpProxy` / `httpsProxy` will be visible in pod env vars and in plaintext YAML on the filesystem. For sensitive credentials, keep the password out of the chart values and inject the full URL via `existingSecret` on a per-service `envFrom` instead.
+</Info>
+
+---
+
 ## Offline or private-network deployments
 
 For restricted environments, verify these points:

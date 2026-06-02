@@ -44,7 +44,7 @@ Create `prismeai-core-values.yaml`. The block below lists every **critical** key
 global:
   # Public URLs — REQUIRED
   apiUrl: "https://api.studio.example.com/v2"
-  consoleUrl: "https://studio.example.com"            # Comma-separated for multi-domain
+  consoleUrl: "https://studio.example.com"            # Comma-separated list for multi-domain (e.g. "https://studio.example.com,https://studio.partner.com")
 
   # Optional: force internal traffic over a private URL (avoids egress + extra ingress hops)
   internalApiUrl: "http://prismeai-core-prismeai-api-gateway.prismeai-core/v2"
@@ -78,9 +78,9 @@ global:
       prefix: ""                                      # Set when sharing the cluster with other tenants
 ```
 
-### Trusting an extra CA bundle (private PKI / self-signed)
-
-**Mandatory** if any base URL the platform calls — your LLM gateway, vector store, OIDC IdP, internal APIs reached from `prismeai-runtime` — is signed by a private PKI or self-signed certificate. Configure `global.extraCABundle` to propagate your CA bundle to every core pod in one shot. Full step-by-step → [Trusting an extra CA bundle](/self-hosting/kubernetes/configuration#trusting-an-extra-ca-bundle).
+<Tip>
+  **Multi-domain frontends.** `global.consoleUrl` (env var `CONSOLE_URL`) accepts a **comma-separated list of URLs**. Every URL serves the same frontend and all of them call the single `apiUrl` — so you can expose the Studio under several hostnames (e.g. a vanity domain and an internal one) without standing up a second API. All listed origins are auto-allowlisted for CORS and for OIDC auth redirects.
+</Tip>
 
 ### `prismeai-api-gateway`
 
@@ -135,120 +135,20 @@ prismeai-events:
     automationExecutedExpiration: "14d"                     # Retention for automation traces
 ```
 
----
+### Ingress and load balancer
 
-## 3. Install `core`
+The `prismeai-core` chart ships a default `core-ingress` object — you only need to override its annotations, hosts and TLS secret to match your environment. Use a single ingress for both `api.<your-domain>` and `studio.<your-domain>`. Below is an **AWS ALB** example; equivalent annotations exist for [Azure Application Gateway](/self-hosting/cloud/azure), [GKE Ingress](/self-hosting/cloud/gcp), [OpenShift Routes](/self-hosting/cloud/openshift).
 
-```bash
-helm install prismeai-core prismeai/prismeai-core \
-  --namespace prismeai-core \
-  --create-namespace \
-  -f prismeai-core-values.yaml
-```
-
----
-
-## 4. Configure the `apps` namespace
-
-Create `prismeai-apps-values.yaml`. The `apps` namespace pulls images from a private registry.
-
-<Note>
-  **License + registry credentials.** The `apps` chart (functions, crawler, searchengine) is gated by your subscription license. Credentials for `registry.gitlab.com` are issued as a GitLab Deploy Token — contact [support@prisme.ai](mailto:support@prisme.ai) if you don't have them yet.
-</Note>
-
-```yaml
-global:
-  repository:
-    host: registry.gitlab.com
-    username: ""                                            # Provided by Prisme.ai
-    token: ""                                               # Provided by Prisme.ai
-    create: true
-    imagePullSecretName: "registry-secret"
-
-  storage:
-    documents:
-      existingSecret: "apps-crawler-documents"              # Elasticsearch URL + credentials
-    searchengines:
-      existingSecret: "apps-crawler-searchengines"          # Redis URL with `db` number
-```
-
-### Trusting an extra CA bundle (private PKI / self-signed)
-
-**Mandatory** if any base URL the apps call — Elasticsearch/OpenSearch for the crawler, Redis for the searchengine, an internal LLM endpoint, third-party APIs hit by user Custom Code — is signed by a private PKI or self-signed certificate. Configure `global.extraCABundle` to propagate your CA bundle to every apps pod; an init container automatically merges it with the system trust store so public HTTPS keeps working. Full step-by-step → [Trusting an extra CA bundle](/self-hosting/kubernetes/configuration#trusting-an-extra-ca-bundle).
-
-### `prismeai-functions`
-
-Custom code execution (JavaScript / Python).
-
-```yaml
-prismeai-functions:
-  persistence:
-    existingClaim: "apps-prismeai-sfsturbo"                 # Shared RWX PVC (EFS / Azure Files / Filestore)
-```
-
-### `prismeai-crawler`
-
-Web crawler and document indexing.
-
-```yaml
-prismeai-crawler:
-  env:
-    - name: ELASTIC_INDICES_PREFIX
-      value: &ELASTIC_INDICES_PREFIX ""             # Set when sharing Elasticsearch
-```
-
-### `prismeai-searchengine`
-
-Query routing on top of crawled indices.  
-Make sure the `ELASTIC_INDICES_PREFIX` match the one in `prismeai-crawler` with a yaml anchor :  
-
-```yaml
-prismeai-searchengine:
-  env:
-    - name: ELASTIC_INDICES_PREFIX
-      value: *ELASTIC_INDICES_PREFIX
-```
-
-### Install `apps`
-
-```bash
-helm install prismeai-apps prismeai/prismeai-apps \
-  --namespace prismeai-apps \
-  --create-namespace \
-  -f prismeai-apps-values.yaml
-```
-
-<Accordion title="Troubleshooting: ImagePullBackOff on the apps namespace">
-  If pods stay in `ImagePullBackOff`, the registry secret was not created or doesn't carry the right credentials. The chart creates it automatically when `global.repository.create: true` — if you manage secrets externally, create it by hand:
-
-  ```bash
-  kubectl create secret docker-registry registry-secret \
-    --docker-server=registry.gitlab.com \
-    --docker-username=YOUR_USERNAME \
-    --docker-password=YOUR_TOKEN \
-    --namespace prismeai-apps
-  ```
-
-  Then set `global.repository.create: false` and keep `imagePullSecretName: "registry-secret"` so the chart references the existing secret.
-</Accordion>
-
----
-
-## 5. Ingress and load balancer
-
-Use a single ingress for both hostnames. Below is an **AWS ALB** example — equivalent annotations exist for [Azure Application Gateway](/self-hosting/cloud/azure), [GKE Ingress](/self-hosting/cloud/gcp), [OpenShift Routes](/self-hosting/cloud/openshift).
-
-### Two timeouts to tune
+#### Two timeouts to tune
 
 These are **two different settings** on the load balancer and they must both be set:
 
 - **`client_keep_alive`** — how long the LB keeps a client TCP connection open between requests so the browser can reuse the same socket. Set to **60 s** (must be **under** the api-gateway server keep-alive of **70 s**, otherwise the LB sends requests on a socket the gateway just closed and you get 502s).
 - **`idle_timeout`** — the longest period of inactivity allowed on an in-flight request before the LB cuts it. Set to **300 s** so server-sent events and long LLM streaming responses don't get killed mid-flight.
 
-### ALB example
+#### ALB example
 
-This **core-ingress** object should already be configured in prismeai-core Helm chart default values.  
-Make sure the annotations match the ones expected by your Ingress Controller.  
+Make sure the annotations match the ones expected by your Ingress Controller.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -296,8 +196,118 @@ spec:
       secretName: prismeai-tls
 ```
 
-
 `prismeai-events` benefits from sticky sessions — pin clients via a header (e.g. `user-agent` consistent hash) at the ingress or via an Istio `DestinationRule`.
+
+---
+
+## 3. Configure the `apps` namespace
+
+Create `prismeai-apps-values.yaml`. The `apps` namespace pulls images from a private registry.
+
+<Note>
+  **License + registry credentials.** The `apps` chart (functions, crawler, searchengine) is gated by your subscription license. Credentials for `registry.gitlab.com` are issued as a GitLab Deploy Token — contact [support@prisme.ai](mailto:support@prisme.ai) if you don't have them yet.
+</Note>
+
+```yaml
+global:
+  repository:
+    host: registry.gitlab.com
+    username: ""                                            # Provided by Prisme.ai
+    token: ""                                               # Provided by Prisme.ai
+    create: true
+    imagePullSecretName: "registry-secret"
+
+  storage:
+    documents:
+      existingSecret: "apps-crawler-documents"              # Elasticsearch URL + credentials
+    searchengines:
+      existingSecret: "apps-crawler-searchengines"          # Redis URL with `db` number
+```
+
+### `prismeai-functions`
+
+Custom code execution (JavaScript / Python).
+
+```yaml
+prismeai-functions:
+  persistence:
+    existingClaim: "apps-prismeai-sfsturbo"                 # Shared RWX PVC (EFS / Azure Files / Filestore)
+```
+
+### `prismeai-crawler`
+
+Web crawler and document indexing.
+
+```yaml
+prismeai-crawler:
+  env:
+    - name: ELASTIC_INDICES_PREFIX
+      value: &ELASTIC_INDICES_PREFIX ""             # Set when sharing Elasticsearch
+```
+
+### `prismeai-searchengine`
+
+Query routing on top of crawled indices.  
+Make sure the `ELASTIC_INDICES_PREFIX` match the one in `prismeai-crawler` with a yaml anchor :  
+
+```yaml
+prismeai-searchengine:
+  env:
+    - name: ELASTIC_INDICES_PREFIX
+      value: *ELASTIC_INDICES_PREFIX
+```
+
+---
+
+## 4. Cross-cutting configuration (both charts)
+
+The next two settings live under `global.*` and behave identically on both `prismeai-core` and `prismeai-apps`. Define them in **both** values files when applicable — same block, same Secret reference.
+
+### Trusting an extra CA bundle (private PKI / self-signed)
+
+**Mandatory** if any URL the platform calls — LLM gateway, vector store, OIDC IdP, managed Elasticsearch/OpenSearch, internal HTTP APIs, third-party APIs hit by user Custom Code — is signed by a private PKI or a self-signed certificate. Configure `global.extraCABundle` to propagate your CA bundle to every pod in one shot. On `prismeai-apps`, an init container automatically merges your bundle with the service image's system trust store so public HTTPS keeps working.
+
+Full step-by-step → [Trusting an extra CA bundle](/self-hosting/kubernetes/configuration#trusting-an-extra-ca-bundle).
+
+### HTTP/HTTPS proxy
+
+**Mandatory** if the cluster has no direct egress to the internet (LLM providers, OIDC IdP, public sites for the crawler, third-party APIs called by automations or user Custom Code). Configure `global.proxy` (httpProxy / httpsProxy / noProxy) to set `HTTP_PROXY` & friends on every pod.
+
+Don't forget to append your **HTTP-based** external hosts to `noProxy` (managed Elasticsearch/OpenSearch, S3 / Blob / GCS, internal LLM gateway, OIDC IdP) — Mongo/Postgres/Redis are binary protocols and bypass the proxy natively.
+
+Full step-by-step → [HTTP/HTTPS Proxy](/self-hosting/kubernetes/configuration#httphttps-proxy).
+
+---
+
+## 5. Install both charts
+
+```bash
+helm install prismeai-core prismeai/prismeai-core \
+  --namespace prismeai-core \
+  --create-namespace \
+  -f prismeai-core-values.yaml
+
+helm install prismeai-apps prismeai/prismeai-apps \
+  --namespace prismeai-apps \
+  --create-namespace \
+  -f prismeai-apps-values.yaml
+```
+
+Both releases are independent — order doesn't matter and you can re-run either one with `helm upgrade` after editing the matching values file.
+
+<Accordion title="Troubleshooting: ImagePullBackOff on the apps namespace">
+  If pods stay in `ImagePullBackOff`, the registry secret was not created or doesn't carry the right credentials. The chart creates it automatically when `global.repository.create: true` — if you manage secrets externally, create it by hand:
+
+  ```bash
+  kubectl create secret docker-registry registry-secret \
+    --docker-server=registry.gitlab.com \
+    --docker-username=YOUR_USERNAME \
+    --docker-password=YOUR_TOKEN \
+    --namespace prismeai-apps
+  ```
+
+  Then set `global.repository.create: false` and keep `imagePullSecretName: "registry-secret"` so the chart references the existing secret.
+</Accordion>
 
 ---
 
