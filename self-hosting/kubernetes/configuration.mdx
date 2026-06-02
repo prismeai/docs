@@ -5,11 +5,71 @@ description: 'The most important post-install settings — auth, mail, event ret
 
 This page documents the settings you'll most often tune **after** the basic install. The Helm-level wiring (DB URLs, secrets, ingress) lives in [Install with Helm](/self-hosting/kubernetes/helm); the exhaustive env-var dump lives in [Environment Variables](/self-hosting/kubernetes/environment-variables).
 
-For every setting below: the **env var name** and the **Helm values path** (when one exists).
+<Info>
+  Every option on this page is **already wired in the Helm chart defaults** — either via a dedicated Helm value or as a direct environment variable on the relevant service.
+
+  Each setting is listed as the **env var name** with its **Helm values path** written right below it. **Always set the Helm value when one exists** rather than overriding the env var directly — they map to the same setting, but the Helm value is the supported, upgrade-safe path.
+</Info>
 
 ---
 
-## Accounts and authentication
+## Pin all service & app tags
+
+Pin **all** core service and app image tags to the desired tag. Available tags are listed on the [Prisme.ai releases page](https://gitlab.com/prisme.ai/prisme.ai/-/releases).
+
+## prismeai-runtime dependencies
+
+### LLM & vector store credentials
+
+LLM Gateway and Storage workspaces consume credentials through `WORKSPACE_SECRET_*` environment variables exposed on **prismeai-runtime**.
+
+<Info>
+  The string after `llm-gateway_` or `storage_` is the **secret name** as it will be consumed by the LLM Gateway and Storage workspaces. The names you choose here must match the secret names referenced from the products configuration at the later [products install](/self-hosting/install-products) step.
+</Info>
+
+<Tabs>
+  <Tab title="LLM providers">
+    Declare every LLM provider credential as a `WORKSPACE_SECRET_llm-gateway_*` variable.
+
+    **Examples:**
+
+    | Provider | Variable |
+    | --- | --- |
+    | AWS Bedrock | `WORKSPACE_SECRET_llm-gateway_awsBedrockAccessKey`<br/>`WORKSPACE_SECRET_llm-gateway_awsBedrockSecretAccessKey` |
+    | OpenAI | `WORKSPACE_SECRET_llm-gateway_openaiApiKey` |
+    | Azure OpenAI | `WORKSPACE_SECRET_llm-gateway_azureOpenaiApiKey` |
+  </Tab>
+  <Tab title="Vector store">
+    Declare every vector store credential as a `WORKSPACE_SECRET_storage_*` variable.
+
+    **Examples:**
+
+    | Field | Variable |
+    | --- | --- |
+    | Host | `WORKSPACE_SECRET_storage_opensearch_host` |
+    | Username | `WORKSPACE_SECRET_storage_opensearch_username` |
+    | Password | `WORKSPACE_SECRET_storage_opensearch_password` |
+  </Tab>
+</Tabs>
+
+<Tip>
+  Alternatively, these secrets can be entered directly from the **Secrets** page of the **LLM Gateway** and **Storage** workspaces (after they are imported during products installation), without touching environment variables.
+</Tip>
+
+### Runtime app endpoints (custom deployments)
+
+With the standard Helm charts, runtime → app routing is wired automatically. If you run a custom deployment, verify that the runtime configuration points to the right hosts:
+
+```env
+APP_CONFIG_CustomCode_apiUrl=http://FUNCTIONS_HOST:80
+APP_CONFIG_Crawler_apiUrl=http://SEARCHENGINE_HOST:80
+```
+
+`FUNCTIONS_HOST` must point to `prismeai-functions`, `SEARCHENGINE_HOST` to `prismeai-searchengine`, both reachable from `prismeai-runtime`.
+
+---
+
+## prismeai-api-gateway: Accounts and authentication
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -112,6 +172,7 @@ prismeai-events:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| `EVENTS_STORAGE_NAMESPACE`<br/>Helm: `prismeai-events.env` | — | Per-tenant event index prefix when sharing an ES / OS cluster. |
 | `BROKER_EMIT_MAXLEN`<br/>Helm: `prismeai-runtime.env`, `prismeai-events.env` | `100000` chars | Max event payload size emitted to the broker. Default keeps the broker healthy; raise it only if you understand the disk impact. |
 | `BROKER_EMIT_EXECUTED_AUTOMATION_MAXLEN`<br/>Helm: `prismeai-runtime.env` | `10000` chars | Tighter limit for `runtime.automations.executed` (monitoring-only events). |
 | `EVENTS_BUFFER_FLUSH_AT`<br/>Helm: `prismeai-events.env` | `500` | Flush the in-memory events buffer once it holds this many events. Pairs with `EVENTS_BUFFER_FLUSH_EVERY` — whichever threshold is hit first triggers a flush. Raise it on high-throughput deployments to reduce write amplification on Elasticsearch / OpenSearch. |
@@ -120,39 +181,29 @@ prismeai-events:
 
 ---
 
-## Runtime tuning
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `RUNNER_MAX_THREADS`<br/>Helm: **`prismeai-runtime.maxWorkers`** | `1` | Number of execution workers (Node.js worker_threads) per runtime pod. Set via the `maxWorkers` Helm value, which populates this env var inside the container. When you raise it, **also raise `resources.requests` / `limits` proportionally** so each worker keeps the same budget — see [Scaling `prismeai-runtime` workers](/self-hosting/kubernetes/resources#scaling-prismeai-runtime-workers). |
-| Gateway timeout<br/>ConfigMap: `core-prismeai-api-gateway-config` | 60 s | Default API-gateway request timeout. Raise to **120 s** for LLM-heavy workloads. |
-
-For runtime-side rate limits (also `RATE_LIMIT_*`, but on `prismeai-runtime`), see the [Rate limiting](#rate-limiting) section below.
-
----
-
 ## Functions (custom code)
 
+The two settings below are the most often tuned — see [Functions Microservice](/self-hosting/entreprise/functions) for the full env-var reference (task storage, memory caps, NPM registry, …).
+
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `NODE_OPTIONS`<br/>Helm: `prismeai-functions.env` | — | Node.js memory cap. Set to `--max-old-space-size=2200` (or proportional to the pod memory limit). |
-| `KERNEL_POOL_SIZE`<br/>Helm: `prismeai-functions.env` | `2` | Python Jupyter kernels kept warm per pod. Raise to `10` for Python-heavy workloads. |
-| `TASKS_STORAGE_FILESYSTEM_DIRPATH`<br/>Helm: `prismeai-functions.env` | `/tmp/tasks` | Where execution tasks are written. Use a mounted RWX PVC if you need persistence across restarts. |
+| `REQUEST_MAX_SIZE`<br/>Helm: `prismeai-functions.env` | `20mb` | Max request body accepted by `prismeai-functions`.  |
+| `KERNEL_POOL_SIZE`<br/>Helm: `prismeai-functions.env` | `10` | Python Jupyter kernels kept warm per pod.  |
 
 ---
 
-## Crawler
+## Crawler & Searchengine
 
-For document-processing workloads, the crawler's polling tuning matters more than its raw resources.
+The settings below are the most often tuned — see [Crawler & SearchEngine Microservices](/self-hosting/entreprise/crawler-searchengine) for the full env-var reference.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| `ELASTIC_INDICES_PREFIX`<br/>Helm: `prismeai-crawler.env`, `prismeai-searchengine.env` | — | Index name prefix. Set when sharing Elasticsearch with other tenants. |
 | `MAX_CONTENT_LEN`<br/>Helm: `prismeai-crawler.env` | `1500000` (1.5 M chars) | Max indexed document size. |
 | `DOWNLOAD_DELAY`<br/>Helm: `prismeai-crawler.env` | `0` | Seconds between requests to the same source. Set to `0.5` for typical sources to avoid rate-limiting. |
 | `REQUEST_QUEUES_POLLING_SIZE`<br/>Helm: `prismeai-crawler.env` | `1` | Concurrent requests per pod. `8` for typical document mix. |
 | `REQUEST_QUEUES_POLLING_INTERVAL`<br/>Helm: `prismeai-crawler.env` | `2` s | Queue poll frequency. |
 | `DEFAULT_ENGINE_WEBPAGES_LIMIT`<br/>Helm: `prismeai-crawler.env` | `30000` | Max pages indexed per search engine before crawling stops. |
-| `ELASTIC_INDICES_PREFIX`<br/>Helm: `prismeai-crawler.env`, `prismeai-searchengine.env` | — | Index name prefix. Set when sharing Elasticsearch with other tenants. |
 
 ---
 
@@ -189,13 +240,27 @@ Override by editing the ConfigMap directly. These are platform-level guardrails 
 
 ---
 
-## Cross-cluster optimizations
+## Offline or private-network deployments
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `INTERNAL_API_URL`<br/>Helm: `global.internalApiUrl` | — | Force internal service-to-service traffic over a private URL (e.g. `http://prismeai-core-prismeai-api-gateway.prismeai-core/v2`). Avoids extra LB hops and saves significant CPU on internal HTTPS. |
-| `WEBSOCKETS_DEFAULT_TRANSPORTS`<br/>Helm: `prismeai-console.env` | `websocket,polling` | Socket.io transports. Keep both to support clients behind strict proxies. |
-| `EVENTS_STORAGE_NAMESPACE`<br/>Helm: `prismeai-events.env` | — | Per-tenant event index prefix when sharing an ES / OS cluster. |
+For restricted environments, verify these points:
+
+- `prismeai-functions` only needs an npm registry if you plan to write Custom Code that pulls in extra packages beyond the ones bundled in the image. See [Custom Code Functions — NPM Registry Access](/self-hosting/entreprise/functions#optional-npm-registry-access).
+- If internal or self-signed certificates are used, mount the CA bundle into every service that calls internal HTTPS endpoints:
+  - Python services such as `prismeai-crawler` and `prismeai-searchengine` use `REQUESTS_CA_BUNDLE`.
+  - Node.js services use `NODE_EXTRA_CA_CERTS`.
+- LLM providers, vector stores, and crawler targets must be reachable from the relevant pods.
+
+---
+
+## Readiness check
+
+Open the platform in a browser, sign in as a super admin and open the readiness URL directly from your browser:
+
+```
+https://api.<your-domain>/v2/readiness
+```
+
+All required services should return a `ready` status. Resolve any errors before moving on to [Install products](/self-hosting/install-products).
 
 ---
 
