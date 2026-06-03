@@ -32,7 +32,7 @@ When you open the **Chat** home screen, category pills appear below the input bo
 
 ## Default Categories
 
-The Prompt Library ships with the following default categories, each containing ready-to-use templates:
+The Prompt Library ships with the following default categories, each containing ready-to-use templates. The list is shared per deployment and can be customized through the [Category Management API](#category-management) below — translate the labels, add a new pill, or remove one you don't want.
 
 <CardGroup cols="2">
   <Card title="Write" icon="pen-line">
@@ -52,7 +52,7 @@ The Prompt Library ships with the following default categories, each containing 
   </Card>
 </CardGroup>
 
-Additional categories can be configured by administrators: **Sales**, **Support**, **Marketing**, **Engineering**, and **General**.
+The shipped configuration also includes empty categories ready to be populated: **Sales**, **Support**, **Marketing**, **Engineering**, and **General**.
 
 ## Prompt Scopes
 
@@ -173,8 +173,71 @@ All endpoints require authentication. Organization prompts are visible only to m
 </CardGroup>
 
 <Info>
-  Administrators can manage prompts directly from the Builder: open the **prompt-library** workspace and use the **Run automation** UI to call the CRUD endpoints above (or the `seed-prompts` automation to bulk-load a starter set scoped to an organization or agent). The same workspace also exposes the prompts collection if you prefer editing entries directly.
+  Prompt and category management are entirely driven by the REST API documented on this page. There is no dedicated admin UI today — call the endpoints from your own tooling, scripts, or an HTTP client.
 </Info>
+
+## Category Management
+
+The category pills shown on the chat home screen are read from the deployment's configured category list. Administrators can list them, rename them (for example to translate the default English labels), add new ones, or remove ones they don't want.
+
+<CardGroup cols="2">
+  <Card title="List & inspect" icon="list">
+    Read the current category list with `GET /v1/categories`. Each item is a string used both as the slug stored on prompts and as the label rendered in the UI.
+  </Card>
+  <Card title="Rename" icon="pen">
+    Use `PATCH /v1/categories/:value` to replace a category by its translated label (e.g. rename `write` to `Écrire`).
+  </Card>
+  <Card title="Add" icon="plus">
+    Use `POST /v1/categories` with `{ "value": "<string>" }` to append a new category to the list.
+  </Card>
+  <Card title="Remove" icon="trash">
+    Use `DELETE /v1/categories/:value` to remove an entry from the list.
+  </Card>
+</CardGroup>
+
+### Category Endpoints
+
+| Method | Path | Action |
+|---|---|---|
+| `GET` | `/v1/categories` | List configured categories (returns `{ items: string[], total }`) |
+| `POST` | `/v1/categories` | Add a new category. Body: `{ "value": "<string>" }`. `409` if already present |
+| `GET` | `/v1/categories/:value` | Fetch a single category. `404` if unknown |
+| `PATCH` | `/v1/categories/:value` | Rename a category. Body: `{ "value": "<new>" }`. `404` if unknown, `409` if the new value is already taken by another entry |
+| `DELETE` | `/v1/categories/:value` | Remove a category. `404` if unknown. `204 No Content` on success |
+
+<Warning>
+  Renaming a category with `PATCH` updates the configured list only — it does **not** rewrite the `category` field of existing prompts. To fully localize the library, also update each prompt with `PATCH /v1/prompts/:name` so its `category` matches the new value.
+</Warning>
+
+### Example: translate the default categories
+
+To switch a deployment from the default English labels to French, do it one category at a time so users never see a half-translated UI:
+
+1. Pick one category (e.g. `write`).
+2. `PATCH /v1/prompts/:name` on every prompt that has `category: write` to set the new value (e.g. `Écrire`).
+3. `PATCH /v1/categories/write` to rename the pill itself.
+4. Move on to the next category.
+
+If you do all the `/v1/prompts` updates first and the `/v1/categories` updates after, there is a window where users click the old pill (`write`) and see nothing because every prompt has already moved to `Écrire`. Doing it per category, or during a low-traffic window, avoids that.
+
+```bash
+# Base URL convention used in all examples below
+export PRISME_API_BASE="https://api.studio.prisme.ai/v2/workspaces/slug:prompt-library/webhooks/prompt-library"
+# (use https://api.sandbox.prisme.ai/... on the sandbox environment)
+
+curl -X PATCH "$PRISME_API_BASE/v1/categories/write" \
+  -H "Authorization: Bearer $WORKSPACE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "value": "Écrire" }'
+```
+
+### Permissions
+
+- `GET` endpoints (list / single) accept any authenticated caller (user session or workspace API key).
+- `POST`, `PATCH`, `DELETE` require a **workspace API key** (`Authorization: Bearer <workspace-api-key>`). User sessions are rejected with `403`, even for admin users, because the configured list is shared across the whole deployment and must be managed by a service credential.
+- Concurrent mutations are serialized: a second admin call that arrives while another mutation is in flight is rejected with `429`. Retry after a few seconds. In practice this only matters if you script bulk renames in parallel.
+
+The configured list is shared across the whole deployment — every user in every organization sees the same pills.
 
 ## Privacy & Security
 
