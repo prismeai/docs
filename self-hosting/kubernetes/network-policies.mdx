@@ -1,0 +1,321 @@
+---
+title: "Network Policies"
+description: "Minimal network flows to run a self-hosted Prisme.ai platform with a default-deny network posture."
+---
+
+This page lists the **minimal network flows** to allow when you run Prisme.ai with Kubernetes
+`NetworkPolicy` resources, cloud security groups, or an equivalent firewall model.
+
+Start from default-deny ingress and egress, then open only the flows that match the services and
+products you deploy.
+
+<Note>
+The examples below assume the default chart namespaces and release-style service names:
+`core-...` services in the `core` namespace and `apps-...` services in the `apps` namespace.
+Adjust names, namespaces, selectors, and external endpoint CIDRs to your installation.
+</Note>
+
+## Chart-backed ports and labels
+
+| Component | Service port | Pod target port | Notes |
+|-----------|--------------|-----------------|-------|
+| `prismeai-api-gateway` | 80/TCP | 80/TCP | Public API entrypoint. |
+| `prismeai-workspaces` | 80/TCP | 80/TCP | Workspace, file, app and page metadata API. |
+| `prismeai-runtime` | 80/TCP | 80/TCP | Automation runtime. |
+| `prismeai-events` | 80/TCP | 80/TCP | Events API and WebSocket backend. |
+| `prismeai-console` | 80/TCP | 80/TCP | Active frontend. The `prismeai-console` chart serves the current `prisme.ai-platform` image. |
+| `prismeai-pages` | 80/TCP | 80/TCP | **Legacy** standalone pages frontend; `enabled: false` by default and slated for removal. |
+| `prismeai-functions` | 80/TCP | 80/TCP | Custom code service. |
+| `prismeai-searchengine` | 80/TCP | 80/TCP | Crawler/searchengine API. |
+| `prismeai-crawler` | 3000/TCP | 3000/TCP | Crawler worker/API. |
+
+The subcharts label pods with:
+
+```yaml
+app.kubernetes.io/name: <chart name>
+app.kubernetes.io/instance: <release name>
+app: <chart name>
+```
+
+For example, the default runtime selector is:
+
+```yaml
+app.kubernetes.io/name: prismeai-runtime
+app.kubernetes.io/instance: core
+```
+
+<Note>
+**Frontend naming.** The active frontend is `platform` (the `prisme.ai-platform` image), deployed by
+the **`prismeai-console`** chart and exposed by the `prismeai-console` Service — so all
+frontend-related rules below use the `prismeai-console` selector. The chart name is kept for
+compatibility even though the image is now `prisme.ai-platform`. `prismeai-pages` is the legacy
+standalone pages frontend; it is disabled by default and slated for removal. Skip its rules unless
+you explicitly enable it.
+</Note>
+
+<Warning>
+The core chart has optional `networkPolicy.enabled` settings for core services, but those templates
+only create **ingress** policies for the selected service. They do not create a complete egress
+policy set. If you enforce default-deny egress, you must add the egress rules listed on this page.
+</Warning>
+
+## Public ingress
+
+Only public entrypoints should accept traffic from the ingress controller or load balancer.
+
+| Destination | Port | Required when |
+|-------------|------|---------------|
+| `prismeai-api-gateway` | 80/TCP | Always — the only mandatory public entrypoint. Serves `/v2`, webhooks and WebSocket proxying. |
+| `prismeai-console` | 80/TCP | For browser/UI access. The reference ingress maps the `studio.<domain>` host directly to it (it serves the active `platform` frontend). Optional only for headless/API-only deployments. |
+| `prismeai-pages` | 80/TCP | Only if the legacy pages service is explicitly enabled. |
+
+Do not expose `workspaces`, `runtime`, `events`, or apps services directly to the internet.
+
+## Core service flows
+
+### api-gateway
+
+`api-gateway` proxies public API traffic to the internal backend services.
+
+| Direction | Peer | Port | Why |
+|-----------|------|------|-----|
+| Ingress | Ingress controller / load balancer | 80/TCP | Public API entrypoint. |
+| Egress | `workspaces`, `runtime`, `events`, `console` | 80/TCP | Gateway route targets from `gateway.config.yml`. |
+| Egress | Redis broker | 6379/TCP | Event broker. |
+| Egress | Redis sessions store | 6379/TCP | Sessions/rate-limit storage. |
+| Egress | MongoDB or PostgreSQL users database | 27017/TCP or 5432/TCP | User/account storage. |
+| Egress | MongoDB or PostgreSQL permissions database | 27017/TCP or 5432/TCP | Permissions checks. |
+| Egress | Object storage | 443/TCP or storage endpoint port | Only when uploads use `S3_LIKE`, `AZURE_BLOB`, or `GCS`. |
+| Egress | Mail provider / identity provider | 443/TCP | Only when account validation, SSO, OIDC or SAML integrations are enabled. |
+
+### workspaces
+
+`workspaces` stores DSUL, metadata, files, apps and page definitions.
+
+| Direction | Peer | Port | Why |
+|-----------|------|------|-----|
+| Ingress | `api-gateway` | 80/TCP | API traffic routed by the gateway. |
+| Egress | `api-gateway` | 80/TCP | Internal readiness/import flows use `global.internalApiUrl` or `global.apiUrl`. |
+| Egress | Redis broker | 6379/TCP | Event broker. |
+| Egress | MongoDB or PostgreSQL permissions database | 27017/TCP or 5432/TCP | Permissions storage. |
+| Egress | Object storage | 443/TCP or storage endpoint port | Required for workspaces models/uploads when storage is not `FILESYSTEM`. |
+
+### runtime
+
+`runtime` executes automations. This service needs the broadest egress because workspace products and
+user-authored automations run from it.
+
+| Direction | Peer | Port | Why |
+|-----------|------|------|-----|
+| Ingress | `api-gateway` | 80/TCP | Webhooks and test routes. |
+| Egress | `api-gateway` | 80/TCP | Internal API calls and readiness checks. |
+| Egress | `prismeai-functions` | 80/TCP | `APP_CONFIG_CustomCode_apiUrl`. |
+| Egress | `prismeai-searchengine` | 80/TCP | `APP_CONFIG_Crawler_apiUrl` and `WORKSPACE_CONFIG_crawler_apiUrl`. Crawler-based AI Knowledge indexing and search. |
+| Egress | Redis broker | 6379/TCP | Event broker. |
+| Egress | Redis runtime cache | 6379/TCP | Context/cache storage. |
+| Egress | MongoDB or PostgreSQL permissions database | 27017/TCP or 5432/TCP | Permissions checks. |
+| Egress | MongoDB or PostgreSQL collections database | 27017/TCP or 5432/TCP | AI Collection and product data. |
+| Egress | Object storage | 443/TCP or storage endpoint port | Required for DSUL model storage when not `FILESYSTEM`. |
+| Egress | LLM providers | 443/TCP | OpenAI, Azure OpenAI, AWS Bedrock, Mistral, Groq, Gemini/Vertex, Anthropic, etc. |
+| Egress | Vector store (via `fetch`) | 9200/TCP, or 443/TCP for a managed HTTPS endpoint | The `storage` product queries Elasticsearch/OpenSearch directly from automations (its `VectorElasticsearch` / `VectorOpensearch` apps), so this rides on the `fetch` egress but targets the **DB port**, not 443. |
+| Egress | Anything an automation calls via `fetch` | 443/TCP (or proxy) | Installed apps and user automations call external services through the runtime `fetch` instruction. |
+
+<Note>
+**The `fetch` instruction drives runtime egress.** Automations call arbitrary URLs through the
+runtime `fetch` instruction, so `runtime` must reach **every endpoint your automations target** —
+external LLM providers (chat **and** embeddings), SaaS APIs, internal services and webhooks. `fetch`
+honors the standard `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` environment variables, so you can route
+all outbound automation traffic through a single forward proxy and restrict egress to that proxy's
+address.
+
+LLM and embedding calls are executed by these automations: if you use external providers, allow
+runtime egress to their HTTPS endpoints.
+
+**Vector store — two paths.** Crawler-based AI Knowledge indexing/search goes through `searchengine`
+(`runtime` → `searchengine` on port 80, then `searchengine` → Elasticsearch/OpenSearch on `9200`). In
+addition, the `storage` product queries the vector store **directly from automations** via its
+`VectorElasticsearch` / `VectorOpensearch` apps — a `fetch` call to the configured
+`elasticsearch_host` / `opensearch_host`. That direct path means `runtime` needs egress to the vector
+store on its **database port** (`9200`, or `443` for a managed HTTPS endpoint). If you scope `fetch`
+egress tightly (forward proxy or CIDR allow-list), include the vector store endpoint, since a broad
+`443`-only rule will not cover an in-cluster `9200` store (see
+[Databases overview](/self-hosting/databases/overview)).
+</Note>
+
+### events
+
+`events` stores and streams platform events.
+
+| Direction | Peer | Port | Why |
+|-----------|------|------|-----|
+| Ingress | `api-gateway` | 80/TCP | Events API and WebSocket proxy target. |
+| Egress | `api-gateway` | 80/TCP | Internal readiness checks. |
+| Egress | Redis broker | 6379/TCP | Event broker. |
+| Egress | MongoDB or PostgreSQL permissions database | 27017/TCP or 5432/TCP | Permissions checks. |
+| Egress | Elasticsearch or OpenSearch events store | 9200/TCP | Event storage and cleanup. |
+
+### platform frontend (console chart)
+
+The active frontend (`platform`) is a server-rendered Next.js app, deployed by the `prismeai-console`
+chart and reached through the `prismeai-console` Service.
+
+| Direction | Peer | Port | Why |
+|-----------|------|------|-----|
+| Ingress | Ingress controller / load balancer | 80/TCP | Public frontend traffic. |
+| Egress | `api-gateway` | 80/TCP | Server-side API calls when `global.internalApiUrl` is configured. |
+| Egress | Public API URL | 443/TCP | Only when frontend server-side calls use the public `global.apiUrl`. |
+
+<Note>
+`prismeai-pages` is disabled by default and slated for removal; if you enable it, apply the same
+flows as the table above (public ingress on 80, egress to `api-gateway`).
+</Note>
+
+## Apps namespace flows
+
+Deploy these flows only for the AI Products services you enable.
+
+| Service | Ingress from | Egress to | Why |
+|---------|--------------|-----------|-----|
+| `prismeai-functions` | `runtime` on 80/TCP | External package/API endpoints as required by custom code | The chart itself uses filesystem storage and does not inject Redis/MongoDB credentials. User code may need more egress. |
+| `prismeai-searchengine` | `runtime` on 80/TCP | Elasticsearch/OpenSearch documents store on 9200/TCP; Redis searchengines store on 6379/TCP | Crawler/searchengine API and readiness. |
+| `prismeai-crawler` | No service-to-service ingress required by the default runtime path | Elasticsearch/OpenSearch documents store on 9200/TCP; Redis searchengines store on 6379/TCP; crawled websites on 80/443/TCP | Crawling, parsing and indexing. |
+
+<Note>
+`prismeai-crawler` can include an optional Splash sidecar listening on `8050`, `8051`, and `5023`.
+The chart points `SPLASH_URL` to `http://localhost:8050/`, so this is same-pod traffic and does not
+require a separate inter-pod NetworkPolicy rule.
+</Note>
+
+## Datastore ingress
+
+Restrict database ingress to only the services that need each datastore.
+
+| Datastore | Port | Allow from |
+|-----------|------|------------|
+| Redis broker | 6379/TCP | `api-gateway`, `workspaces`, `runtime`, `events` |
+| Redis sessions store | 6379/TCP | `api-gateway` |
+| Redis runtime cache | 6379/TCP | `runtime` |
+| Redis searchengines store | 6379/TCP | `searchengine`, `crawler` |
+| MongoDB/PostgreSQL users database | 27017/TCP or 5432/TCP | `api-gateway` |
+| MongoDB/PostgreSQL permissions database | 27017/TCP or 5432/TCP | `api-gateway`, `workspaces`, `runtime`, `events` |
+| MongoDB/PostgreSQL collections database | 27017/TCP or 5432/TCP | `runtime` |
+| Elasticsearch/OpenSearch events store | 9200/TCP | `events` |
+| Elasticsearch/OpenSearch documents / vector store | 9200/TCP | `searchengine`, `crawler` (crawler indexing/search); `runtime` (direct vector queries from the `storage` product via `fetch`) |
+
+Use separate Redis databases or separate Redis instances according to your sizing and isolation
+requirements. The Helm values expose distinct URLs for broker, sessions, runtime cache,
+and searchengines.
+
+## Baseline policies
+
+Create a deny-all policy in each namespace where you enforce NetworkPolicy.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: core
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+Also allow DNS egress from all application pods:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: core
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+```
+
+## Example runtime egress
+
+This example shows the shape of a runtime egress policy. Replace release labels, namespace names and
+external CIDRs with your own values.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-runtime-egress
+  namespace: core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: prismeai-runtime
+      app.kubernetes.io/instance: core
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prismeai-api-gateway
+              app.kubernetes.io/instance: core
+      ports:
+        - protocol: TCP
+          port: 80
+
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: apps
+      ports:
+        - protocol: TCP
+          port: 80
+
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 27017
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 9200 # vector store — direct queries from the storage product via fetch
+
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+<Warning>
+Scope external egress as tightly as your environment allows. For managed databases, use private VPC
+CIDRs or private endpoints. For LLM providers and user-authored automations, prefer a controlled
+egress gateway or forward proxy instead of unrestricted `0.0.0.0/0` access.
+</Warning>
+
+## Related
+
+- [Databases overview](/self-hosting/databases/overview)
+- [Requirements - Networking and DNS](/self-hosting/requirements#networking-and-dns)
+- [Install with Helm](/self-hosting/kubernetes/helm)
+- [Testing a deployment](/self-hosting/operations/testing)
