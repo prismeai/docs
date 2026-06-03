@@ -25,7 +25,7 @@ The Brave Search connector exposes the **Brave Search API** as a remote MCP serv
     Apply site whitelist / re-ranking rules per call or workspace-wide
   </Card>
   <Card title="MCP Native" icon="robot">
-    Exposes a JSON-RPC MCP endpoint that Knowledges agents can call directly
+    Exposes a JSON-RPC MCP endpoint that Agent Creator agents can call directly
   </Card>
 </CardGroup>
 
@@ -46,7 +46,8 @@ The **Brave Search** connector is available in your Prisme.ai instance. Before u
 
 1. Open the connector configuration
 2. Set the Brave API key in workspace secrets
-3. Adjust the default search options if needed (count, market, token budget…)
+3. **Add your Brave Goggle in the `Default Goggles` field** (see the "Brave Goggles" section below) — this is required if you want every Brave Search call to be scoped to your whitelist
+4. Adjust the other default search options if needed (count, market, token budget…)
 
 ## Connector Configuration
 
@@ -61,7 +62,9 @@ Set these values in the connector configuration. They define the provider and th
 | **Default LLM Context Market** | `us` | Country code when `country` is omitted (`brave_llm_context`) |
 | **Default Max Tokens** | `8192` | Token budget for the LLM context response when `max_tokens` is omitted |
 | **Default Context Threshold Mode** | `balanced` | Relevance filter for `brave_llm_context` (`strict`, `balanced`, `lenient`, `disabled`) |
-| **Default Goggles** | _(empty)_ | Raw Brave Goggles definition or hosted URL applied to every call when the tool argument `goggles` is omitted |
+| **Default Goggles** | _(empty)_ | **Primary place to configure a Brave Goggle.** Paste a raw Goggle definition or a hosted URL — applied to every call from this workspace. Leave empty only if you intentionally want unfiltered Brave Search. |
+
+The **Default Goggles** field is where you configure the Goggle that applies to every Brave Search call from this workspace. Most deployments will set this once at install time and leave the `goggles` tool argument unused.
 
 ## Workspace Secrets
 
@@ -82,7 +85,13 @@ A **Brave Goggle** is a small text file that re-ranks or filters Brave Search re
 
 Reference syntax: [github.com/brave/goggles-quickstart](https://github.com/brave/goggles-quickstart).
 
-### Two ways to provide a goggle
+### Where to configure
+
+**Goggles are configured in the workspace connector configuration**, in the `Default Goggles` field. This is the standard way to apply a Goggle to every Brave Search call from agents in this workspace. Once set, agents don't need to be aware of the goggle — it is applied transparently.
+
+A per-call `goggles` MCP argument also exists, but it is an **advanced override** for special cases (A/B testing, dynamic goggles, multi-tenant flows). Day-to-day deployments only need the workspace config.
+
+### Format accepted by `Default Goggles`
 
 - **Hosted URL** — point to a publicly reachable goggle file (e.g. a GitHub raw URL).
 - **Inline raw definition** — paste the goggle content as a multi-line string.
@@ -107,7 +116,7 @@ $boost,site=banque-france.fr
 
 ### Precedence
 
-If the MCP call passes a `goggles` argument, it **fully replaces** the workspace `default_goggles` for that call (no merge). Omit the argument to fall back to `default_goggles`. Leave both empty to run a plain Brave Search.
+By default every Brave Search call uses the workspace `Default Goggles`. The `goggles` MCP tool argument is an **override**: when provided, it fully replaces the workspace default for that call (no merge). Leave both empty only to run a plain, unfiltered Brave Search.
 
 <Note>
   To keep large inline goggle definitions safe from URL length limits, the
@@ -115,13 +124,42 @@ If the MCP call passes a `goggles` argument, it **fully replaces** the workspace
   transparent to agents — the MCP request/response format does not change.
 </Note>
 
-## MCP Setup
+## Plug into an Agent Creator capability
 
-1. Open your **Knowledges project**
-2. Go to **Advanced > Tools**
-3. Click **Add** and select the **MCP** tab
-4. Paste the MCP endpoint URL from the connector configuration
-5. Save the tool and let the agent discover the `brave_search` and `brave_llm_context` tools
+Agents consume MCP servers directly through **Agent Creator** capabilities. This is the preferred way to expose Brave Search to an agent.
+
+<Steps>
+  <Step title="Install the Brave Search connector">
+    From the Prisme.ai console, open the workspace that will host the connector and install **Brave Search** from the Imports panel.
+  </Step>
+  <Step title="Configure the connector">
+    Set `BRAVE_API_KEY` in workspace secrets, then open the connector configuration and fill in the defaults you need (most importantly **Default Goggles** — see the "Brave Goggles" section above).
+  </Step>
+  <Step title="Copy the MCP endpoint">
+    Still on the connector configuration page, copy the value of **MCP Endpoint**.
+  </Step>
+  <Step title="Open Agent Creator">
+    Switch to **Agent Creator** and open the agent you want to extend.
+  </Step>
+  <Step title="Add a capability">
+    Add a new capability to the agent:
+
+    - **If a dedicated Brave Search capability exists** — select it. The server URL is already wired; the connector resolves the Brave API key server-side from the workspace configuration.
+    - **Otherwise** — select the generic **`custom_mcp`** capability and paste the **MCP Endpoint** into the *Server URL* field. The endpoint is authenticated with the caller's Prisme.ai principal (user JWT, workspace JWT, or organization API key), so no extra header is required.
+  </Step>
+  <Step title="Save">
+    The agent now has access to `brave_search` and `brave_llm_context`.
+  </Step>
+  <Step title="Brief the agent in its system prompt">
+    Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+
+    ```text
+    You have access to the Brave Search MCP server. Use it whenever the user asks for information that requires fresh, public web sources — news, regulatory updates, market data, factual lookups, competitor research. Call `brave_search` when you need raw web results (titles, URLs, snippets) and `brave_llm_context` when you only need pre-formatted grounding snippets to cite in your answer. Prefer recent results (`freshness: Day` / `pd` for breaking news) and a market matching the user's language. Always cite the source URLs returned by the tool.
+    ```
+
+    Refine the trigger keywords (regulatory areas, market codes, language) so the agent reliably picks up the right intent in your context.
+  </Step>
+</Steps>
 
 ## Available Tools
 
@@ -145,7 +183,7 @@ If the MCP call passes a `goggles` argument, it **fully replaces** the workspace
 | `num_results` | number | No | Number of results to request, from 1 to 20 |
 | `market` | string | No | Market code, for example `en-US` or `fr-FR` (the connector maps it to a 2-letter country code) |
 | `freshness` | string | No | Recency filter: `Day`, `Week`, or `Month` |
-| `goggles` | string | No | URL of a hosted Brave Goggle **or** raw inline goggle definition. Overrides the workspace `default_goggles` for this call. |
+| `goggles` | string | No | Advanced per-call override of the workspace `Default Goggles`. URL of a hosted Brave Goggle **or** raw inline goggle definition. Most deployments configure goggles once at the workspace level — see the "Brave Goggles" section. |
 
 ### `brave_llm_context` Arguments
 
@@ -158,7 +196,7 @@ If the MCP call passes a `goggles` argument, it **fully replaces** the workspace
 | `freshness` | string | No | Recency filter: `pd` (past day), `pw` (past week), `pm` (past month), `py` (past year) |
 | `max_tokens` | number | No | Maximum total tokens in the response, from 1024 to 32768 (default 8192) |
 | `context_threshold_mode` | string | No | Relevance threshold: `strict`, `balanced`, `lenient`, or `disabled` |
-| `goggles` | string | No | URL of a hosted Brave Goggle **or** raw inline goggle definition. Overrides the workspace `default_goggles` for this call. |
+| `goggles` | string | No | Advanced per-call override of the workspace `Default Goggles`. URL of a hosted Brave Goggle **or** raw inline goggle definition. Most deployments configure goggles once at the workspace level — see the "Brave Goggles" section. |
 
 ## MCP Examples
 
@@ -219,7 +257,9 @@ If the MCP call passes a `goggles` argument, it **fully replaces** the workspace
 }
 ```
 
-### Web Search with an Inline Goggle (Whitelist)
+### Web Search with a Per-Call Goggle Override (Advanced)
+
+Most workspaces will configure the Goggle once in the connector configuration (`Default Goggles`) and never pass `goggles` in the MCP call. The example below shows the advanced per-call override path.
 
 ```json
 {
@@ -292,7 +332,7 @@ If the Brave API rejects the call or the query is missing, the connector returns
   <Card title="Connectors Overview" icon="plug" href="/apps-store/marketplace/connectors">
     Compare App and MCP connector usage modes
   </Card>
-  <Card title="Knowledges Tools" icon="robot" href="/products/ai-knowledge/connectors">
-    Add MCP tools to a Knowledges agent
+  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
+    Plug MCP servers into Knowledges agents
   </Card>
 </CardGroup>
