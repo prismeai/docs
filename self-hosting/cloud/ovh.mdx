@@ -1,0 +1,188 @@
+---
+title: "Deploying Prisme.ai on OVHcloud"
+description: "OVHcloud-specific managed services, persistent storage, ingress and IaC pointers. The Helm install itself is documented under Installation."
+---
+
+This page covers the OVHcloud-specific bits. The actual Helm install — values, ingress, env vars — lives in [Install with Helm](/self-hosting/kubernetes/helm).
+
+---
+
+## Recommended managed services
+
+| Component | OVHcloud service | Notes |
+|-----------|------------------|-------|
+| Kubernetes | **Managed Kubernetes Service (MKS)** | 3–5 nodes, ≥ `b3-16` (4 vCPU / 16 GB). Pick the **`EU-WEST-PAR`** region for a Multi-AZ controlplane — all other regions are single-AZ ([OVH KB](https://help.ovhcloud.com/csm/fr-public-cloud-kubernetes-premium?id=kb_article_view&sysparm_article=KB0067581)). Cluster autoscaler enabled per node pool. |
+| MongoDB | **OVHcloud Managed Databases for MongoDB** (preferred) | Provisioned via `ovh_cloud_project_database` with engine `mongodb`. Standard cluster plan, 3 nodes. Alternative: MongoDB Atlas. See [MongoDB](/self-hosting/databases/mongodb). |
+| OpenSearch | **OVHcloud Managed Databases for OpenSearch** | Provisioned via `ovh_cloud_project_database` with engine `opensearch`. ACLs enabled — use per-tenant index patterns (`events-<env>-*`, `<env>-searchengine-*`, `<env>_aik_rag_*`). See [Elasticsearch](/self-hosting/databases/elasticsearch). |
+| Redis / Valkey | **OVHcloud Managed Databases for Valkey** | Valkey is a Redis fork — wire-compatible with the platform's Redis client. Standard Redis (no modules) is enough. See [Redis](/self-hosting/databases/redis). |
+| PostgreSQL (optional) | **OVHcloud Managed Databases for PostgreSQL** | Provisioned via `ovh_cloud_project_database`. See [PostgreSQL](/self-hosting/databases/postgresql). |
+| Object storage | **OVH Object Storage** (S3-compatible) | Two buckets: `<prefix>-workspaces` and `<prefix>-uploads`. Add a third `<prefix>-uploads-public` only if you want public assets served directly from a CDN. |
+| File storage (PVC RWX) | **OVH NAS-HA** or any NFS provider | Mount as `ReadWriteMany` with a `nfs` storage class — required by `prismeai-functions` for its shared volume. |
+| Ingress / Load balancer | **OVH Public Cloud Load Balancer** + **ingress-nginx** | The chart deploys ingress-nginx as a `DaemonSet` exposed via a `LoadBalancer` service annotated with `loadbalancer.ovhcloud.com/flavor`. Proxy protocol enabled. |
+| TLS / Certificates | **cert-manager** + DNS-01 webhook (Gandi, Route53, OVH) | Wildcard certificate covering `api.<domain>`, `studio.<domain>` and `*.pages.<domain>` issued from Let's Encrypt. |
+| Secrets | **HashiCorp Vault**, **External Secrets Operator**, or **AWS Secrets Manager** (cross-cloud) | OVHcloud has no first-party secrets manager — pick whichever your team already runs. |
+| DNS | External provider (Gandi, Cloudflare, Route53…) | Wire `api.<domain>`, `studio.<domain>` and `*.pages.<domain>` to the LB IP. |
+
+<Note>
+  **Valkey users must be created manually**. The OVH Terraform provider does not yet expose a resource for Valkey users — after the database is provisioned, create the `<env>-core` user from the OVH Manager (settings: `*` keys, `+@all` categories, `*` channels) and store the URL + credentials in your secrets manager before applying the rest of the Helm chart.
+</Note>
+
+---
+
+## Persistent storage
+
+The shared RWX PVC (used by `prismeai-functions`) must be backed by **NFS** — OVH NAS-HA or any NFS-compatible storage class — and mounted as `ReadWriteMany`. OVH block storage (`csi-cinder`) is RWO and not suitable for the shared volume.
+
+Example PVC:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: apps-prismeai-sfsturbo
+  namespace: <env>-apps
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: nfs
+```
+
+Then reference it from the apps chart:
+
+```yaml
+prismeai-functions:
+  persistence:
+    existingClaim: apps-prismeai-sfsturbo
+```
+
+---
+
+## Infrastructure as Code
+
+A reference Terraform bundle for OVHcloud is available on request from Prisme.ai support. It provisions:
+
+| Module | What it provisions |
+|--------|--------------------|
+| `prismeai` | Managed Kubernetes cluster (`ovh_cloud_project_kube`), node pools across availability zones with autoscaling. |
+| `mongodb` | Managed MongoDB cluster + `permissions` and `collections` users with `readWrite` roles scoped per database. |
+| `opensearch` | Managed OpenSearch cluster with ACL-restricted user — pattern-scoped to `events-*`, `searchengine-*` and `aik_rag_*`. |
+| `redis` | Managed Valkey cluster. User creation is manual (see note above). |
+| `s3` | Object storage buckets — `workspaces`, `uploads`, `uploads-public`. |
+| `loadbalancer` | ingress-nginx as `DaemonSet` + `LoadBalancer` service annotated for the OVH Public Cloud LB, with proxy protocol enabled. |
+
+### Apply order
+
+1. `terraform init && terraform apply` on the cluster + databases.
+2. Once the cluster is up, retrieve the kubeconfig and point `kubectl` at it.
+3. Manually create the Valkey user (see note above) and back its credentials into your secrets manager.
+4. Re-run `terraform apply` to inject the Valkey secret into the Helm values.
+
+<Note>
+  **Kubeconfig drift.** If Terraform loses access to the cluster after a kubeconfig rotation, re-import the resource:
+
+  ```bash
+  terraform state rm "module.prismeai.ovh_cloud_project_kube.main[0]"
+  terraform import "module.prismeai.ovh_cloud_project_kube.main[0]" <ovh_project_id>/<k8s_cluster_id>
+  terraform refresh
+  ```
+</Note>
+
+---
+
+## DNS
+
+Retrieve the public IP of the ingress-nginx `LoadBalancer` service:
+
+```bash
+kubectl -n ingress-nginx get service/ingress-nginx-controller \
+  -o jsonpath="{.metadata.annotations['loadbalancer\.openstack\.org/load-balancer-address']}"
+```
+
+Then create the records on your DNS provider:
+
+```
+api.<your-domain>      A      <LB_IP>
+studio.<your-domain>   A      <LB_IP>
+*.pages.<your-domain>  A      <LB_IP>
+```
+
+---
+
+## cert-manager and Let's Encrypt
+
+OVHcloud has no managed certificate service, so issue TLS certificates with **cert-manager** and a DNS-01 webhook matching your DNS provider. Example for Gandi:
+
+```bash
+helm repo add jetstack https://charts.jetstack.io
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --set installCRDs=true \
+  --set 'extraArgs={--dns01-recursive-nameservers=8.8.8.8:53\,1.1.1.1:53}'
+
+helm repo add cert-manager-webhook-gandi https://sintef.github.io/cert-manager-webhook-gandi
+helm install cert-manager-webhook-gandi cert-manager-webhook-gandi/cert-manager-webhook-gandi \
+  --namespace cert-manager \
+  --set gandiApiToken=<GANDI_PAT>
+```
+
+Then create a `ClusterIssuer` and `Certificate` resource per environment — a full example is available on request from Prisme.ai support.
+
+---
+
+## Ingress annotations
+
+<Warning>
+  **ingress-nginx is no longer actively maintained.** The project entered maintenance mode and will stop receiving updates — including security patches — in the near future. For new deployments we recommend picking a maintained alternative such as **Ingress NGINX (InGate)**, **Traefik**, **HAProxy Ingress** or **Envoy Gateway**. The annotations below still apply to existing ingress-nginx installs.
+</Warning>
+
+ingress-nginx is the controller historically used on OVH MKS. The non-negotiable annotations on the `LoadBalancer` service:
+
+```yaml
+metadata:
+  annotations:
+    loadbalancer.ovhcloud.com/flavor: small        # or medium / large depending on traffic
+    loadbalancer.openstack.org/proxy-protocol: "true"
+```
+
+Inside the ingress-nginx controller chart values, enable proxy protocol so the gateway sees real client IPs:
+
+```yaml
+controller:
+  kind: DaemonSet
+  config:
+    use-proxy-protocol: "true"
+```
+
+For the **two distinct LB timeouts** (60s client keep-alive < 70s gateway keep-alive, 300s idle for SSE / long LLM streams), set them on the ingress-nginx ConfigMap:
+
+```yaml
+controller:
+  config:
+    keep-alive: "60"
+    proxy-read-timeout: "300"
+    proxy-send-timeout: "300"
+```
+
+Full ingress example lives in [Helm install — Ingress and load balancer](/self-hosting/kubernetes/helm#5-ingress-and-load-balancer).
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Install with Helm" icon="ship" href="/self-hosting/kubernetes/helm">
+    Configure values and deploy core + apps namespaces.
+  </Card>
+  <Card title="Databases" icon="database" href="/self-hosting/databases/overview">
+    MongoDB, Valkey, OpenSearch and PostgreSQL.
+  </Card>
+  <Card title="Install products" icon="rocket" href="/self-hosting/install-products">
+    Fresh-install walkthrough.
+  </Card>
+  <Card title="Resources & Autoscaling" icon="gauge" href="/self-hosting/kubernetes/resources">
+    Balanced vs High-throughput, HPA targets.
+  </Card>
+</CardGroup>
