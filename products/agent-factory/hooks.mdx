@@ -1,0 +1,163 @@
+---
+title: "Hooks"
+description: "Intercept the agent pipeline at lifecycle events to inspect, modify, allow or block messages, files and LLM calls."
+---
+
+**Hooks** let you plug custom logic into an agent's runtime pipeline. At defined lifecycle events — when a message arrives, before/after the LLM call, when a file is ingested or about to be uploaded — a hook can **inspect**, **modify**, **allow** or **block** the payload by calling an external endpoint, a workspace automation, or by evaluating a declarative policy in the browser.
+
+Typical uses: PII redaction, toxicity / classification blocking, citation enforcement, file MIME or watermark checks, antivirus scanning, and the **client-side file-classification gate** (block a document before it ever leaves the browser).
+
+<Note>
+Hooks exist at three levels — **agent**, **org**, and **platform**. They are merged (agent ∪ org ∪ platform). The agent UI manages the agent's own hooks and shows org/platform hooks as **read-only**. An org/platform hook can be marked **immutable** so it always applies and cannot be disabled below.
+</Note>
+
+## Lifecycle events
+
+A hook subscribes to one or more events:
+
+| Event | When it fires | Typical use |
+|-------|---------------|-------------|
+| `before_upload` | In the **browser**, before a file is uploaded | Client-side file-classification gate (see below) |
+| `before_file_ingest` | Server-side, before a file is ingested | MIME/type allow-list, antivirus, virus scanning |
+| `after_file_parse` | After a file has been parsed to text | Watermark / sensitivity-marking detection |
+| `before_message` | Before a user message enters the pipeline | PII redaction, input filtering |
+| `before_llm` | Just before the LLM call | Prompt inspection, proxying |
+| `after_llm` | After the LLM response | Toxicity blocking, citation enforcement, output rewriting |
+
+## Targets
+
+The `target.type` decides **where** the hook runs.
+
+### `http` — call an external endpoint
+
+The hook posts the event payload to a URL and uses the response to allow / modify / block. The endpoint is most often a [Builder automation exposed as a webhook](/products/ai-builder/automations), so you stay inside Prisme.ai (RBAC, secrets, audit).
+
+```json
+{
+  "id": "pii-redact",
+  "events": ["before_message"],
+  "mode": "sync",
+  "target": {
+    "type": "http",
+    "url": "https://<api>/v2/workspaces/slug:my-ws/webhooks/hook-pii-redact"
+  },
+  "on_error": "allow",
+  "enabled": true
+}
+```
+
+You can add custom `headers` to the request.
+
+### `workspace` — call a workspace automation directly
+
+Reference a Builder automation by slug instead of a full URL.
+
+```json
+{
+  "target": {
+    "type": "workspace",
+    "automation_slug": "scan-document",
+    "workspace_slug": "my-ws"
+  }
+}
+```
+
+### `client` — declarative browser policy (file gate)
+
+A `client` hook is evaluated **in the browser** against a file's extracted metadata, before any upload. No external call, no third-party JavaScript — see [The client-side file gate](#the-client-side-file-gate). For `client` targets `mode` is ignored (it is always a synchronous, in-browser check).
+
+## Execution modes
+
+`mode` controls the **server-side timing** of `http` / `workspace` hooks:
+
+| Mode | Behavior |
+|------|----------|
+| `sync` | The pipeline **waits** for the hook and uses its decision (allow / deny / modified payload). Use for anything that must block or rewrite. |
+| `async` | Fire-and-forget — the pipeline does not wait. Use for logging, scanning, analytics. Combine with `sample_rate` to run it on a fraction of events. |
+| `stream` | The hook can stream a transformed response (e.g. an LLM proxy). |
+
+## Behavior controls
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `enabled` | Turn the hook on/off | `true` |
+| `on_error` | What happens if the hook call fails or times out: `allow` (fail-open) or `deny` (fail-closed) | `allow` |
+| `expose_reason` | Surface the hook's block reason to the end user (otherwise a generic message) | `false` |
+| `rate_limit_per_min` | Max hook invocations per minute | `1000` |
+| `apply_output_guardrails` | Re-run the agent's output guardrails after the hook modified an `after_llm` response | `false` |
+| `payload_mode` | Send the payload `inline` or as a `reference` the endpoint fetches | `inline` |
+| `sample_rate` | Fraction (0–1) of events to run an `async` hook on | `1` |
+| `display_name` | Human-readable label in the UI (falls back to `id`) | — |
+
+<Warning>
+Choose `on_error` deliberately. For a **security** control (block forbidden files/content) use `on_error: "deny"` so a failing or unreachable hook never silently lets the payload through. For a **best-effort** enrichment use `allow`.
+</Warning>
+
+## The client-side file gate
+
+The most common `client` hook is a **file-classification gate**: read a document's metadata locally and reject non-conformant files **before they ever leave the browser** (e.g. a document classified above the level your SaaS is allowed to process).
+
+```json
+{
+  "id": "titus-classification-gate",
+  "events": ["before_upload"],
+  "target": {
+    "type": "client",
+    "policy": [
+      {
+        "property": "custom.Classification",
+        "operator": "in",
+        "allowed": ["C0", "C1"],
+        "on_fail": "deny",
+        "message": "This document is classified above the allowed level. Upload blocked."
+      }
+    ]
+  },
+  "enabled": true
+}
+```
+
+### Policy rules
+
+Rules are evaluated with **AND** semantics — the first rule the file does not satisfy whose `on_fail` is `deny` blocks the upload.
+
+| `operator` | Conforms when… |
+|------------|----------------|
+| `in` | the value is in `allowed` |
+| `not_in` | the value is **not** in `allowed` (a missing value conforms — fail-open) |
+| `equals` | the value equals `allowed[0]` |
+| `exists` | the property is present and non-empty |
+| `matches` | the value matches one of the `allowed` regular expressions |
+
+<Note>
+`in` / `equals` / `matches` / `exists` are **fail-closed**: a missing property fails the rule, so an unmarked document is blocked by a `deny` rule. `not_in` is **fail-open** (nothing to forbid when the property is absent) — pair it with an `exists` rule to also block unmarked files.
+</Note>
+
+### Metadata namespaces
+
+The extractor flattens each file's metadata into namespaced keys you target with `property`:
+
+| Prefix | Source | Examples |
+|--------|--------|----------|
+| `file.*` | Always present (the `File` object) | `file.name`, `file.type`, `file.size` |
+| `custom.*` | Office `docProps/custom.xml` (where classification tools like TITUS write markings) | `custom.Classification`, `custom.TitusGUID` |
+| `core.*` / `app.*` | Office core / app properties | `core.title`, `app.Company` |
+| `info.*` / `xmp.*` | PDF info dictionary / XMP | `info.Subject`, `info.Keywords` |
+| `email.*` | `.eml` RFC 5322 headers | `email.X-TITUS-Classification` |
+
+<Warning>
+The client gate is a **fast-fail UX convenience, not an authoritative barrier** — it runs in the user's browser. Always pair a classification policy with a **server-side** `before_file_ingest` hook (e.g. `target: http` / `workspace`) that re-checks the file, so the rule is enforced even if the browser is bypassed.
+</Warning>
+
+## Org & platform hooks
+
+Hooks defined at the **org** or **platform** level apply to every agent in scope. Set `immutable: true` to make a policy mandatory: it always applies and cannot be disabled or overridden by an agent. In the agent UI these appear as **read-only / locked**, with `locked_by` indicating `org` or `platform`.
+
+## Limits
+
+- Up to **10** hooks per agent.
+- Default rate limit: **1000** invocations/minute per hook.
+
+## Configuring hooks
+
+Hooks are managed from the agent's **Capabilities** page (see [Capabilities](./capabilities)). Add a hook, pick its event(s), choose the target (HTTP / workspace / client) and mode, then set the behavior controls. For HTTP/workspace targets, point it at a [Builder automation](/products/ai-builder/automations) exposed as a webhook.
