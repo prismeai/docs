@@ -5,13 +5,18 @@ description: "Manage service account tokens, product bindings, and access checks
 
 The **access-manager** module provides four groups of functions :
 
-1. **Service account management** — Create, rotate, delete service accounts and issue JWT tokens. Restricted to **privileged workspaces** defined via `PRIVILEGED_WORKSPACES`.
+1. **Service account management** — Create, rotate, delete service accounts and issue JWT tokens. Restricted to **privileged workspaces**.
 2. **Org API key management** — Create, list, rotate, revoke org API keys scoped to the privileged workspace. Restricted to **privileged workspaces**.
 3. **Product bindings** — CRUD operations on the `product_bindings` collection to link resources to users, orgs, or groups. Available to **any workspace**.
 4. **Access checking** — High-level `checkAccess` function that combines permissions, scopes, and bindings to determine if a caller can access a resource. Available to **any workspace**.
 
 <Warning>
-Service account and org API key functions (`getServiceAccountToken`, `createServiceAccount`, `rotateServiceAccountSecret`, `deleteServiceAccount`, `createOrgApiKey`, `listOrgApiKeys`, `rotateOrgApiKey`, `deleteOrgApiKey`) are only available to workspaces listed in the `PRIVILEGED_WORKSPACES` environment variable. Binding and access check functions are available to all workspaces.
+Service-account and org-API-key functions (`getServiceAccountToken`, `createServiceAccount`, `rotateServiceAccountSecret`, `deleteServiceAccount`, `createOrgApiKey`, `listOrgApiKeys`, `rotateOrgApiKey`, `deleteOrgApiKey`) are only available to **privileged workspaces**. A workspace is privileged when **either** of the following holds:
+
+- It is listed in the **`PRIVILEGED_WORKSPACES` environment variable** (operator-curated, slug-keyed — applies platform-wide), **or**
+- An organization has granted it privileges via `PUT /v2/orgs/{orgSlug}/workspaces/{workspaceIdOrSlug}/privileges` (per-org grant, ID-keyed — applies only inside that org's session).
+
+Binding and access-check functions are available to all workspaces.
 </Warning>
 
 ## Service Account Functions
@@ -36,7 +41,7 @@ Service account and org API key functions (`getServiceAccountToken`, `createServ
 | `serviceAccountSlug` | string | yes | Service account slug |
 | `create` | boolean | no | When `true`, creates the service account if it doesn't exist and rotates the secret if needed. When `false` or omitted, only works with a cached secret. |
 | `name` | string | no | Display name for the service account (used on creation) |
-| `roleSlug` | string | no | Role to assign. Must be in the workspace's `allowedRoleSlugs`. Defaults to the workspace's `defaultRoleSlug`. |
+| `roleSlug` | string | no | Role to assign. Must be in the workspace's `serviceAccounts.allowedRoleSlugs`. Defaults to `serviceAccounts.defaultRoleSlug`. |
 | `expiresIn` | number | no | Token TTL in seconds |
 
 Returns the token response including `accessToken`, `tokenType`, `expiresAt`, `permissions`, and `scopes`.
@@ -153,13 +158,15 @@ The runtime enforces strict isolation so a privileged workspace can only see and
 
 ### Configuration
 
-Add an `apiKeys` block to the workspace's entry in `PRIVILEGED_WORKSPACES`:
+Add `serviceAccounts` and/or `apiKeys` blocks to the workspace's entry in `PRIVILEGED_WORKSPACES`:
 
 ```json
 {
   "agent-factory": {
-    "defaultRoleSlug": "agent-standard",
-    "allowedRoleSlugs": ["agent-standard", "agent-admin"],
+    "serviceAccounts": {
+      "defaultRoleSlug": "agent-standard",
+      "allowedRoleSlugs": ["agent-standard", "agent-admin"]
+    },
     "apiKeys": {
       "allowedPermissions": [
         "agent-factory:agents:read",
@@ -171,12 +178,16 @@ Add an `apiKeys` block to the workspace's entry in `PRIVILEGED_WORKSPACES`:
 }
 ```
 
+The same shape is accepted by the per-org grant endpoint as the `privileges.accessManager` body.
+
 | Field | Type | Description |
 |---|---|---|
+| `serviceAccounts.defaultRoleSlug` | `string` | Role assigned to service accounts when the DSUL omits `roleSlug`. Required only if the DSUL calls `createServiceAccount` or `getServiceAccountToken` without a `roleSlug`. |
+| `serviceAccounts.allowedRoleSlugs` | `string[]` | Allowlist of role slugs the workspace may assign. Empty / omitted means only `defaultRoleSlug` is accepted. |
 | `apiKeys.allowedPermissions` | `string[]` | Fully-qualified permission patterns the workspace may mint. Trailing `*` is supported (e.g. `agent-factory:agents:*`). The runtime rejects any permission not matching at least one pattern. |
 | `apiKeys.allowedScopes` | `string[]` | Fully-qualified scope patterns the workspace may attach to its API keys. Same glob semantics as `allowedPermissions`. |
 
-If `apiKeys` is omitted, the workspace cannot create API keys.
+If `serviceAccounts` is omitted, the workspace cannot mint service-account tokens. If `apiKeys` is omitted, the workspace cannot create API keys.
 
 ### createOrgApiKey — Mint a new API key
 
