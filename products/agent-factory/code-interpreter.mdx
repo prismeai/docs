@@ -1,0 +1,78 @@
+---
+title: "Code Interpreter"
+description: "Let your agent run sandboxed Python to compute, transform data, and read attached files — with a companion skill that tells it when and how"
+---
+
+The **Code Interpreter** is an MCP capability that lets an agent execute LLM-generated **Python** in an isolated sandbox and get the result back. Use it whenever an answer is better *computed* than *guessed*: math and statistics, data transforms, parsing or aggregating large tool outputs, or reading an attached **CSV / Excel** file.
+
+It sits alongside MCP servers, Custom Tools, Skills, and File Search under the agent's **Capabilities** tab, and ships as two catalog entries:
+
+| Catalog entry | Type | Role |
+|---|---|---|
+| **Code Interpreter** | MCP tool | the `execute_python` tool that runs the code |
+| **Code Interpreter (skill)** | Skill | tells the agent *when* to run code, how to handle files, and to retry on error |
+
+<Note>
+Add **both** for the best behaviour: the tool gives the capability, the skill gives the judgement. The tool works on its own, but the skill makes the agent use it reliably (and recover from errors).
+</Note>
+
+## Add it to an agent
+
+1. Open your agent → **Capabilities** → **Add capability**.
+2. Pick **Code Interpreter** (category *Data*). The server URL is pre-filled — nothing to type.
+3. (Recommended) Add **Code Interpreter (skill)** as well.
+4. (Recommended) Set the tool's permission to **Ask first** so the user approves each run — see [Tool permissions](/products/agent-factory/tool-permissions).
+
+## The `execute_python` tool
+
+| Argument | Required | Description |
+|---|---|---|
+| `code` | yes | A complete Python script (string). Print or assign the result; its stdout / return value is sent back. |
+| `files` | no | A list of file **URLs** downloaded into the working directory before the run. Reference each by its filename in your code. |
+
+The tool returns a compact result: the script's `result` (stdout / return value), any `logs`, and on failure an `error` object (`code`, `message`, `stack`). It does **not** render anything in the chat by itself — to visualize the numbers, pair it with the [Dataviz](#pairing-with-dataviz) skill.
+
+### Reading an attached file (CSV / Excel)
+
+To analyse a file the user attached, pass its URL in `files`, then read it **in code** — never paste the file's contents into the prompt:
+
+```python
+import csv
+with open("ventes.csv", newline="") as f:
+    rows = list(csv.DictReader(f))
+total = sum(float(r["montant"]) for r in rows)
+print({"lignes": len(rows), "total": total})
+```
+
+The agent decides, from the user's request, whether to pass a file and what code to write.
+
+## Sandbox & limits
+
+<Warning>
+The interpreter runs in a **locked-down sandbox**: **no network access**, and imports are restricted to an **allow-list** managed by your platform operator. A non-allowed import fails with `ImportError: ... not allowed by PYTHON_PACKAGES_WHITELIST_IMPORT`.
+</Warning>
+
+- **Prefer the standard library** (`csv`, `json`, `statistics`, `math`, `datetime`) — always available.
+- Heavier libraries (`pandas`, `openpyxl`, …) only work if your operator added them to the allow-list. If an import is rejected, fall back to a standard-library approach.
+- **Supported files: CSV and Excel** (PDF is not supported).
+- No internet: the code cannot fetch URLs or call APIs. Pass data in via `files` or the prompt.
+
+## Errors & retry
+
+The tool always returns a result. On failure `isError` is `true` and the payload carries the traceback. The **Code Interpreter skill** instructs the agent to:
+
+- read the traceback, **fix the code, and run again** (up to two retries);
+- on an `ImportError` from the allow-list, switch to a standard-library approach (or tell the user the library is unavailable);
+- on `CodeSandboxUnreachable` (infra), not retry immediately and tell the user it is temporarily unavailable;
+- **never fabricate a result** when the code failed.
+
+## Pairing with Dataviz
+
+The Code Interpreter is the **compute** layer; it returns data, not visuals. To turn results into a chart or dashboard, combine it with the **Dataviz** skill, which renders interactive charts in the [canvas](/products/agent-factory/a2ui) (HTML + JS / Chart.js). A typical flow:
+
+1. **Code Interpreter** — read the CSV, compute the monthly totals.
+2. **Dataviz** — render those totals as a bar chart in the canvas.
+
+## Security
+
+Calls to the Code Interpreter are authenticated by **workspace identity** (trusted-source), not a per-call API key — only Agent Factory agents can reach it. Because it runs arbitrary code, combine it with **Ask first** approval for any sensitive context. The sandbox isolation and import allow-list are managed by your platform operator.
