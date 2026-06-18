@@ -33,14 +33,14 @@ The Google Workspaces app provides read/write access to five [Google Workspace](
 
 ## Who is this for?
 
-This connector is used by three different roles. Jump to the tab that matches yours — each one is self-contained.
+This connector is used by three different roles. Jump to the section that matches yours — each one is self-contained.
 
 <CardGroup cols={3}>
   <Card title="Agent builder" icon="robot">
     You build agents in **Agent Factory** and want them to read and act on Google Workspace. → *Agent builder* tab.
   </Card>
   <Card title="Platform admin" icon="shield-halved">
-    You run the platform and set up the shared Google OAuth client once for everyone. → *Platform admin* tab.
+    You run the platform and set up the shared Google OAuth client once for everyone. → *Platform admin setup* accordion below.
   </Card>
   <Card title="Workspace builder" icon="puzzle-piece">
     You write Builder automations (DSUL) that call Google operations directly. → *Workspace builder* tab.
@@ -51,7 +51,7 @@ This connector is used by three different roles. Jump to the tab that matches yo
 
 - A **Google** account (or a Google Workspace domain for service-account / domain-wide delegation).
 - The Google APIs you intend to call must be **enabled** in the Cloud project: Drive, Docs, Sheets, Gmail, Calendar.
-- An OAuth client or service-account key, depending on the auth mode (see the *Platform admin* and *Workspace builder* tabs).
+- An OAuth client or service-account key, depending on the auth mode (see the *Platform admin setup* accordion below and the *Workspace builder* tab).
 
 The OAuth scopes requested by default are:
 
@@ -64,6 +64,59 @@ https://www.googleapis.com/auth/calendar
 openid email
 ```
 
+<Accordion title="Platform admin (Governance) — one-time platform setup" icon="shield-halved">
+  **Goal:** two one-time tasks — (1) configure the shared **central OAuth client** so every workspace lets its users sign in with their own Google account, and (2) expose Google Workspaces as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
+
+  ## 1. Configure the connector
+
+  <Steps>
+    <Step title="Register the OAuth Application at Google">
+      In the [Google Cloud Console](https://console.cloud.google.com/apis/credentials), open **APIs & Services > Credentials > Create credentials > OAuth client ID**, type *Web application*. Set the single authorized redirect URI to the core workspace callback:
+
+      ```text
+      <api-url>/workspaces/slug:google-workspaces/webhooks/oauthCallback
+      ```
+
+      (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:google-workspaces/webhooks/oauthCallback` on production). Enable the Drive, Docs, Sheets, Gmail and Calendar APIs in the same project, and add the scopes listed in *Prerequisites*. Save the **Client ID** + **Client Secret**.
+    </Step>
+    <Step title="Enter the credentials through the configuration app">
+      Open the central `google-workspaces` workspace and launch its **Configuration app** — `<studio>/apps/google-workspaces` (e.g. `https://studio.prisme.ai/apps/google-workspaces`), also linked as `Configuration app` on the installed instance. Follow the in-app instructions to paste the **Client ID** and **Client Secret** — the app stores them in the core workspace's secrets for you. Do not edit Studio's raw Secrets by hand. These credentials stay in the `google-workspaces` workspace and are never exposed to tenants or end users; token exchange is proxied through the core `centralTokenExchange` webhook so the client secret never leaves the core workspace.
+    </Step>
+    <Step title="Tell workspaces to use the central client">
+      Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**.
+    </Step>
+  </Steps>
+
+  ## 2. Declare the capability in AI Governance
+
+  Generic connectors — broad tool surfaces meant to be shared across many agents, like Google Workspaces — are best exposed as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
+
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) the **Google Workspaces** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
+
+      ```text
+      context_id,agent_id,user_id
+      ```
+
+      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
+    </Step>
+    <Step title="Grant the capability to the right roles">
+      Grant the capability to the roles or users whose agents may use Google Workspaces. They will then see it in their agent's capability picker.
+    </Step>
+    <Step title="Smoke-test">
+      From an agent that has the capability, in a workspace configured for `oauthCentral`, trigger any tool. The user is prompted to connect once (Google sign-in); subsequent calls reuse the stored token transparently and refresh it automatically.
+    </Step>
+  </Steps>
+
+  <Warning>
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model** — which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is also **no OAuth auth-config JSON** to attach in Governance (unlike GitLab): connect / status / disconnect are handled by the connector's own webhooks, wired automatically.
+  </Warning>
+</Accordion>
+
 ---
 
 <Tabs>
@@ -71,7 +124,7 @@ openid email
     **Goal:** let an agent you build in Agent Factory read and act on Google Workspace through MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Google Workspaces app in a workspace (see the *Workspace builder* tab), and — for the central OAuth mode — a *Platform admin* must have provisioned the shared OAuth client (see the *Platform admin* tab).
+      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Google Workspaces app in a workspace (see the *Workspace builder* tab), and — for the central OAuth mode — a *Platform admin* must have provisioned the shared OAuth client (see the *Platform admin setup* accordion above).
     </Note>
 
     This connector runs in the **tenant app-instance context**: your agent is authorized two ways at once — it is identified by the `agent_id` that Agent Factory injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The Google access token itself is resolved server-side from the configured auth mode.
@@ -80,7 +133,7 @@ openid email
 
     ## Option A — Enable the shared capability from the catalog
 
-    The fastest path: a *Platform admin* has already published a **Google Workspaces** capability (see the *Platform admin* tab, §2), so you just pick it from the catalog.
+    The fastest path: a *Platform admin* has already published a **Google Workspaces** capability (see the *Platform admin setup* accordion above, §2), so you just pick it from the catalog.
 
     <Steps>
       <Step title="Open your agent in Agent Factory">
@@ -249,59 +302,6 @@ openid email
     | `calendarId` | No | Calendar id (defaults to `primary`). |
     | `eventId` | For eventsGet/Update/Delete | Target event id. |
     | `body` | For eventsInsert/Update, freebusy | Event resource `{summary,start,end,attendees}`, or freebusy request `{timeMin,timeMax,items}`. |
-  </Tab>
-
-  <Tab title="Platform admin (Governance)">
-    **Goal:** two one-time tasks — (1) configure the shared **central OAuth client** so every workspace lets its users sign in with their own Google account, and (2) expose Google Workspaces as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
-
-    ## 1. Configure the connector
-
-    <Steps>
-      <Step title="Register the OAuth Application at Google">
-        In the [Google Cloud Console](https://console.cloud.google.com/apis/credentials), open **APIs & Services > Credentials > Create credentials > OAuth client ID**, type *Web application*. Set the single authorized redirect URI to the core workspace callback:
-
-        ```text
-        <api-url>/workspaces/slug:google-workspaces/webhooks/oauthCallback
-        ```
-
-        (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:google-workspaces/webhooks/oauthCallback` on production). Enable the Drive, Docs, Sheets, Gmail and Calendar APIs in the same project, and add the scopes listed in *Prerequisites*. Save the **Client ID** + **Client Secret**.
-      </Step>
-      <Step title="Enter the credentials through the configuration app">
-        Open the central `google-workspaces` workspace and launch its **Configuration app** — `<studio>/apps/google-workspaces` (e.g. `https://studio.prisme.ai/apps/google-workspaces`), also linked as `Configuration app` on the installed instance. Follow the in-app instructions to paste the **Client ID** and **Client Secret** — the app stores them in the core workspace's secrets for you. Do not edit Studio's raw Secrets by hand. These credentials stay in the `google-workspaces` workspace and are never exposed to tenants or end users; token exchange is proxied through the core `centralTokenExchange` webhook so the client secret never leaves the core workspace.
-      </Step>
-      <Step title="Tell workspaces to use the central client">
-        Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**.
-      </Step>
-    </Steps>
-
-    ## 2. Declare the capability in AI Governance
-
-    Generic connectors — broad tool surfaces meant to be shared across many agents, like Google Workspaces — are best exposed as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
-
-    <Steps>
-      <Step title="Open AI Governance > Capabilities">
-        Create (or edit) the **Google Workspaces** capability.
-      </Step>
-      <Step title="Point it at the MCP endpoint">
-        Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
-
-        ```text
-        context_id,agent_id,user_id
-        ```
-
-        The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
-      </Step>
-      <Step title="Grant the capability to the right roles">
-        Grant the capability to the roles or users whose agents may use Google Workspaces. They will then see it in their agent's capability picker.
-      </Step>
-      <Step title="Smoke-test">
-        From an agent that has the capability, in a workspace configured for `oauthCentral`, trigger any tool. The user is prompted to connect once (Google sign-in); subsequent calls reuse the stored token transparently and refresh it automatically.
-      </Step>
-    </Steps>
-
-    <Warning>
-      Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model** — which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is also **no OAuth auth-config JSON** to attach in Governance (unlike GitLab): connect / status / disconnect are handled by the connector's own webhooks, wired automatically.
-    </Warning>
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
