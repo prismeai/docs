@@ -14,8 +14,8 @@ description: 'Run Google web searches from Agent Factory agents and Builder work
 
 The Google Search app exposes Google web search through a single `search` tool. It can be consumed two ways: as a remote MCP server that **Agent Factory** agents call as a tool, or as a Builder app whose instruction you call directly from DSUL. It runs in the **tenant app-instance context** (it resolves the installing workspace's own Google credential) and automatically routes between two backends depending on the tenant configuration:
 
-- **Gemini Grounding** (default — when no `cx` is set) — behaves like a real google.com search of the entire web and returns a synthesized `answer` with cited sources.
-- **Custom Search JSON API** (legacy — when a Programmable Search Engine `cx` is set) — returns ranked organic results with rich filters (date, site, language, file type) and image search.
+- **Gemini Grounding** (default — when no `cx` is set) — behaves like a real google.com search of the **entire web** and returns a synthesized `answer` with cited sources.
+- **Custom Search JSON API** (legacy — when a Programmable Search Engine `cx` is set) — returns ranked organic results with rich filters (date, site, language, file type) and image search, but searches **only the sites whitelisted in the Programmable Search Engine's context**, never the open web. Google has **removed the "Search the entire web" option for new Programmable Search Engines**, so this backend cannot cover the whole web — use Grounding (leave `cx` empty) for that.
 
 Authentication is a **Google Cloud API key** (`AIza…`) or a **service-account JSON** (signed into a short-lived Bearer token). Agents are identified by the capability **Scope** `context_id,agent_id,user_id` and gated by a per-workspace authorized-agents allowlist.
 
@@ -51,12 +51,12 @@ This connector is used by three different roles. Jump to the section that matche
 
 - A **Google** account with a **Google Cloud project**.
 - The matching API must be **enabled** in that project:
-  - **Generative Language API** — for the default Gemini Grounding backend.
-  - **Custom Search API** — for the legacy `cx` backend.
+  - **Gemini API** (listed as **Generative Language API**, `generativelanguage.googleapis.com`) — for the default Gemini Grounding backend.
+  - **Custom Search API** (`customsearch.googleapis.com`) — for the legacy `cx` backend.
 - A **credential**, one of:
   - A **Google Cloud API key** (`AIza…`) — *APIs & Services > Credentials > Create credentials > API key*.
   - A **service-account key** JSON — for server-to-server use (signed JWT exchanged for a Bearer token).
-- For the Custom Search backend only: a **Programmable Search Engine** (the `cx` id), created at [programmablesearchengine.google.com](https://programmablesearchengine.google.com).
+- For the Custom Search backend only: a **Programmable Search Engine** (the `cx` id), created at [programmablesearchengine.google.com](https://programmablesearchengine.google.com). A PSE searches **only the sites you add to its context** — Google has **retired the "Search the entire web" option for newly created engines**, so the Custom Search backend can no longer span the open web. For whole-web coverage, leave `cx` empty and use the Grounding backend.
 
 <Note>
   The Gemini API free tier is limited (e.g. ~20 requests/day for `gemini-2.5-flash`). For production traffic, enable billing on the Cloud project or use the Custom Search backend (100 free queries/day, then paid).
@@ -72,8 +72,16 @@ This connector is used by three different roles. Jump to the section that matche
   ## 1. Configure the shared platform key
 
   <Steps>
+    <Step title="Enable the right API in the Cloud project">
+      The backend you use decides which API to enable in the Google Cloud project:
+
+      - **Gemini Grounding (default).** Enable the **Gemini API** — listed in the Cloud Console as **Generative Language API** (`generativelanguage.googleapis.com`); the two names are the same service. *Grounding with Google Search* is **not** a separate API to enable: it is the `google_search` tool exposed inside the Gemini `generateContent` call, so enabling the Gemini API is all that the Grounding backend needs.
+      - **Custom Search (legacy, `cx` set).** Enable the **Custom Search API** (`customsearch.googleapis.com`) and create a **Programmable Search Engine** at [programmablesearchengine.google.com](https://programmablesearchengine.google.com), noting its `cx`. Note the scope: a PSE returns results **only from the sites whitelisted in its context**, never the whole web — Google has **removed the "Search the entire web" option for new engines**. For broad web coverage, leave `cx` empty and use the Grounding backend instead.
+
+      Enable it from **APIs & Services > Library** (or run `gcloud services enable generativelanguage.googleapis.com`).
+    </Step>
     <Step title="Get a Google credential">
-      In the [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an **API key** (or a service-account key JSON) in a project where the **Generative Language API** (Grounding) and/or **Custom Search API** is enabled. For the Custom Search backend, also create a **Programmable Search Engine** and note its `cx`.
+      In the [Google Cloud Console](https://console.cloud.google.com/apis/credentials), in that same project, create an **API key** (or a service-account key JSON). For a service account, the connector requests the `https://www.googleapis.com/auth/generative-language` scope when exchanging the JWT.
     </Step>
     <Step title="Enter the key through the core workspace's config app">
       Open the central `google-search` workspace and launch its **Configuration app** maintainer view — `<studio>/apps/google-search` (e.g. `https://studio.prisme.ai/apps/google-search`). Follow the in-app instructions to paste the **platform global key** (and optional `cx`). The app stores it in the core workspace's secrets for you — do not edit Studio's raw Secrets by hand. The global key stays in the `google-search` workspace and is never inherited by tenant instances; only search **results** are returned to tenants (proxied through the core `centralSearch` webhook).
@@ -275,7 +283,7 @@ This connector is used by three different roles. Jump to the section that matche
     | Backend | Selected when | Behavior |
     |---------|---------------|----------|
     | **Gemini Grounding** (default) | `cx` is empty | Real google.com search of the whole web; returns a synthesized `answer` + cited sources. `options.*` are hints. |
-    | **Custom Search JSON API** (legacy) | `cx` is set (a Programmable Search Engine id) | Ranked organic results with rich filters (`num`, `dateRestrict`, `siteSearch`, language) and image search. |
+    | **Custom Search JSON API** (legacy) | `cx` is set (a Programmable Search Engine id) | Ranked organic results with rich filters (`num`, `dateRestrict`, `siteSearch`, language) and image search. Scoped to the **sites whitelisted in the PSE context** — never the open web (Google retired "Search the entire web" for new engines). |
 
     <Note>
       Credentials are provisioned into the workspace's Secrets and resolved server-side. The agent allowlist (**Authorized agents**) gates which Agent Factory agents may call the MCP endpoint — see the *Agent builder* tab. A workspace with no credential of its own transparently falls back to the platform global key (if a *Platform admin* set one).
