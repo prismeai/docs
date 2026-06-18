@@ -33,14 +33,14 @@ Authentication is a **Google Cloud API key** (`AIza…`) or a **service-account 
 
 ## Who is this for?
 
-This connector is used by three different roles. Jump to the tab that matches yours — each one is self-contained.
+This connector is used by three different roles. Jump to the section that matches yours — each one is self-contained.
 
 <CardGroup cols={3}>
   <Card title="Agent builder" icon="robot">
     You build agents in **Agent Factory** and want them to search the web. → *Agent builder* tab.
   </Card>
   <Card title="Platform admin" icon="shield-halved">
-    You run the platform and set up a shared Google Search key once for everyone. → *Platform admin* tab.
+    You run the platform and set up a shared Google Search key once for everyone. → *Platform admin setup* accordion below.
   </Card>
   <Card title="Workspace builder" icon="puzzle-piece">
     You write Builder automations (DSUL) that call the `search` instruction directly. → *Workspace builder* tab.
@@ -62,6 +62,58 @@ This connector is used by three different roles. Jump to the tab that matches yo
   The Gemini API free tier is limited (e.g. ~20 requests/day for `gemini-2.5-flash`). For production traffic, enable billing on the Cloud project or use the Custom Search backend (100 free queries/day, then paid).
 </Note>
 
+<Accordion title="Platform admin (Governance) — one-time platform setup" icon="shield-halved">
+  **Goal:** two optional one-time tasks — (1) set a **shared platform Google key** so workspaces that have not configured their own credential can still search, and (2) expose Google Search as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
+
+  <Note>
+    Both tasks are optional. If every workspace pastes its own Google key, you can skip this section entirely — there is no per-tenant credential to register on the platform.
+  </Note>
+
+  ## 1. Configure the shared platform key
+
+  <Steps>
+    <Step title="Get a Google credential">
+      In the [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an **API key** (or a service-account key JSON) in a project where the **Generative Language API** (Grounding) and/or **Custom Search API** is enabled. For the Custom Search backend, also create a **Programmable Search Engine** and note its `cx`.
+    </Step>
+    <Step title="Enter the key through the core workspace's config app">
+      Open the central `google-search` workspace and launch its **Configuration app** maintainer view — `<studio>/apps/google-search` (e.g. `https://studio.prisme.ai/apps/google-search`). Follow the in-app instructions to paste the **platform global key** (and optional `cx`). The app stores it in the core workspace's secrets for you — do not edit Studio's raw Secrets by hand. The global key stays in the `google-search` workspace and is never inherited by tenant instances; only search **results** are returned to tenants (proxied through the core `centralSearch` webhook).
+    </Step>
+  </Steps>
+
+  <Note>
+    When a platform global key is set, the shared connector instance becomes a **global endpoint**: the per-agent allowlist no longer applies there, and every agent granted the capability (Option A in the *Agent builder* tab) is accepted. The global key is the gate.
+  </Note>
+
+  ## 2. Declare the capability in AI Governance
+
+  Generic connectors — broad tool surfaces meant to be shared across many agents — are best exposed as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
+
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) the **Google Search** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
+
+      ```text
+      context_id,agent_id,user_id
+      ```
+
+      The `agent_id` in the scope is what lets the connector identify the calling agent.
+    </Step>
+    <Step title="Grant the capability to the right roles">
+      Grant the capability to the roles or users whose agents may search the web. They will then see it in their agent's capability picker.
+    </Step>
+    <Step title="Smoke-test">
+      From an agent that has the capability, trigger any web question. The agent calls `search` and grounds its answer on the returned sources.
+    </Step>
+  </Steps>
+
+  <Warning>
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model** — when a workspace runs its own instance (Option B), which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app. There is **no OAuth auth-config JSON** to attach in Governance: authentication is a server-side Google key, not a per-user OAuth flow.
+  </Warning>
+</Accordion>
+
 ---
 
 <Tabs>
@@ -69,7 +121,7 @@ This connector is used by three different roles. Jump to the tab that matches yo
     **Goal:** let an agent you build in Agent Factory search the web through the `search` MCP tool.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Google Search app in a workspace (see the *Workspace builder* tab) — or a *Platform admin* must have set a shared platform key and published the capability (see the *Platform admin* tab).
+      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Google Search app in a workspace (see the *Workspace builder* tab) — or a *Platform admin* must have set a shared platform key and published the capability (see the *Platform admin setup* accordion above).
     </Note>
 
     This connector runs in the **tenant app-instance context**: your agent is identified by the `agent_id` that Agent Factory injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The Google credential itself is resolved server-side — never exposed to the agent.
@@ -78,7 +130,7 @@ This connector is used by three different roles. Jump to the tab that matches yo
 
     ## Option A — Enable the shared capability from the catalog
 
-    The fastest path: a *Platform admin* has set a shared platform Google key and published a **Google Search** capability (see the *Platform admin* tab, §2), so you just pick it from the catalog.
+    The fastest path: a *Platform admin* has set a shared platform Google key and published a **Google Search** capability (see the *Platform admin setup* accordion above, §2), so you just pick it from the catalog.
 
     <Steps>
       <Step title="Open your agent in Agent Factory">
@@ -194,58 +246,6 @@ This connector is used by three different roles. Jump to the tab that matches yo
     | `options.lr` / `options.gl` / `options.hl` | No | Language restriction (`lang_fr`), country boost (`fr`), interface language. |
     | `options.searchType` | No | Set to `image` for an image search (**Custom Search only** — rejected in Grounding). Pair with `imgSize` / `imgType` / `imgColorType` / `imgDominantColor`. |
     | `outputFormat` | No | `verbose` (default), `structured`, or `both`. |
-  </Tab>
-
-  <Tab title="Platform admin (Governance)">
-    **Goal:** two optional one-time tasks — (1) set a **shared platform Google key** so workspaces that have not configured their own credential can still search, and (2) expose Google Search as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
-
-    <Note>
-      Both tasks are optional. If every workspace pastes its own Google key, you can skip this tab entirely — there is no per-tenant credential to register on the platform.
-    </Note>
-
-    ## 1. Configure the shared platform key
-
-    <Steps>
-      <Step title="Get a Google credential">
-        In the [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an **API key** (or a service-account key JSON) in a project where the **Generative Language API** (Grounding) and/or **Custom Search API** is enabled. For the Custom Search backend, also create a **Programmable Search Engine** and note its `cx`.
-      </Step>
-      <Step title="Enter the key through the core workspace's config app">
-        Open the central `google-search` workspace and launch its **Configuration app** maintainer view — `<studio>/apps/google-search` (e.g. `https://studio.prisme.ai/apps/google-search`). Follow the in-app instructions to paste the **platform global key** (and optional `cx`). The app stores it in the core workspace's secrets for you — do not edit Studio's raw Secrets by hand. The global key stays in the `google-search` workspace and is never inherited by tenant instances; only search **results** are returned to tenants (proxied through the core `centralSearch` webhook).
-      </Step>
-    </Steps>
-
-    <Note>
-      When a platform global key is set, the shared connector instance becomes a **global endpoint**: the per-agent allowlist no longer applies there, and every agent granted the capability (Option A in the *Agent builder* tab) is accepted. The global key is the gate.
-    </Note>
-
-    ## 2. Declare the capability in AI Governance
-
-    Generic connectors — broad tool surfaces meant to be shared across many agents — are best exposed as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
-
-    <Steps>
-      <Step title="Open AI Governance > Capabilities">
-        Create (or edit) the **Google Search** capability.
-      </Step>
-      <Step title="Point it at the MCP endpoint">
-        Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
-
-        ```text
-        context_id,agent_id,user_id
-        ```
-
-        The `agent_id` in the scope is what lets the connector identify the calling agent.
-      </Step>
-      <Step title="Grant the capability to the right roles">
-        Grant the capability to the roles or users whose agents may search the web. They will then see it in their agent's capability picker.
-      </Step>
-      <Step title="Smoke-test">
-        From an agent that has the capability, trigger any web question. The agent calls `search` and grounds its answer on the returned sources.
-      </Step>
-    </Steps>
-
-    <Warning>
-      Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model** — when a workspace runs its own instance (Option B), which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app. There is **no OAuth auth-config JSON** to attach in Governance: authentication is a server-side Google key, not a per-user OAuth flow.
-    </Warning>
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
