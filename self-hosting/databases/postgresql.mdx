@@ -146,7 +146,8 @@ Notes:
 
 In practice, the steady-state usage stays **very close to the Min column** — pools rarely all hit `max=10` simultaneously, because that requires every pool to face a concurrent burst at the same instant. The Max column is a theoretical worst case, not a sizing target.
 
-For this deployment, sizing `max_connections \approx 100` (Min + a small headroom for migrations and the occasional admin session) is enough under normal traffic. You only need to approach the 340 ceiling if you regularly see large concurrent bursts hitting every service at once — at that point [PgBouncer](#connection-pooling-with-pgbouncer) is a far better answer than raising `max_connections`, because it removes the linear coupling between pod count and Postgres backend count entirely.
+For this deployment, sizing `max_connections ~= 100` (Min + a small headroom) is enough under normal traffic. You only need to approach the 340 ceiling if you regularly see large concurrent bursts hitting every service at once, **or simply if you need to scale the runtime to many pods** — each additional runtime replica adds 5 permissions pools \+ 8 collections pools, so the high-water mark grows fast.  
+**At that point [PgBouncer](#connection-pooling-with-pgbouncer) is a far better answer than raising `max_connections`**, because it removes the linear coupling between pod count and Postgres backend count entirely.
 
 #### Inspecting current usage
 
@@ -164,7 +165,6 @@ ORDER BY nb_connexions DESC;
 
 #### Resolving the error
 
-- **Cap the per-pod pool size** via env vars — e.g. `PERMISSIONS_STORAGE_OPT_max=5`, `COLLECTIONS_STORAGE_OPT_max=3`. This is the lowest-friction fix and bounds the budget without restarting Postgres. See [connection pool internals — tuning levers](/technical/postgresql-connection-pools#tuning-levers).
 - **Raise `max_connections`** on the cluster (requires a restart on most managed services). Add headroom for migrations and admin sessions on top of the steady-state usage.
 - **Reduce replicas** when possible — lower HPA `maxReplicas`, or `RUNNER_MAX_THREADS` on the runtime (each unit removed = -1 `permissions` pool and -2 `collections` pools per runtime pod).
 - **Put a connection pooler in front of Postgres** (see below). This is the durable fix for any deployment that scales horizontally.
@@ -175,15 +175,16 @@ For any deployment that scales horizontally, **a connection pooler in front of P
 
 ##### Why Postgres can't absorb the connections on its own
 
-PostgreSQL uses a **one-process-per-connection** model: every open client connection spawns a dedicated OS backend process on the server, holding \~5–10 MB of RSS plus its own work\_mem allocations, file descriptors, and scheduler footprint. This design is excellent for query isolation but scales terribly with connection count:
+PostgreSQL uses a **one-process-per-connection** model: every open client connection spawns a dedicated OS backend process on the server, holding ~5–10 MB of RSS plus its own working mem allocations, file descriptors, and scheduler footprint. This design is excellent for query isolation but scales terribly with connection count:
 
 - **Memory blows up linearly** — 500 connections \= 2.5–5 GB of backend RAM just to hold the processes open, **before any query runs**. On a small managed instance (4–8 GB total), that swallows most of the shared\_buffers budget.
 - **CPU context-switching degrades** as the kernel juggles hundreds of mostly-idle processes.
 - **Even idle connections cost** — a connection sitting in `idle` state still holds its backend process; it doesn't "go to sleep" for free.
 
-This is why managed Postgres services cap `max_connections` aggressively (typically \~100 on small tiers, \~300–600 on medium ones): raising the cap doesn't free you, it just shifts the wall further out before the same RAM limit hits.
+This is why managed Postgres services cap `max_connections` aggressively (typically ~100 on small tiers, ~300–600 on medium ones): raising the cap doesn't free you, it just shifts the wall further out before the same RAM limit hits.
 
-Now combine that with how Prisme.ai pods open connections (`(1 + RUNNER_MAX_THREADS) × N_runtime` permissions pools, `2 × RUNNER_MAX_THREADS × N_runtime` collections pools, all multiplied by HPA replicas): the count grows on every scaling axis at once. **You hit `max_connections` long before you hit the CPU/RAM ceiling of the database itself** — i.e. the cluster could happily serve the query load, but it runs out of *connection slots* first.
+Now combine that with how Prisme.ai pods open connections (`(1 + RUNNER_MAX_THREADS) × N_runtime` permissions pools, `2 × RUNNER_MAX_THREADS × N_runtime` collections pools, all multiplied by HPA replicas): the count grows on every scaling axis at once.  
+**You hit `max_connections` long before you hit the CPU/RAM ceiling of the database itself** — i.e. the cluster could happily serve the query load, but it runs out of *connection slots* first.
 
 ##### What PgBouncer changes
 
