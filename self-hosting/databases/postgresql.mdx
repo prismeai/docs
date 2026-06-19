@@ -117,9 +117,107 @@ On Azure DB for PostgreSQL Flexible Server, use Entra ID Workload Identity to in
 
 The PostgreSQL cluster has reached its `max_connections` limit — non-superuser roles can no longer open new connections because the remaining slots are reserved for superusers (see [`superuser_reserved_connections`](https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-SUPERUSER-RESERVED-CONNECTIONS)).
 
-Two ways to resolve it:
+#### How many connections does each pod open?
 
-- **Reduce the number of connections** by scaling down the backend pods (`prismeai-api-gateway`, `prismeai-runtime`, …) — each replica opens its own pool against Postgres.
-- **Raise `max_connections`** on the cluster (requires a restart on most managed services). Size it against the total expected pool: roughly _(replicas across all services connecting to that database) × (pool size per replica)_, plus headroom for migrations and admin sessions.
+Every backend pod talking to PostgreSQL keeps one connection pool per database it consumes. Each pool grows on demand to serve concurrent queries, so the count varies between an idle baseline and a saturation cap. The figures below assume the default pool cap (`max=10` sockets per pool):
 
-For high-concurrency deployments, putting **PgBouncer** in front of Postgres (see [Scaling](#scaling)) is the durable fix — it multiplexes many client connections onto a small, fixed pool of backend connections.
+| Service | Database | Pools per pod | Min (warm idle) | Max (saturated) |
+| --- | --- | --- | --- | --- |
+| `prismeai-api-gateway` | `users` | 2 (users storage \+ org RBAC) | \~2–4 | 20 |
+| `prismeai-workspaces` | `permissions` | 1 | \~1–2 | 10 |
+| `prismeai-events` | `permissions` | 1 | \~1–2 | 10 |
+| `prismeai-runtime` | `permissions` | `1 + RUNNER_MAX_THREADS` | \~2–3 per pool | 10 per pool |
+| `prismeai-runtime` | `collections` | `2 × RUNNER_MAX_THREADS` | \~1–2 per pool | 10 per pool |
+
+Notes:
+
+- `prismeai-api-gateway` does **not** connect to the `permissions` DB. Its org-level RBAC (organizations, memberships, service accounts) is stored in the `users` DB alongside the user accounts. The `permissions` DB only holds workspace-level RBAC, consumed by `workspaces`, `events` and `runtime`.
+- The runtime is multi-threaded: each worker thread opens its own pools in addition to the main thread, so a runtime pod with `RUNNER_MAX_THREADS=4` (the recommended setting for large loads) holds **5 pools** to `permissions` and **8 pools** to `collections` — by itself it can consume 50 + 80 = 130 sockets at peak.
+- HPA scale-out multiplies these numbers linearly with the replica count of every service.
+
+**Worked example** — `RUNNER_MAX_THREADS=4` and 2 pods of each backend service:
+
+| DB | Contributions | Min (idle warm) | Max (theoretical cap) |
+| --- | --- | --- | --- |
+| `users` | api-gateway: 2 × (2–4 → 20) | **4–8** | **40** |
+| `permissions` | workspaces: 2 × (1–2 → 10) \+ events: 2 × (1–2 → 10) \+ runtime: 2 × (10–15 → 50) | **24–38** | **140** |
+| `collections` | runtime: 2 × (8–16 → 80) | **16–32** | **160** |
+| **Total (shared cluster)** | | **44–78** | **340** |
+
+In practice, the steady-state usage stays **very close to the Min column** — pools rarely all hit `max=10` simultaneously, because that requires every pool to face a concurrent burst at the same instant. The Max column is a theoretical worst case, not a sizing target.
+
+For this deployment, sizing `max_connections \approx 100` (Min + a small headroom for migrations and the occasional admin session) is enough under normal traffic. You only need to approach the 340 ceiling if you regularly see large concurrent bursts hitting every service at once — at that point [PgBouncer](#connection-pooling-with-pgbouncer) is a far better answer than raising `max_connections`, because it removes the linear coupling between pod count and Postgres backend count entirely.
+
+#### Inspecting current usage
+
+Check how connections are distributed across databases — this tells you whether one DB (typically `collections`) is responsible for the saturation:
+
+```sql
+SELECT
+    datname,
+    COUNT(*) AS nb_connexions
+FROM pg_stat_activity
+WHERE usename = 'avnadmin'  -- replace with the role used by Prisme.ai
+GROUP BY datname
+ORDER BY nb_connexions DESC;
+```
+
+#### Resolving the error
+
+- **Cap the per-pod pool size** via env vars — e.g. `PERMISSIONS_STORAGE_OPT_max=5`, `COLLECTIONS_STORAGE_OPT_max=3`. This is the lowest-friction fix and bounds the budget without restarting Postgres. See [connection pool internals — tuning levers](/technical/postgresql-connection-pools#tuning-levers).
+- **Raise `max_connections`** on the cluster (requires a restart on most managed services). Add headroom for migrations and admin sessions on top of the steady-state usage.
+- **Reduce replicas** when possible — lower HPA `maxReplicas`, or `RUNNER_MAX_THREADS` on the runtime (each unit removed = -1 `permissions` pool and -2 `collections` pools per runtime pod).
+- **Put a connection pooler in front of Postgres** (see below). This is the durable fix for any deployment that scales horizontally.
+
+#### Connection pooling with PgBouncer
+
+For any deployment that scales horizontally, **a connection pooler in front of Postgres is not optional — it is the structural fix that lets Prisme.ai scale at all without crushing the database.**
+
+##### Why Postgres can't absorb the connections on its own
+
+PostgreSQL uses a **one-process-per-connection** model: every open client connection spawns a dedicated OS backend process on the server, holding \~5–10 MB of RSS plus its own work\_mem allocations, file descriptors, and scheduler footprint. This design is excellent for query isolation but scales terribly with connection count:
+
+- **Memory blows up linearly** — 500 connections \= 2.5–5 GB of backend RAM just to hold the processes open, **before any query runs**. On a small managed instance (4–8 GB total), that swallows most of the shared\_buffers budget.
+- **CPU context-switching degrades** as the kernel juggles hundreds of mostly-idle processes.
+- **Even idle connections cost** — a connection sitting in `idle` state still holds its backend process; it doesn't "go to sleep" for free.
+
+This is why managed Postgres services cap `max_connections` aggressively (typically \~100 on small tiers, \~300–600 on medium ones): raising the cap doesn't free you, it just shifts the wall further out before the same RAM limit hits.
+
+Now combine that with how Prisme.ai pods open connections (`(1 + RUNNER_MAX_THREADS) × N_runtime` permissions pools, `2 × RUNNER_MAX_THREADS × N_runtime` collections pools, all multiplied by HPA replicas): the count grows on every scaling axis at once. **You hit `max_connections` long before you hit the CPU/RAM ceiling of the database itself** — i.e. the cluster could happily serve the query load, but it runs out of *connection slots* first.
+
+##### What PgBouncer changes
+
+[**PgBouncer**](https://www.pgbouncer.org/) is a small, single-binary proxy that decouples *client sockets* from *backend processes*. The Prisme.ai pods open thousands of cheap client connections against PgBouncer, while PgBouncer maintains only a small fixed pool of expensive real connections against Postgres.
+
+In **transaction mode** — the recommended mode for Prisme.ai — PgBouncer keeps a fixed *server pool* of backend connections permanently open and warm against Postgres. When a pod begins a transaction, PgBouncer hands it one of these warm connections; on `COMMIT`/`ROLLBACK`, the connection is immediately returned to the pool and made available to the next caller. Between transactions the server connection sits idle but stays open — it never has to be re-established.
+
+Practical consequence: **the size of your Postgres backend pool is decoupled from the number of pods you run**. You can scale Prisme.ai horizontally (more api-gateway/workspaces/runtime replicas, more runtime worker threads) without changing the load on Postgres — only the number of *concurrently executing queries* matters, and that is bounded by `default_pool_size`, not by `pods × pool_size`.
+
+The MikroORM / `pg` pools inside each Prisme.ai pod work transparently against transaction-mode PgBouncer; the platform does not use session-scoped features (`LISTEN/NOTIFY`, advisory locks, `SET` outside a transaction) that would break it.
+
+##### What happens when the pool is full
+
+If `default_pool_size=10` and an 11th query arrives concurrently, PgBouncer **does not return an error** — it **queues the request** until one of the 10 server connections is released. For Prisme.ai workloads (short auth lookups, RBAC checks, small writes) transactions typically last a few milliseconds, so the queue drains almost instantly even with a small server pool. A client only sees an error if its wait exceeds `query_wait_timeout` (default `120s`).
+
+So `default_pool_size` should be read as "max queries **simultaneously executing on Postgres**" — not "max queries the platform can serve". The hundreds of client sockets opened by the Prisme.ai pods are absorbed by PgBouncer (`max_client_conn`, typically set to a few thousand) and never reach Postgres.
+
+##### Where to deploy it
+
+| Environment | Where PgBouncer lives | Notes |
+| --- | --- | --- |
+| **Azure DB for PostgreSQL Flexible Server** | Managed, co-located with the DB | [Built-in PgBouncer](https://learn.microsoft.com/azure/postgresql/flexible-server/concepts-pgbouncer) — enable a server parameter, nothing to deploy. |
+| **AWS RDS / Aurora** | Managed (RDS Proxy) **or** in the app k8s cluster | [**RDS Proxy**](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html) is the managed equivalent. Otherwise deploy PgBouncer as a Deployment in the Prisme.ai cluster. |
+| **GCP Cloud SQL** | In the app k8s cluster, **or** use AlloyDB (built-in pooler) | Cloud SQL itself has no built-in pooler. |
+| **Self-hosted Postgres (Crunchy / on-prem)** | Either side | The [Crunchy PGO operator](https://access.crunchydata.com/documentation/postgres-operator/latest/tutorials/day-two/connection-pooling) deploys PgBouncer next to the Postgres pods. Otherwise deploy it standalone in the Prisme.ai cluster (e.g. [`edoburu/pgbouncer`](https://hub.docker.com/r/edoburu/pgbouncer)). |
+
+When self-deploying, the Prisme.ai-side cluster is the most common location: lowest RTT from the client pools, decoupled from the DB lifecycle. Expose PgBouncer as a `Service` and point the Helm storage URLs at it instead of at the Postgres host.
+
+##### When to deploy it
+
+| Deployment shape | Recommendation |
+| --- | --- |
+| Single-replica, POC, dev | Raising `max_connections` is enough — PgBouncer is overkill. |
+| 2–3 replicas per service, fixed | Borderline. Capping pool sizes via env vars usually buys enough headroom. |
+| HPA-driven scale-out, `RUNNER_MAX_THREADS \geq 2`, multi-tenant production | **Deploy PgBouncer (or a managed equivalent) — it is the only path that scales linearly without resizing Postgres each time you add a pod.** |
+
+The pattern to watch for is recurring `remaining connection slots are reserved...` errors during traffic peaks, even though the Postgres CPU and memory usage stay moderate. That is the signature of connection-slot exhaustion rather than database overload — exactly what PgBouncer is built to absorb.

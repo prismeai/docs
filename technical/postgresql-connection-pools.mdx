@@ -1,0 +1,214 @@
+---
+title: "PostgreSQL connection pools — internals"
+description: "How each Prisme.ai backend service opens connection pools against PostgreSQL: number of pools per pod, per-thread behavior, observed warm-up patterns, and tuning levers."
+---
+
+This page is the **source of truth** for understanding how many PostgreSQL connections each Prisme.ai pod can consume, where they come from in the code, and how to tune them. The user-facing summary lives in [Self-hosting / PostgreSQL](/self-hosting/databases/postgresql); this document drills into the implementation details that explain the numbers.
+
+## What sits between Prisme.ai and PostgreSQL
+
+All four backend services that talk to PostgreSQL (`api-gateway`, `workspaces`, `events`, `runtime`) use:
+
+- **[MikroORM](https://mikro-orm.io/) v6** as the ORM layer (instantiated from `@prisme.ai/permissions` → `lib/databases/orm.ts`).
+- The underlying driver is [`pg`](https://node-postgres.com/) (`node-postgres`) v8, which uses [`pg-pool`](https://node-postgres.com/apis/pool) for connection pooling.
+- Neither MikroORM nor Prisme.ai overrides the `pg-pool` defaults — so each pool runs with:
+
+  | Option | Default |
+  | --- | --- |
+  | `max` | **10** sockets per pool |
+  | `min` | **0** |
+  | `idleTimeoutMillis` | **10 000 ms** (10 s) |
+  | `connectionTimeoutMillis` | **0** (no timeout) |
+
+A pool grows on demand up to `max`, and is supposed to release idle sockets after `idleTimeoutMillis`. In practice (see [Why pools never shrink](#why-pools-never-shrink-in-practice)) continuous background activity keeps the pools at their high-water mark for hours.
+
+## How many pools does each pod open?
+
+This is the part that explains why a "small" deployment can hold many connections.
+
+### `prismeai-api-gateway`
+
+Single-process pod (no clustering, no worker threads).
+
+| Pool | Target DB | Code reference |
+| --- | --- | --- |
+| Users storage | **`users`** | `services/api-gateway/src/storage/index.ts:50` (`DatabaseOrm.build()`) |
+| Org AccessManager | **`users`** (same DB) | `services/api-gateway/src/index.ts:102` → `initOrgAccessManager(orgStorageConfig)` where `orgStorageConfig` is derived from the same `storage` config (`src/config/storage.ts:90`) |
+
+The api-gateway does **not** connect to the `permissions` database. Its AccessManager handles **org-level** RBAC (organizations, memberships, service accounts, invites) and stores those tables inside the `users` DB alongside the user accounts. The `permissions` DB is reserved for **workspace-level** RBAC, which only `workspaces`, `events` and `runtime` consume.
+
+The two pools are independent `pg.Pool` instances on the same DB, which is why a single api-gateway pod typically shows \~4 connections on `users` (2 pools × \~2 warm sockets).
+
+Also, no separate pool exists for sessions, magic links, refresh tokens, or service accounts — they all share the single users storage pool.
+
+**Total pools per pod:** 2, both targeting `users`.
+
+### `prismeai-workspaces`
+
+Single-process pod.
+
+| Pool | Code reference |
+| --- | --- |
+| 1 pool to **`permissions`** | `services/workspaces/src/app.ts:71` → `initAccessManager(PERMISSIONS_STORAGE_OPTIONS, broker)` |
+
+**Total pools per pod:** 1.
+
+### `prismeai-events`
+
+Single-process pod.
+
+| Pool | Code reference |
+| --- | --- |
+| 1 pool to **`permissions`** | `services/events/src/app.ts:39` → `initAccessManager(PERMISSIONS_STORAGE_OPTIONS, broker)` |
+
+**Total pools per pod:** 1.
+
+### `prismeai-runtime`
+
+**Multi-threaded** via Node.js `worker_threads`. The number of worker threads is controlled by `RUNNER_MAX_THREADS` (`services/runtime/config/runtime.ts:7`, **default `1`**). Each worker thread fully re-initializes its database stack, so it opens **its own pools** — they are not shared with the main thread.
+
+Let `W = RUNNER_MAX_THREADS`.
+
+**Main thread:**
+
+| Pool | Code reference |
+| --- | --- |
+| 1 pool to **`permissions`** | `services/runtime/src/app.ts:41` → `initAccessManager()` |
+
+The main thread does **not** open a pool to `collections` — the collections modules are only started inside workers.
+
+**Per worker thread** (×W):
+
+| Pool | Code reference |
+| --- | --- |
+| 1 pool to **`permissions`** | `services/runtime/src/services/runtime/workers/runner.ts:90` → `initAccessManager()` re-called in the worker context |
+| 1 pool to **`collections`** | `services/runtime/src/runtimeModules/collections/index.ts:133` → `DatabaseOrm.build()` in `CollectionModules.start()` |
+| 1 pool to **`collections`** (second one) | `services/runtime/src/runtimeModules/access-manager/productBindingsManager.ts:108` → `DatabaseOrm.build()` for product bindings — distinct pool, same DB |
+
+**Total pools per pod:**
+- `permissions`: `1 + W` pools
+- `collections`: `2 × W` pools
+
+For the default `W=1`: 2 pools to permissions, 2 to collections.
+For a tuned runtime `W=4`: 5 pools to permissions, 8 to collections.
+
+## Connection budget per pod, per database
+
+Multiplying pool count by the `pg-pool` `max=10` default gives the **theoretical maximum** each pod can hold. The **observed minimum** in our sandbox (idle but warm) is roughly 1–3 sockets per pool, because there is enough background traffic to keep every pool at a non-zero high-water mark.
+
+| Service | Database | Pools per pod | Min observed (warm but idle) | Max possible (default `max=10`) |
+| --- | --- | --- | --- | --- |
+| `prismeai-api-gateway` | `users` | 2 (users storage \+ org AccessManager) | \~2–4 | 20 |
+| `prismeai-workspaces` | `permissions` | 1 | \~1–2 | 10 |
+| `prismeai-events` | `permissions` | 1 | \~1–2 | 10 |
+| `prismeai-runtime` | `permissions` | `1 + RUNNER_MAX_THREADS` | \~2–3 × pools | 10 × pools |
+| `prismeai-runtime` | `collections` | `2 × RUNNER_MAX_THREADS` | \~1–2 × pools | 10 × pools |
+
+`prismeai-api-gateway` does not open any pool against the `permissions` DB — its org-level RBAC tables live alongside the user accounts in the `users` DB.
+
+### Total connection envelope
+
+For a deployment with `Na` api-gateway pods, `Nw` workspaces pods, `Ne` events pods, `Nr` runtime pods (each with `W` worker threads):
+
+```
+permissions = (Nw + Ne + Nr × (1 + W)) × <connections per pool>
+users       =  Na × 2                  × <connections per pool>
+collections =  Nr × 2 × W              × <connections per pool>
+```
+
+With "connections per pool" ranging from ~1 (cold) to 10 (saturated). Add HPA scale-out into the mix and the cluster-wide envelope multiplies linearly with the number of replicas of every service.
+
+## Why pools never shrink in practice
+
+`pg-pool` is supposed to release idle sockets after `idleTimeoutMillis=10s`. Yet observed connections on the sandbox stay open for **hours**:
+
+> PID 3066265 opened at 05:00, last query at 11:47 — still open at 12:45.
+
+This is because Prisme.ai pods continuously emit small queries against `permissions` (RBAC checks during event subscriptions, cron-triggered automations, workspace registry refresh, etc.). Each of these queries touches a socket and resets its idle timer just often enough to keep it from being recycled. Once a pool reaches its high-water mark during a burst, it stays there indefinitely.
+
+A signature of this pattern is visible in `pg_stat_activity`: several connections holding the **exact same `query_id`** for the same workspace's role lookup. That is one warm socket per runtime thread (main \+ each worker), each having most recently served the same RBAC check.
+
+## Tuning levers
+
+Every storage block accepts environment variables of the form `<NAME>_STORAGE_OPT_<key>`, forwarded as-is to the `pg-pool` constructor. Set the same env var on every replica of the corresponding Deployment.
+
+The relevant keys:
+
+| Env var | `pg-pool` option | Effect |
+| --- | --- | --- |
+| `PERMISSIONS_STORAGE_OPT_max` | `max` | Hard cap on sockets in the permissions pool. Default `10`. |
+| `USERS_STORAGE_OPT_max` | `max` | Hard cap on the api-gateway users pool. |
+| `COLLECTIONS_STORAGE_OPT_max` | `max` | Hard cap on each of the runtime collections pools. |
+| `..._STORAGE_OPT_idleTimeoutMillis` | `idleTimeoutMillis` | Lower it to release sockets faster after a burst. Default `10000`. |
+| `..._STORAGE_OPT_connectionTimeoutMillis` | `connectionTimeoutMillis` | Fail-fast when the pool is saturated instead of blocking forever. |
+
+For the runtime specifically, `RUNNER_MAX_THREADS` (default `1`) has the largest impact on connection count — each unit reduction removes one `permissions` pool and two `collections` pools.
+
+### Typical tuning recipes
+
+**Cap pool growth without losing parallelism** (sensible default for medium deployments):
+
+```bash
+PERMISSIONS_STORAGE_OPT_max=5
+USERS_STORAGE_OPT_max=5
+COLLECTIONS_STORAGE_OPT_max=3
+```
+
+This bounds each pod to a predictable budget while still allowing ~5 concurrent queries per pool — enough for most request bursts.
+
+**Make pools shrink faster after activity stops:**
+
+```bash
+PERMISSIONS_STORAGE_OPT_idleTimeoutMillis=2000
+COLLECTIONS_STORAGE_OPT_idleTimeoutMillis=2000
+```
+
+Combined with capped `max`, this brings the steady-state connection count back down between bursts instead of camping at the high-water mark.
+
+**Reduce runtime footprint** by lowering worker count if you don't need the parallelism:
+
+```bash
+RUNNER_MAX_THREADS=1   # default; remove if you previously raised it
+```
+
+## Inspection queries
+
+Distribution of connections per database (replace `avnadmin` with your role):
+
+```sql
+SELECT datname, COUNT(*) AS nb_connexions
+FROM pg_stat_activity
+WHERE usename = 'avnadmin'
+GROUP BY datname
+ORDER BY nb_connexions DESC;
+```
+
+Per-query distribution to identify hot pools (useful to spot the runtime worker fan-out — repeated identical `query_id` across N rows = N runtime threads):
+
+```sql
+SELECT
+    datname,
+    query_id,
+    COUNT(*) AS nb,
+    MIN(backend_start) AS oldest,
+    MAX(state_change)  AS most_recent
+FROM pg_stat_activity
+WHERE usename = 'avnadmin' AND state = 'idle'
+GROUP BY datname, query_id
+ORDER BY nb DESC, oldest;
+```
+
+Connection age (to confirm pools are not shrinking):
+
+```sql
+SELECT pid, datname, application_name,
+       backend_start, state, state_change,
+       NOW() - backend_start AS age
+FROM pg_stat_activity
+WHERE usename = 'avnadmin'
+ORDER BY backend_start;
+```
+
+## Related
+
+- [Self-hosting / PostgreSQL](/self-hosting/databases/postgresql) — user-facing setup, sizing, and PgBouncer guidance.
