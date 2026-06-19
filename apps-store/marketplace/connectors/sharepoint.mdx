@@ -1,6 +1,6 @@
 ---
 title: 'SharePoint'
-description: 'Browse and download files from SharePoint document libraries'
+description: 'SharePoint sites, document libraries, files, lists and permissions from Agent Factory agents and Builder workflows, via Microsoft Graph with per-user Microsoft Entra OAuth'
 ---
 
 <img
@@ -12,276 +12,509 @@ description: 'Browse and download files from SharePoint document libraries'
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The SharePoint connector provides access to Microsoft SharePoint Online document libraries via the Microsoft Graph API, enabling AI agents and automations to browse folders, list files, and download content.
+The SharePoint app provides read/write access to Microsoft SharePoint Online and OneDrive — sites, document libraries (drives), files and folders, SharePoint lists, sharing permissions, and the Azure AD directory — through the [Microsoft Graph](https://learn.microsoft.com/en-us/graph/overview) REST API (v1.0). It can be consumed two ways: as a remote MCP server that **Agent Factory** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. The MCP surface groups every operation into **seven entity tools** (`sites`, `drives`, `items`, `search`, `permissions`, `lists`, `directory`), each driven by an `action` argument, and runs in the **tenant app-instance context** (it resolves the installing workspace's own credentials). Authentication is per-user and supports several modes:
+
+- **Per-user OAuth2 — central client** (`oauthCentral`, recommended) — one Microsoft Entra OAuth Application is registered once by the platform maintainer; every end user signs in with their own Microsoft account. Nothing to register per tenant: each workspace just installs the app and clicks *Connect*.
+- **Per-user OAuth2 — tenant client** (`oauth`) — paste your own Entra application (client) ID/secret in the connector config app. Each user signs in with their own account against your client (PKCE authorization-code flow).
+- **Application — client credentials** (`clientCredentials`) — an Entra app with **application** Graph permissions and admin consent, acting without an interactive sign-in. Best for back-office / service automations and content indexing.
+- **Direct access token** (`accessToken`) — a caller-managed Microsoft Graph access token, used as-is with no exchange.
 
 <CardGroup cols={3}>
-  <Card title="Browse Structure" icon="folder-tree">
-    List sites, drives, and folder hierarchies
+  <Card title="Sites & files" icon="folder-tree">
+    Discover sites and subsites, browse document libraries and folders, read/create/move/copy files, get pre-signed download URLs, thumbnails and versions
   </Card>
-  <Card title="File Access" icon="file">
-    Download files with metadata for change detection
+  <Card title="Lists, search & permissions" icon="list">
+    Query and write SharePoint lists and list items, run Microsoft Search across drives and sites, and inspect or manage sharing permissions for access-aware RAG
   </Card>
-  <Card title="Access Control" icon="shield">
-    Per-user permission validation (PBAV) for secure access
+  <Card title="Flexible per-user auth" icon="key">
+    Per-user Microsoft Entra OAuth (central or tenant client), application client-credentials, or a direct access token
   </Card>
 </CardGroup>
 
-## Prerequisites
+## Who is this for?
 
-- An **Azure AD Application** registered in your tenant
-- **Application permissions** granted:
-  - `Sites.Read.All` - Read sites and files
-  - `Files.Read.All` - Read file content
-  - `GroupMember.Read.All` - For PBAV group membership checks (optional)
-- **Admin consent** granted for these permissions
+This connector is used by three different roles. Jump to the section that matches yours — each one is self-contained.
 
-<Note>
-  For Knowledges document sync with per-user access control, see the dedicated [SharePoint Connector for Knowledges](/products/ai-knowledge/connectors) documentation.
-</Note>
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot">
+    You build agents in **Agent Factory** and want them to browse SharePoint sites, read files and query lists. → *Agent builder* tab.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved">
+    You run the platform and set up the shared Microsoft Entra OAuth client once for everyone. → *Platform admin setup* accordion below.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece">
+    You write Builder automations (DSUL) that call SharePoint operations directly. → *Workspace builder* tab.
+  </Card>
+</CardGroup>
+
+## Prerequisites (Microsoft side)
+
+- A **Microsoft 365 / SharePoint Online** tenant, and an **Azure / Microsoft Entra ID** tenant where you can register an application (or a maintainer who already did).
+- An **app registration** in [Microsoft Entra ID](https://entra.microsoft.com) (Azure portal → **App registrations**), with a **client secret** created under **Certificates & secrets**.
+- **Microsoft Graph delegated permissions** granted on the app (for the per-user OAuth modes), covering the resources you intend to use:
+  - Sites & files: `Sites.Read.All` (or `Sites.ReadWrite.All` for create/update/move), `Files.Read.All` (or `Files.ReadWrite.All`)
+  - Directory (access-aware RAG): `User.Read`, `GroupMember.Read.All` (optional)
+  - Sign-in / identity: `openid`, `profile`, `offline_access`
+- For the **application (client-credentials)** mode instead, grant the equivalent **application** permissions (e.g. `Sites.Read.All`, `Files.Read.All`) and have a Global Administrator grant admin consent.
+
+The OAuth scopes requested by default are:
+
+```text
+offline_access
+https://graph.microsoft.com/Sites.Read.All
+https://graph.microsoft.com/Files.Read.All
+https://graph.microsoft.com/User.Read
+```
+
+<Accordion title="Platform admin (Governance) — one-time platform setup" icon="shield-halved">
+  **Goal:** two one-time tasks — (1) configure the shared **central Microsoft Entra OAuth client** so every workspace lets its users sign in with their own Microsoft account, and (2) expose SharePoint as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
+
+  ## 1. Configure the connector
+
+  <Steps>
+    <Step title="Register the OAuth Application in Microsoft Entra ID">
+      In [Microsoft Entra ID](https://entra.microsoft.com) → **App registrations > New registration**, register a **Web** application. Add a **Redirect URI** pointing at the core workspace callback:
+
+      ```text
+      <api-url>/workspaces/<workspace-id>/webhooks/oauthCallback
+      ```
+
+      (e.g. `https://api.studio.prisme.ai/v2/workspaces/7oQvI6Q/webhooks/oauthCallback` on production).
+
+      <Warning>
+        Microsoft Entra rejects redirect URIs that contain a colon in the path, so use the **raw workspace id** of the core SharePoint workspace (`<workspace-id>`, e.g. `7oQvI6Q`) — **not** the `slug:sharepoint-next` form used by other connectors. Copy the exact URI from the connector's configuration app, which renders it for you.
+      </Warning>
+
+      Add the Microsoft Graph **delegated** permissions listed in *Prerequisites*, create a **client secret** under **Certificates & secrets**, and note the **Application (client) ID**, the **secret value**, and the **Directory (tenant) ID** (or use `common` / `organizations` for multi-tenant).
+    </Step>
+    <Step title="Enter the credentials through the configuration app">
+      Open the central `sharepoint-next` workspace and launch its **Configuration app** — `<studio>/apps/sharepoint-next` (e.g. `https://studio.prisme.ai/apps/sharepoint-next`), also linked as `Configuration app` on the installed instance. Switch to the maintainer view and follow the in-app instructions to paste the **Client ID**, **Client Secret**, **Tenant** and (optionally) scopes — the app stores them in the core workspace's secrets for you. Do not edit Studio's raw Secrets by hand. These credentials stay in the `sharepoint-next` workspace and are never exposed to tenants or end users; token exchange is proxied through the core `centralTokenExchange` webhook so the client secret never leaves the core workspace.
+    </Step>
+    <Step title="Tell workspaces to use the central client">
+      Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**.
+    </Step>
+  </Steps>
+
+  ## 2. Declare the capability in AI Governance
+
+  Generic connectors — broad tool surfaces meant to be shared across many agents, like SharePoint — are best exposed as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
+
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) the **SharePoint** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
+
+      ```text
+      context_id,agent_id,user_id
+      ```
+
+      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
+    </Step>
+    <Step title="Make it available to agent builders">
+      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant.
+    </Step>
+    <Step title="Smoke-test">
+      From an agent that has the capability, in a workspace configured for `oauthCentral`, trigger any tool. The user is prompted to connect once (Microsoft sign-in); subsequent calls reuse the stored token transparently and refresh it automatically.
+    </Step>
+  </Steps>
+
+  <Note>
+    The connector's configuration app also offers a one-click **Add to catalog** button (workspace owner / admin only) that publishes the SharePoint capability to the organization-wide Capabilities catalog for you — the easiest way to expose it to agent builders without hand-editing Governance.
+  </Note>
+
+  <Warning>
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model** — which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is also **no OAuth auth-config JSON** to attach in Governance: connect / status / disconnect are handled by the connector's own webhooks, wired automatically.
+  </Warning>
+</Accordion>
 
 ---
 
 <Tabs>
-  <Tab title="Usage as App">
-    ## Installation
+  <Tab title="Agent builder (Agent Factory)">
+    ## Agent builder
 
-    1. Go to **Apps** in your workspace
-    2. Search for **Sharepoint** and install it
-    3. Configure the app instance with your Azure AD credentials
+    **Goal:** let an agent you build in Agent Factory browse SharePoint sites, read and manage files, query lists, and check permissions through MCP tools.
 
-    ## Configuration
+    <Note>
+      Before an agent can call the connector, a *Workspace builder* must have installed and configured the SharePoint app in a workspace (see the *Workspace builder* tab), and — for the central OAuth mode — a *Platform admin* must have provisioned the shared Microsoft Entra OAuth client (see the *Platform admin setup* accordion above).
+    </Note>
 
-    | Field | Value |
-    |-------|-------|
-    | **Client ID** | Application (client) ID from Azure AD |
-    | **Client Secret** | Client secret value |
-    | **Tenant ID** | Directory (tenant) ID |
-    | **Site URL** | Optional, default SharePoint site URL |
-    | **Site ID** | Optional, default SharePoint site ID |
+    This connector runs in the **tenant app-instance context**: your agent is authorized two ways at once — it is identified by the `agent_id` that Agent Factory injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The Microsoft Graph access token itself is resolved server-side from the configured auth mode.
 
-    ## Available Automations
+    There are two ways to wire it up. Pick based on how much isolation you need.
 
-    ### Site Operations
+    ## Option A — Enable the shared capability from the catalog
 
-    | Automation | Description |
-    |------------|-------------|
-    | `listSites` | List SharePoint sites accessible to the app |
+    The fastest path: a *Platform admin* has already published a **SharePoint** capability (see the *Platform admin setup* accordion above, §2), so you just pick it from the catalog. A workspace owner can publish it in one click with the config app's **Add to catalog** button.
 
-    ### Drive Operations
+    <Steps>
+      <Step title="Open your agent in Agent Factory">
+        Open the agent you want to extend and go to its capabilities / tools.
+      </Step>
+      <Step title="Add the SharePoint capability">
+        Browse the capability catalog, select **SharePoint**, and enable it. The MCP endpoint URL and the *Scope* (`context_id,agent_id,user_id`) are already wired by the admin — nothing to paste, and the shared instance accepts every agent, so there is no allowlist step on your side.
+      </Step>
+      <Step title="Connect a Microsoft account (OAuth modes)">
+        On the first tool call, an unconnected user is prompted to sign in — Agent Factory surfaces a `connect_url`. Application (`clientCredentials`) and `accessToken` modes need no per-user sign-in.
+      </Step>
+    </Steps>
 
-    | Automation | Description |
-    |------------|-------------|
-    | `listDrives` | List document libraries in a site |
+    <Note>
+      Convenient, but your agent runs against a **shared, platform-managed instance**: its Microsoft credentials are owned by someone else and the instance accepts every agent that is granted the capability. Prefer Option B for anything beyond quick experiments.
+    </Note>
 
-    ### File & Folder Operations
+    ## Option B — Run it from your own workspace (recommended)
 
-    | Automation | Description |
-    |------------|-------------|
-    | `listChildren` | List items in a folder or drive root |
-    | `getItem` | Get item metadata by ID |
-    | `getFiles` | List files with metadata |
-    | `getFileTree` | Get recursive folder structure |
-    | `downloadFile` | Download file content |
+    For production agents, install the connector in **your own workspace** and point the agent at *that* workspace's MCP endpoint.
 
-    ### Authentication
+    <Warning>
+      **Prefer this mode for security.** Because the MCP runs in *your* app-instance context, the Microsoft credentials, the per-user OAuth tokens and the authorized-agents allowlist are all **scoped to your workspace** — not shared platform-wide. You decide exactly which agents may call it and which Microsoft account / auth mode backs them, and a misconfiguration elsewhere can never expose your SharePoint content. The shared catalog capability (Option A) is a broad surface many agents can reach; your own workspace is an isolated, least-privilege boundary.
+    </Warning>
 
-    | Automation | Description |
-    |------------|-------------|
-    | `ensureAccessToken` | Get or refresh access token |
-    | `getAccessToken` | Get a new access token |
+    <Steps>
+      <Step title="Install and configure the connector in your workspace">
+        Follow the *Workspace builder* tab: install **SharePoint** in your workspace, open its **Configuration app**, choose the auth mode and connect a Microsoft account.
+      </Step>
+      <Step title="Allowlist your agent">
+        In that workspace's config app, open **Authorized agents** and tick your agent (the **Install capability** button does this for you).
+      </Step>
+      <Step title="Add the MCP capability to your agent">
+        In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
 
-    ## DSUL Examples
+        ```text
+        context_id,agent_id,user_id
+        ```
 
-    ### List Sites
+        The `agent_id` is what lets the connector identify and authorize your agent — without it, every call is rejected with an explicit "agent could not be identified" message. This *Scope* is separate from the Microsoft Graph OAuth scopes.
+      </Step>
+      <Step title="Connect a Microsoft account (OAuth modes)">
+        On the first tool call, the user is prompted to sign in (or uses **Connect** in the config app).
+      </Step>
+    </Steps>
 
-    ```yaml
-    - Sharepoint.listSites:
-        output: sites
+    ## Brief the agent in its system prompt
+
+    Whichever option you pick, wiring the capability is not enough — the agent must know the MCP exists and when to use it. Copy-pasteable starter:
+
+    ```text
+    You have access to the SharePoint MCP server (tools: sites, drives, items, search, permissions, lists, directory). Each tool takes an `action` argument. Use it whenever the user asks about SharePoint sites, document libraries, files and folders, SharePoint lists, sharing permissions, or who can access a document. To read a file, list its drive's children, then use the @microsoft.graph.downloadUrl the item exposes (content is not returned inline). Prefer calling a tool over guessing, and confirm with the user before any write or destructive action (create, update/move, copy, delete, invite, create link).
     ```
 
-    ### List Document Libraries
-
-    ```yaml
-    - Sharepoint.listDrives:
-        siteId: "contoso.sharepoint.com,abc-123,def-456"
-        output: drives
-    ```
-
-    ### List Files in a Folder
-
-    ```yaml
-    - Sharepoint.listChildren:
-        siteId: "contoso.sharepoint.com,abc-123,def-456"
-        driveId: "b!xyz..."
-        itemId: "01ABCDEF..."
-        output: items
-    ```
-
-    ### Download a File
-
-    ```yaml
-    - Sharepoint.downloadFile:
-        siteId: "contoso.sharepoint.com,abc-123,def-456"
-        driveId: "b!xyz..."
-        itemId: "01ABCDEF..."
-        output: fileContent
-    ```
-
-    ### Get Folder Tree
-
-    ```yaml
-    - Sharepoint.getFileTree:
-        siteId: "contoso.sharepoint.com,abc-123,def-456"
-        driveId: "b!xyz..."
-        output: tree
-    ```
-  </Tab>
-
-  <Tab title="Usage as MCP">
-    ## MCP Setup
-
-    1. Open your **Knowledges project**
-    2. Go to **Advanced > Tools**
-    3. Click **Add** and select the **MCP** tab
-    4. Enter the MCP endpoint URL
-    5. In the **Headers** field, add your credentials:
-
-    ```json
-    {
-      "mcp-api-key": "your-mcp-api-key",
-      "azure-client-id": "your-client-id",
-      "azure-client-secret": "your-client-secret",
-      "azure-tenant": "your-tenant-id"
-    }
-    ```
-
-    ## Authentication
-
-    The MCP server supports both service-to-service and delegated authentication:
-
-    ### Service Account (Client Credentials)
-
-    Configure workspace secrets:
-
-    | Secret | Description |
-    |--------|-------------|
-    | `azureClientId` | Azure AD client ID |
-    | `azureClientSecret` | Azure AD client secret |
-    | `azureTenant` | Azure AD tenant ID |
-    | `azureSiteId` | Optional default SharePoint site ID |
-
-    ### Delegated Auth (OAuth)
-
-    For per-user access with PBAV (Permission-Based Access Validation), users connect their Microsoft account via OAuth. This enables:
-
-    - Per-user file access validation
-    - Respecting SharePoint permissions at query time
-    - Secure document access in multi-tenant environments
+    <Note>
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the config app and its identity propagated so the connector can read its `agent_id`.
+    </Note>
 
     ## Available Tools
 
+    Each tool takes an `action` argument selecting the concrete operation, plus the per-action parameters.
+
     | Tool | Description |
     |------|-------------|
-    | `configureSharePoint` | Configure credentials for service-to-service auth |
-    | `listSharePointFolders` | List folders and document libraries |
-    | `listSharePointFiles` | List files with metadata for RAG indexing |
-    | `downloadSharePointFile` | Download file content |
-
-    ## Tool Details
-
-    ### configureSharePoint
-
-    Configure SharePoint credentials for Client Credentials Flow.
-
-    ```json
-    {
-      "name": "configureSharePoint",
-      "arguments": {
-        "clientId": "your-azure-client-id",
-        "clientSecret": "your-client-secret",
-        "tenant": "your-tenant-id"
-      }
-    }
-    ```
-
-    ### listSharePointFolders
-
-    List folders and document libraries with metadata for change detection. Supports pagination.
-
-    ```json
-    {
-      "name": "listSharePointFolders",
-      "arguments": {
-        "siteId": "contoso.sharepoint.com,abc-123,def-456",
-        "driveId": "b!xyz...",
-        "folderId": "01ABCDEF..."
-      }
-    }
-    ```
-
-    | Parameter | Description |
-    |-----------|-------------|
-    | `siteId` | SharePoint site ID (optional if default configured) |
-    | `driveId` | Document library ID (omit to list all drives) |
-    | `folderId` | Folder item ID (omit for root) |
-    | `pageToken` | Pagination token from previous response |
-
-    ### listSharePointFiles
-
-    List files with full metadata for RAG indexing. Returns `eTag`, `cTag`, `contentHash` for change detection.
-
-    ```json
-    {
-      "name": "listSharePointFiles",
-      "arguments": {
-        "siteId": "contoso.sharepoint.com,abc-123,def-456",
-        "driveId": "b!xyz...",
-        "includeDownloadUrl": true
-      }
-    }
-    ```
-
-    | Parameter | Description |
-    |-----------|-------------|
-    | `siteId` | SharePoint site ID (optional if default configured) |
-    | `driveId` | Document library ID (required unless using pageToken) |
-    | `folderId` | Folder item ID (omit for drive root) |
-    | `includeDownloadUrl` | Include pre-signed download URLs (default: false) |
-    | `pageToken` | Pagination token from previous response |
-
-    ### downloadSharePointFile
-
-    Download file content as text or base64-encoded binary.
-
-    ```json
-    {
-      "name": "downloadSharePointFile",
-      "arguments": {
-        "siteId": "contoso.sharepoint.com,abc-123,def-456",
-        "driveId": "b!xyz...",
-        "fileId": "01ABCDEF..."
-      }
-    }
-    ```
+    | `sites` | SharePoint sites discovery. Actions: `search`, `get`, `getRoot`, `listSubsites`. |
+    | `drives` | Document libraries (drives) of sites and OneDrive. Actions: `listForSite`, `getSiteDefault`, `get`, `getMine`, `listMine`. |
+    | `items` | Files & folders (driveItems). `get` / `listChildren` return a `@microsoft.graph.downloadUrl` (~1h pre-signed) — content is not inline. Actions: `listChildren`, `listRootChildren`, `get`, `createFolder`, `update`, `delete`, `copy`, `thumbnails`, `versions`. |
+    | `search` | Microsoft Search across SharePoint / OneDrive. Action: `query`. |
+    | `permissions` | Sharing & permissions on driveItems (access-aware RAG). Actions: `list`, `get`, `invite`, `createLink`, `delete`. |
+    | `lists` | SharePoint lists and list items. Actions: `listForSite`, `get`, `listItems`, `getItem`, `createItem`, `updateItemFields`, `deleteItem`. |
+    | `directory` | Azure AD users & groups — resolve identities and group membership. Actions: `getUser`, `userMemberOf`, `checkUserMemberGroups`, `getGroup`, `groupMembers`. |
 
     ## Output Formats
 
-    All tools support an `outputFormat` parameter:
+    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
 
-    - **`verbose`** (default) - Human-readable text for LLM consumption
-    - **`structured`** - Machine-readable JSON in `structuredContent`
-    - **`both`** - Both text and structured content
+    - **`verbose`** (default) — a human-readable text view, optimized for LLM consumption.
+    - **`structured`** — concise machine-readable JSON in `structuredContent`.
+    - **`both`** — the structured payload, with its JSON also rendered as text.
 
-    ## Permission-Based Access Validation (PBAV)
+    ## Tool Details
 
-    When using delegated OAuth, PBAV ensures that RAG query results respect each user's SharePoint permissions:
+    ### sites
 
-    1. User submits a query to the Knowledges agent
-    2. RAG retrieves relevant document chunks
-    3. For each SharePoint chunk, the system validates user access via their OAuth token
-    4. Chunks from inaccessible files are filtered out before the LLM responds
+    ```json
+    {
+      "name": "sites",
+      "arguments": {
+        "action": "search",
+        "search": "marketing",
+        "top": 10
+      }
+    }
+    ```
 
-    See [SharePoint Connector for Knowledges](/products/ai-knowledge/connectors) for detailed PBAV documentation.
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `search`, `get`, `getRoot`, `listSubsites`. |
+    | `siteId` | For get/listSubsites | SharePoint site id (`hostname,siteCollectionId,siteId`). |
+    | `search` | For search | Keyword to match sites; use `*` to list all. |
+    | `top` / `select` | No | OData `$top` / `$select`. |
+
+    ### drives
+
+    ```json
+    {
+      "name": "drives",
+      "arguments": {
+        "action": "listForSite",
+        "siteId": "contoso.sharepoint.com,abc-123,def-456"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `listForSite`, `getSiteDefault`, `get`, `getMine`, `listMine`. |
+    | `siteId` | For listForSite/getSiteDefault | SharePoint site id. |
+    | `driveId` | For get | Drive (document library) id. |
+    | `select` | No | OData `$select`. |
+
+    ### items
+
+    ```json
+    {
+      "name": "items",
+      "arguments": {
+        "action": "listChildren",
+        "driveId": "b!xyz...",
+        "itemId": "01ABCDEF...",
+        "top": 50
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `listChildren`, `listRootChildren`, `get`, `createFolder`, `update`, `delete`, `copy`, `thumbnails`, `versions`. |
+    | `driveId` | Yes | Drive id (required for all item actions). |
+    | `itemId` | For get/update/delete/copy/thumbnails/versions/listChildren | DriveItem id. |
+    | `parentItemId` | For createFolder | Parent folder item id. |
+    | `top` / `select` / `orderby` / `expand` / `skiptoken` | No | OData query options and pagination. |
+    | `body` | For createFolder/update/copy | JSON body, e.g. `createFolder` → `{ name, folder: {}, "@microsoft.graph.conflictBehavior" }`; `copy` → `{ parentReference, name }`. |
+
+    ### items — reading a file's content
+
+    `get` and `listChildren` return each file's `@microsoft.graph.downloadUrl`, a ~1-hour pre-signed link. Fetch that URL out-of-band to read the bytes; the MCP response never embeds file content inline.
+
+    ### lists
+
+    ```json
+    {
+      "name": "lists",
+      "arguments": {
+        "action": "listItems",
+        "siteId": "contoso.sharepoint.com,abc-123,def-456",
+        "listId": "b6c8...",
+        "expand": "fields"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `listForSite`, `get`, `listItems`, `getItem`, `createItem`, `updateItemFields`, `deleteItem`. |
+    | `siteId` | Yes | SharePoint site id. |
+    | `listId` | For get/listItems/getItem/createItem/updateItemFields/deleteItem | SharePoint list id. |
+    | `itemId` | For getItem/updateItemFields/deleteItem | List item id. |
+    | `expand` | No | OData `$expand`; use `fields` to get column values. |
+    | `select` / `top` / `filter` | No | OData query options. |
+    | `body` | For createItem/updateItemFields | `createItem` → `{ fields: { <Column>: <value> } }`; `updateItemFields` → `{ <Column>: <value> }`. |
+
+    ### permissions
+
+    ```json
+    {
+      "name": "permissions",
+      "arguments": {
+        "action": "list",
+        "driveId": "b!xyz...",
+        "itemId": "01ABCDEF..."
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `list`, `get`, `invite`, `createLink`, `delete`. |
+    | `driveId` | Yes | Drive id. |
+    | `itemId` | Yes | DriveItem id. |
+    | `permId` | For get/delete | Permission id. |
+    | `body` | For invite/createLink | `invite` → `{ recipients, roles, requireSignIn, sendInvitation }`; `createLink` → `{ type, scope }`. |
+  </Tab>
+
+  <Tab title="Workspace builder (DSUL)">
+    ## Workspace builder
+
+    **Goal:** install the connector in a workspace, configure authentication and the agent allowlist, and call SharePoint operations from your automations.
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **SharePoint** and install it
+    3. Open the **Configuration app** (the link auto-populated on install) to choose the auth mode, provide credentials, connect, and allow the agents that may call the connector
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Configuration app** | Auto-populated on install — open this link to configure authentication (mode + credentials), connect a Microsoft account (OAuth modes), and manage the authorized-agents allowlist. |
+    | **Microsoft Graph API version** | `v1.0` (default) or `beta`. |
+
+    The configuration app drives everything; the app instance itself has no per-field credential form. From it you pick one of:
+
+    | Auth mode | What you provide | Best for |
+    |-----------|------------------|----------|
+    | `oauthCentral` | Nothing — just click **Connect** | Workspaces on a platform where the admin set up the central client |
+    | `oauth` | Your own Entra **Application (client) ID + Secret** (+ tenant; redirect URI `<api-url>/workspaces/<your-workspace-id>/webhooks/oauthCallback`) | You manage your own Microsoft Entra OAuth app |
+    | `clientCredentials` | Entra **client ID + secret + tenant** with admin-consented **application** Graph permissions | Server-to-server / back-office, content indexing, no interactive sign-in |
+    | `accessToken` | A pre-minted Microsoft Graph **access token** | Short-lived / caller-managed tokens |
+
+    <Warning>
+      Microsoft Entra rejects a colon in the redirect URI path, so for the `oauth` mode use your workspace's **raw id** (`<your-workspace-id>`) in the redirect URI — not the `slug:` form. The configuration app shows the exact URI to register.
+    </Warning>
+
+    <Note>
+      Credentials are provisioned into the workspace's Secrets by the `onInstall` flow and resolved server-side. The agent allowlist (**Authorized agents**) gates which Agent Factory agents may call the MCP endpoint — see the *Agent builder* tab.
+    </Note>
+
+    ## Available Instructions
+
+    Every instruction resolves credentials from the workspace configuration. Operations are grouped by SharePoint resource; the MCP server exposes the same operations behind the seven entity tools (see the *Agent builder* tab). Site ids use the `hostname,siteCollectionId,siteId` format.
+
+    ### Sites
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `searchSites` | Search sites across the tenant; `search` = keyword (`*` for all). | `{ value: [{ id, name, webUrl, displayName }] }` |
+    | `getSite` | Get a site by `siteId`. | A site resource `{ id, displayName, webUrl, … }`. |
+    | `getRootSite` | Get the tenant root site. | A site resource. |
+    | `listSubsites` | List subsites of `siteId`. | `{ value: [ site ] }` |
+
+    ### Drives
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listSiteDrives` | List the document libraries of a `siteId`. | `{ value: [{ id, name, driveType, webUrl }] }` |
+    | `getSiteDefaultDrive` | Get the default document library of a `siteId`. | A drive resource. |
+    | `getDrive` | Get a drive by `driveId`. | A drive resource `{ id, name, quota, … }`. |
+    | `getMyDrive` | Get the signed-in user's OneDrive (OAuth modes). | A drive resource. |
+    | `listMyDrives` | List the signed-in user's drives (OAuth modes). | `{ value: [ drive ] }` |
+
+    ### Items (files & folders)
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listChildren` | List children of a folder (`driveId`, `itemId`). | `{ value: [ driveItem ], "@odata.nextLink" }` — each item carries `@microsoft.graph.downloadUrl`. |
+    | `listRootChildren` | List children of the drive root (`driveId`). | `{ value: [ driveItem ] }` |
+    | `getItem` | Get a driveItem (`driveId`, `itemId`). | A driveItem `{ id, name, size, file, folder, "@microsoft.graph.downloadUrl" }`. |
+    | `createFolder` | Create a folder under `parentItemId`; `body` = `{ name, folder: {}, "@microsoft.graph.conflictBehavior" }`. | The created driveItem. |
+    | `updateItem` | Rename/move an item (`itemId`); `body` = changed fields / `parentReference`. | The updated driveItem. |
+    | `deleteItem` | Recycle an item (`driveId`, `itemId`). | Empty (HTTP 204). |
+    | `copyItem` | Copy an item asynchronously; `body` = `{ parentReference, name }`. | Empty (HTTP 202 Accepted, `Location` monitor URL). |
+    | `getThumbnails` | List thumbnails for an item. | `{ value: [{ id, small, medium, large }] }` |
+    | `listItemVersions` | List versions of an item. | `{ value: [{ id, lastModifiedDateTime, size }] }` |
+
+    ### Lists
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listSiteLists` | List the lists of a `siteId`. | `{ value: [{ id, displayName, list }] }` |
+    | `getList` | Get a list (`siteId`, `listId`). | A list resource. |
+    | `listListItems` | List items of a list; use `expand=fields` for column values. | `{ value: [ listItem ] }` |
+    | `getListItem` | Get a list item (`siteId`, `listId`, `itemId`). | A listItem resource `{ id, fields }`. |
+    | `createListItem` | Create a list item; `body` = `{ fields: { <Column>: <value> } }`. | The created listItem. |
+    | `updateListItemFields` | Update column values; `body` = `{ <Column>: <value> }`. | The updated fields. |
+    | `deleteListItem` | Delete a list item. | Empty (HTTP 204). |
+
+    ### Search & permissions
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `searchQuery` | Microsoft Search; `body` = `{ requests: [{ entityTypes, query: { queryString }, from, size }] }`. | `{ value: [{ hitsContainers: [{ hits: [...] }] }] }` |
+    | `listPermissions` | List permission grants on an item. | `{ value: [{ id, roles, grantedToV2, link }] }` |
+    | `getPermission` | Get a single permission by `permId`. | A permission resource. |
+    | `invite` | Grant access; `body` = `{ recipients, roles, requireSignIn, sendInvitation }`. | `{ value: [ permission ] }` |
+    | `createLink` | Create a sharing link; `body` = `{ type, scope }`. | A permission with `{ link: { webUrl } }`. |
+    | `deletePermission` | Remove a permission by `permId`. | Empty (HTTP 204). |
+
+    ### Directory
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `getUser` | Get a user by id or UPN/email. | A user resource `{ id, displayName, mail }`. |
+    | `listUserMemberOf` | List groups/roles a user belongs to. | `{ value: [ group ] }` |
+    | `checkUserMemberGroups` | Check which of given group ids a user is in; `body` = `{ groupIds: [<id>] }`. | `{ value: [ <groupId> ] }` |
+    | `getGroup` | Get a group by id. | A group resource. |
+    | `listGroupMembers` | List members of a group. | `{ value: [ user ] }` |
+
+    <Note>
+      `Returns` shows the shape of the operation output (the underlying Microsoft Graph resource). To download a file, read the `@microsoft.graph.downloadUrl` returned by `getItem` / `listChildren` (a ~1h pre-signed link) — content is not returned inline.
+    </Note>
+
+    ## DSUL Examples
+
+    **Find a site and list its document libraries:**
+
+    ```yaml
+    - Sharepoint.searchSites:
+        search: 'Marketing'
+        top: 5
+      output: sites
+    - Sharepoint.listSiteDrives:
+        siteId: '{{sites.value[0].id}}'
+      output: drives
+    ```
+
+    **List files at a drive root:**
+
+    ```yaml
+    - Sharepoint.listRootChildren:
+        driveId: '{{drives.value[0].id}}'
+        top: 50
+        orderby: lastModifiedDateTime desc
+      output: items
+    ```
+
+    **Create a folder:**
+
+    ```yaml
+    - Sharepoint.createFolder:
+        driveId: '{{drives.value[0].id}}'
+        parentItemId: root
+        body:
+          name: 'Reports 2026'
+          folder: {}
+          '@microsoft.graph.conflictBehavior': rename
+      output: folder
+    ```
+
+    **Run a Microsoft Search across document libraries:**
+
+    ```yaml
+    - Sharepoint.searchQuery:
+        body:
+          requests:
+            - entityTypes:
+                - driveItem
+              query:
+                queryString: 'quarterly report'
+              from: 0
+              size: 25
+      output: results
+    ```
+
+    **Create a SharePoint list item:**
+
+    ```yaml
+    - Sharepoint.createListItem:
+        siteId: '{{sites.value[0].id}}'
+        listId: '{{listId}}'
+        body:
+          fields:
+            Title: 'New entry'
+            Status: 'Open'
+      output: created
+    ```
   </Tab>
 </Tabs>
 
@@ -289,34 +522,40 @@ The SharePoint connector provides access to Microsoft SharePoint Online document
 
 ## Error Handling
 
-| HTTP Status | Error | Solution |
-|-------------|-------|----------|
-| 401 | Unauthorized | Verify Azure AD credentials |
-| 403 | Forbidden | Check app permissions or user access |
-| 404 | Not Found | Verify site/drive/item IDs exist |
-| 429 | Rate Limited | Wait and retry |
+| HTTP code | Meaning |
+|-----------|---------|
+| `400` | Bad request — invalid parameters or malformed body (e.g. bad OData filter, invalid driveItem/list resource). |
+| `401` | Unauthorized — the Microsoft Graph access token is missing, expired or revoked. The user must reconnect (OAuth modes). |
+| `403` | Forbidden — insufficient Graph scope/permission, missing admin consent (application mode), or the account lacks access to the site/drive/item. |
+| `404` | Not found — the site, drive, item, list or permission id does not exist or is not visible to the account. |
+| `429` | Throttled — Microsoft Graph rate limit; back off and retry (honor `Retry-After`). |
+| `500` / `503` | Microsoft Graph service error — transient; retry shortly, no reconnection needed. |
 
 ### Common Issues
 
-**"Site not found"** - The site ID format is `hostname,siteCollectionId,siteId`. Use Graph Explorer to find the correct format.
+**"This agent is not authorized to use this connector"** — The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (or enable **Allow all agents**) and Save.
 
-**"Access denied"** - The Azure AD app needs `Sites.Read.All` permission with admin consent.
+**"The calling agent could not be identified"** — The MCP capability *Scope* does not declare `agent_id`, so Agent Factory never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allow the agent in the config app.
 
-**"Token expired"** - OAuth tokens expire after 1 hour. Use `ensureAccessToken` to refresh.
+**"Microsoft Graph is not connected for this user"** — No per-user OAuth token. Open the configuration app (OAuth mode) and click **Connect**, or use the agent's connect flow.
+
+**"Microsoft Graph token refresh failed … must reconnect"** — The stored refresh token was revoked or expired (Microsoft Entra invalidated it, or it aged past its limit). The connection is dropped automatically; the user must reconnect from the config app.
+
+**"Microsoft Graph not authenticated" / "OAuth is not configured"** — Neither a tenant OAuth client nor the central platform client is available. Set the client ID/secret/tenant in the config app, or ask the platform maintainer to provision the central Entra OAuth client.
+
+**`client_credentials` exchange failed** — In application mode, check the Application (client) ID / secret, the tenant id, and that a Global Administrator granted **admin consent** for the application Graph permissions.
+
+**"Site not found"** — The site id format is `hostname,siteCollectionId,siteId`. Use `sites` `search` (or Graph Explorer) to find the correct id.
+
+**Microsoft Entra redirect URI rejected** — Entra rejects a colon in the redirect URI path. Register the redirect URI with the workspace's **raw id** (`/workspaces/<workspace-id>/webhooks/oauthCallback`), not the `slug:` form — copy the exact value from the config app.
 
 ## External Resources
 
 <CardGroup cols={2}>
-  <Card title="Microsoft Graph Files API" icon="book" href="https://learn.microsoft.com/en-us/graph/api/resources/driveitem">
-    Official API documentation
+  <Card title="Microsoft Graph API" icon="microsoft" href="https://learn.microsoft.com/en-us/graph/api/resources/sharepoint">
+    Official reference for the SharePoint sites, drives, files, lists and permissions REST APIs.
   </Card>
-  <Card title="SharePoint Sites API" icon="book" href="https://learn.microsoft.com/en-us/graph/api/resources/site">
-    Site operations reference
-  </Card>
-  <Card title="Graph Explorer" icon="flask" href="https://developer.microsoft.com/en-us/graph/graph-explorer">
-    Test API calls interactively
-  </Card>
-  <Card title="Knowledges SharePoint Connector" icon="database" href="/products/ai-knowledge/connectors">
-    Document sync and PBAV for Knowledges
+  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
+    Learn how Agent Factory agents consume MCP tools in Prisme.ai.
   </Card>
 </CardGroup>
