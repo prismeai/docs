@@ -1,0 +1,611 @@
+---
+title: 'Power BI'
+description: 'Query Power BI datasets with DAX, manage workspaces, reports, dashboards and refreshes from Agent Factory agents and Builder workflows, with per-user Microsoft Entra ID OAuth'
+---
+
+<img
+  src="/images/connectors/powerbi.png"
+  alt="Power BI"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The Power BI app provides read/write access to the [Microsoft Power BI REST API (v1.0)](https://learn.microsoft.com/en-us/rest/api/power-bi/) through its official endpoints. It can be consumed two ways: as a remote MCP server that **Agent Factory** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. The MCP surface groups every operation into **eleven entity tools** (`workspaces`, `datasets`, `query`, `refresh`, `reports`, `dashboards`, `dataflows`, `gateways`, `imports`, `capacities`, `admin`), each driven by an `action` argument, and runs in the **tenant app-instance context** (it resolves the installing workspace's own credentials and authorizes the calling agent against a per-workspace allowlist). Authentication is **per-user OAuth2 authorization-code with PKCE against Microsoft Entra ID**: each end user signs in with their own Microsoft account, so every call runs with that user's Power BI permissions.
+
+<CardGroup cols={3}>
+  <Card title="DAX & semantic models" icon="chart-line">
+    Run DAX queries against datasets, inspect schema, parameters and datasources, trigger and schedule refreshes
+  </Card>
+  <Card title="Reports & dashboards" icon="chart-pie">
+    List, clone, rebind, export (PDF/PPTX/PNG) reports and dashboards, manage tiles and generate embed tokens
+  </Card>
+  <Card title="Workspaces & admin" icon="building">
+    Manage workspaces (groups) and their users, gateways, dataflows, imports and capacities, plus tenant admin APIs
+  </Card>
+</CardGroup>
+
+## Who is this for?
+
+This connector is used by three different roles. Jump to the section that matches yours — each one is self-contained.
+
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot">
+    You build agents in **Agent Factory** and want them to query and manage Power BI. → *Agent builder* tab.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved">
+    You run the platform and register the shared Microsoft Entra ID OAuth application. → *Platform admin setup* accordion below.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece">
+    You write Builder automations (DSUL) that call Power BI operations directly. → *Workspace builder* tab.
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- A **Microsoft Power BI** account (Power BI Pro / Premium Per User, or access to a Premium / Fabric capacity for paginated exports and the admin APIs).
+- A **Microsoft Entra ID** (formerly Azure AD) tenant where you can register an OAuth **application** — done in the [Microsoft Entra admin center](https://entra.microsoft.com) under **App registrations**.
+- The application must request delegated **Power BI service** permissions; the connector requests this default scope set:
+
+```text
+https://analysis.windows.net/powerbi/api/.default
+offline_access
+openid
+profile
+```
+
+- For tenant-wide admin operations (`admin` tool), the connected user must be a **Fabric / Power BI administrator**, and the Power BI tenant settings must allow service-principal / API access where applicable.
+- To run DAX queries, the **"Dataset Execute Queries REST API"** must be enabled in the Power BI tenant settings.
+
+<Accordion title="Platform admin (Governance) — one-time platform setup" icon="shield-halved">
+  **Goal:** two one-time tasks — (1) register the shared **Microsoft Entra ID OAuth application** and enter its credentials through the connector's configuration app so every workspace lets its users sign in with their own Microsoft account, and (2) expose Power BI as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
+
+  ## 1. Configure the connector
+
+  <Steps>
+    <Step title="Register the OAuth application in Microsoft Entra ID">
+      In the [Microsoft Entra admin center](https://entra.microsoft.com), open **Identity > Applications > App registrations > New registration**. Choose a *Web* platform and set the single redirect URI to the connector's OAuth callback:
+
+      ```text
+      <api-url>/workspaces/slug:powerbi/webhooks/oauthCallback
+      ```
+
+      (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:powerbi/webhooks/oauthCallback` on production). Under **API permissions**, add the **Power BI Service** delegated permissions matching the scopes in *Prerequisites*, then create a **client secret**. Save the **Application (client) ID**, the **client secret** and the **directory (tenant) ID**.
+    </Step>
+    <Step title="Enter the credentials through the configuration app">
+      Open the central `powerbi` workspace and launch its **Configuration app** — `<studio>/apps/powerbi` (e.g. `https://studio.prisme.ai/apps/powerbi`), also linked as `Configuration app` on the installed instance. Follow the in-app instructions to paste the **client ID**, **client secret** and **tenant** — the app stores them in the workspace's secrets for you. Do not edit Studio's raw Secrets by hand.
+    </Step>
+    <Step title="Tell workspaces to connect">
+      Each consuming workspace opens the same configuration app, then its users click **Connexion** to sign in with their own Microsoft account (PKCE authorization-code flow). Tokens are stored per user and refreshed automatically.
+    </Step>
+  </Steps>
+
+  ## 2. Declare the capability in AI Governance
+
+  Generic connectors — broad tool surfaces meant to be shared across many agents, like Power BI — are best exposed as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
+
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) the **Power BI** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
+
+      ```text
+      context_id,agent_id,user_id
+      ```
+
+      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
+    </Step>
+    <Step title="Make it available to agent builders">
+      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant.
+    </Step>
+    <Step title="Smoke-test">
+      From an agent that has the capability, trigger any tool. The user is prompted to connect once (Microsoft sign-in); subsequent calls reuse the stored token transparently and refresh it automatically.
+    </Step>
+  </Steps>
+
+  <Warning>
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model** — which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is also **no OAuth auth-config JSON** to attach in Governance: connect / status / disconnect are handled by the connector's own webhooks, wired automatically.
+  </Warning>
+</Accordion>
+
+---
+
+<Tabs>
+  <Tab title="Agent builder (Agent Factory)">
+    ## Agent builder
+
+    **Goal:** let an agent you build in Agent Factory query and manage Power BI through MCP tools.
+
+    <Note>
+      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Power BI app in a workspace (see the *Workspace builder* tab), and a *Platform admin* must have registered the Microsoft Entra ID OAuth application (see the *Platform admin setup* accordion above).
+    </Note>
+
+    This connector runs in the **tenant app-instance context**: your agent is authorized two ways at once — it is identified by the `agent_id` that Agent Factory injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The Power BI access token itself is resolved server-side from the connected user's OAuth session.
+
+    There are two ways to wire it up. Pick based on how much isolation you need.
+
+    ## Option A — Enable the shared capability from the catalog
+
+    The fastest path: a *Platform admin* (or a workspace owner via the config app's one-click **Add to catalog** button) has already published a **Power BI** capability to your organization's catalog, so you just pick it.
+
+    <Steps>
+      <Step title="Open your agent in Agent Factory">
+        Open the agent you want to extend and go to its capabilities / tools.
+      </Step>
+      <Step title="Add the Power BI capability">
+        Browse the capability catalog, select **Power BI**, and enable it. The MCP endpoint URL and the *Scope* (`context_id,agent_id,user_id`) are already wired — nothing to paste, and the shared instance accepts every agent granted the capability, so there is no allowlist step on your side.
+      </Step>
+      <Step title="Connect a Microsoft account">
+        On the first tool call, an unconnected user is prompted to sign in — Agent Factory surfaces a `connect_url`. Subsequent calls reuse the stored token.
+      </Step>
+    </Steps>
+
+    <Note>
+      Convenient, but your agent runs against a **shared, platform-managed instance**: its Entra ID OAuth client is owned by someone else and the instance accepts every agent that is granted the capability. Prefer Option B for anything beyond quick experiments.
+    </Note>
+
+    ## Option B — Run it from your own workspace (recommended)
+
+    For production agents, install the connector in **your own workspace** and point the agent at *that* workspace's MCP endpoint.
+
+    <Warning>
+      **Prefer this mode for security.** Because the MCP runs in *your* app-instance context, the OAuth client, the per-user Power BI tokens and the authorized-agents allowlist are all **scoped to your workspace** — not shared platform-wide. You decide exactly which agents may call it and which Microsoft accounts back them, and a misconfiguration elsewhere can never expose your data. The shared catalog capability (Option A) is a broad surface many agents can reach; your own workspace is an isolated, least-privilege boundary.
+    </Warning>
+
+    <Steps>
+      <Step title="Install and configure the connector in your workspace">
+        Follow the *Workspace builder* tab: install **Power BI** in your workspace, open its **Configuration app**, and connect a Microsoft account.
+      </Step>
+      <Step title="Allowlist your agent">
+        In that workspace's config app, open **Authorized agents** and tick your agent (the **Install capability** button does this for you), or enable **Allow all agents**.
+      </Step>
+      <Step title="Add the MCP capability to your agent">
+        In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
+
+        ```text
+        context_id,agent_id,user_id
+        ```
+
+        The `agent_id` is what lets the connector identify and authorize your agent — without it, every call is rejected with an explicit "agent could not be identified" message. This *Scope* is separate from the Microsoft OAuth scopes.
+      </Step>
+      <Step title="Connect a Microsoft account">
+        On the first tool call, the user is prompted to sign in (or uses **Connexion** in the config app).
+      </Step>
+    </Steps>
+
+    ## Brief the agent in its system prompt
+
+    Whichever option you pick, wiring the capability is not enough — the agent must know the MCP exists and when to use it. Copy-pasteable starter:
+
+    ```text
+    You have access to the Power BI MCP server (tools: workspaces, datasets, query, refresh, reports, dashboards, dataflows, gateways, imports, capacities, admin). Each tool takes an `action` argument plus per-action parameters. Use the `query` tool (action executeQuery) to answer data questions with DAX against a dataset; use `datasets` getSchema first to discover tables and columns. Power BI's `groupId` is the workspace id and is optional (empty = "My workspace"). Prefer calling a tool over guessing, and confirm with the user before any destructive action (delete a dataset/report, cancel a refresh).
+    ```
+
+    <Note>
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the config app and its identity propagated so the connector can read its `agent_id`.
+    </Note>
+
+    ## Available Tools
+
+    Each tool takes an `action` argument selecting the concrete operation, plus the per-action parameters. `groupId` (the workspace id) is optional on most data tools — empty means "My workspace".
+
+    | Tool | Description |
+    |------|-------------|
+    | `workspaces` | Power BI workspaces (groups): list, create, delete and manage workspace users. Actions: `list`, `create`, `delete`, `listUsers`, `addUser`, `updateUser`, `deleteUser`. |
+    | `datasets` | Datasets (semantic models): list, get, delete, inspect/update datasources & parameters, get schema, take over, bind to a gateway. Actions: `list`, `get`, `delete`, `getTables`, `getDatasources`, `updateDatasources`, `getParameters`, `updateParameters`, `takeOver`, `bindToGateway`, `getSchema`. |
+    | `query` | Run a DAX query against a dataset and return result rows. Action: `executeQuery`. |
+    | `refresh` | Dataset refreshes: trigger, read history, get/update schedule, cancel an in-progress refresh. Actions: `trigger`, `history`, `getSchedule`, `updateSchedule`, `cancel`. |
+    | `reports` | Reports: list, get, delete, clone, rebind, get pages, export (PDF/PPTX/PNG), poll/download an export, update content, generate an embed token. Actions: `list`, `get`, `delete`, `clone`, `rebind`, `getPages`, `getPage`, `export`, `getExportStatus`, `getExportFile`, `updateContent`, `generateToken`. |
+    | `dashboards` | Dashboards & tiles: list, get, create dashboards; list/get/clone tiles; generate an embed token. Actions: `list`, `get`, `create`, `getTiles`, `getTile`, `cloneTile`, `generateToken`. |
+    | `dataflows` | Dataflows: list, get (model.json), delete, refresh, list transactions and datasources. Actions: `list`, `get`, `delete`, `refresh`, `getTransactions`, `getDatasources`. |
+    | `gateways` | On-premises data gateways: list, get, list/create/delete datasources, get a datasource status. Actions: `list`, `get`, `getDatasources`, `createDatasource`, `deleteDatasource`, `getDatasourceStatus`. |
+    | `imports` | Imports: list imports, get an import, create a temporary upload location (to publish a PBIX). Actions: `list`, `get`, `createUploadLocation`. |
+    | `capacities` | Premium / Fabric capacities: list capacities, get workloads, get refreshables. Actions: `list`, `getWorkloads`, `getRefreshables`. |
+    | `admin` | Tenant ADMIN APIs (require the connected user to be a Fabric/Power BI admin): list all workspaces/datasets/reports/dashboards/dataflows, get workspace users, query the activity log, list capacities, get modified workspaces, run the metadata scanner. Actions: `listGroups`, `getGroupUsers`, `listDatasets`, `listReports`, `listDashboards`, `listDataflows`, `getActivityEvents`, `listCapacities`, `getModifiedWorkspaces`, `scanWorkspaces`, `getScanStatus`, `getScanResult`. |
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
+
+    - **`verbose`** (default) — human-readable text optimized for LLM consumption
+    - **`structured`** — machine-readable JSON in `structuredContent`
+    - **`both`** — verbose text plus the structured payload
+
+    ## Tool Details
+
+    ### query
+
+    ```json
+    {
+      "name": "query",
+      "arguments": {
+        "action": "executeQuery",
+        "groupId": "f089354e-8366-4e18-aae3-a5f3c3b0c4d8",
+        "datasetId": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+        "daxQuery": "EVALUATE TOPN(10, 'Sales', 'Sales'[Amount], DESC)"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `executeQuery`. |
+    | `datasetId` | Yes | Target dataset (semantic model) id. |
+    | `daxQuery` | Yes (or `queries`) | A single DAX query string. Use `queries` for the raw multi-query body. |
+    | `groupId` | No | Workspace id; omit for "My workspace". |
+    | `impersonatedUserName` | No | UPN to impersonate for row-level security (admin / service principal). |
+
+    ### datasets
+
+    ```json
+    {
+      "name": "datasets",
+      "arguments": {
+        "action": "getSchema",
+        "groupId": "f089354e-8366-4e18-aae3-a5f3c3b0c4d8",
+        "datasetId": "cfafbeb1-8037-4d0c-896e-a46fb27ff229"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `list`, `get`, `delete`, `getTables`, `getDatasources`, `updateDatasources`, `getParameters`, `updateParameters`, `takeOver`, `bindToGateway`, `getSchema`. |
+    | `datasetId` | For all but `list` | Target dataset id. |
+    | `groupId` | No | Workspace id; omit for "My workspace". |
+    | `gatewayObjectId` | For `bindToGateway` | Gateway to bind the dataset to. |
+    | `updateDetails` | For `updateDatasources`/`updateParameters` | The update payload (datasource mappings or parameter values). |
+
+    <Note>
+      `getTables` works **only** for Push-API datasets. On a normal import / DirectQuery semantic model use `getSchema` (column schema via DAX), or the `query` tool with `EVALUATE INFO.VIEW.TABLES()` / `EVALUATE INFO.VIEW.COLUMNS()`.
+    </Note>
+
+    ### refresh
+
+    ```json
+    {
+      "name": "refresh",
+      "arguments": {
+        "action": "trigger",
+        "groupId": "f089354e-8366-4e18-aae3-a5f3c3b0c4d8",
+        "datasetId": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+        "notifyOption": "MailOnFailure"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `trigger`, `history`, `getSchedule`, `updateSchedule`, `cancel`. |
+    | `datasetId` | Yes | Target dataset id. |
+    | `groupId` | No | Workspace id; omit for "My workspace". |
+    | `refreshId` | For `cancel` | Id of the in-progress refresh to cancel. |
+    | `notifyOption` | No | Completion notification: `MailOnFailure`, `MailOnCompletion`, `NoNotification`. |
+
+    ### reports
+
+    ```json
+    {
+      "name": "reports",
+      "arguments": {
+        "action": "export",
+        "groupId": "f089354e-8366-4e18-aae3-a5f3c3b0c4d8",
+        "reportId": "5b218778-e7a5-4d73-8187-f10824047715",
+        "format": "PDF"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `list`, `get`, `delete`, `clone`, `rebind`, `getPages`, `getPage`, `export`, `getExportStatus`, `getExportFile`, `updateContent`, `generateToken`. |
+    | `reportId` | For all but `list` | Target report id. |
+    | `groupId` | No | Workspace id; omit for "My workspace". |
+    | `format` | For `export` | `PDF`, `PPTX` or `PNG` (export is async — poll `getExportStatus`, then `getExportFile`). |
+    | `targetWorkspaceId` / `targetModelId` | For `clone` / `rebind` | Destination workspace / dataset to clone into or rebind to. |
+
+    ### dashboards
+
+    ```json
+    {
+      "name": "dashboards",
+      "arguments": {
+        "action": "generateToken",
+        "groupId": "f089354e-8366-4e18-aae3-a5f3c3b0c4d8",
+        "dashboardId": "69ffaa6c-b36d-4d01-96f5-1ed67c64d4af",
+        "accessLevel": "View"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `list`, `get`, `create`, `getTiles`, `getTile`, `cloneTile`, `generateToken`. |
+    | `dashboardId` | For all but `list`/`create` | Target dashboard id. |
+    | `groupId` | No | Workspace id; omit for "My workspace". |
+    | `tileId` | For `getTile`/`cloneTile` | Target tile id. |
+    | `accessLevel` | For `generateToken` | Embed token access level, e.g. `View`. |
+
+    ### admin
+
+    ```json
+    {
+      "name": "admin",
+      "arguments": {
+        "action": "getActivityEvents",
+        "startDateTime": "2026-06-01T00:00:00Z",
+        "endDateTime": "2026-06-01T23:59:59Z"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `listGroups`, `getGroupUsers`, `listDatasets`, `listReports`, `listDashboards`, `listDataflows`, `getActivityEvents`, `listCapacities`, `getModifiedWorkspaces`, `scanWorkspaces`, `getScanStatus`, `getScanResult`. |
+    | `groupId` | For `getGroupUsers` and per-workspace listings | Workspace id. |
+    | `startDateTime` / `endDateTime` | For `getActivityEvents` | ISO 8601 window (same UTC day, per the Power BI admin API). |
+    | `workspaces` | For `scanWorkspaces` | Array of workspace ids to scan. |
+    | `scanId` | For `getScanStatus`/`getScanResult` | Id returned by `scanWorkspaces`. |
+
+    <Note>
+      All `admin` actions require the **connected user to be a Fabric / Power BI administrator**; otherwise the provider returns `401` / `403`.
+    </Note>
+  </Tab>
+
+  <Tab title="Workspace builder (DSUL)">
+    ## Workspace builder
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **Power BI** and install it
+    3. Open the **Configuration app** (the link auto-populated on install) to connect a Microsoft account and manage the authorized-agents allowlist
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Configuration app** | Auto-populated on install — open this link to register the Microsoft Entra ID OAuth credentials, connect a Microsoft account, and manage the authorized-agents allowlist. |
+
+    The configuration app drives everything; the app instance itself has no per-field credential form. Authentication is a single mode:
+
+    | Auth mode | What you provide | Best for |
+    |-----------|------------------|----------|
+    | Per-user OAuth2 (PKCE) | Microsoft Entra ID **client ID + secret + tenant** (entered once in the config app), then each user clicks **Connexion** | Every workspace — each user acts with their own Power BI permissions |
+
+    <Note>
+      Credentials are provisioned into the workspace's Secrets by the `onInstall` flow and resolved server-side. The agent allowlist (**Authorized agents**) gates which Agent Factory agents may call the MCP endpoint — see the *Agent builder* tab. Per-user tokens are refreshed automatically; a revoked token drops the connection and the user is asked to reconnect.
+    </Note>
+
+    ## Available Instructions
+
+    Every instruction resolves credentials from the workspace configuration. Operations are grouped by Power BI resource; the MCP server exposes the same operations behind the eleven entity tools (see the *Agent builder* tab). `groupId` is the workspace id and is optional on data operations (omit for "My workspace").
+
+    ### Workspaces (groups)
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listWorkspaces` | List the workspaces (groups) the user can access. | `{ value: [{ id, name, isReadOnly, type }] }` |
+    | `createWorkspace` | Create a workspace by `name`. | The created group `{ id, name }`. |
+    | `deleteWorkspace` | Delete a workspace by `groupId`. | Empty (HTTP 200). |
+    | `listWorkspaceUsers` | List the users/roles of a workspace by `groupId`. | `{ value: [{ identifier, principalType, groupUserAccessRight }] }` |
+    | `addWorkspaceUser` | Grant a user/group access: `user` = `{ identifier, principalType, groupUserAccessRight }`. | Empty (HTTP 200). |
+    | `updateWorkspaceUser` | Change a user's access right on a workspace. | Empty (HTTP 200). |
+    | `deleteWorkspaceUser` | Remove a user from a workspace by `emailAddress`/`identifier`. | Empty (HTTP 200). |
+
+    ### Datasets (semantic models)
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listDatasets` | List datasets in a workspace (or "My workspace"). | `{ value: [{ id, name, configuredBy, isRefreshable }] }` |
+    | `getDataset` | Fetch one dataset by `datasetId`. | A Dataset resource `{ id, name, webUrl, … }`. |
+    | `deleteDataset` | Delete a dataset by `datasetId`. | Empty (HTTP 200). |
+    | `getDatasetSchema` | Discover the model's column schema via DAX. | `{ tables: [{ name, columns: [{ name, dataType }] }] }` |
+    | `getDatasetTables` | List push-API dataset tables (Push datasets only). | `{ value: [{ name, columns }] }` |
+    | `getDatasetDatasources` | List a dataset's datasources. | `{ value: [{ datasourceType, connectionDetails, … }] }` |
+    | `updateDatasetDatasources` | Remap datasources via `updateDetails`. | Empty (HTTP 200). |
+    | `getDatasetParameters` | List the dataset's M parameters. | `{ value: [{ name, type, currentValue }] }` |
+    | `updateDatasetParameters` | Set parameter values via `updateDetails`. | Empty (HTTP 200). |
+    | `takeOverDataset` | Take over a dataset (bind it to the calling user). | Empty (HTTP 200). |
+    | `bindDatasetToGateway` | Bind a dataset to a gateway by `gatewayObjectId`. | Empty (HTTP 200). |
+
+    ### DAX query
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `executeQueries` | Run a DAX query (`daxQuery`, or a raw `queries` body) against `datasetId`; `impersonatedUserName` for RLS. | `{ results: [{ tables: [{ rows: [ {…} ] }] }] }` |
+
+    ### Refreshes
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `refreshDataset` | Trigger a refresh of `datasetId`; `notifyOption` controls notifications. | Empty (HTTP 202) with a refresh request id header. |
+    | `getRefreshHistory` | List recent refreshes; `top` caps the count. | `{ value: [{ requestId, status, startTime, endTime }] }` |
+    | `getRefreshSchedule` | Read the scheduled-refresh configuration. | `{ days, times, enabled, localTimeZoneId, notifyOption }` |
+    | `updateRefreshSchedule` | Update the refresh schedule via `value`. | Empty (HTTP 200). |
+    | `cancelRefresh` | Cancel an in-progress refresh by `refreshId`. | Empty (HTTP 200). |
+
+    ### Reports
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listReports` | List reports in a workspace. | `{ value: [{ id, name, datasetId, webUrl, embedUrl }] }` |
+    | `getReport` | Fetch one report by `reportId`. | A Report resource `{ id, name, datasetId, embedUrl }`. |
+    | `deleteReport` | Delete a report by `reportId`. | Empty (HTTP 200). |
+    | `cloneReport` | Clone a report into `targetWorkspaceId` / `targetModelId` with a new `name`. | The cloned Report `{ id, name }`. |
+    | `rebindReport` | Rebind a report to another dataset (`datasetId`). | Empty (HTTP 200). |
+    | `getReportPages` / `getReportPage` | List a report's pages / get one by `pageName`. | `{ value: [{ name, displayName, order }] }` / a Page resource. |
+    | `exportReport` | Start an async export to `format` (PDF/PPTX/PNG). | `{ id, status }` (poll for completion). |
+    | `getReportExportStatus` | Poll an export by `exportId`. | `{ id, status, percentComplete, resourceLocation }` |
+    | `getReportExportFile` | Download the finished export by `exportId`. | The exported file bytes. |
+    | `updateReportContent` | Overwrite a report's content from a source report. | Empty (HTTP 200). |
+    | `generateReportToken` | Generate an embed token; `accessLevel`, optional `identities` for RLS. | `{ token, tokenId, expiration }` |
+
+    ### Dashboards & tiles
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listDashboards` | List dashboards in a workspace. | `{ value: [{ id, displayName, embedUrl }] }` |
+    | `getDashboard` | Fetch one dashboard by `dashboardId`. | A Dashboard resource `{ id, displayName, embedUrl }`. |
+    | `createDashboard` | Create a dashboard by `name`. | The created Dashboard `{ id, displayName }`. |
+    | `getDashboardTiles` / `getDashboardTile` | List a dashboard's tiles / get one by `tileId`. | `{ value: [{ id, title, embedUrl }] }` / a Tile resource. |
+    | `cloneDashboardTile` | Clone a tile into `targetDashboardId` (optionally rebinding report/model). | The cloned Tile `{ id, title }`. |
+    | `generateDashboardToken` | Generate an embed token for a dashboard; `accessLevel`. | `{ token, tokenId, expiration }` |
+
+    ### Dataflows
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listDataflows` | List dataflows in a workspace. | `{ value: [{ objectId, name, description }] }` |
+    | `getDataflow` | Fetch a dataflow's `model.json` by `dataflowId`. | The dataflow model JSON. |
+    | `deleteDataflow` | Delete a dataflow by `dataflowId`. | Empty (HTTP 200). |
+    | `refreshDataflow` | Trigger a dataflow refresh; `processType`/`notifyOption`. | Empty (HTTP 200). |
+    | `getDataflowTransactions` | List a dataflow's refresh transactions. | `{ value: [{ id, status, startTime, endTime }] }` |
+    | `getDataflowDatasources` | List a dataflow's datasources. | `{ value: [{ datasourceType, connectionDetails }] }` |
+
+    ### Gateways
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listGateways` | List the on-premises data gateways. | `{ value: [{ id, name, type, gatewayStatus }] }` |
+    | `getGateway` | Fetch one gateway by `gatewayId`. | A Gateway resource `{ id, name, publicKey }`. |
+    | `getGatewayDatasources` | List a gateway's datasources. | `{ value: [{ id, datasourceType, datasourceName }] }` |
+    | `createGatewayDatasource` | Create a datasource: `dataSourceType`, `connectionDetails`, `credentialDetails`, `datasourceName`. | The created datasource `{ id }`. |
+    | `deleteGatewayDatasource` | Delete a datasource by `datasourceId`. | Empty (HTTP 200). |
+    | `getGatewayDatasourceStatus` | Check a datasource's connectivity status. | `{ status }` (or an error object). |
+
+    ### Imports
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listImports` | List imports in a workspace. | `{ value: [{ id, importState, reports, datasets }] }` |
+    | `getImport` | Fetch one import by `importId`. | An Import resource `{ id, importState, reports, datasets }`. |
+    | `createImportUploadLocation` | Create a temporary upload URL to publish a PBIX. | `{ url }` (time-limited upload location). |
+
+    ### Capacities
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listCapacities` | List the Premium / Fabric capacities the user can see. | `{ value: [{ id, displayName, sku, state }] }` |
+    | `getCapacityWorkloads` | List a capacity's workloads by `capacityId`. | `{ value: [{ name, state, maxMemoryPercentageSetByUser }] }` |
+    | `getCapacityRefreshables` | List refreshables on a capacity; `top`/`expand`. | `{ value: [{ id, refreshCount, refreshFailures, … }] }` |
+
+    ### Admin (tenant)
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `adminListGroups` | List all workspaces in the tenant; `filter`/`top`/`skip`. | `{ value: [{ id, name, type, state }] }` |
+    | `adminGetGroupUsers` | List a workspace's users (admin) by `groupId`. | `{ value: [{ identifier, principalType, groupUserAccessRight }] }` |
+    | `adminListDatasets` / `adminListReports` / `adminListDashboards` / `adminListDataflows` | Tenant-wide listing of each resource. | `{ value: [ … ] }` |
+    | `adminGetActivityEvents` | Query the activity log between `startDateTime`/`endDateTime` (same UTC day). | `{ activityEventEntities: [...], continuationToken }` |
+    | `adminListCapacities` | List all capacities in the tenant. | `{ value: [{ id, displayName, sku, state }] }` |
+    | `adminGetModifiedWorkspaces` | List workspaces modified since `modifiedSince`. | `{ value: [{ id }] }` |
+    | `adminScanWorkspaces` | Start a metadata scan over `workspaces[]` (`lineage`, `datasourceDetails`, `datasetSchema`, `datasetExpressions`). | `{ id, status }` (scan id). |
+    | `adminGetScanStatus` / `adminGetScanResult` | Poll a scan by `scanId` / fetch the scan result. | `{ id, status }` / the full metadata scan result. |
+
+    <Note>
+      `Returns` shows the shape of the operation output (the underlying Power BI API resource). `groupId` is the workspace id and is optional on data operations — omit it to target "My workspace". All `admin*` instructions require the connected user to be a Fabric / Power BI administrator.
+    </Note>
+
+    ## DSUL Examples
+
+    **List datasets in a workspace, then run a DAX query:**
+
+    ```yaml
+    - Power BI.listDatasets:
+        groupId: '{{workspaceId}}'
+      output: datasets
+    - Power BI.executeQueries:
+        groupId: '{{workspaceId}}'
+        datasetId: '{{datasets.value[0].id}}'
+        daxQuery: "EVALUATE TOPN(10, 'Sales', 'Sales'[Amount], DESC)"
+      output: rows
+    ```
+
+    **Trigger a refresh and check its history:**
+
+    ```yaml
+    - Power BI.refreshDataset:
+        groupId: '{{workspaceId}}'
+        datasetId: '{{datasetId}}'
+        notifyOption: MailOnFailure
+    - Power BI.getRefreshHistory:
+        groupId: '{{workspaceId}}'
+        datasetId: '{{datasetId}}'
+        top: 5
+      output: history
+    ```
+
+    **Export a report to PDF (async — start, poll, download):**
+
+    ```yaml
+    - Power BI.exportReport:
+        groupId: '{{workspaceId}}'
+        reportId: '{{reportId}}'
+        format: PDF
+      output: export
+    - Power BI.getReportExportStatus:
+        groupId: '{{workspaceId}}'
+        reportId: '{{reportId}}'
+        exportId: '{{export.id}}'
+      output: status
+    - Power BI.getReportExportFile:
+        groupId: '{{workspaceId}}'
+        reportId: '{{reportId}}'
+        exportId: '{{export.id}}'
+      output: file
+    ```
+
+    **Discover a model's structure with DAX (works on import/DirectQuery models):**
+
+    ```yaml
+    - Power BI.executeQueries:
+        groupId: '{{workspaceId}}'
+        datasetId: '{{datasetId}}'
+        daxQuery: "EVALUATE INFO.VIEW.TABLES()"
+      output: tables
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+| HTTP code | Meaning |
+|-----------|---------|
+| `400` | Bad request — invalid parameters, malformed body or DAX syntax error. |
+| `401` | Unauthorized — the Power BI access token is missing, expired or revoked. The user must reconnect. |
+| `403` | Forbidden — insufficient OAuth scope, the account lacks access to the resource, or an `admin` action by a non-admin user. |
+| `404` | Not found — the workspace, dataset, report, dashboard or other id does not exist or is not visible to the account. |
+| `409` | Conflict — e.g. a refresh is already in progress, or a name collision when creating a resource. |
+| `429` | Rate limit / capacity throttling — back off and retry. |
+| `500` / `503` | Power BI service error — transient; retry shortly, no reconnection needed. |
+
+### Common Issues
+
+**"This agent is not authorized to use this connector"** — The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (or enable **Allow all agents**) and Save.
+
+**"The calling agent could not be identified"** — The MCP capability *Scope* does not declare `agent_id`, so Agent Factory never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allow the agent in the config app.
+
+**"Power BI is not connected for this user"** — No per-user OAuth token. Open the configuration app and click **Connexion**, or use the agent's connect flow.
+
+**"Power BI token refresh failed … must reconnect"** — The stored refresh token was revoked or expired (Microsoft Entra ID invalidated it). The connection is dropped automatically; the user must reconnect from the config app.
+
+**"Power BI OAuth is not configured"** — The Microsoft Entra ID client ID/secret/tenant is missing. Open the configuration app and enter the OAuth credentials (or ask the platform admin to register the central application).
+
+**`getTables` fails with "not Push API dataset"** — `getTables` only works on Push-API datasets. To inspect a normal import / DirectQuery semantic model, use the `datasets` `getSchema` action, or run a DAX query such as `EVALUATE INFO.VIEW.TABLES()` / `EVALUATE INFO.VIEW.COLUMNS()` via the `query` tool.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="Power BI REST API" icon="microsoft" href="https://learn.microsoft.com/en-us/rest/api/power-bi/">
+    Official reference for the Microsoft Power BI REST API (v1.0).
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
+    Learn how Agent Factory agents consume MCP tools in Prisme.ai.
+  </Card>
+</CardGroup>
