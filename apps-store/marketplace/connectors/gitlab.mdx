@@ -1,6 +1,6 @@
 ---
 title: 'GitLab'
-description: 'Manage GitLab projects, issues, merge requests and CI/CD pipelines from Prisme.ai workflows and AI agents'
+description: 'Let Agent Factory agents manage GitLab projects, issues, merge requests and CI/CD pipelines through MCP, with per-user OAuth resolved server-side'
 ---
 
 <img
@@ -12,10 +12,11 @@ description: 'Manage GitLab projects, issues, merge requests and CI/CD pipelines
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The GitLab app provides read/write access to the [GitLab](https://gitlab.com) DevOps platform via its REST v4 API. It can be used either as a Builder app (automations call GitLab instructions directly) or as a remote MCP server consumed by an Knowledges agent — covering projects, issues, merge requests, pipelines, branches, commits, releases, CI/CD variables, deploy keys, webhooks, wikis, groups and users. Supports two authentication modes:
+The GitLab connector exposes the [GitLab](https://gitlab.com) DevOps platform (REST v4 API) to **Agent Factory** agents (through MCP) and to Builder automations (through the `GitLab.op:` App instructions) — covering projects, issues, merge requests, pipelines, jobs, environments, branches, commits, tags, releases, labels, milestones, wikis, CI/CD variables, deploy keys, webhooks, groups and users. The 90+ GitLab operations are grouped into **16 entity tools**, each driven by an `action` argument. The MCP server runs in the **tenant app-instance context**: it resolves the installing workspace's own credentials and authorizes the calling agent against that workspace's allowlist. Authentication is per-user and supports several modes:
 
-- **Central OAuth2** (recommended) — one OAuth Application is registered once by the Prisme.ai workspace admin; every end user signs in with their own GitLab account. Nothing to install per tenant. Requires the platform admin to grant the GitLab capability in Prisme.ai Governance (see below).
-- **Tenant PAT** — install the GitLab app in your workspace and paste a Personal Access Token. Shared across the workspace's users; no per-user sign-in.
+- **Per-user OAuth2 — central client** (`oauthCentral`, recommended) — one GitLab OAuth application is registered once by the platform maintainer; every end user signs in with their own GitLab account. Nothing to register per workspace: each one just installs the app and clicks *Connect*.
+- **Per-user OAuth2 — tenant client** (`oauth`) — paste your own GitLab OAuth client ID/secret in the connector config app. Each user signs in with their own account against your client (authorization-code flow).
+- **Direct access token** (`accessToken`) — a caller-managed GitLab token (e.g. a Personal Access Token with the `api` scope), used as-is with no exchange.
 
 <CardGroup cols={3}>
   <Card title="Project Management" icon="diagram-project">
@@ -24,277 +25,543 @@ The GitLab app provides read/write access to the [GitLab](https://gitlab.com) De
   <Card title="CI/CD & DevOps" icon="rocket">
     Pipelines, jobs, environments, CI variables, deploy keys and webhooks
   </Card>
-  <Card title="Central OAuth or PAT" icon="key">
-    One shared OAuth Application with per-user sign-in, or a tenant-level static PAT — both modes coexist on the same MCP endpoint
+  <Card title="Per-user auth" icon="key">
+    Per-user OAuth (central or tenant client) resolved server-side, or a direct access token
+  </Card>
+</CardGroup>
+
+## Who is this for?
+
+This connector is used by three different roles. Jump to the section that matches yours — each one is self-contained.
+
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot">
+    You build agents in **Agent Factory** and want them to use GitLab. → *Agent builder* tab.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved">
+    You run the platform and set up the shared GitLab OAuth client once for everyone. → *Platform admin setup* accordion below.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece">
+    You write Builder automations (DSUL) that call GitLab operations directly. → *Workspace builder* tab.
   </Card>
 </CardGroup>
 
 ## Prerequisites
 
-- A **GitLab** account (gitlab.com or self-hosted)
-- **For the central OAuth mode** — the platform admin has registered ONE OAuth Application at **User Settings > Applications** (`https://gitlab.com/-/user_settings/applications`) with `api` scope and the callback URL `<api-url>/workspaces/slug:gitlab/webhooks/oauthCallback`, and has stored its `Client ID` + `Client Secret` in the Secrets of the central `gitlab` workspace. The end user only needs to click *Connect* once.
-- **For the tenant PAT mode** — a Personal Access Token with `api` scope (Preferences > Access Tokens), pasted into the installed app instance.
-- Base URL (default: `https://gitlab.com/api/v4` — override for self-hosted instances)
+- A **GitLab** account (gitlab.com or a self-hosted instance).
+- For the **OAuth modes** — a GitLab OAuth application created at **User Settings > Applications** (`https://gitlab.com/-/user_settings/applications`) with the `api` scope (or `read_api` for read-only agents); copy its Application ID and Secret. The platform maintainer registers one app for the central mode; a workspace can also register its own for the tenant mode.
+- For the **access-token mode** — a Personal Access Token created at **User Settings > Access Tokens** (`https://gitlab.com/-/user_settings/personal_access_tokens`) with the `api` scope.
+- Base URL: `https://gitlab.com/api/v4`.
 
-<Note>
-  The two modes are mutually exclusive per MCP call: callers identify themselves either by being authenticated to Prisme.ai (central) or by sending the `mcp-api-key` header (tenant). The same workspace can serve both at the same time.
-</Note>
+<Accordion title="Platform admin (Governance) — one-time platform setup" icon="shield-halved">
+  **Goal:** two one-time tasks — (1) configure the shared **central OAuth client** so every workspace lets its users sign in with their own GitLab account, and (2) optionally expose GitLab as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs. Throughout, `<api-url>` is your environment's API URL (`https://api.studio.prisme.ai/v2` on production).
 
-## Setup (one-time, platform admin)
+  ## 1. Configure the connector
 
-The central OAuth flow is set up once per environment by the Prisme.ai workspace admin. End users never touch any of this.
+  <Steps>
+    <Step title="Register the OAuth application at GitLab">
+      Open `https://gitlab.com/-/user_settings/applications` and click **Add new application**. Set the single authorized redirect URI (callback URL) to the **core workspace** callback:
 
-<Steps>
-  <Step title="Register the OAuth Application at GitLab">
-    Open `https://gitlab.com/-/user_settings/applications` and click **Add new application**. Use these values:
+      ```text
+      <api-url>/workspaces/slug:gitlab/webhooks/oauthCallback
+      ```
 
-    - **Name** — `Prisme.ai GitLab connector` (or whatever fits your branding)
-    - **Redirect URI** — `<api-url>/workspaces/slug:gitlab/webhooks/oauthCallback` (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:gitlab/webhooks/oauthCallback` on production)
-    - **Scopes** — `api`
+      (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:gitlab/webhooks/oauthCallback` on production). Add the `api` scope (or `read_api` for read-only). Save and copy the **Application ID** and **Secret** (the secret is shown only once).
+    </Step>
+    <Step title="Enter the credentials through the configuration app">
+      Open the central `gitlab` workspace and launch its **Configuration app** — `<studio>/apps/gitlab` (e.g. `https://studio.prisme.ai/apps/gitlab`). Loaded from the core workspace, the app shows the **maintainer view** (org owner / editor / admin only); paste the **Application ID** and **Secret** there and Save — the app stores them in the core workspace's secrets for you. Do not edit Studio's raw Secrets by hand. These credentials stay in the `gitlab` workspace and are never exposed to tenants or end users; token exchange is proxied through the core `centralTokenExchange` webhook so the client secret never leaves the core workspace.
+    </Step>
+    <Step title="Tell workspaces to use the central client">
+      Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**.
+    </Step>
+    <Step title="(Optional) Publish to the Capabilities catalog">
+      From that same maintainer view, the **Add to catalog** button publishes GitLab to the org-wide **Capabilities catalog** in one click (org owner / admin only; it stays disabled until the central client is saved). Once published, every agent builder in the org can enable GitLab from the catalog without pasting an endpoint — see *Option A* in the *Agent builder* tab.
+    </Step>
+  </Steps>
 
-    Save and copy the **Application ID** + **Secret** (the Secret is shown only once).
-  </Step>
-  <Step title="Store the credentials in the gitlab workspace secrets">
-    Open the central `gitlab` workspace in the Prisme.ai Builder (Studio), go to **Workspace settings > Secrets** and set:
+  ## 2. Declare the capability in AI Governance
 
-    - `gitlabOauthClientId` — the Application ID from GitLab
-    - `gitlabOauthClientSecret` — the Secret from GitLab
+  As an alternative to (or in addition to) the catalog button, you can declare GitLab as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
 
-    These secrets are scoped to the `gitlab` workspace itself — they are NOT exposed to the end users or to any tenant who installs the app.
-  </Step>
-  <Step title="Declare the OAuth authentication in Governance">
-    Open **Prisme.ai Governance > Capabilities > GitLab** (or whichever capability your agents will use to consume the connector) and attach an authentication configuration that points at the three central webhooks of the `gitlab` workspace:
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) the **GitLab** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
 
-    ```json
-    {
-      "type": "oauth2",
-      "status_url": "<api-url>/workspaces/slug:gitlab/webhooks/checkAuthStatus",
-      "connect_url": "<api-url>/workspaces/slug:gitlab/webhooks/initiateOAuth",
-      "disconnect_url": "<api-url>/workspaces/slug:gitlab/webhooks/disconnectOAuth"
-    }
-    ```
+      ```text
+      context_id,agent_id,user_id
+      ```
 
-    Replace `<api-url>` with your environment's API URL (`https://api.studio.prisme.ai/v2` on production). Governance uses these URLs to (1) probe whether the calling user is already connected (`status_url`), (2) trigger the OAuth handshake when they are not (`connect_url`), and (3) revoke the session on demand (`disconnect_url`).
-  </Step>
-  <Step title="Grant the capability to the right roles">
-    Still in Governance, grant the **GitLab** capability to the roles or users who should be allowed to sign in with their own GitLab account through the central MCP. Without this grant, callers without an `mcp-api-key` header are rejected with `401 Authentication required`.
-  </Step>
-  <Step title="Test the flow">
-    From an Agent Creator agent with the GitLab capability enabled, call any tool (e.g. `getCurrentUser`). The agent receives a `connect_url` on the first call; opening it in a new window redirects the user to GitLab, then back to a callback page that closes itself after 5 seconds. Subsequent calls reuse the stored access token transparently.
-  </Step>
-</Steps>
+      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
+    </Step>
+    <Step title="Make it available to agent builders">
+      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant.
+    </Step>
+    <Step title="Smoke-test">
+      From an agent that has the capability, in a workspace configured for `oauthCentral`, trigger any tool (e.g. `users` with `action: "getCurrent"`). The user is prompted to connect once (GitLab sign-in); subsequent calls reuse the stored token transparently and refresh it automatically.
+    </Step>
+  </Steps>
+
+  <Warning>
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model** — which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is also **no OAuth auth-config JSON** to attach in Governance: connect / status / disconnect are handled by the connector's own webhooks, wired automatically.
+  </Warning>
+</Accordion>
 
 ---
 
 <Tabs>
-  <Tab title="Usage as App">
+  <Tab title="Agent builder (Agent Factory)">
+    ## Agent builder
+
+    **Goal:** let an agent you build in Agent Factory use GitLab through MCP tools.
+
+    <Note>
+      Before an agent can call the connector, a *Workspace builder* must have installed and configured the GitLab app in a workspace (see the *Workspace builder* tab), and — for the central OAuth mode — a *Platform admin* must have provisioned the shared OAuth client (see the *Platform admin setup* accordion above).
+    </Note>
+
+    This connector runs in the **tenant app-instance context**: your agent is authorized two ways at once — it is identified by the `agent_id` that Agent Factory injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The GitLab access token itself is resolved server-side from the configured auth mode.
+
+    There are two ways to wire it up. Pick based on how much isolation you need.
+
+    ## Option A — Enable the shared capability from the catalog
+
+    The fastest path: a *Platform admin* has already published a **GitLab** capability to the Capabilities catalog (see the *Platform admin setup* accordion above — the **Add to catalog** button, or §2), so you just pick it from the catalog.
+
+    <Steps>
+      <Step title="Open your agent in Agent Factory">
+        Open the agent you want to extend and go to its capabilities / tools.
+      </Step>
+      <Step title="Add the GitLab capability">
+        Browse the capability catalog, select **GitLab**, and enable it. The MCP endpoint URL and the *Scope* (`context_id,agent_id,user_id`) are already wired by the admin — nothing to paste, and the shared instance accepts every agent, so there is no allowlist step on your side.
+      </Step>
+      <Step title="Connect a GitLab account">
+        On the first tool call, an unconnected user is prompted to sign in — Agent Factory surfaces a `connect_url` to GitLab's authorization page. After sign-in the per-user token is stored and reused on subsequent calls; refresh is automatic.
+      </Step>
+    </Steps>
+
+    <Note>
+      Convenient, but your agent runs against a **shared, platform-managed instance**: its GitLab credentials are owned by someone else and the instance accepts every agent that is granted the capability. Prefer Option B for anything beyond quick experiments.
+    </Note>
+
+    ## Option B — Run it from your own workspace (recommended)
+
+    For production agents, install the connector in **your own workspace** and point the agent at *that* workspace's MCP endpoint.
+
+    <Warning>
+      **Prefer this mode for security.** Because the MCP runs in *your* app-instance context, the GitLab credentials, the per-user OAuth tokens and the authorized-agents allowlist are all **scoped to your workspace** — not shared platform-wide. You decide exactly which agents may call it and which GitLab account / auth mode backs them, and a misconfiguration elsewhere can never expose your data. The shared catalog capability (Option A) is a broad surface many agents can reach; your own workspace is an isolated, least-privilege boundary.
+    </Warning>
+
+    <Steps>
+      <Step title="Install and configure the connector in your workspace">
+        Follow the *Workspace builder* tab: install **GitLab** in your workspace, open its **Configuration app**, choose the auth mode and connect a GitLab account.
+      </Step>
+      <Step title="Allowlist your agent">
+        In that workspace's config app, open **Authorized agents** and tick your agent (the **Install capability** button does this for you), or enable **Allow all agents**.
+      </Step>
+      <Step title="Add the MCP capability to your agent">
+        In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
+
+        ```text
+        context_id,agent_id,user_id
+        ```
+
+        The `agent_id` is what lets the connector identify and authorize your agent — without it, every call is rejected with an explicit "agent could not be identified" message. This *Scope* is separate from the GitLab OAuth scopes.
+      </Step>
+      <Step title="Connect a GitLab account">
+        On the first tool call, the user is prompted to sign in (or uses **Connect** in the config app). The per-user token is stored and reused; refresh is automatic.
+      </Step>
+    </Steps>
+
+    ## Brief the agent in its system prompt
+
+    Whichever option you pick, wiring the capability is not enough — the agent must know the connector exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+
+    ```text
+    You have access to the GitLab MCP server. Use it whenever the user asks about GitLab content — projects, issues, merge requests, pipelines, jobs, branches, commits, tags, releases, milestones or members. Examples: "List my open merge requests", "What's failing in pipeline #1234?", "Create an issue in project X with label bug", "Show the latest release of my main project". Each tool is an entity that takes an `action` argument. Prefer calling tools over guessing, and confirm with the user before any destructive action (close an issue, merge or revert an MR, delete a branch, cancel a pipeline).
+    ```
+
+    Refine the trigger keywords (project names, group names, label conventions) so the agent reliably picks up the right intent in your context.
+
+    <Note>
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the config app and its identity propagated so the connector can read its `agent_id`.
+    </Note>
+
+    ## Available Tools
+
+    Tools are grouped by resource. Each MCP tool takes an `action` argument selecting the operation, plus the parameters for that action. Every tool also accepts an `outputFormat` parameter (see *Output Formats*).
+
+    ### Projects
+
+    | Tool | Description |
+    |------|-------------|
+    | `projects` | Projects (repositories) and their settings, members, webhooks and CI/CD variables. Actions: `list` (pass `membership:true` or `owned:true` for *my* projects), `get`, `create`, `update`, `delete`, `fork`, `archive`, `unarchive`, `listMembers`, `addMember`, `removeMember`, `listHooks`, `createHook`, `deleteHook`, `listVariables`, `createVariable`, `updateVariable`, `deleteVariable`. |
+
+    ### Issues
+
+    | Tool | Description |
+    |------|-------------|
+    | `issues` | Issues and their notes. Actions: `list` (one project), `listAll` (across all accessible projects — use for "my issues" with `scope:assigned_to_me`/`created_by_me`), `listGroup`, `get`, `create`, `update`, `close`, `reopen`, `delete`, `listNotes`, `getNote`, `createNote`, `updateNote`, `deleteNote`. |
+
+    ### Merge Requests
+
+    | Tool | Description |
+    |------|-------------|
+    | `mergeRequests` | Merge requests and their notes. Actions: `list`, `listAll` (use for "my MRs" / reviews via `scope` + `reviewer_username`), `listGroup`, `get`, `create`, `update`, `delete`, `approve`, `unapprove`, `merge`, `listNotes`, `getNote`, `createNote`, `updateNote`, `deleteNote`. |
+
+    ### Repository
+
+    | Tool | Description |
+    |------|-------------|
+    | `branches` | Repository branches. Actions: `list`, `get`, `create`, `delete`. |
+    | `commits` | Repository commits. Actions: `list`, `get`, `create` (multi-file action), `cherryPick`, `revert`. |
+    | `tags` | Repository tags. Actions: `list`, `get`, `create`. |
+    | `releases` | Project releases. Actions: `list`, `get`, `create`, `delete`. |
+
+    ### CI/CD
+
+    | Tool | Description |
+    |------|-------------|
+    | `pipelines` | CI/CD pipelines. Actions: `list`, `get`, `create` (trigger a run), `retry`, `cancel`. |
+    | `pipelineJobs` | CI/CD jobs within a pipeline. Actions: `list`, `get`, `retry`. |
+    | `environments` | CI/CD environments. Actions: `list`, `get`, `stop`. |
+    | `deployKeys` | Project deploy keys. Actions: `list`, `create`, `delete`. |
+
+    ### Planning
+
+    | Tool | Description |
+    |------|-------------|
+    | `labels` | Project labels. Actions: `list`, `create`, `update`, `delete`. |
+    | `milestones` | Project milestones. Actions: `list`, `get`, `create`, `update`. |
+    | `wikiPages` | Project wiki pages. Actions: `list`, `get`, `create`. |
+
+    ### Organization
+
+    | Tool | Description |
+    |------|-------------|
+    | `groups` | Groups (namespaces). Actions: `list` (pass `owned:true` for *my* groups), `get`, `create`, `update`. |
+    | `users` | Users. Actions: `list`, `get`, `search`, `getCurrent`. |
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` parameter that controls the MCP response shape:
+
+    - **`verbose`** (default) — human-readable text for LLM consumption
+    - **`structured`** — machine-readable JSON in `structuredContent`
+    - **`both`** — both text and structured content
+
+    ## Tool Details
+
+    ### issues (create)
+
+    Open an issue in a GitLab project.
+
+    ```json
+    {
+      "name": "issues",
+      "arguments": {
+        "action": "create",
+        "id": "123456",
+        "title": "Investigate 500s on /api/v1/search",
+        "description": "Spike of 500s since 14:00 UTC.",
+        "labels": "BUG,Incident",
+        "assignee_ids": ["987654"]
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `create` |
+    | `id` | Yes | Project ID (numeric) or URL-encoded `namespace/project` |
+    | `title` | Yes | Issue title |
+    | `description` | No | Markdown body |
+    | `labels` | No | Comma-separated label names |
+    | `assignee_ids` | No | Array of user IDs |
+    | `milestone_id` | No | Milestone ID to associate |
+    | `confidential` | No | `true` to make the issue confidential |
+    | `due_date` | No | `YYYY-MM-DD` |
+
+    ### mergeRequests (create)
+
+    ```json
+    {
+      "name": "mergeRequests",
+      "arguments": {
+        "action": "create",
+        "id": "123456",
+        "source_branch": "feature/auto-deploy",
+        "target_branch": "main",
+        "title": "Automate staging deploy",
+        "description": "Closes #42",
+        "remove_source_branch": true
+      }
+    }
+    ```
+
+    `source_branch`, `target_branch` and `title` are required. Accepts `assignee_ids`, `reviewer_ids`, `labels`, `milestone_id`, `squash`.
+
+    ### pipelines (create)
+
+    Trigger a new pipeline on a given ref. Requires a `.gitlab-ci.yml` at the ref.
+
+    ```json
+    {
+      "name": "pipelines",
+      "arguments": {
+        "action": "create",
+        "id": "123456",
+        "ref": "main",
+        "variables": [
+          { "key": "DEPLOY_ENV", "value": "staging" }
+        ]
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `create` |
+    | `id` | Yes | Project ID |
+    | `ref` | Yes | Branch or tag to run against |
+    | `variables` | No | Array of `{key, value, variable_type?}` overrides |
+
+    ### projects (list)
+
+    List accessible projects. By default returns ALL accessible projects including public ones. Pass `membership: true` or `owned: true` to limit to the user's own projects.
+
+    ```json
+    {
+      "name": "projects",
+      "arguments": {
+        "action": "list",
+        "membership": true,
+        "order_by": "last_activity_at",
+        "sort": "desc",
+        "per_page": 20
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `list` |
+    | `membership` | No | `true` → only projects the user is a member of |
+    | `owned` | No | `true` → only projects the user owns |
+    | `search` | No | Free-text filter on project name/path |
+    | `visibility` | No | `public` / `internal` / `private` |
+    | `order_by` | No | e.g. `last_activity_at`, `created_at`, `name` |
+    | `sort` | No | `asc` / `desc` |
+    | `per_page` | No | 1-100 (default 20) |
+
+    ### mergeRequests (merge)
+
+    Merge an open merge request. The MR must be in a mergeable state.
+
+    ```json
+    {
+      "name": "mergeRequests",
+      "arguments": {
+        "action": "merge",
+        "id": "123456",
+        "iid": "1",
+        "squash": true,
+        "should_remove_source_branch": true
+      }
+    }
+    ```
+
+    Accepts `merge_commit_message`, `squash_commit_message`, `merge_when_pipeline_succeeds`, `sha` (to fail if HEAD changed).
+  </Tab>
+
+  <Tab title="Workspace builder (DSUL)">
+    ## Workspace builder
+
+    **Goal:** install the connector in a workspace, configure authentication and the agent allowlist, and call GitLab operations from your automations.
+
     ## Installation
 
     1. Go to **Apps** in your workspace
     2. Search for **GitLab** and install it
-    3. Open the app instance configuration and fill in the required fields
+    3. Open the **Configuration app** (the link auto-populated on install) to choose the auth mode, provide credentials, connect a GitLab account, and allow the agents that may call the connector
 
     ## Configuration
 
     | Field | Description |
     |-------|-------------|
-    | **GitLab API Base URL** | Base URL of the GitLab API (default `https://gitlab.com/api/v4`). Override for self-hosted instances. |
-    | **Personal Access Token** | GitLab PAT with `api` scope, stored as a workspace secret. Required when calling the MCP endpoint with the `mcp-api-key` header (tenant mode). Leave empty to use the central OAuth shared by the platform admin. |
-    | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this instance. |
-    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header for tenant PAT mode. Do not modify. |
+    | **Configuration app** | Auto-populated on install — open this link to configure authentication (mode + credentials), connect a GitLab account (OAuth modes), and manage the authorized-agents allowlist. |
+
+    The configuration app drives everything; the app instance itself has no per-field credential form. From it you pick one of:
+
+    | Auth mode | What you provide | Best for |
+    |-----------|------------------|----------|
+    | `oauthCentral` | Nothing — just click **Connect** | Workspaces on a platform where the maintainer set up the central GitLab client |
+    | `oauth` | Your own GitLab **Application ID + Secret** (redirect URI shown in the config app: `<api-url>/workspaces/slug:<your-workspace>/webhooks/<app-instance>.oauthCallback`) | You manage your own GitLab OAuth app |
+    | `accessToken` | A pre-minted GitLab **access token** / Personal Access Token with the `api` scope | Short-lived or caller-managed tokens, service-account / non-interactive automations |
 
     <Note>
-      OAuth credentials (Client ID / Client Secret / authorization URL / token URL / scopes) are NOT part of the app instance config anymore — they live in the Secrets of the central `gitlab` workspace and are shared by all callers in central mode. See the *Setup* section above.
+      Credentials are stored in the workspace's Secrets (`gitlabAuth`) and resolved server-side. The agent allowlist (**Authorized agents**, secret `gitlabAuthorizedAgents`) gates which Agent Factory agents may call the MCP endpoint — see the *Agent builder* tab. Builder automations calling `GitLab.op:` instructions resolve the same workspace credentials.
     </Note>
 
     ## Available Instructions
 
-    Every instruction resolves credentials from the workspace configuration.
+    Every instruction resolves credentials from the workspace configuration. The MCP server exposes the same operations behind the 16 entity tools (see the *Agent builder* tab).
 
-        ### Projects
+    ### Projects
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listProjects` | `search`, `visibility`, `owned`, `membership`, `order_by`, `sort`, `per_page`, `page` |
-    | `createProject` | `name`*, `path`, `namespace_id`, `description`, `visibility`, `default_branch`, `initialize_with_readme` |
-    | `getProject` | `id`* |
-    | `updateProject` | `id`*, `name`, `path`, `description`, `visibility`, `default_branch` |
-    | `deleteProject` | `id`* |
-    | `archiveProject` | `id`* |
-    | `unarchiveProject` | `id`* |
-    | `forkProject` | `id`*, `namespace`, `namespace_id`, `name`, `path` |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listProjects` | List accessible projects; pass `membership`/`owned` for *my* projects, plus `search`, `visibility`, `order_by`, `sort`, `per_page`, `page` | `[ { id, name, path_with_namespace, visibility, ... } ]` |
+    | `createProject` | Create a project by `name` (+ `path`, `namespace_id`, `description`, `visibility`, `default_branch`, `initialize_with_readme`) | `{ id, name, web_url, ... }` |
+    | `getProject` | Get a project by `id` | `{ id, name, namespace, ... }` |
+    | `updateProject` | Update a project by `id` (`name`, `path`, `description`, `visibility`, `default_branch`) | `{ id, name, ... }` |
+    | `deleteProject` | Delete a project by `id` | Empty (HTTP 202) |
+    | `archiveProject` | Archive a project by `id` | `{ id, archived: true }` |
+    | `unarchiveProject` | Unarchive a project by `id` | `{ id, archived: false }` |
+    | `forkProject` | Fork a project by `id` into a `namespace`/`namespace_id` (+ `name`, `path`) | `{ id, forked_from_project, ... }` |
 
     ### Issues
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listIssues` | `id`*, `state`, `labels`, `milestone`, `search`, `assignee_username`, `per_page`, `page` |
-    | `createIssue` | `id`*, `title`*, `description`, `labels`, `assignee_ids`, `milestone_id`, `confidential`, `due_date` |
-    | `getIssue` | `id`*, `iid`* |
-    | `updateIssue` | `id`*, `iid`*, `title`, `description`, `labels`, `assignee_ids`, `milestone_id`, `state_event` |
-    | `deleteIssue` | `id`*, `iid`* |
-    | `closeIssue` | `id`*, `iid`* |
-    | `reopenIssue` | `id`*, `iid`* |
-    | `listIssueNotes` | `id`*, `iid`*, `sort`, `order_by`, `per_page` |
-    | `createIssueNote` | `id`*, `iid`*, `body`*, `confidential` |
-    | `getIssueNote` | `id`*, `iid`*, `note_id`* |
-    | `updateIssueNote` | `id`*, `iid`*, `note_id`*, `body`* |
-    | `deleteIssueNote` | `id`*, `iid`*, `note_id`* |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listIssues` | List issues of project `id` (`state`, `labels`, `milestone`, `search`, `assignee_username`, `per_page`, `page`) | `[ { iid, title, state, ... } ]` |
+    | `createIssue` | Create an issue in `id` with `title` (+ `description`, `labels`, `assignee_ids`, `milestone_id`, `confidential`, `due_date`) | `{ iid, title, web_url, ... }` |
+    | `getIssue` | Get issue `iid` of project `id` | `{ iid, title, description, ... }` |
+    | `updateIssue` | Update issue `iid` of `id` (`title`, `description`, `labels`, `assignee_ids`, `milestone_id`, `state_event`) | `{ iid, ... }` |
+    | `deleteIssue` | Delete issue `iid` of `id` | Empty (HTTP 204) |
+    | `closeIssue` | Close issue `iid` (state_event=close) | `{ iid, state: "closed" }` |
+    | `reopenIssue` | Reopen issue `iid` (state_event=reopen) | `{ iid, state: "opened" }` |
+    | `listIssueNotes` | List notes of issue `iid` (`sort`, `order_by`, `per_page`) | `[ { id, body, author, ... } ]` |
+    | `createIssueNote` | Add a note (`body`) on issue `iid` (+ `confidential`) | `{ id, body, ... }` |
+    | `getIssueNote` | Get note `note_id` of issue `iid` | `{ id, body, ... }` |
+    | `updateIssueNote` | Update note `note_id` body of issue `iid` | `{ id, body, ... }` |
+    | `deleteIssueNote` | Delete note `note_id` of issue `iid` | Empty (HTTP 204) |
 
     ### Merge Requests
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listMergeRequests` | `id`*, `state`, `source_branch`, `target_branch`, `labels`, `search`, `per_page` |
-    | `createMergeRequest` | `id`*, `source_branch`*, `target_branch`*, `title`*, `description`, `assignee_ids`, `reviewer_ids`, `labels`, `milestone_id`, `remove_source_branch`, `squash` |
-    | `getMergeRequest` | `id`*, `iid`* |
-    | `updateMergeRequest` | `id`*, `iid`*, `title`, `description`, `target_branch`, `assignee_ids`, `labels`, `milestone_id`, `state_event` |
-    | `deleteMergeRequest` | `id`*, `iid`* |
-    | `mergeMergeRequest` | `id`*, `iid`*, `merge_commit_message`, `squash_commit_message`, `squash`, `should_remove_source_branch`, `merge_when_pipeline_succeeds`, `sha` |
-    | `approveMergeRequest` | `id`*, `iid`*, `sha` |
-    | `unapproveMergeRequest` | `id`*, `iid`* |
-    | `listMergeRequestNotes` | `id`*, `iid`*, `sort`, `order_by`, `per_page` |
-    | `createMergeRequestNote` | `id`*, `iid`*, `body`* |
-    | `getMergeRequestNote` | `id`*, `iid`*, `note_id`* |
-    | `updateMergeRequestNote` | `id`*, `iid`*, `note_id`*, `body`* |
-    | `deleteMergeRequestNote` | `id`*, `iid`*, `note_id`* |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listMergeRequests` | List MRs of `id` (`state`, `source_branch`, `target_branch`, `labels`, `search`, `per_page`) | `[ { iid, title, state, ... } ]` |
+    | `createMergeRequest` | Create an MR in `id` (`source_branch`, `target_branch`, `title` + `description`, `assignee_ids`, `reviewer_ids`, `labels`, `milestone_id`, `remove_source_branch`, `squash`) | `{ iid, title, web_url, ... }` |
+    | `getMergeRequest` | Get MR `iid` of `id` | `{ iid, title, merge_status, ... }` |
+    | `updateMergeRequest` | Update MR `iid` of `id` (`title`, `description`, `target_branch`, `assignee_ids`, `labels`, `milestone_id`, `state_event`) | `{ iid, ... }` |
+    | `deleteMergeRequest` | Delete MR `iid` of `id` | Empty (HTTP 204) |
+    | `mergeMergeRequest` | Merge MR `iid` of `id` (`merge_commit_message`, `squash`, `should_remove_source_branch`, `merge_when_pipeline_succeeds`, `sha`) | `{ iid, state: "merged", ... }` |
+    | `approveMergeRequest` | Approve MR `iid` of `id` (+ `sha`) | `{ id, approved_by, ... }` |
+    | `unapproveMergeRequest` | Remove your approval on MR `iid` of `id` | Empty (HTTP 204) |
+    | `listMergeRequestNotes` | List notes of MR `iid` (`sort`, `order_by`, `per_page`) | `[ { id, body, ... } ]` |
+    | `createMergeRequestNote` | Add a note (`body`) on MR `iid` | `{ id, body, ... }` |
+    | `getMergeRequestNote` | Get note `note_id` of MR `iid` | `{ id, body, ... }` |
+    | `updateMergeRequestNote` | Update note `note_id` body of MR `iid` | `{ id, body, ... }` |
+    | `deleteMergeRequestNote` | Delete note `note_id` of MR `iid` | Empty (HTTP 204) |
 
-    ### Branches
+    ### Branches & Commits
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listBranches` | `id`*, `search`, `per_page` |
-    | `createBranch` | `id`*, `branch`*, `ref`* |
-    | `getBranch` | `id`*, `branch`* |
-    | `deleteBranch` | `id`*, `branch`* |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listBranches` | List branches of `id` (`search`, `per_page`) | `[ { name, commit, protected } ]` |
+    | `createBranch` | Create `branch` from `ref` in `id` | `{ name, commit, ... }` |
+    | `getBranch` | Get `branch` of `id` | `{ name, commit, merged, ... }` |
+    | `deleteBranch` | Delete `branch` of `id` | Empty (HTTP 204) |
+    | `listCommits` | List commits of `id` (`ref_name`, `since`, `until`, `path`, `author`, `per_page`) | `[ { id, title, author_name, ... } ]` |
+    | `createCommit` | Create a commit on `branch` of `id` with `commit_message` + `actions` (multi-file) | `{ id, short_id, web_url, ... }` |
+    | `getCommit` | Get commit `sha` of `id` | `{ id, title, stats, ... }` |
+    | `cherryPickCommit` | Cherry-pick `sha` onto `branch` of `id` (+ `dry_run`, `message`) | `{ id, short_id, ... }` |
+    | `revertCommit` | Revert `sha` on `branch` of `id` (+ `dry_run`) | `{ id, short_id, ... }` |
 
-    ### Commits
+    ### Tags & Releases
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listCommits` | `id`*, `ref_name`, `since`, `until`, `path`, `author`, `per_page` |
-    | `createCommit` | `id`*, `branch`*, `commit_message`*, `start_branch`, `start_sha`, `author_email`, `author_name`, `actions`* |
-    | `getCommit` | `id`*, `sha`* |
-    | `cherryPickCommit` | `id`*, `sha`*, `branch`*, `dry_run`, `message` |
-    | `revertCommit` | `id`*, `sha`*, `branch`*, `dry_run` |
-
-    ### Tags
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listTags` | `id`*, `search`, `order_by`, `sort`, `per_page` |
-    | `createTag` | `id`*, `tag_name`*, `ref`*, `message` |
-    | `getTag` | `id`*, `tag_name`* |
-
-    ### Releases
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listReleases` | `id`*, `order_by`, `sort`, `per_page` |
-    | `createRelease` | `id`*, `name`, `tag_name`*, `description`, `ref`, `released_at` |
-    | `getRelease` | `id`*, `tag_name`* |
-    | `deleteRelease` | `id`*, `tag_name`* |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listTags` | List tags of `id` (`search`, `order_by`, `sort`, `per_page`) | `[ { name, target, commit } ]` |
+    | `createTag` | Create `tag_name` from `ref` in `id` (+ `message`) | `{ name, target, ... }` |
+    | `getTag` | Get `tag_name` of `id` | `{ name, target, commit }` |
+    | `listReleases` | List releases of `id` (`order_by`, `sort`, `per_page`) | `[ { tag_name, name, released_at } ]` |
+    | `createRelease` | Create a release for `tag_name` in `id` (+ `name`, `description`, `ref`, `released_at`) | `{ tag_name, name, ... }` |
+    | `getRelease` | Get release by `tag_name` of `id` | `{ tag_name, name, assets, ... }` |
+    | `deleteRelease` | Delete release `tag_name` of `id` | `{ tag_name, ... }` |
 
     ### Pipelines & Jobs
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listPipelines` | `id`*, `status`, `ref`, `sha`, `username`, `order_by`, `sort`, `per_page` |
-    | `createPipeline` | `id`*, `ref`*, `variables` |
-    | `getPipeline` | `id`*, `pipeline_id`* |
-    | `retryPipeline` | `id`*, `pipeline_id`* |
-    | `cancelPipeline` | `id`*, `pipeline_id`* |
-    | `listPipelineJobs` | `id`*, `pipeline_id`*, `scope`, `per_page` |
-    | `getJob` | `id`*, `job_id`* |
-    | `retryJob` | `id`*, `job_id`* |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listPipelines` | List pipelines of `id` (`status`, `ref`, `sha`, `username`, `order_by`, `sort`, `per_page`) | `[ { id, status, ref, sha } ]` |
+    | `createPipeline` | Trigger a pipeline on `ref` of `id` (+ `variables`) | `{ id, status, web_url, ... }` |
+    | `getPipeline` | Get pipeline `pipeline_id` of `id` | `{ id, status, duration, ... }` |
+    | `retryPipeline` | Retry failed/canceled jobs of pipeline `pipeline_id` | `{ id, status: "running", ... }` |
+    | `cancelPipeline` | Cancel pipeline `pipeline_id` of `id` | `{ id, status: "canceled", ... }` |
+    | `listPipelineJobs` | List jobs of pipeline `pipeline_id` (`scope`, `per_page`) | `[ { id, name, status, stage } ]` |
+    | `getJob` | Get job `job_id` of `id` | `{ id, name, status, ... }` |
+    | `retryJob` | Retry job `job_id` of `id` | `{ id, status: "pending", ... }` |
 
     ### Environments
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listEnvironments` | `id`*, `name`, `search`, `states`, `per_page` |
-    | `getEnvironment` | `id`*, `environment_id`* |
-    | `stopEnvironment` | `id`*, `environment_id`* |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listEnvironments` | List environments of `id` (`name`, `search`, `states`, `per_page`) | `[ { id, name, state, external_url } ]` |
+    | `getEnvironment` | Get `environment_id` of `id` | `{ id, name, last_deployment, ... }` |
+    | `stopEnvironment` | Stop environment `environment_id` of `id` | `{ id, state: "stopped" }` |
 
-    ### Labels
+    ### Labels & Milestones
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listLabels` | `id`*, `with_counts`, `search`, `per_page` |
-    | `createLabel` | `id`*, `name`*, `color`*, `description`, `priority` |
-    | `updateLabel` | `id`*, `name`, `label_id`, `new_name`, `color`, `description`, `priority` |
-    | `deleteLabel` | `id`*, `name`, `label_id` |
-
-    ### Milestones
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listMilestones` | `id`*, `state`, `search`, `per_page` |
-    | `createMilestone` | `id`*, `title`*, `description`, `due_date`, `start_date` |
-    | `getMilestone` | `id`*, `milestone_id`* |
-    | `updateMilestone` | `id`*, `milestone_id`*, `title`, `description`, `due_date`, `start_date`, `state_event` |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listLabels` | List labels of `id` (`with_counts`, `search`, `per_page`) | `[ { id, name, color, ... } ]` |
+    | `createLabel` | Create label `name` with `color` in `id` (+ `description`, `priority`) | `{ id, name, color }` |
+    | `updateLabel` | Update label (by `name` or `label_id`) of `id` (`new_name`, `color`, `description`, `priority`) | `{ id, name, color }` |
+    | `deleteLabel` | Delete label (by `name` or `label_id`) of `id` | Empty (HTTP 204) |
+    | `listMilestones` | List milestones of `id` (`state`, `search`, `per_page`) | `[ { id, title, state, due_date } ]` |
+    | `createMilestone` | Create milestone `title` in `id` (+ `description`, `due_date`, `start_date`) | `{ id, title, ... }` |
+    | `getMilestone` | Get `milestone_id` of `id` | `{ id, title, state, ... }` |
+    | `updateMilestone` | Update `milestone_id` of `id` (`title`, `description`, `due_date`, `start_date`, `state_event`) | `{ id, title, ... }` |
 
     ### Wiki
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listWikiPages` | `id`*, `with_content` |
-    | `createWikiPage` | `id`*, `title`*, `content`*, `format` |
-    | `getWikiPage` | `id`*, `slug`*, `render_html`, `version` |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listWikiPages` | List wiki pages of `id` (+ `with_content`) | `[ { slug, title, format } ]` |
+    | `createWikiPage` | Create a wiki page in `id` with `title` + `content` (+ `format`) | `{ slug, title, content }` |
+    | `getWikiPage` | Get wiki page by `slug` of `id` (+ `render_html`, `version`) | `{ slug, title, content }` |
 
-    ### Webhooks
+    ### Webhooks & CI/CD Variables
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listProjectHooks` | `id`*, `per_page` |
-    | `createProjectHook` | `id`*, `url`*, `token`, `push_events`, `issues_events`, `merge_requests_events`, `tag_push_events`, `note_events`, `job_events`, `pipeline_events`, `wiki_page_events`, `enable_ssl_verification` |
-    | `deleteProjectHook` | `id`*, `hook_id`* |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listProjectHooks` | List webhooks of `id` (+ `per_page`) | `[ { id, url, ...events } ]` |
+    | `createProjectHook` | Add a webhook `url` to `id` (+ per-event boolean flags, `token`, `enable_ssl_verification`) | `{ id, url, ... }` |
+    | `deleteProjectHook` | Delete webhook `hook_id` of `id` | Empty (HTTP 204) |
+    | `listProjectVariables` | List CI/CD variables of `id` (+ `per_page`) | `[ { key, value, variable_type, ... } ]` |
+    | `createProjectVariable` | Create variable `key`=`value` in `id` (+ `variable_type`, `protected`, `masked`, `raw`, `environment_scope`, `description`) | `{ key, value, ... }` |
+    | `updateProjectVariable` | Update variable `key` of `id` (same params, `filter[environment_scope]`) | `{ key, value, ... }` |
+    | `deleteProjectVariable` | Delete variable `key` of `id` (+ `filter[environment_scope]`) | Empty (HTTP 204) |
 
-    ### CI/CD Variables
+    ### Deploy Keys & Members
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listProjectVariables` | `id`*, `per_page` |
-    | `createProjectVariable` | `id`*, `key`*, `value`*, `variable_type`, `protected`, `masked`, `raw`, `environment_scope`, `description` |
-    | `updateProjectVariable` | `id`*, `key`*, `filter[environment_scope]`, `value`, `variable_type`, `protected`, `masked`, `raw`, `environment_scope`, `description` |
-    | `deleteProjectVariable` | `id`*, `key`*, `filter[environment_scope]` |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listDeployKeys` | List deploy keys of `id` (+ `per_page`) | `[ { id, title, key, can_push } ]` |
+    | `createDeployKey` | Add deploy key `title`/`key` to `id` (+ `can_push`) | `{ id, title, ... }` |
+    | `deleteDeployKey` | Delete deploy key `key_id` of `id` | Empty (HTTP 204) |
+    | `listProjectMembers` | List direct members of `id` (`query`, `per_page`) | `[ { id, username, access_level } ]` |
+    | `addProjectMember` | Add user `user_id` to `id` with `access_level` (+ `expires_at`) | `{ id, username, access_level }` |
+    | `removeProjectMember` | Remove member `user_id` from `id` | Empty (HTTP 204) |
 
-    ### Deploy Keys
+    ### Users & Groups
 
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listDeployKeys` | `id`*, `per_page` |
-    | `createDeployKey` | `id`*, `title`*, `key`*, `can_push` |
-    | `deleteDeployKey` | `id`*, `key_id`* |
-
-    ### Project Members
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listProjectMembers` | `id`*, `query`, `per_page` |
-    | `addProjectMember` | `id`*, `user_id`*, `access_level`*, `expires_at` |
-    | `removeProjectMember` | `id`*, `user_id`* |
-
-    ### Users
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `getCurrentUser` | – |
-    | `getUser` | `user_id`* |
-    | `listUsers` | `active`, `blocked`, `username`, `per_page`, `page` |
-    | `searchUsers` | `search`*, `per_page` |
-
-    ### Groups
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listGroups` | `search`, `owned`, `min_access_level`, `top_level_only`, `per_page` |
-    | `createGroup` | `name`*, `path`*, `description`, `visibility`, `parent_id` |
-    | `getGroup` | `id`* |
-    | `updateGroup` | `id`*, `name`, `path`, `description`, `visibility` |
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `getCurrentUser` | Get the currently authenticated user | `{ id, username, name, email }` |
+    | `getUser` | Get a user by `user_id` | `{ id, username, name, ... }` |
+    | `listUsers` | List users (`active`, `blocked`, `username`, `per_page`, `page`) | `[ { id, username, name } ]` |
+    | `searchUsers` | Search users by `search` (name/username/email) (+ `per_page`) | `[ { id, username, name } ]` |
+    | `listGroups` | List groups (`search`, `owned`, `min_access_level`, `top_level_only`, `per_page`) | `[ { id, name, full_path } ]` |
+    | `createGroup` | Create a group `name`/`path` (+ `description`, `visibility`, `parent_id`) | `{ id, name, web_url, ... }` |
+    | `getGroup` | Get group by `id` (or URL-encoded path) | `{ id, name, projects, ... }` |
+    | `updateGroup` | Update group `id` (`name`, `path`, `description`, `visibility`) | `{ id, name, ... }` |
 
     <Note>
-      Arguments flagged with `*` are required.
+      `Returns` shows the shape of the operation output (the underlying GitLab API resource).
     </Note>
 
     ## DSUL Examples
@@ -354,408 +621,6 @@ The central OAuth flow is set up once per environment by the Prisme.ai workspace
         output: pipeline
     ```
   </Tab>
-
-  <Tab title="Usage as MCP">
-    The GitLab connector ships with a built-in MCP server hosted at one stable URL per environment:
-
-    ```
-    <api-url>/workspaces/slug:gitlab/webhooks/mcp
-    ```
-
-    The same endpoint serves two authentication modes depending on whether the caller sends an `mcp-api-key` header.
-
-    ## Plug into an Agent Creator capability (central OAuth)
-
-    The preferred path for human-facing agents. End users sign in with their own GitLab account; tokens are stored against their Prisme.ai user identity, never shared with other users of the same workspace.
-
-    <Steps>
-      <Step title="Prerequisites">
-        The platform admin has completed the *Setup* section above: OAuth Application registered at GitLab, `gitlabOauthClientId` + `gitlabOauthClientSecret` stored in the `gitlab` workspace secrets, and the GitLab capability granted in Governance to the right roles.
-      </Step>
-      <Step title="Open Agent Creator">
-        Switch to **Agent Creator** and open the agent you want to extend.
-      </Step>
-      <Step title="Add the GitLab capability">
-        Add the **GitLab** capability to the agent. No URL, no `mcp-api-key` to paste — the central endpoint is pre-wired and the caller is identified by the Prisme.ai session of whoever is talking to the agent.
-      </Step>
-      <Step title="Brief the agent in its system prompt">
-        Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Copy-pasteable starter:
-
-        ```text
-        You have access to the GitLab MCP server. Use it whenever the user asks about GitLab content — projects, issues, merge requests, pipelines, jobs, branches, commits, tags, releases, milestones or members. Examples: "List my open merge requests", "What's failing in pipeline #1234?", "Create an issue in project X with label bug", "Show the latest release of my main project". If the user is not yet connected, call the `connect` tool to obtain a sign-in link; if they are already connected, call the relevant data tool directly. Prefer calling MCP tools directly over guessing, and confirm with the user before any destructive action (close an issue, merge or revert an MR, delete a branch, cancel a pipeline).
-        ```
-
-        Refine the trigger keywords (project names, group names, label conventions) so the agent reliably picks up the right intent in your context.
-      </Step>
-      <Step title="First call → sign-in">
-        On the first GitLab tool call, the agent receives a `connect_url`. Open it in a new window: GitLab asks the user to authorize the application, then redirects back to a callback page that closes itself after 5 seconds. The agent retries the same tool call automatically.
-      </Step>
-    </Steps>
-
-    ## Tenant PAT (shared token, no per-user sign-in)
-
-    Use this when one shared token is preferable to per-user OAuth — typical for service-account workflows, automations triggered by a non-interactive bot user, or environments where the central OAuth admin setup is not available.
-
-    <Steps>
-      <Step title="Install the GitLab app in your workspace">
-        Open the workspace **Imports** panel, search for **GitLab** and install it.
-      </Step>
-      <Step title="Paste a Personal Access Token">
-        Open the freshly installed app instance settings, set the **GitLab API Base URL** (if not gitlab.com) and the **Personal Access Token** (with `api` scope). Save.
-      </Step>
-      <Step title="Copy the MCP endpoint and API key">
-        Still on the app instance configuration page, copy the values of **MCP Endpoint** and **MCP API Key** — both are generated automatically on install. The endpoint is the same as the central one above; the `mcp-api-key` identifies your tenant.
-      </Step>
-      <Step title="Wire into Agent Creator">
-        Add a new capability to the agent:
-
-        - **If a dedicated GitLab tenant capability exists** — select it and paste the **MCP API Key** into the `mcp-api-key` field.
-        - **Otherwise** — select the generic **`custom_mcp`** capability, paste the **MCP Endpoint** into the *Server URL* field, then add an `mcp-api-key` entry to the *Headers* field:
-
-          ```json
-          {
-            "mcp-api-key": "your-mcp-api-key"
-          }
-          ```
-      </Step>
-      <Step title="Save">
-        The agent now calls GitLab through the tenant PAT — every user of this agent shares the same GitLab identity (the owner of the PAT).
-      </Step>
-    </Steps>
-
-    <Note>
-      The signed `mcp-api-key` encodes the workspace ID and a `getConfig` webhook URL. The MCP server validates the signature and resolves the tenant PAT (`{{config.token}}` → `{{secret.gitlabToken}}`) server-side. The `connect` / `disconnect` tools are filtered out of `tools/list` in tenant mode — they only make sense for central OAuth.
-    </Note>
-
-    ## Output Formats
-
-    Every tool accepts an `outputFormat` parameter that controls the MCP response shape:
-
-    - **`verbose`** (default) — human-readable text for LLM consumption
-    - **`structured`** — machine-readable JSON in `structuredContent`
-    - **`both`** — both text and structured content
-
-    ## Available Tools
-
-        ### Projects
-
-    | Tool | Description |
-    |------|-------------|
-    | `listProjects` | List GitLab projects accessible to the authenticated user. **Important**: by default this returns ALL accessible projects including publi... |
-    | `createProject` | Create a new project. |
-    | `getProject` | Get a project by ID or URL-encoded namespace/path. |
-    | `updateProject` | Update an existing project. |
-    | `deleteProject` | Delete a project. |
-    | `archiveProject` | Archive a project. |
-    | `unarchiveProject` | Unarchive a project. |
-    | `forkProject` | Fork a project into the authenticated user's namespace or given namespace. |
-
-    ### Issues
-
-    | Tool | Description |
-    |------|-------------|
-    | `listIssues` | List issues of a project. |
-    | `createIssue` | Create a new issue in a project. |
-    | `getIssue` | Get a single issue by iid. |
-    | `updateIssue` | Update an existing issue. |
-    | `deleteIssue` | Delete an issue. |
-    | `closeIssue` | Close an issue (via state_event=close). |
-    | `reopenIssue` | Reopen a closed issue (via state_event=reopen). |
-    | `listIssueNotes` | List notes (comments) of an issue. |
-    | `createIssueNote` | Create a new note (comment) on an issue. |
-    | `getIssueNote` | Get a specific note from an issue. |
-    | `updateIssueNote` | Update an existing issue note. |
-    | `deleteIssueNote` | Delete an issue note. |
-
-    ### Merge Requests
-
-    | Tool | Description |
-    |------|-------------|
-    | `listMergeRequests` | List merge requests of a project. |
-    | `createMergeRequest` | Create a new merge request. |
-    | `getMergeRequest` | Get a single merge request by iid. |
-    | `updateMergeRequest` | Update an existing merge request. |
-    | `deleteMergeRequest` | Delete a merge request. |
-    | `mergeMergeRequest` | Accept and merge an open merge request. |
-    | `approveMergeRequest` | Approve a merge request. |
-    | `unapproveMergeRequest` | Unapprove a merge request. |
-    | `listMergeRequestNotes` | List notes (comments) of a merge request. |
-    | `createMergeRequestNote` | Create a note (comment) on a merge request. |
-    | `getMergeRequestNote` | Get a specific note from a merge request. |
-    | `updateMergeRequestNote` | Update an existing MR note. |
-    | `deleteMergeRequestNote` | Delete a merge request note. |
-
-    ### Branches
-
-    | Tool | Description |
-    |------|-------------|
-    | `listBranches` | List branches of a project repository. |
-    | `createBranch` | Create a new branch from a ref. |
-    | `getBranch` | Get a single branch. |
-    | `deleteBranch` | Delete a branch. |
-
-    ### Commits
-
-    | Tool | Description |
-    |------|-------------|
-    | `listCommits` | List commits of a project repository. |
-    | `createCommit` | Create a commit with one or more file actions. |
-    | `getCommit` | Get a single commit by SHA. |
-    | `cherryPickCommit` | Cherry-pick a commit onto a target branch. |
-    | `revertCommit` | Revert a commit on a target branch. |
-
-    ### Tags
-
-    | Tool | Description |
-    |------|-------------|
-    | `listTags` | List tags of a project repository. |
-    | `createTag` | Create a new tag from a ref. |
-    | `getTag` | Get a single tag. |
-
-    ### Releases
-
-    | Tool | Description |
-    |------|-------------|
-    | `listReleases` | List releases of a project. |
-    | `createRelease` | Create a new release for a tag. |
-    | `getRelease` | Get a single release by tag name. |
-    | `deleteRelease` | Delete a release. |
-
-    ### Pipelines & Jobs
-
-    | Tool | Description |
-    |------|-------------|
-    | `listPipelines` | List pipelines of a project. |
-    | `createPipeline` | Trigger a new pipeline for a given ref. |
-    | `getPipeline` | Get a single pipeline. |
-    | `retryPipeline` | Retry failed jobs in a pipeline. |
-    | `cancelPipeline` | Cancel running jobs in a pipeline. |
-    | `listPipelineJobs` | List jobs belonging to a pipeline. |
-    | `getJob` | Get a single CI job. |
-    | `retryJob` | Retry a single job. |
-
-    ### Environments
-
-    | Tool | Description |
-    |------|-------------|
-    | `listEnvironments` | List environments of a project. |
-    | `getEnvironment` | Get a single environment. |
-    | `stopEnvironment` | Stop a running environment. |
-
-    ### Labels
-
-    | Tool | Description |
-    |------|-------------|
-    | `listLabels` | List labels of a project. |
-    | `createLabel` | Create a new project label. |
-    | `updateLabel` | Update an existing project label (by name or id). |
-    | `deleteLabel` | Delete a project label (by name or id). |
-
-    ### Milestones
-
-    | Tool | Description |
-    |------|-------------|
-    | `listMilestones` | List milestones of a project. |
-    | `createMilestone` | Create a new milestone in a project. |
-    | `getMilestone` | Get a single milestone. |
-    | `updateMilestone` | Update a milestone. |
-
-    ### Wiki
-
-    | Tool | Description |
-    |------|-------------|
-    | `listWikiPages` | List wiki pages of a project. |
-    | `createWikiPage` | Create a new wiki page. |
-    | `getWikiPage` | Get a single wiki page by slug. |
-
-    ### Webhooks
-
-    | Tool | Description |
-    |------|-------------|
-    | `listProjectHooks` | List project webhooks. |
-    | `createProjectHook` | Add a new project webhook. |
-    | `deleteProjectHook` | Delete a project webhook. |
-
-    ### CI/CD Variables
-
-    | Tool | Description |
-    |------|-------------|
-    | `listProjectVariables` | List CI/CD variables of a project. |
-    | `createProjectVariable` | Create a new project CI/CD variable. |
-    | `updateProjectVariable` | Update an existing project CI/CD variable. |
-    | `deleteProjectVariable` | Delete a project CI/CD variable. |
-
-    ### Deploy Keys
-
-    | Tool | Description |
-    |------|-------------|
-    | `listDeployKeys` | List deploy keys of a project. |
-    | `createDeployKey` | Add a new deploy key to a project. |
-    | `deleteDeployKey` | Delete a deploy key from a project. |
-
-    ### Project Members
-
-    | Tool | Description |
-    |------|-------------|
-    | `listProjectMembers` | List direct members of a project. |
-    | `addProjectMember` | Add a user as a member to a project. |
-    | `removeProjectMember` | Remove a member from a project. |
-
-    ### Users
-
-    | Tool | Description |
-    |------|-------------|
-    | `getCurrentUser` | Get the currently authenticated user. |
-    | `getUser` | Get a single user by ID. |
-    | `listUsers` | List users (admin-scoped or filtered). |
-    | `searchUsers` | Search users by name, username or email. |
-
-    ### Groups
-
-    | Tool | Description |
-    |------|-------------|
-    | `listGroups` | List groups accessible to the authenticated user. |
-    | `createGroup` | Create a new group. |
-    | `getGroup` | Get a single group by ID or URL-encoded path. |
-    | `updateGroup` | Update a group. |
-
-    ### OAuth Session
-
-    | Tool | Description |
-    |------|-------------|
-    | `disconnect` | Disconnect the current GitLab OAuth session and revoke the access token at the provider (RFC 7009). Only call when the user explicitly as... |
-    | `connect` | Initiate an OAuth connection to GitLab. Returns a connect_url for the user to click. **Prefer calling data tools directly (listProjects, ... |
-
-    ## Tool Details
-
-    ### createIssue
-
-    Open an issue in a GitLab project.
-
-    ```json
-    {
-      "name": "createIssue",
-      "arguments": {
-        "id": "123456",
-        "title": "Investigate 500s on /api/v1/search",
-        "description": "Spike of 500s since 14:00 UTC.",
-        "labels": "BUG,Incident",
-        "assignee_ids": [987654]
-      }
-    }
-    ```
-
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `id` | Yes | Project ID (numeric) or URL-encoded `namespace/project` |
-    | `title` | Yes | Issue title |
-    | `description` | No | Markdown body |
-    | `labels` | No | Comma-separated label names |
-    | `assignee_ids` | No | Array of user IDs |
-    | `milestone_id` | No | Milestone ID to associate |
-    | `confidential` | No | `true` to make the issue confidential |
-    | `due_date` | No | `YYYY-MM-DD` |
-
-    ### createMergeRequest
-
-    ```json
-    {
-      "name": "createMergeRequest",
-      "arguments": {
-        "id": "123456",
-        "source_branch": "feature/auto-deploy",
-        "target_branch": "main",
-        "title": "Automate staging deploy",
-        "description": "Closes #42",
-        "remove_source_branch": true
-      }
-    }
-    ```
-
-    `source_branch`, `target_branch` and `title` are required. Accepts `assignee_id`, `reviewer_ids`, `labels`, `milestone_id`, `squash`, `allow_collaboration`.
-
-    ### createPipeline
-
-    Trigger a new pipeline on a given ref. Requires a `.gitlab-ci.yml` at the ref.
-
-    ```json
-    {
-      "name": "createPipeline",
-      "arguments": {
-        "id": "123456",
-        "ref": "main",
-        "variables": [
-          { "key": "DEPLOY_ENV", "value": "staging" }
-        ]
-      }
-    }
-    ```
-
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `id` | Yes | Project ID |
-    | `ref` | Yes | Branch or tag to run against |
-    | `variables` | No | Array of `{key, value, variable_type?}` overrides |
-
-    ### listProjects
-
-    List accessible projects. By default returns ALL accessible projects including public ones. **Pass `membership: true` or `owned: true` to limit to the user's own projects.**
-
-    ```json
-    {
-      "name": "listProjects",
-      "arguments": {
-        "membership": true,
-        "order_by": "last_activity_at",
-        "sort": "desc",
-        "per_page": 20
-      }
-    }
-    ```
-
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `membership` | No | `true` → only projects the user is a member of |
-    | `owned` | No | `true` → only projects the user owns |
-    | `search` | No | Free-text filter on project name/path |
-    | `visibility` | No | `public` / `internal` / `private` |
-    | `order_by` | No | e.g. `last_activity_at`, `created_at`, `name` |
-    | `sort` | No | `asc` / `desc` |
-    | `per_page` | No | 1-100 (default 20) |
-
-    ### createBranch
-
-    ```json
-    {
-      "name": "createBranch",
-      "arguments": {
-        "id": "123456",
-        "branch": "feature/auto-deploy",
-        "ref": "main"
-      }
-    }
-    ```
-
-    `ref` is the source branch or commit SHA. To delete a branch later use `deleteBranch` with `{id, branch}`.
-
-    ### mergeMergeRequest
-
-    Merge an open merge request. The MR must be in a mergeable state.
-
-    ```json
-    {
-      "name": "mergeMergeRequest",
-      "arguments": {
-        "id": "123456",
-        "iid": 1,
-        "squash": true,
-        "should_remove_source_branch": true
-      }
-    }
-    ```
-
-    Accepts `merge_commit_message`, `squash_commit_message`, `sha` (to fail if HEAD changed).
-  </Tab>
 </Tabs>
 
 ---
@@ -765,30 +630,28 @@ The central OAuth flow is set up once per environment by the Prisme.ai workspace
 | HTTP Status | Error | Solution |
 |-------------|-------|----------|
 | 400 | Bad request | Check argument shapes (IDs, dates, enum values) |
-| 401 | Unauthorized | Verify the PAT has `api` scope, or re-authorize OAuth |
-| 403 | Forbidden | The token lacks permission on this project/group — check access level |
-| 404 | Not Found | Verify the project ID (numeric or URL-encoded path) and resource IID |
+| 401 | Unauthorized | Sign in again (OAuth modes), or verify the access token has the `api` scope |
+| 403 | Forbidden | The token lacks permission on this project/group — check the access level |
+| 404 | Not Found | Verify the project `id` (numeric or URL-encoded path) and resource `iid` |
 | 409 | Conflict | Common on merge conflicts or concurrent updates |
-| 429 | Rate Limited | GitLab.com enforces 2000 req/min per-token; back off and retry |
+| 429 | Rate Limited | GitLab.com enforces ~2000 req/min per token; back off and retry |
 | 500 | Server Error | Transient GitLab issue; retry after a few seconds |
 
 ### Common Issues
 
-**"Authentication required: please sign in to Prisme.ai before calling the GitLab MCP without an `mcp-api-key` header"** — A caller hit the central endpoint without a valid Prisme.ai session AND without an `mcp-api-key`. Either sign in to Prisme.ai (central mode) or pass the tenant `mcp-api-key` (tenant mode).
+**"This agent is not authorized to use this connector"** — The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (id is shown in the error) or enable **Allow all agents**, and Save. The **Install capability** button does this for you.
 
-**"Central OAuth config missing"** — The `gitlabOauthClientId` / `gitlabOauthClientSecret` secrets of the central `gitlab` workspace are empty. Ask the platform admin to complete the *Setup* section above.
+**"The calling agent could not be identified"** — The MCP capability *Scope* does not declare `agent_id`, so Agent Factory never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability (this is separate from the GitLab OAuth scopes), then allow the agent in the config app.
 
-**"GitLab capability not granted"** — The current user is signed in to Prisme.ai but has not been granted the GitLab capability in Governance. Ask the platform admin.
+**"GitLab is not connected for this user"** — No per-user OAuth token is stored for the caller. Open the configuration app (OAuth mode) and click **Connect**, or use the agent's connect flow.
 
-**"Invalid mcp-api-key" (tenant mode)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
+**"GitLab token refresh failed … must reconnect"** — The stored refresh token was rejected by GitLab (revoked / expired). The connection is dropped automatically; the user must reconnect from the config app.
 
-**"This GitLab tenant has no Personal Access Token configured"** — Tenant mode was used (`mcp-api-key` header present) but the app instance's `token` field is empty. Either fill the token or drop the header to fall back to central OAuth.
+**"GitLab is not authenticated / OAuth is not configured"** — Neither a tenant OAuth client nor the central platform client is available. Set the OAuth client ID/secret in the config app (tenant mode), or ask the platform maintainer to provision the central OAuth client from the core workspace's config app.
 
-**"Can't approve own MR"** — A GitLab project access token's bot user counts as the MR author and cannot approve its own merge requests. Use a different token (PAT for a human user) for the approval step.
+**"Can't approve own MR"** — A user counts as the MR author and cannot approve its own merge requests. Connect with a different GitLab account (or use an `accessToken` from another user) for the approval step.
 
-**"pipeline creation 404"** — The target ref has no `.gitlab-ci.yml` at its root. Either commit a CI config first or pick a ref that has one.
-
-**Central OAuth — disconnecting a user** — In central mode, the agent calls the `disconnect` tool (or the user opens `<api-url>/workspaces/slug:gitlab/webhooks/disconnectOAuth`) to revoke the access token at GitLab (RFC 7009) and delete the stored secrets. The next data tool call returns a fresh `connect_url`.
+**"pipeline creation 404"** — The target ref has no `.gitlab-ci.yml` at its root. Commit a CI config first, or pick a ref that has one.
 
 ## External Resources
 
@@ -797,6 +660,6 @@ The central OAuth flow is set up once per environment by the Prisme.ai workspace
     Official GitLab REST v4 API reference
   </Card>
   <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
-    Plug MCP servers into Knowledges agents
+    Learn how Agent Factory agents consume MCP tools in Prisme.ai.
   </Card>
 </CardGroup>
