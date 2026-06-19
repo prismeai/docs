@@ -112,6 +112,27 @@ global:
   **Multi-domain frontends.** `global.consoleUrl` (env var `CONSOLE_URL`) accepts a **comma-separated list of URLs**. Every URL serves the same frontend and all of them call the single `apiUrl` — so you can expose the Studio under several hostnames (e.g. a vanity domain and an internal one) without standing up a second API. All listed origins are auto-allowlisted for CORS and for OIDC auth redirects.
 </Tip>
 
+#### Secret bootstrapping — `global.secrets.allowCreation`
+
+```yaml
+global:
+  secrets:
+    allowCreation: true   # First install only — flip to false afterwards
+```
+
+This flag controls whether the chart creates / overwrites the secrets referenced by `existingSecret` fields and the **internal secrets** it generates on its own — OIDC signing keys (`oidc`), the internal API key shared between services (`internalSecurity.apiKey`), and the workspace secrets encryption keys (`secretsEncryption.masterKeys` / `refKeys`).
+
+**Required workflow:**
+
+1. **First install** — keep `allowCreation: true` so the chart seeds the internal secrets (OIDC, internal API key, encryption keys) with freshly generated values. Without this the platform cannot start.
+2. **After the first install** — set `allowCreation: false` and keep it that way for every subsequent `helm template` render or **ArgoCD** sync. (`helm upgrade` itself has cluster API access and preserves existing secrets correctly even with `allowCreation: true`, but you still want `false` everywhere to stay safe against any pipeline that doesn't.)
+
+<Warning>
+  **Why flipping to `false` is mandatory for ArgoCD / `helm template`.** With `allowCreation: true`, the chart preserves existing secret values across upgrades by calling `lookup "v1" "Secret"` against the live cluster. **That lookup returns nothing under `helm template` and under ArgoCD's diff** (both render the chart offline, without API access). The chart then regenerates fresh random values on every render and the resulting Secret manifests overwrite the live ones — invalidating OIDC sessions, breaking inter-service auth, and **making every previously-encrypted workspace secret unrecoverable**. Setting `allowCreation: false` skips the secret manifests entirely so the live secrets are left untouched.
+</Warning>
+
+The same flag also gates whether the chart writes the connection-URL secrets (`broker`, `permissions`, `users`, `collections`, object storage…) from the inline `url` / `password` values. Once those secrets exist in the cluster, strip the plaintext credentials from your values file and leave `allowCreation: false` — the services keep reading from the live secrets via their `existingSecret` references.
+
 ### `prismeai-api-gateway`
 
 Authentication, mail, sessions, super-admin emails.
@@ -441,6 +462,10 @@ helm install prismeai-apps prismeai/prismeai-apps \
 ```
 
 Both releases are independent — order doesn't matter and you can re-run either one with `helm upgrade` after editing the matching values file.
+
+<Warning>
+  **Once both releases are up, set `global.secrets.allowCreation: false`** in `prismeai-core-values.yaml` and re-run `helm upgrade`. Leaving it at `true` will silently overwrite the internal OIDC / encryption / internal-API-key secrets the first install just seeded as soon as the chart is rendered without cluster API access — typically an ArgoCD sync or a `helm template`-based pipeline. See [Secret bootstrapping](#secret-bootstrapping-global-secrets-allowcreation) for the full rationale.
+</Warning>
 
 <Accordion title="Troubleshooting: ImagePullBackOff on the apps namespace">
   If pods stay in `ImagePullBackOff`, the registry secret was not created or doesn't carry the right credentials. The chart creates it automatically when `global.repository.create: true` — if you manage secrets externally, create it by hand:
