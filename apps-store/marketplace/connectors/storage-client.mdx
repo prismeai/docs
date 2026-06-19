@@ -1,404 +1,191 @@
 ---
 title: 'Prisme.ai Storage'
-description: 'Manage Prisme.ai files, vector stores, web crawling, RBAC bindings, API keys and skills from workflows and AI agents'
+description: 'Manage Prisme.ai files, vector stores, RAG indexing, web crawling, RBAC and API keys from Agent Factory agents and Builder workflows'
 ---
 
-The Prisme.ai Storage app is a **client connector to the Prisme.ai Storage backend** (the `slug:storage` workspace running in the current environment). It can be used either as a Builder app (automations call Storage instructions directly) or as a remote MCP server consumed by an AI agent. The connector exposes the full Storage REST API — files, vector stores, vector-store files, web crawling, RBAC access bindings, per-store API keys, agent skills and admin diagnostics — grouped into 8 entity tools covering ~38 operations.
+The Prisme.ai Storage app is a **client connector to the Prisme.ai Storage backend** (the `slug:storage` workspace running in the current environment). It can be consumed two ways: as a remote MCP server that **Agent Factory** agents call as tools, or as a Builder app whose instructions you call directly from DSUL automations. It exposes the full Storage REST API — files, vector stores, vector-store files, web crawling, RBAC access bindings, per-store API keys, agent skills and admin diagnostics — grouped into 8 entity tools covering ~38 operations.
 
-Unlike third-party SaaS connectors, **this connector does not require a per-tenant API key**. It propagates the caller's identity to the Storage backend over the platform's cross-workspace forward-auth mechanism: every call inherits the user × workspace permissions of the user who triggered it, and the Storage backend enforces its own RBAC bindings on top.
+Unlike third-party SaaS connectors, **this connector requires no credential to paste**. It runs in the installing workspace's app-instance context and propagates the caller's Prisme.ai identity to the Storage backend over the platform's cross-workspace forward-auth mechanism: every call inherits the user × workspace permissions of whoever triggered it, and the Storage backend enforces its own RBAC bindings on top. Agents are identified by the capability **Scope** `context_id,agent_id,user_id`; credentials are resolved server-side.
 
 <CardGroup cols={3}>
   <Card title="Files & Downloads" icon="folder-tree">
-    Upload by URL or bytes, list, download, share and delete files in workspace-scoped storage
+    Upload by URL or bytes, list, download, share and delete files in workspace-scoped storage.
   </Card>
   <Card title="Vector Stores & RAG" icon="layer-group">
-    Create vector stores, attach files (by `file_id` or URL), trigger reindex, run semantic search, monitor crawling
+    Create vector stores, attach files (by `file_id` or URL), trigger reindex, run semantic search, monitor crawling.
   </Card>
   <Card title="Access, Keys & Skills" icon="key">
-    Grant/revoke RBAC bindings per principal, create and rotate per-store API keys, manage reusable agent skills
+    Grant/revoke RBAC bindings per principal, create and rotate per-store API keys, manage reusable agent skills.
+  </Card>
+</CardGroup>
+
+## Who is this for?
+
+This connector is used by three different roles. Jump to the section that matches yours — each one is self-contained.
+
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot">
+    You build agents in **Agent Factory** and want them to manage files, vector stores and RAG. → *Agent builder* tab.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved">
+    You run the platform and want to expose Storage as a reusable capability once for everyone. → *Platform admin setup* accordion below.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece">
+    You write Builder automations (DSUL) that call Storage instructions directly. → *Workspace builder* tab.
   </Card>
 </CardGroup>
 
 ## Prerequisites
 
 - A Prisme.ai workspace with the **Prisme.ai Storage** app installed.
-- The end user calling the connector must have the appropriate **role on the target vector store / file**:
-  - **`viewer`** — read files, list vector stores, run semantic search
-  - **`contributor`** — add/remove files in a vector store, trigger recrawls
-  - **`owner`** — manage access bindings, API keys, skills; delete vector stores
-  - **`admin`** (platform admin) — `admin.getStats`, `admin.healthCheck`, cross-workspace listings (`scope=all`)
-- For URL-based ingestion (`files.upload` with `url=...`, `vectorStoreFiles.add` with `url=...`), the URL must be reachable from the Storage backend (public URL or a Prisme.ai `share_token`).
+- The Storage backend ships pre-wired to the **current environment** (sandbox or prod) — there is **no `baseUrl`, service URL or API token to configure**. The connector resolves the Storage workspace via `slug:storage` and forwards the caller's authentication automatically.
+- The end user (or agent's calling user) must hold the appropriate **role on the target vector store / file**:
+  - **`viewer`** — read files, list vector stores, run semantic search.
+  - **`contributor`** — add/remove files in a vector store, trigger recrawls.
+  - **`owner`** — manage access bindings, API keys and skills; delete vector stores.
+  - **`admin`** (platform admin) — `admin.getStats`, `admin.healthCheck`, cross-workspace listings (`scope=all`).
+- For URL-based ingestion (`files.upload` with `url=…`, `vectorStoreFiles.add` with `url=…`), the URL must be reachable from the Storage backend (a public URL or a Prisme.ai `share_token`).
 
-<Note>
-  This connector ships pre-wired to the Storage backend of the **current environment** (sandbox or prod). No `baseUrl` or service URL needs to be configured. The MCP server resolves the Storage workspace via `slug:storage` and forwards the caller's authentication automatically.
-</Note>
+<Accordion title="Platform admin (Governance) — one-time platform setup" icon="shield-halved">
+  <Note>
+    **No platform-level credential.** This connector carries no third-party API key — each workspace installs the app and the caller's Prisme.ai identity is forwarded to the Storage backend automatically. There is nothing to register in Studio Secrets and no per-tenant credential to provision.
+  </Note>
+
+  The only optional one-time task is to expose Storage as a reusable **capability** in AI Governance, so agent builders can enable it from the capability picker instead of pasting an MCP endpoint URL.
+
+  ## Declare the capability in AI Governance
+
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) a **Prisme.ai Storage** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the connector's **MCP Endpoint** (read from the installed app instance), and set its **Scope** to:
+
+      ```text
+      context_id,agent_id,user_id
+      ```
+
+      The `agent_id` and `user_id` in the scope are what let the connector identify the calling agent and forward the user's identity to the Storage backend.
+    </Step>
+    <Step title="Make it available to agent builders">
+      Once created, the capability appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
+    </Step>
+    <Step title="Smoke-test">
+      From an agent that has the capability, ask it to list vector stores or files. The call runs as the agent's user, and the Storage backend returns only the resources that user can see.
+    </Step>
+  </Steps>
+
+  <Warning>
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent against any data. Authorization is enforced by the **Storage backend's own RBAC bindings**, evaluated against the forwarded caller identity — a user (or agent's user) only ever sees the stores and files they hold a role on. There is no OAuth auth-config JSON to attach in Governance: authentication is the forwarded Prisme.ai identity, not a per-user OAuth flow.
+  </Warning>
+</Accordion>
 
 ---
 
 <Tabs>
-  <Tab title="Usage as App">
-    ## Installation
+  <Tab title="Agent builder (Agent Factory)">
+    ## Agent builder
 
-    1. Go to **Apps** in your workspace
-    2. Search for **Prisme.ai Storage** and install it
-    3. Open the app instance configuration — only the MCP endpoint and key are surfaced; both are auto-populated
-
-    ## Configuration
-
-    | Field | Description |
-    |-------|-------------|
-    | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this instance |
-    | **MCP API Key** | Auto-populated on install — signed key used in the `mcp-api-key` header. Do not modify |
+    **Goal:** let an agent you build in Agent Factory manage files, vector stores and RAG through the Storage MCP tools.
 
     <Note>
-      There is no third-party credential to configure. The connector forwards the caller's Prisme.ai identity to the Storage backend on every call, and the backend enforces its own RBAC bindings (see *Access* below).
+      Before an agent can call the connector, a *Workspace builder* must have installed the Prisme.ai Storage app in a workspace (see the *Workspace builder* tab) — or a *Platform admin* must have published the capability in AI Governance (see the *Platform admin setup* accordion above).
     </Note>
 
-    ## Available Instructions
-
-    Every instruction resolves identity from the caller's authenticated request. All vector-store-scoped operations target a `vector_store_id`; file operations take a `file_id`; cross-store operations take a `scope` (`own`, `shared`, or `all` for admins).
-
-    ### Files
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listFiles` | `conversation_id`, `purpose`, `status`, `limit`, `page` |
-    | `uploadFile` | `url`, `purpose`, `file_name`, `mime_type`, `bytes` |
-    | `getFile` | `file_id`* |
-    | `deleteFile` | `file_id`* |
-    | `downloadFileContent` | `file_id`*, `redirect`, `share_token` |
-
-    ### Vector Stores
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listVectorStores` | `scope` (`own`/`shared`/`all`), `pageSize`, `page`, `status`, `agent_id`, `include_agents` |
-    | `createVectorStore` | `name`*, `description`, `embedding`*, `chunking`, `metadata` |
-    | `getVectorStore` | `vector_store_id`* |
-    | `updateVectorStore` | `vector_store_id`*, `name`, `description`, `metadata` |
-    | `deleteVectorStore` | `vector_store_id`* |
-    | `searchVectorStore` | `vector_store_id`*, `query`*, `top_k`, `filters`, `include_metadata` |
-    | `reindexAllVectorStoreFiles` | `vector_store_id`* |
-    | `getVectorStoreAdminUrl` | `vector_store_id`* |
-
-    ### Vector Store Files
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listVectorStoreFiles` | `vector_store_id`*, `status`, `limit`, `page`, `agent_id` |
-    | `addFileToVectorStore` | `vector_store_id`*, `file_id`, `url`, `tags`, `metadata`, `force_recrawl`, `file_name`, `mime_type`, `headers`, `agent_id` |
-    | `getVectorStoreFile` | `vector_store_id`*, `file_id`* |
-    | `updateVectorStoreFile` | `vector_store_id`*, `file_id`*, `tags`, `metadata` |
-    | `deleteVectorStoreFile` | `vector_store_id`*, `file_id`* |
-    | `getVectorStoreFileChunks` | `vector_store_id`*, `file_id`*, `limit`, `page` |
-    | `reindexVectorStoreFile` | `vector_store_id`*, `file_id`* |
-
-    ### Web Crawling
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `getCrawlStatus` | `vector_store_id`* |
-    | `recrawlWebSources` | `vector_store_id`*, `websites` |
-    | `getWebSourceCounts` | `vector_store_id`* |
-
-    ### Access (RBAC)
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listVectorStoreAccess` | `vector_store_id`*, `limit`, `page` |
-    | `grantVectorStoreAccess` | `vector_store_id`*, `principal_type`*, `principal_id`*, `role`* |
-    | `updateVectorStoreAccess` | `vector_store_id`*, `binding_id`*, `role`* |
-    | `revokeVectorStoreAccess` | `vector_store_id`*, `binding_id`* |
-
-    ### API Keys
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listAPIKeys` | `vector_store_id`*, `limit`, `page` |
-    | `createAPIKey` | `vector_store_id`*, `name`*, `slug`, `permissions`, `expiresAt` |
-    | `revokeAPIKey` | `vector_store_id`*, `key_id`* |
-    | `rotateAPIKey` | `vector_store_id`*, `key_id`* |
-
-    ### Skills
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listSkills` | `search`, `pageSize`, `page` |
-    | `createSkill` | `name`*, `display_name`, `description`, `instructions`*, `tools` |
-    | `getSkill` | `skill_id`* |
-    | `updateSkill` | `skill_id`*, `name`, `display_name`, `description`, `instructions`, `tools` |
-    | `deleteSkill` | `skill_id`* |
-
-    ### Admin
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `getStorageStats` | `scope` (`own`/`shared`/`all`) |
-    | `healthCheck` | *(none)* |
-
-    <Note>
-      Arguments flagged with `*` are required. Calls run with the **caller's identity**; the Storage backend rejects anonymous calls.
-    </Note>
-
-    ## DSUL Examples
-
-    ### Upload a file from a URL and add it to a vector store
-
-    ```yaml
-    - Prisme.ai Storage.files:
-        action: upload
-        url: 'https://example.com/whitepapers/q2-results.pdf'
-        purpose: 'rag'
-        file_name: 'q2-results.pdf'
-        mime_type: 'application/pdf'
-        output: uploaded
-    - Prisme.ai Storage.vectorStoreFiles:
-        action: add
-        vector_store_id: '{{knowledgeBaseId}}'
-        file_id: '{{uploaded.file_id}}'
-        tags:
-          - quarterly-report
-          - q2
-        metadata:
-          source: 'corporate-whitepapers'
-          year: 2026
-    ```
-
-    ### Create a vector store and grant access to a team
-
-    ```yaml
-    - Prisme.ai Storage.vectorStores:
-        action: create
-        name: 'Customer Support KB'
-        description: 'Searchable knowledge base for the support team'
-        embedding:
-          model: 'text-embedding-3-large'
-          dimensions: 3072
-        chunking:
-          strategy: 'auto'
-        output: store
-    - Prisme.ai Storage.access:
-        action: grant
-        vector_store_id: '{{store.id}}'
-        principal_type: 'group'
-        principal_id: '{{supportTeamGroupId}}'
-        role: 'contributor'
-    ```
-
-    ### Run a semantic search
-
-    ```yaml
-    - Prisme.ai Storage.vectorStores:
-        action: search
-        vector_store_id: '{{knowledgeBaseId}}'
-        query: '{{user.question}}'
-        top_k: 5
-        filters:
-          year: 2026
-        include_metadata: true
-        output: hits
-    ```
-
-    ### Trigger a recrawl after web sources changed
-
-    ```yaml
-    - Prisme.ai Storage.crawling:
-        action: recrawl
-        vector_store_id: '{{knowledgeBaseId}}'
-        websites:
-          - 'https://docs.example.com'
-          - 'https://blog.example.com'
-    ```
-
-    ### Issue a per-store API key for an external client
-
-    ```yaml
-    - Prisme.ai Storage.apiKeys:
-        action: create
-        vector_store_id: '{{knowledgeBaseId}}'
-        name: 'integration-test-suite'
-        slug: 'qa-tests'
-        permissions:
-          - 'vector_store:read'
-          - 'vector_store:search'
-        expiresAt: '2026-12-31T23:59:59Z'
-        output: created
-    ```
-  </Tab>
-
-  <Tab title="Usage as MCP">
-    The Prisme.ai Storage app ships with a built-in MCP server. Each app instance gets its own signed `mcp-api-key` that encodes the workspace ID — the MCP server forwards the caller's Prisme.ai identity to the Storage backend on every tool call, so per-user RBAC bindings apply automatically.
-
-    ## Plug into an Agent Creator capability
-
-    Agents consume MCP servers directly through **Agent Creator** capabilities. This is the preferred way to expose the Storage backend to an agent.
+    This connector runs in the **tenant app-instance context** and forwards the caller's Prisme.ai identity to the Storage backend. Your agent is identified by the `agent_id` and `user_id` that Agent Factory injects through the capability *Scope*; the Storage backend then enforces its own RBAC bindings against that user — there is no credential for the agent to hold or paste.
 
     <Steps>
-      <Step title="Create or open a workspace">
-        From the Prisme.ai console, create a new workspace (or open the one that will host the connector).
+      <Step title="Get the MCP endpoint">
+        Install the Prisme.ai Storage app in your workspace (see the *Workspace builder* tab) and copy its **MCP Endpoint** from the app instance configuration. If a *Platform admin* already published the capability, you can skip straight to the capability picker.
       </Step>
-      <Step title="Install the Prisme.ai Storage app">
-        Open the workspace **Imports** panel, search for **Prisme.ai Storage** and install it.
-      </Step>
-      <Step title="Copy the MCP endpoint and API key">
-        On the app instance configuration page, copy the values of **MCP Endpoint** and **MCP API Key** — both are generated automatically on install.
-      </Step>
-      <Step title="Open Agent Creator">
-        Switch to **Agent Creator** and open the agent you want to extend.
-      </Step>
-      <Step title="Add a capability">
-        Add a new capability to the agent:
-
-        - **If a dedicated Storage capability exists** — select it and paste the **MCP API Key** into the `mcp-api-key` field. The server URL is already wired.
-        - **Otherwise** — select the generic **`custom_mcp`** capability, paste the **MCP Endpoint** into the *Server URL* field, then open the *Headers* field and add an `mcp-api-key` entry whose value is the **MCP API Key** copied earlier:
-
-          ```json
-          {
-            "mcp-api-key": "your-mcp-api-key"
-          }
-          ```
-      </Step>
-      <Step title="Save">
-        The agent now has access to every Storage tool exposed by the MCP server, running as the calling user.
-      </Step>
-      <Step title="Brief the agent in its system prompt">
-        Wiring the capability is not enough — the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+      <Step title="Add the capability to your agent">
+        In your agent, add a capability pointing at the **MCP Endpoint** URL (or pick the published **Prisme.ai Storage** capability from the catalog), and set its **Scope** to:
 
         ```text
-        You have access to the Prisme.ai Storage MCP server. Use it whenever the user asks to manage files (upload, list, download), vector stores (create, list, search), attach documents to a knowledge base, trigger a recrawl, manage RBAC bindings or per-store API keys. Calls run with the user's identity, so the user only sees stores and files they have access to. Always confirm with the user before destructive actions (deleteFile, deleteVectorStore, revokeAccess, revokeAPIKey).
+        context_id,agent_id,user_id
         ```
 
-        Refine the trigger keywords (resource names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
+        The `agent_id` lets the connector identify the calling agent; `user_id` is what propagates the caller's identity to the Storage backend so its RBAC applies. Without `user_id` in the scope, calls run anonymously and the backend rejects them.
+      </Step>
+      <Step title="Use it">
+        Ask the agent to manage files or knowledge — it calls the Storage tools, and every call is scoped to what the calling user is allowed to see.
       </Step>
     </Steps>
 
-    ## Legacy MCP Install (Advanced > Tools)
+    ## Brief the agent in its system prompt
 
-    Use this flow to plug the Storage MCP into an AI Knowledge agent that does not yet support the native MCP picker.
+    Wiring the capability is not enough — the agent must know the tools exist and when to reach for them. Copy-pasteable starter:
 
-    <Steps>
-      <Step title="Install the Prisme.ai Storage app">
-        Install the app in the same workspace as your agent. Once installed, `mcpEndpoint` and `mcpApiKey` are auto-populated.
-      </Step>
-      <Step title="Copy the MCP credentials">
-        Open the app instance config and copy the values of **MCP Endpoint** and **MCP API Key**.
-      </Step>
-      <Step title="Open your AI Knowledge project">
-        Navigate to **Advanced > Tools**.
-      </Step>
-      <Step title="Add an MCP tool">
-        Click **Add** and select the **MCP** tab.
-      </Step>
-      <Step title="Fill in the endpoint">
-        Paste the **MCP Endpoint** URL copied from the app instance.
-      </Step>
-      <Step title="Add the auth header">
-        In the **Headers** field, add the signed API key:
+    ```text
+    You have access to the Prisme.ai Storage MCP server. Use it whenever the user asks to manage files (upload, list, download), vector stores (create, list, search), attach documents to a knowledge base, trigger a recrawl, manage RBAC bindings or per-store API keys. Calls run with the user's identity, so the user only sees stores and files they have access to. Always confirm with the user before destructive actions (files.delete, vectorStores.delete, access.revoke, apiKeys.revoke).
+    ```
 
-        ```json
-        {
-          "mcp-api-key": "your-mcp-api-key"
-        }
-        ```
-      </Step>
-      <Step title="Save">
-        The agent can now list and call Storage tools through the MCP endpoint.
-      </Step>
-    </Steps>
+    Refine the trigger keywords (resource names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
 
     <Note>
-      The signed `mcp-api-key` encodes the workspace ID and the central App secret. The MCP server forwards the caller's identity (user × workspace) to the Storage backend via cross-workspace forward-auth — no third-party token is needed. Anonymous calls are rejected by the Storage backend.
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent's identity is still propagated so the Storage backend can resolve the caller's RBAC.
     </Note>
-
-    ## Output Formats
-
-    Every tool accepts an `outputFormat` parameter that controls the MCP response shape:
-
-    - **`verbose`** (default) — human-readable text for LLM consumption
-    - **`structured`** — machine-readable JSON in `structuredContent`
-    - **`both`** — both text and structured content
 
     ## Available Tools
 
-    The MCP server exposes 8 entity-level tools (each with an `action` argument to select the operation).
+    The MCP server exposes 8 entity-level tools, each with an `action` argument that selects the operation. Every tool also accepts an `outputFormat` argument (`verbose` default / `structured` / `both`).
 
     ### `files`
 
-    | Action | Description |
-    |--------|-------------|
-    | `list` | List files (optionally filter by `conversation_id`, `purpose`, `status`) |
-    | `upload` | Upload a file from a public URL or raw bytes |
-    | `get` | Retrieve file metadata by `file_id` |
-    | `delete` | Delete a file |
-    | `download` | Download the file content (optionally via a `share_token`) |
+    | Tool | Description |
+    |------|-------------|
+    | `files` | Storage files. Actions: `list` (filter by `conversation_id`, `purpose`, `status`), `upload` (from a public URL or raw bytes), `get` (by `file_id`), `delete`, `download` (optionally via a `share_token`). |
 
     ### `vectorStores`
 
-    | Action | Description |
-    |--------|-------------|
-    | `list` | List vector stores. `scope` controls visibility (`own`, `shared`, `all` — admin only) |
-    | `create` | Create a vector store. Requires `name` and `embedding` (`{ model, dimensions? }`) |
-    | `get` | Retrieve a vector store by id |
-    | `update` | Update a vector store's name, description or metadata |
-    | `delete` | Delete a vector store (and all its files) |
-    | `search` | Run a semantic search across the store with optional `filters` and `top_k` |
-    | `reindexAll` | Re-embed all files in the store |
-    | `getAdminUrl` | Return a deep-link to the store's admin page in the platform UI |
+    | Tool | Description |
+    |------|-------------|
+    | `vectorStores` | Vector stores (RAG indexes). Actions: `list` (`scope` = `own`/`shared`/`all`), `create` (`name` + `embedding` object `{model, dimensions?}`, optional `chunking_strategy` object), `get`, `update`, `delete` (removes all files/chunks), `search` (`query` ≤2048 chars, optional `max_num_results`, `filters`, `ranking_options`), `reindexAll`, `getAdminUrl` (pure URL formatter, no HTTP call). |
 
     ### `vectorStoreFiles`
 
-    | Action | Description |
-    |--------|-------------|
-    | `list` | List files attached to a vector store |
-    | `add` | Attach a file by `file_id` (preferred) OR by `url` (the backend downloads it). Accepts `tags`, `metadata`, `force_recrawl` |
-    | `get` | Retrieve metadata of a vector-store file |
-    | `update` | Update a vector-store file's tags / metadata |
-    | `delete` | Detach (and delete) a file from a vector store |
-    | `getChunks` | Return the embedded chunks of a file (for debugging) |
-    | `reindex` | Re-embed a single file |
+    | Tool | Description |
+    |------|-------------|
+    | `vectorStoreFiles` | Files attached to a vector store. Actions: `list`, `add` (by `file_id` preferred, or `url` for backend ingestion; accepts `tags`, `metadata`, `force_recrawl`, `file_name`, `mime_type`, `headers`), `get`, `update`, `delete`, `getChunks` (debug), `reindex`. |
 
     ### `crawling`
 
-    | Action | Description |
-    |--------|-------------|
-    | `getStatus` | Get the current crawl status of a vector store |
-    | `recrawl` | Trigger a recrawl of one or more web sources |
-    | `getSourceCounts` | Get per-source page counts |
+    | Tool | Description |
+    |------|-------------|
+    | `crawling` | Web-crawling for a vector store. Actions: `getStatus`, `recrawl` (one or more `websites`), `getSourceCounts` (per-source page counts). |
 
     ### `access`
 
-    | Action | Description |
-    |--------|-------------|
-    | `list` | List RBAC bindings on a vector store |
-    | `grant` | Grant access to a principal (`user`, `group`, `apiKey`) with a role (`viewer`, `contributor`, `owner`) |
-    | `update` | Change the role of an existing binding |
-    | `revoke` | Remove a binding |
+    | Tool | Description |
+    |------|-------------|
+    | `access` | RBAC access bindings on a vector store. Actions: `list`, `grant` (`principal_type`, `principal_id`, `role`), `update` (change role), `revoke`. |
 
     ### `apiKeys`
 
-    | Action | Description |
-    |--------|-------------|
-    | `list` | List API keys on a vector store |
-    | `create` | Create an API key with `permissions` and optional `expiresAt` |
-    | `revoke` | Revoke an API key |
-    | `rotate` | Rotate an API key (mints a new secret and revokes the old one) |
+    | Tool | Description |
+    |------|-------------|
+    | `apiKeys` | Per-vector-store API keys. Actions: `list`, `create` (`name`, optional `slug`, `permissions`, `expiresAt`), `revoke`, `rotate` (mints a new secret, revokes the old one). |
 
     ### `skills`
 
-    | Action | Description |
-    |--------|-------------|
-    | `list` | List reusable agent skills |
-    | `create` | Create a skill (`instructions` + optional `tools`) |
-    | `get` | Retrieve a skill by id |
-    | `update` | Update a skill |
-    | `delete` | Delete a skill |
+    | Tool | Description |
+    |------|-------------|
+    | `skills` | Reusable agent skills (instructions + tools). Actions: `list` (optional `search`), `create` (`name`, `instructions`, optional `tools`), `get`, `update`, `delete`. |
 
     ### `admin`
 
-    | Action | Description |
-    |--------|-------------|
-    | `getStats` | Aggregate stats over `own`, `shared` or `all` (admin only) |
-    | `healthCheck` | End-to-end health check (admin only) |
+    | Tool | Description |
+    |------|-------------|
+    | `admin` | Admin-only diagnostics. Actions: `getStats` (aggregate over `own`/`shared`/`all`), `healthCheck` (end-to-end). |
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
+
+    - **`verbose`** (default) — human-readable text optimized for LLM consumption.
+    - **`structured`** — machine-readable JSON in `structuredContent`.
+    - **`both`** — the structured payload, with its JSON also rendered as text.
 
     ## Tool Details
 
@@ -415,19 +202,19 @@ Unlike third-party SaaS connectors, **this connector does not require a per-tena
           "model": "text-embedding-3-large",
           "dimensions": 3072
         },
-        "chunking": { "strategy": "auto" }
+        "chunking_strategy": { "type": "auto" }
       }
     }
     ```
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | ✓ | Must be `create` |
-    | `name` | ✓ | Display name of the store |
-    | `embedding` | ✓ | `{ model: string, dimensions?: number }` — embedding model to use |
-    | `description` | – | Free-text description |
-    | `chunking` | – | `{ strategy: "auto" \| "fixed", chunk_size?, overlap? }` |
-    | `metadata` | – | Arbitrary metadata attached to the store |
+    | `action` | Yes | Must be `create`. |
+    | `name` | Yes | Display name of the store. |
+    | `embedding` | Yes | Object `{ model, dimensions? }` — the embedding model. Never pass a string. |
+    | `description` | No | Free-text description. |
+    | `chunking_strategy` | No | Object `{type: "auto"}` (default) or `{type: "static", max_chunk_size_tokens, chunk_overlap_tokens}`. |
+    | `provider` | No | Vector index backend (`elasticsearch`/`opensearch`/`mock`) — NOT the embedding provider. Omit for the workspace default. |
 
     ### `vectorStoreFiles` (action: `add`)
 
@@ -446,13 +233,13 @@ Unlike third-party SaaS connectors, **this connector does not require a per-tena
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | ✓ | Must be `add` |
-    | `vector_store_id` | ✓ | Target vector store |
-    | `file_id` | – | Existing file to attach. Either `file_id` OR `url` must be set |
-    | `url` | – | Public URL — the backend ingests the file. **Note:** URL ingestion does not honor `file_name`; for filename control, upload first via `files.upload` and pass `file_id` |
-    | `tags` | – | List of free-text tags for filtering at search time |
-    | `metadata` | – | Structured metadata stored on the chunk |
-    | `force_recrawl` | – | Re-ingest the URL even if it was crawled before |
+    | `action` | Yes | Must be `add`. |
+    | `vector_store_id` | Yes | Target vector store. |
+    | `file_id` | No | Existing file to attach. Either `file_id` OR `url` must be set. |
+    | `url` | No | Public URL — the backend ingests the file. **Note:** URL ingestion does not honor `file_name`; for filename control, upload first via `files.upload` and pass `file_id`. |
+    | `tags` | No | List of free-text tags for filtering at search time. |
+    | `metadata` | No | Structured metadata stored on the chunk. |
+    | `force_recrawl` | No | Re-ingest the URL even if a previous crawl was cached (also pass the original `url`). |
 
     ### `vectorStores` (action: `search`)
 
@@ -463,21 +250,20 @@ Unlike third-party SaaS connectors, **this connector does not require a per-tena
         "action": "search",
         "vector_store_id": "vs_01H...",
         "query": "How do I reset my password?",
-        "top_k": 5,
-        "filters": { "year": 2026 },
-        "include_metadata": true
+        "max_num_results": 5,
+        "filters": { "key": "year", "type": "eq", "value": 2026 }
       }
     }
     ```
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | ✓ | Must be `search` |
-    | `vector_store_id` | ✓ | Target vector store |
-    | `query` | ✓ | The natural-language query |
-    | `top_k` | – | Number of chunks to return (default 10) |
-    | `filters` | – | Metadata filters — e.g. `{ year: 2026, owner: "support-team" }` |
-    | `include_metadata` | – | Include chunk metadata in the response |
+    | `action` | Yes | Must be `search`. |
+    | `vector_store_id` | Yes | Target vector store. |
+    | `query` | Yes | Natural-language query (max 2048 chars). |
+    | `max_num_results` | No | Number of chunks to return. |
+    | `filters` | No | Elasticsearch-like metadata filter, e.g. `{key, type: "eq", value}` or `{type: "and", filters: [...]}`. |
+    | `ranking_options` | No | Object, e.g. `{score_threshold: 0.5}`. |
 
     ### `access` (action: `grant`)
 
@@ -496,11 +282,11 @@ Unlike third-party SaaS connectors, **this connector does not require a per-tena
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | ✓ | Must be `grant` |
-    | `vector_store_id` | ✓ | Target vector store |
-    | `principal_type` | ✓ | `user`, `group` or `apiKey` |
-    | `principal_id` | ✓ | ID of the principal |
-    | `role` | ✓ | `viewer`, `contributor` or `owner` |
+    | `action` | Yes | Must be `grant`. |
+    | `vector_store_id` | Yes | Target vector store. |
+    | `principal_type` | Yes | `user`, `group` or `apiKey`. |
+    | `principal_id` | Yes | ID of the principal. |
+    | `role` | Yes | `viewer`, `contributor` or `owner`. |
 
     ### `apiKeys` (action: `create`)
 
@@ -520,16 +306,215 @@ Unlike third-party SaaS connectors, **this connector does not require a per-tena
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | ✓ | Must be `create` |
-    | `vector_store_id` | ✓ | Target vector store |
-    | `name` | ✓ | Human-readable key name |
-    | `slug` | – | Stable identifier (recommended for traceability) |
-    | `permissions` | – | List of scopes the key is allowed to call. Default = same as the creator's role |
-    | `expiresAt` | – | RFC3339 timestamp. Omit for non-expiring keys |
+    | `action` | Yes | Must be `create`. |
+    | `vector_store_id` | Yes | Target vector store. |
+    | `name` | Yes | Human-readable key name. |
+    | `slug` | No | Stable identifier (recommended for traceability). |
+    | `permissions` | No | List of scopes the key may call. Default = same as the creator's role. |
+    | `expiresAt` | No | RFC3339 timestamp. Omit for non-expiring keys. |
 
     <Warning>
-      The plaintext secret is returned only at creation time. Store it securely; the platform keeps only a hash.
+      The plaintext API-key secret is returned only at creation time. Store it securely; the platform keeps only a hash.
     </Warning>
+  </Tab>
+
+  <Tab title="Workspace builder (DSUL)">
+    ## Workspace builder
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **Prisme.ai Storage** and install it
+    3. Open the app instance configuration — only the MCP endpoint is surfaced, and it is auto-populated on install. There is no credential to enter.
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **MCP Endpoint** | Auto-populated on install — URL of the MCP endpoint for this app instance. |
+
+    There is no third-party credential to configure. The connector forwards the caller's Prisme.ai identity to the Storage backend on every call, and the backend enforces its own RBAC bindings.
+
+    | Auth mode | What you provide | Best for |
+    |-----------|------------------|----------|
+    | **Forward-auth (default)** | Nothing — the caller's user × workspace identity is propagated automatically over cross-workspace forward-auth. | All standard use; calls run with the caller's permissions. |
+    | **`accessToken` override** | An explicit Storage token passed per call via the `accessToken` argument. | Server-to-server flows that must act as a specific principal rather than the caller. |
+
+    <Note>
+      The connector is pre-wired to the Storage backend of the **current environment** (sandbox or prod) via `slug:storage` — no `baseUrl` to set. Anonymous calls (no forwarded identity and no `accessToken`) are rejected by the Storage backend.
+    </Note>
+
+    ## Available Instructions
+
+    Every instruction resolves identity from the caller's authenticated request. Vector-store-scoped operations target a `vector_store_id`; file operations take a `file_id`; cross-store operations take a `scope` (`own`, `shared`, or `all` for admins).
+
+    ### Files
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listFiles` | List files; optional `conversation_id`, `purpose`, `status`, `limit`, `page`. | `{ files: [{ id, name, purpose, status, … }], page }` |
+    | `uploadFile` | Upload a file from a public `url` or raw `bytes`; `purpose`, `file_name`, `mime_type`. | `{ file_id, name, purpose, status }` |
+    | `getFile` | Retrieve file metadata by `file_id`. | `{ id, name, purpose, status, … }` |
+    | `deleteFile` | Delete a file by `file_id`. | Empty (HTTP 204) |
+    | `downloadFileContent` | Download content by `file_id`; optional `redirect`, `share_token`. | File bytes (or a redirect URL). |
+
+    ### Vector Stores
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listVectorStores` | List stores; `scope` (`own`/`shared`/`all`), `pageSize`, `page`, `status`, `agent_id`, `include_agents`. | `{ vector_stores: [{ id, name, status }], page }` |
+    | `createVectorStore` | Create a store; `name` + `embedding` object `{model, dimensions?}`; optional `chunking_strategy`, `metadata`, `provider`. | `{ id, name, embedding, status }` |
+    | `getVectorStore` | Retrieve a store by `vector_store_id`. | `{ id, name, description, embedding, status }` |
+    | `updateVectorStore` | Update `name`, `description`, `metadata`, `expires_after`, `chunking_strategy`. | `{ id, name, … }` |
+    | `deleteVectorStore` | Delete a store and all its files/chunks. | Empty (HTTP 204) |
+    | `searchVectorStore` | Semantic search; `query` (≤2048 chars), optional `max_num_results`, `filters`, `ranking_options`, `rewrite_query`. | `{ data: [{ score, content, metadata }] }` |
+    | `reindexAllVectorStoreFiles` | Re-index every file in the store. | `{ status }` |
+    | `getVectorStoreAdminUrl` | Format a deep-link to the store's admin page (no HTTP call). | `{ url }` |
+
+    ### Vector Store Files
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listVectorStoreFiles` | List files in a store; `vector_store_id` + optional `status`, `limit`, `page`, `agent_id`. | `{ files: [{ id, name, status }], page }` |
+    | `addFileToVectorStore` | Attach a file by `file_id` (preferred) OR `url`; `tags`, `metadata`, `force_recrawl`, `file_name`, `mime_type`, `headers`. | `{ file_id, status }` |
+    | `getVectorStoreFile` | Retrieve a vector-store file's metadata by `vector_store_id` + `file_id`. | `{ id, name, status, tags, metadata }` |
+    | `updateVectorStoreFile` | Update a vector-store file's `tags` / `metadata`. | `{ id, tags, metadata }` |
+    | `deleteVectorStoreFile` | Detach (and delete) a file from a store. | Empty (HTTP 204) |
+    | `getVectorStoreFileChunks` | Return the embedded chunks of a file (debug); `limit`, `offset`. | `{ chunks: [{ content, metadata }] }` |
+    | `reindexVectorStoreFile` | Re-embed a single file; optional `force`. | `{ status }` |
+
+    ### Web Crawling
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `getCrawlStatus` | Get the current crawl status of a store by `vector_store_id`. | `{ status, sources: [...] }` |
+    | `recrawlWebSources` | Trigger a recrawl of one or more `websites`. | `{ status }` |
+    | `getWebSourceCounts` | Get per-source page counts. | `{ counts: [{ url, pages }] }` |
+
+    ### Access (RBAC)
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listVectorStoreAccess` | List RBAC bindings on a store; `limit`, `page`. | `{ bindings: [{ id, principal_type, principal_id, role }] }` |
+    | `grantVectorStoreAccess` | Grant access; `principal_type` (`user`/`group`/`apiKey`), `principal_id`, `role` (`viewer`/`contributor`/`owner`). | `{ id, role }` |
+    | `updateVectorStoreAccess` | Change the role of an existing binding. | `{ id, role }` |
+    | `revokeVectorStoreAccess` | Remove a binding. | Empty (HTTP 204) |
+
+    ### API Keys
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listAPIKeys` | List API keys on a store; `limit`, `page`. | `{ keys: [{ id, name, slug, permissions }] }` |
+    | `createAPIKey` | Create a key; `name`, optional `slug`, `permissions`, `expiresAt`. | `{ id, secret, name, permissions }` (secret returned once) |
+    | `revokeAPIKey` | Revoke a key by `key_id`. | Empty (HTTP 204) |
+    | `rotateAPIKey` | Mint a new secret and revoke the old one. | `{ id, secret }` |
+
+    ### Skills
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listSkills` | List reusable agent skills; optional `search`, `pageSize`, `page`. | `{ skills: [{ id, name, display_name }] }` |
+    | `createSkill` | Create a skill; `name`, `instructions`, optional `display_name`, `description`, `tools`. | `{ id, name, instructions }` |
+    | `getSkill` | Retrieve a skill by `skill_id`. | `{ id, name, instructions, tools }` |
+    | `updateSkill` | Update a skill's `name`, `display_name`, `description`, `instructions`, `tools`. | `{ id, … }` |
+    | `deleteSkill` | Delete a skill by `skill_id`. | Empty (HTTP 204) |
+
+    ### Admin
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `getStorageStats` | Aggregate stats over `scope` (`own`/`shared`/`all`) — admin only. | `{ stores, files, chunks, … }` |
+    | `healthCheck` | End-to-end backend health check — admin only. | `{ status, checks: [...] }` |
+
+    <Note>
+      `Returns` shows the shape of the operation output. Calls run with the **caller's identity**; the Storage backend rejects anonymous calls.
+    </Note>
+
+    ## DSUL Examples
+
+    **Upload a file from a URL and add it to a vector store:**
+
+    ```yaml
+    - Prisme.ai Storage.files:
+        action: upload
+        url: 'https://example.com/whitepapers/q2-results.pdf'
+        purpose: 'rag'
+        file_name: 'q2-results.pdf'
+        mime_type: 'application/pdf'
+      output: uploaded
+    - Prisme.ai Storage.vectorStoreFiles:
+        action: add
+        vector_store_id: '{{knowledgeBaseId}}'
+        file_id: '{{uploaded.file_id}}'
+        tags:
+          - quarterly-report
+          - q2
+        metadata:
+          source: 'corporate-whitepapers'
+          year: 2026
+    ```
+
+    **Create a vector store and grant access to a team:**
+
+    ```yaml
+    - Prisme.ai Storage.vectorStores:
+        action: create
+        name: 'Customer Support KB'
+        description: 'Searchable knowledge base for the support team'
+        embedding:
+          model: 'text-embedding-3-large'
+          dimensions: 3072
+        chunking_strategy:
+          type: 'auto'
+      output: store
+    - Prisme.ai Storage.access:
+        action: grant
+        vector_store_id: '{{store.id}}'
+        principal_type: 'group'
+        principal_id: '{{supportTeamGroupId}}'
+        role: 'contributor'
+    ```
+
+    **Run a semantic search:**
+
+    ```yaml
+    - Prisme.ai Storage.vectorStores:
+        action: search
+        vector_store_id: '{{knowledgeBaseId}}'
+        query: '{{user.question}}'
+        max_num_results: 5
+        filters:
+          key: 'year'
+          type: 'eq'
+          value: 2026
+      output: hits
+    ```
+
+    **Trigger a recrawl after web sources changed:**
+
+    ```yaml
+    - Prisme.ai Storage.crawling:
+        action: recrawl
+        vector_store_id: '{{knowledgeBaseId}}'
+        websites:
+          - 'https://docs.example.com'
+          - 'https://blog.example.com'
+    ```
+
+    **Issue a per-store API key for an external client:**
+
+    ```yaml
+    - Prisme.ai Storage.apiKeys:
+        action: create
+        vector_store_id: '{{knowledgeBaseId}}'
+        name: 'integration-test-suite'
+        slug: 'qa-tests'
+        permissions:
+          - 'vector_store:read'
+          - 'vector_store:search'
+        expiresAt: '2026-12-31T23:59:59Z'
+      output: created
+    ```
   </Tab>
 </Tabs>
 
@@ -537,37 +522,37 @@ Unlike third-party SaaS connectors, **this connector does not require a per-tena
 
 ## Error Handling
 
-| HTTP Status | Meaning | Typical Cause |
-|-------------|---------|----------------|
-| `400` | Bad Request | Missing required field (e.g. `embedding` on `createVectorStore`), invalid `principal_type`, malformed metadata filter |
-| `401` | Unauthorized | The forward-auth chain did not propagate the caller's identity. The Storage backend rejects anonymous calls |
-| `403` | Forbidden | The caller does not have the required role on the target store/file (e.g. `viewer` cannot add files; only `owner` can grant access) |
-| `404` | Not Found | Vector store / file / binding / skill does not exist |
-| `409` | Conflict | Duplicate slug / unique-property collision (e.g. an API key with the same slug already exists) |
-| `429` | Rate Limited | Storage backend quota exceeded — back off and retry |
-| `500` / `503` | Server Error | Transient backend failure — retry with exponential backoff |
+| HTTP code | Meaning | Typical cause |
+|-----------|---------|----------------|
+| `400` | Bad Request | Missing required field (e.g. `embedding` on `createVectorStore`), invalid `principal_type`, malformed metadata filter. |
+| `401` | Unauthorized | The forward-auth chain did not propagate the caller's identity. The Storage backend rejects anonymous calls. |
+| `403` | Forbidden | The caller lacks the required role on the target store/file (e.g. `viewer` cannot add files; only `owner` can grant access). |
+| `404` | Not Found | Vector store / file / binding / skill does not exist. |
+| `409` | Conflict | Duplicate slug / unique-property collision (e.g. an API key with the same slug already exists). |
+| `429` | Rate Limited | Storage backend quota exceeded — back off and retry. |
+| `500` / `503` | Server Error | Transient backend failure — retry with exponential backoff. |
 
 ### Common Issues
 
-**"Not configured"** — Should not normally happen for this connector since it carries no external credential. If you see it, reinstall the app instance to regenerate the MCP API key.
+**"The calling agent could not be identified"** — The MCP capability *Scope* does not declare `agent_id` / `user_id`, so Agent Factory never injects the caller identity. Set the Scope to `context_id,agent_id,user_id` on the capability.
 
-**"Invalid API key" (MCP)** — The `mcp-api-key` header does not match the central app secret. Reinstall the app instance to regenerate a signed key.
+**"Anonymous request rejected" (401)** — The caller's Prisme.ai identity did not make it through to the Storage backend. This usually means the call is being made from a tool client that does not propagate the workspace identity. Use the Agent Factory capability or call from a DSUL automation — both forward identity correctly — or pass an explicit `accessToken` override.
 
-**"Anonymous request rejected" (401)** — The caller's Prisme.ai identity did not make it through to the Storage backend. This usually means the MCP call is being made from a tool client that does not propagate the workspace JWT. Use the Agent Creator capability or call from a DSUL automation, both of which forward identity correctly.
+**Forbidden on a store you can see (403)** — Listing a store does not imply write access. The operation requires a higher role (e.g. `contributor` to add files, `owner` to grant access or manage keys). Ask the store owner to grant the right binding via `access.grant`.
 
-**`addFileToVectorStore` ignored my `file_name` when using `url`** — URL-based ingestion of vector-store files drops the `file_name` argument. If you need filename control, upload the file first via `files.upload` and then add it via `vectorStoreFiles.add` with `file_id`.
+**`addFileToVectorStore` ignored my `file_name` when using `url`** — URL-based ingestion of vector-store files drops the `file_name` argument. For filename control, upload the file first via `files.upload` and then add it via `vectorStoreFiles.add` with `file_id`.
 
-**`force_recrawl` had no effect** — Make sure you also pass the original `url` argument; the backend keys recrawl identity off the URL, not the `file_id`.
+**`force_recrawl` had no effect** — Also pass the original `url` argument; the backend keys recrawl identity off the URL, not the `file_id`.
 
 **Empty list when listing vector stores** — By default `listVectorStores` returns only `scope: own`. Add `scope: shared` to include stores shared with you, or `scope: all` if you are a platform admin.
 
 ## External Resources
 
 <CardGroup cols={2}>
-  <Card title="Storage backend overview" icon="book" href="/products/storage/overview">
-    Prisme.ai Storage workspace architecture, RBAC model and crawling pipeline
+  <Card title="RAG & Vector Stores" icon="layer-group" href="/products/ai-knowledge/knowledge-bases">
+    How vector stores, embeddings and the RAG crawling pipeline work in Prisme.ai.
   </Card>
   <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
-    Build AI agents that call MCP tools dynamically
+    Learn how Agent Factory agents consume MCP tools and capabilities.
   </Card>
 </CardGroup>
