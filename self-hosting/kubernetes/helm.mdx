@@ -133,6 +133,40 @@ This flag controls whether the chart creates / overwrites the secrets referenced
 
 The same flag also gates whether the chart writes the connection-URL secrets (`broker`, `permissions`, `users`, `collections`, object storage…) from the inline `url` / `password` values. Once those secrets exist in the cluster, strip the plaintext credentials from your values file and leave `allowCreation: false` — the services keep reading from the live secrets via their `existingSecret` references.
 
+#### Secrets encryption keys
+
+Prisme.ai encrypts workspace secrets at rest with **envelope encryption** (AES-256-GCM). The master key (KEK) and short-lived reference keys live in one Kubernetes Secret, read by the services as `SECRETS_MASTER_KEYS` / `SECRETS_REF_KEYS`.
+
+The chart *can* auto-generate them, but auto-generation depends on `lookup` to preserve the keys across renders — and **`lookup` returns empty under `helm template` and ArgoCD**, so every render would emit new keys and make all encrypted data unrecoverable. **For GitOps / `helm template` (the recommended setup), pre-create the Secret yourself** and reference it with `existingSecret`; the chart then generates nothing and runs no `lookup`.
+
+<Steps>
+<Step title="Generate the keys into a Secret you own (run once, before the first install)">
+```bash
+kubectl create secret generic core-secrets-encryption -n prismeai-core \
+  --from-literal=masterKeys="[{\"kid\":\"kek-v1\",\"key\":\"$(openssl rand -hex 32)\",\"active\":true}]" \
+  --from-literal=refKeys="[{\"kid\":\"ref-v1\",\"key\":\"$(openssl rand -hex 32)\",\"active\":true}]"
+```
+
+`openssl rand -hex 32` produces the 64-hex-character key the chart expects. **Back up both values immediately — this Secret is your only copy.** In GitOps, create it through your secret manager (Sealed Secrets, External Secrets, SOPS) so it is reproducible without committing plaintext keys.
+</Step>
+
+<Step title="Reference it from global.secretsEncryption">
+```yaml
+global:
+  secretsEncryption:
+    existingSecret: "core-secrets-encryption"   # pre-created above — chart skips generation entirely
+```
+
+With `existingSecret` set, the chart emits no encryption Secret and runs no `lookup`, so `helm template` output is identical on every run.
+</Step>
+</Steps>
+
+<Warning>
+  If the master keys are lost, **all encrypted workspace data is permanently unrecoverable.** Keep your backup of `masterKeys` / `refKeys` somewhere safe (vault, password manager).
+</Warning>
+
+For a quick, non-GitOps `helm install` you can instead let the chart auto-generate the keys — see [auto-generation and the full value reference](/self-hosting/kubernetes/configuration#secrets-encryption-keys) in Configuration.
+
 ### `prismeai-api-gateway`
 
 Authentication, mail, sessions, super-admin emails.
