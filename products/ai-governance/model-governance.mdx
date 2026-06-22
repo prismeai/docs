@@ -245,6 +245,60 @@ The LLM Gateway abstracts multiple providers behind a unified API:
 
 All providers are normalized to the OpenAI API format for chat completions and streaming (SSE).
 
+### Custom HTTP Headers (OpenAI-compatible)
+
+OpenAI-compatible (`openailike`) providers support a **Custom HTTP Headers** option that attaches arbitrary headers to every request sent to the upstream LLM endpoint. Typical uses: tenant-aware gateways, custom auth schemes, request tagging for cost attribution, or correlating upstream provider logs with Prisme.ai audit trails.
+
+<Note>
+Headers are configured **per-provider** in the workspace that owns the `openailike` config — **LLM Gateway** (`providers.openailike[].options.headers`) for the current LLM Gateway architecture, or **AI Knowledge** (`llm.openailike[].options.headers`) for the legacy AI Knowledge stack. The OpenAI app instance is a pass-through and is **not** the configuration surface; editing it directly there has no effect on traffic that flows through the gateway.
+</Note>
+
+Each entry is a single HTTP header `name → value` pair. Both the single-provider and multi-provider forms of `openailike` support it.
+
+**Static values** are sent verbatim:
+
+| Header name | Value | Sent as |
+|-------------|-------|---------|
+| `X-Tenant-Id` | `acme-corp` | `X-Tenant-Id: acme-corp` |
+| `X-Cost-Center` | `R&D-EMEA` | `X-Cost-Center: R&D-EMEA` |
+
+**Runtime placeholders** inject context from the calling Prisme.ai request. The value of the header must be **exactly** one of the patterns below:
+
+| Placeholder value | Replaced with |
+|-------------------|---------------|
+| `{correlationId}` | The Prisme.ai correlation ID of the current request — propagates trace context to the LLM provider's logs |
+| `{user.<path>}` | Any field of the calling user, at arbitrary depth. `{user.id}` for the Prisme.ai user ID, `{user.email}` for the email, `{user.authData.entraid.firstname}` for a nested provider-specific claim, etc. |
+| `{userId}` | Legacy alias of `{user.id}`, kept for backwards compatibility — prefer `{user.id}` in new configurations |
+
+Resolution rules for `{user.<path>}`:
+- If the path doesn't exist on the user object, the header value resolves to an empty string.
+- If the resolved value is not a string (object, array, number), it is JSON-stringified before being sent.
+
+Example LLM Gateway config (`workspaces/llm-gateway/index.yml`, under `config.value.providers.openailike`):
+
+```yaml
+- api_key: '{{secret.myProviderApiKey}}'
+  endpoint: https://my-openai-like-provider.example.com/v1/
+  models:
+    - my-model
+  options:
+    headers:
+      x-correlation-id: '{correlationId}'
+      x-user-id: '{user.id}'
+      x-user-email: '{user.email}'
+      x-user-firstname: '{user.authData.entraid.firstname}'
+      x-tenant: 'acme-corp'
+```
+
+<Warning>
+Substitution is **full-string only**. The value must match the placeholder pattern exactly — composite values such as `prefix-{user.id}` or `req-{correlationId}-v2` are sent as-is, without substitution. Unknown placeholders that don't match any supported pattern (e.g. `{foo.bar}`) are also sent verbatim.
+</Warning>
+
+**Notes**:
+- Custom headers are merged on top of the default `Content-Type: application/json` and `Authorization: Bearer <api_key>` headers. Reusing a default header name will override it — typically only useful for `Authorization` when the upstream requires a non-Bearer scheme.
+- For multipart endpoints (image edits), the `Content-Type` is dropped automatically so the runtime can set the multipart boundary.
+- The feature is only available on the **OpenAI-compatible** provider type, not on the native OpenAI, Anthropic, Azure, Bedrock, Vertex, or Sagemaker providers.
+
 ## Best Practices
 
 <CardGroup cols={2}>
