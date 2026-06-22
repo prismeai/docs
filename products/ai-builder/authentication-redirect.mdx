@@ -1,0 +1,219 @@
+---
+title: "Authentication Redirect"
+description: "Control where users land after signing in — send them to your page or embedded app instead of the Builder"
+---
+
+When you embed a Prisme.ai page or app in another product — a mobile app, an intranet portal, an iframe — users have to sign in. By default, a user who signs in from the platform root lands on the **Builder**. This guide shows how to send them to **your page** instead.
+
+<Info>
+  This is the single most common integration question: *"After login, how do I redirect to my business page and not the Builder?"* The short answer — **link directly to your page's URL** and Prisme.ai brings the user back to it automatically after sign-in.
+</Info>
+
+## How the redirect works
+
+There are two separate steps in the sign-in flow, and it's important not to confuse them:
+
+<Steps>
+  <Step title="The login callback (fixed)">
+    Prisme.ai uses OpenID Connect. After the identity provider authenticates the user, it returns them to a fixed callback URL on your console domain (`/signin`). This URL is **not** the page the user ends up on — it only completes the secure token exchange. You cannot point it at an arbitrary page, and you don't need to.
+  </Step>
+  <Step title="The landing page (what you control)">
+    Once signed in, the app navigates the user to a **destination**. This is the page they actually see. It is controlled by the URL they started from (the `returnTo` mechanism), or by an organization-wide default. Everything below is about this step.
+  </Step>
+</Steps>
+
+## Solution 1 — Link directly to your page (recommended)
+
+Point your integration at your page's URL directly. When an unauthenticated user opens it, Prisme.ai remembers that destination, sends them through login, and returns them **exactly there** afterward. The Builder is never shown.
+
+Deployed apps and pages are reachable on two routes:
+
+<Tabs>
+  <Tab title="/p/your-app — standalone">
+    ```
+    https://<your-console>/p/<app-slug>
+    ```
+    The app owns the full screen, with **no platform navigation around it**. This is the right choice for **mobile apps, embedded web views, and white-label integrations**.
+  </Tab>
+  <Tab title="/apps/your-app — in-platform">
+    ```
+    https://<your-console>/apps/<app-slug>
+    ```
+    The app is shown **inside the platform shell**, with the Prisme.ai navigation. Use this when the page is part of the normal platform experience.
+  </Tab>
+</Tabs>
+
+<Tip>
+  For a mobile app embedding the chat, use the **`/p/<app-slug>`** route. The user signs in once and lands straight in your chat — full screen, no Builder, no platform chrome.
+</Tip>
+
+## Solution 2 — Force a destination explicitly
+
+If your integration sends users to the sign-in page itself, append a `returnTo` parameter pointing at your page. The value must be a **relative path on the same domain**, URL-encoded:
+
+```
+https://<your-console>/signin?returnTo=%2Fp%2F<app-slug>
+```
+
+After sign-in, the user is redirected to `/p/<app-slug>`.
+
+<Warning>
+  `returnTo` only accepts **relative, same-origin paths** (for example `/p/my-app`). Absolute external URLs (`https://example.com/...`) and protocol-relative URLs (`//example.com`) are rejected to prevent open-redirect attacks. You cannot redirect a user to a third-party site after login.
+</Warning>
+
+## Solution 3 — Make the app public (no login)
+
+If your page or app doesn't require a signed-in Prisme.ai user, deploy it as **public**. A public app renders immediately, without ever prompting for authentication.
+
+This is the simplest option when the experience is fully anonymous or handles its own session — there is no redirect to manage at all.
+
+## Solution 4 — Set an organization default landing page
+
+To change where **every** user in your organization lands when they open the platform root, set a default home page in **AI Governance → Platform Customization**. When a user arrives at the root URL with no specific destination, they are redirected to the page you choose.
+
+<Info>
+  This applies organization-wide and only when a user lands on the root URL. For a targeted, per-integration redirect, prefer **Solution 1** (link directly to the page).
+</Info>
+
+## Choosing an approach
+
+<CardGroup cols={2}>
+  <Card title="Embed in a mobile app / web view" icon="mobile-screen">
+    Open `/p/<app-slug>` directly. The user signs in once and lands in your app.
+  </Card>
+  <Card title="Drive the sign-in page yourself" icon="link">
+    Use `/signin?returnTo=%2Fp%2F<app-slug>` to force the destination.
+  </Card>
+  <Card title="Fully anonymous experience" icon="globe">
+    Deploy the app as **public** — no login, no redirect.
+  </Card>
+  <Card title="Change the default for everyone" icon="house">
+    Set the home page in **AI Governance → Platform Customization**.
+  </Card>
+</CardGroup>
+
+## Embedding in a mobile app — checklist
+
+<Steps>
+  <Step title="Deploy your page or app">
+    Note its slug. The full URL is `https://<your-console>/p/<app-slug>`.
+  </Step>
+  <Step title="Open that URL in the web view">
+    Not the platform root, and not `/signin`. Opening the page directly is what triggers the automatic return-to-page behavior.
+  </Step>
+  <Step title="Keep the whole flow in one web view">
+    The sign-in round-trip must happen in the **same web view / browser context**. If login opens in a separate external browser, the saved destination is lost and the user falls back to the root page. Use an in-app browser tab that shares storage with your web view (for example, `SFSafariViewController` / `Custom Tabs` configured for the same session, or the web view itself).
+  </Step>
+  <Step title="(Optional) Make it public">
+    If the experience doesn't need a Prisme.ai user, deploy as **public** and skip authentication entirely.
+  </Step>
+</Steps>
+
+## Bring your own frontend (OIDC integration)
+
+Everything above assumes the user ends up on a **Prisme.ai page**. If instead you have your **own application** and want to use Prisme.ai only as your **login provider** (OpenID Connect), the redirect works differently — and you control it with two standard OIDC parameters.
+
+<Info>
+  Use this only if you are **not** rendering a Prisme.ai page. You run the login round-trip yourself and keep the user inside your own app. If you are embedding a Prisme.ai page — even inside your own shell — the `/p/<app-slug>` approach above is far less work.
+</Info>
+
+### The two parameters you control
+
+When you send a user to Prisme.ai to sign in, you pass:
+
+- **`redirect_uri`** — the URL on **your** domain where Prisme.ai sends the user back after login. **This is the "final place."**
+- **`state`** — any value you choose; Prisme.ai hands it back to you **unchanged**. Use it to remember which screen to show afterward.
+
+### The flow in three steps
+
+<Steps>
+  <Step title="Send the user to Prisme.ai to sign in">
+    ```
+    GET https://<your-prisme-api>/oidc/auth
+        ?client_id=<your-client-id>
+        &redirect_uri=https://your-app.com/callback
+        &response_type=code
+        &scope=openid
+        &state=<your-context>
+        &code_challenge=<pkce-challenge>
+        &code_challenge_method=S256
+    ```
+  </Step>
+  <Step title="Prisme.ai sends the user back">
+    After login, the browser is redirected to your `redirect_uri` with a one-time `code` and your `state` returned verbatim:
+    ```
+    https://your-app.com/callback?code=<code>&state=<your-context>
+    ```
+  </Step>
+  <Step title="Exchange the code for a token">
+    ```
+    POST https://<your-prisme-api>/oidc/token
+      grant_type=authorization_code
+      &code=<code>
+      &redirect_uri=https://your-app.com/callback
+      &client_id=<your-client-id>
+      &code_verifier=<pkce-verifier>
+    ```
+    Your app now has the access token and can show the right screen based on `state`.
+  </Step>
+</Steps>
+
+<Tip>
+  Read `https://<your-prisme-api>/oidc/.well-known/openid-configuration` for the exact endpoint URLs instead of hardcoding them.
+</Tip>
+
+### Getting your `redirect_uri` approved
+
+Prisme.ai only accepts a `redirect_uri` that was **registered in advance** — this is what prevents an attacker from hijacking the login. Choose one of:
+
+<Tabs>
+  <Tab title="Register your own client (recommended)">
+    Ask your Prisme.ai administrator to register an OIDC client for your app. You provide the exact callback URL(s) you want — **any path**, for example `https://your-app.com/callback`.
+
+    Registration (performed by an administrator):
+    ```
+    POST https://<your-prisme-api>/oidc/reg
+    Authorization: Bearer <registration-token>
+    Content-Type: application/json
+
+    {
+      "redirect_uris": ["https://your-app.com/callback"],
+      "grant_types": ["authorization_code"],
+      "response_types": ["code"],
+      "token_endpoint_auth_method": "none",
+      "allowedResources": ["<your-prisme-api-base-url>"],
+      "resourceScopes": "workspaces:read events:read"
+    }
+    ```
+    The response contains your `client_id`. `allowedResources` and `resourceScopes` are **mandatory** — without them the login is rejected. Valid scopes are any subset of:
+    `workspaces:write workspaces:read events:write events:read webhooks pages:read files:write files:read`.
+  </Tab>
+  <Tab title="Reuse the platform client (self-hosted)">
+    If you self-host, add your app's origin to the `CONSOLE_URL` environment variable (comma-separated). Your callback is then **forced to `<your-origin>/signin`** — you cannot choose another path.
+    ```
+    CONSOLE_URL=https://console.prisme.ai,https://your-app.com
+    → allowed redirect_uri: https://your-app.com/signin
+    ```
+    Reuse the platform's existing client id. Simpler to set up, but only works for the fixed `/signin` callback path.
+  </Tab>
+</Tabs>
+
+### Things to know
+
+- **No client secret.** Clients are public and use **PKCE** (`code_challenge_method=S256`). Generate a fresh verifier/challenge per login.
+- **The `/signin` callback path is fixed for the platform client.** Only a custom-registered client (first tab) lets you pick your own callback path.
+- **You don't need a `resource` parameter.** Prisme.ai defaults it to its platform API automatically. (A custom client must still declare `allowedResources` / `resourceScopes` at registration, as shown above.)
+- **`state` is the right way to carry your post-login destination** — it is echoed back untouched, so your callback can route the user wherever you need.
+
+## Migrating from legacy pages
+
+If you previously embedded Prisme.ai **legacy pages** (served on a dedicated `*.pages.<host>` subdomain), you may have controlled the post-login destination with a `redirect` property on the **Signin** block, a `?redirect=` query parameter, or a `#__redirect_after_auth__` URL hash. Those accepted **absolute URLs**.
+
+On the current platform:
+
+- The equivalent is the **`returnTo`** mechanism described above, and it is **automatic** when you link directly to the page.
+- `returnTo` accepts **relative same-origin paths only**. If your legacy integration passed an absolute URL, replace it with a relative path such as `/p/<app-slug>`.
+
+## Security
+
+You cannot redirect a user to an arbitrary external site after login. Every post-login destination is either a relative same-origin path (validated to reject `http://…` and `//…`), the fixed sign-in callback, or your organization's configured home page. This is by design and protects users from open-redirect phishing.

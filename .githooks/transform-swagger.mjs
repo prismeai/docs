@@ -17,6 +17,14 @@
  *   4. Capitalize first letter of tag names (e.g. `permissions` -> `Permissions`).
  *   5. Insert a root `tags:` block with descriptions if missing.
  *   6. Replace placeholder/legacy server URLs with the canonical set.
+ *   7. Break recursive `$ref` cycles in `components.schemas`. Mintlify's API
+ *      playground eagerly expands request-body schemas to build the form/example;
+ *      a self- or mutually-recursive `$ref` (e.g. TypedArgument, NavigationItem,
+ *      the Instruction/InstructionList family) expands forever and crashes the
+ *      browser tab. Upstream keeps the recursion (dtsgen needs recursive types and
+ *      buildInstructions.ts relies on the circular refs), so we cut the cycles in
+ *      this docs-only copy by replacing each DFS back-edge with a shallow
+ *      placeholder that mirrors the target's `type`.
  *
  * Usage:
  *   npm run swagger:transform                              # canonical entry point
@@ -26,7 +34,7 @@
  * `npm install` has configured `core.hooksPath` via the `prepare` script.
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { parseDocument, isMap, Pair } from 'yaml';
+import { parseDocument, isMap, Pair, visit } from 'yaml';
 
 const HTTP_METHODS = new Set([
   'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'trace',
@@ -107,12 +115,91 @@ function* operations(doc) {
   }
 }
 
+// Break recursive `$ref` cycles among component schemas so a renderer that
+// eagerly expands schemas (the Mintlify API playground) can't loop forever.
+// Models schemas as a graph (nodes = schema names, edges = `$ref`s) and removes
+// the DFS back-edges, which is sufficient and minimal to make the graph acyclic.
+// Each cut `$ref` becomes a shallow placeholder whose `type` mirrors the target,
+// so arrays stay arrays and objects stay objects. Deterministic (document order)
+// and idempotent (a cut node has no `$ref`, so a second run finds no back-edges).
+function breakRecursiveRefs(doc) {
+  const schemasNode = doc.getIn(['components', 'schemas'], true);
+  if (!isMap(schemasNode)) return 0;
+
+  const schemaNodes = new Map();
+  for (const pair of schemasNode.items) {
+    schemaNodes.set(strVal(pair.key), pair.value);
+  }
+
+  const refName = (node) => {
+    if (!isMap(node)) return null;
+    const ref = node.get('$ref');
+    if (typeof ref !== 'string') return null;
+    const m = ref.match(/^#\/components\/schemas\/(.+)$/);
+    return m && schemaNodes.has(m[1]) ? m[1] : null;
+  };
+
+  // Collect the `$ref` edges inside each schema's subtree (document order).
+  const edges = new Map();
+  for (const [name, node] of schemaNodes) {
+    const list = [];
+    visit(node, {
+      Map(_k, m) {
+        const target = refName(m);
+        if (target) list.push({ target, node: m });
+      },
+    });
+    edges.set(name, list);
+  }
+
+  // DFS: a `$ref` to a schema currently on the stack closes a cycle -> cut it.
+  const UNVISITED = 0, ONSTACK = 1, DONE = 2;
+  const state = new Map();
+  const backEdges = [];
+  const dfs = (name) => {
+    state.set(name, ONSTACK);
+    for (const edge of edges.get(name) || []) {
+      const st = state.get(edge.target) || UNVISITED;
+      if (st === ONSTACK) backEdges.push(edge);
+      else if (st === UNVISITED) dfs(edge.target);
+    }
+    state.set(name, DONE);
+  };
+  for (const name of schemaNodes.keys()) {
+    if ((state.get(name) || UNVISITED) === UNVISITED) dfs(name);
+  }
+
+  for (const { target, node } of backEdges) {
+    const targetNode = schemaNodes.get(target);
+    const targetType = isMap(targetNode) ? targetNode.get('type') : null;
+    const type = typeof targetType === 'string' ? targetType : 'object';
+    // Replace the node with a clean, standards-valid Schema Object. We must drop
+    // ALL existing keys — not just `$ref` — because non-standard siblings (e.g.
+    // `hidden: true` on Repeat.do) are tolerated next to `$ref` on a Reference
+    // Object but invalid on a normal Schema Object, and would fail
+    // `mintlify openapi-check`.
+    node.items = [];
+    node.set('type', type);
+    // OpenAPI requires `items` on an array schema; supply a permissive one.
+    if (type === 'array') {
+      node.set('items', doc.createNode({ type: 'object' }));
+    }
+    node.set(
+      'description',
+      `Recursive reference to \`${target}\` — nesting is truncated here to ` +
+        `avoid the infinite expansion that crashes the API reference renderer.`,
+    );
+  }
+  return backEdges.length;
+}
+
 function transform(filePath) {
   const doc = parseDocument(readFileSync(filePath, 'utf-8'));
   const counters = {
     summariesAdded: 0, acronymsFixed: 0, tagsCapitalized: 0,
     duplicateIdsResolved: 0, opsDisambiguated: 0,
     rootTagsAdded: false, serversUpdated: false,
+    recursiveRefsBroken: 0,
   };
 
   // 1. Add summaries from operationId where missing.
@@ -232,10 +319,23 @@ function transform(filePath) {
     }
   }
 
+  // 7. Break recursive $ref cycles so the API playground can't expand forever.
+  counters.recursiveRefsBroken = breakRecursiveRefs(doc);
+
   // lineWidth defaults to 80: keeps long descriptions wrapped on multiple lines
   // rather than collapsing them. YAML 1.2 plain-scalar folding means we can't
   // reproduce the exact original wrap points, but the layout stays readable.
-  writeFileSync(filePath, doc.toString({ flowCollectionPadding: false }));
+  //
+  // Serialize, then round-trip once: a freshly-inserted long scalar (e.g. the
+  // step-7 descriptions) only settles on its final fold points after one
+  // parse/serialize cycle, so a single serialize would not be a fixed point and
+  // the pre-commit hook would re-wrap it on a later run. Round-tripping here
+  // makes the output stable (transform(output) === output). Already-stable
+  // content is unaffected.
+  const stringifyOptions = { flowCollectionPadding: false };
+  const serialized = doc.toString(stringifyOptions);
+  const stable = parseDocument(serialized).toString(stringifyOptions);
+  writeFileSync(filePath, stable);
   return counters;
 }
 
