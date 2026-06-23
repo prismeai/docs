@@ -120,7 +120,7 @@ global:
     allowCreation: true   # First install only — flip to false afterwards
 ```
 
-This flag controls whether the chart creates / overwrites the secrets referenced by `existingSecret` fields and the **internal secrets** it generates on its own — OIDC signing keys (`oidc`), the internal API key shared between services (`internalSecurity.apiKey`), and the workspace secrets encryption keys (`secretsEncryption.masterKeys` / `refKeys`).
+This flag gates **only the internal secrets the chart generates on its own** — OIDC signing keys (`oidc`), the internal API key shared between services (`internalSecurity.apiKey`), and the workspace secrets encryption keys (`secretsEncryption.masterKeys` / `refKeys`). It does **not** affect user-provided secrets (broker, storage, cache, mailgun, …) — those are controlled by their respective `existingSecret` fields (see below).
 
 **Required workflow:**
 
@@ -128,10 +128,18 @@ This flag controls whether the chart creates / overwrites the secrets referenced
 2. **After the first install** — set `allowCreation: false` and keep it that way for every subsequent `helm template` render or **ArgoCD** sync. (`helm upgrade` itself has cluster API access and preserves existing secrets correctly even with `allowCreation: true`, but you still want `false` everywhere to stay safe against any pipeline that doesn't.)
 
 <Warning>
-  **Why flipping to `false` is mandatory for ArgoCD / `helm template`.** With `allowCreation: true`, the chart preserves existing secret values across upgrades by calling `lookup "v1" "Secret"` against the live cluster. **That lookup returns nothing under `helm template` and under ArgoCD's diff** (both render the chart offline, without API access). The chart then regenerates fresh random values on every render and the resulting Secret manifests overwrite the live ones — invalidating OIDC sessions, breaking inter-service auth, and **making every previously-encrypted workspace secret unrecoverable**. Setting `allowCreation: false` skips the secret manifests entirely so the live secrets are left untouched.
+  **Why flipping to `false` is mandatory for ArgoCD / `helm template`.** With `allowCreation: true`, the chart preserves the internal secrets across upgrades by calling `lookup "v1" "Secret"` against the live cluster. **That lookup returns nothing under `helm template` and under ArgoCD's diff** (both render the chart offline, without API access). The chart then regenerates fresh random values on every render and the resulting Secret manifests overwrite the live ones — invalidating OIDC sessions, breaking inter-service auth, and **making every previously-encrypted workspace secret unrecoverable**. Setting `allowCreation: false` skips the internal-secret manifests entirely so the live secrets are left untouched.
 </Warning>
 
-The same flag also gates whether the chart writes the connection-URL secrets (`broker`, `permissions`, `users`, `collections`, object storage…) from the inline `url` / `password` values. Once those secrets exist in the cluster, strip the plaintext credentials from your values file and leave `allowCreation: false` — the services keep reading from the live secrets via their `existingSecret` references.
+#### User-provided secrets — `existingSecret` is authoritative
+
+For every external credential (broker, `storage.*`, `cache.*`, `providers.mailgun`, object storage, …), the chart follows a strict rule:
+
+- **If `existingSecret` is set** → the chart **never** creates or overrides that Secret. The deployment references the named Secret as-is. Any `url` / `password` value left in your values file is silently ignored for that resource. Pre-create the Secret out of band (ExternalSecrets Operator, sealed-secrets, Vault, `kubectl create secret`, …) — this is the **recommended** GitOps-friendly pattern.
+- **If `existingSecret` is empty AND you provide `url` / `password`** → the chart generates the Secret from those inline values. Useful for quick local trials; not recommended for production because plaintext credentials end up in your values file.
+- **If both are empty** → no Secret is created and the deployment fails to start. Pick one of the two patterns above.
+
+This is independent of `global.secrets.allowCreation`: a user secret with `existingSecret` set is safe under `helm template`, ArgoCD, restricted RBAC, or any offline render — no `lookup` is performed.
 
 #### Secrets encryption keys
 
@@ -498,7 +506,7 @@ helm install prismeai-apps prismeai/prismeai-apps \
 Both releases are independent — order doesn't matter and you can re-run either one with `helm upgrade` after editing the matching values file.
 
 <Warning>
-  **Once both releases are up, set `global.secrets.allowCreation: false`** in `prismeai-core-values.yaml` and re-run `helm upgrade`. Leaving it at `true` will silently overwrite the internal OIDC / encryption / internal-API-key secrets the first install just seeded as soon as the chart is rendered without cluster API access — typically an ArgoCD sync or a `helm template`-based pipeline. See [Secret bootstrapping](#secret-bootstrapping-global-secrets-allowcreation) for the full rationale.
+  **Once `prismeai-core` is up, set `global.secrets.allowCreation: false`** in `prismeai-core-values.yaml` and re-run `helm upgrade`. Leaving it at `true` will silently overwrite the **internal** OIDC / encryption / internal-API-key secrets the first install just seeded as soon as the chart is rendered without cluster API access — typically an ArgoCD sync or a `helm template`-based pipeline. User-provided secrets (broker, storage, …) are unaffected by this flag — they are governed by their `existingSecret` field. See [Secret bootstrapping](#secret-bootstrapping-global-secrets-allowcreation) for the full rationale.
 </Warning>
 
 <Accordion title="Troubleshooting: ImagePullBackOff on the apps namespace">
