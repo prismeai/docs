@@ -245,15 +245,47 @@ The LLM Gateway abstracts multiple providers behind a unified API:
 
 All providers are normalized to the OpenAI API format for chat completions and streaming (SSE).
 
-### Custom HTTP Headers (OpenAI-compatible)
+### Provider Options
 
-OpenAI-compatible (`openailike`) providers support a **Custom HTTP Headers** option that attaches arbitrary headers to every request sent to the upstream LLM endpoint. Typical uses: tenant-aware gateways, custom auth schemes, request tagging for cost attribution, or correlating upstream provider logs with Prisme.ai audit trails.
+Every provider block in the LLM Gateway config exposes a uniform `options` object that lets you reshape the request just before it hits the upstream endpoint, without changing application code. Three options are supported, all consumed by the same path inside `fetchLLM`:
+
+| Option | What it does | Applies to |
+|--------|--------------|------------|
+| `options.parameterAliases` | Renames request body keys (e.g. `max_tokens` → `max_completion_tokens` for providers that adopted the new OpenAI name) | All providers |
+| `options.excludeParameters` | Drops request body keys the upstream rejects (e.g. `top_p` for models that don't support it) | All providers |
+| `options.headers` | Attaches arbitrary HTTP headers (tenant tags, gateway subscription keys, correlation IDs…) | All providers |
+
+The same three options are also exposed in the **Agents Controls → Providers** UI for every provider type. Backwards-compatible: any option you omit is a no-op.
 
 <Note>
-Headers are configured **per-provider** in the workspace that owns the `openailike` config — **LLM Gateway** (`providers.openailike[].options.headers`) for the current LLM Gateway architecture, or **AI Knowledge** (`llm.openailike[].options.headers`) for the legacy AI Knowledge stack. The OpenAI app instance is a pass-through and is **not** the configuration surface; editing it directly there has no effect on traffic that flows through the gateway.
+Provider options are configured **per-provider** in the workspace that owns the provider config — **LLM Gateway** (`providers.<provider>.options.*`) for the current LLM Gateway architecture, or **AI Knowledge** (`llm.<provider>.options.*`) for the legacy AI Knowledge stack. The OpenAI app instance is a pass-through and is **not** the configuration surface; editing it directly there has no effect on traffic that flows through the gateway.
 </Note>
 
-Each entry is a single HTTP header `name → value` pair. Both the single-provider and multi-provider forms of `openailike` support it.
+#### `parameterAliases`
+
+Each entry is a `{ from, to }` pair. When a key matching `from` is present in the request body, it is renamed to `to` (the value is preserved, the old key is dropped). Typical use: a provider exposes the OpenAI Chat Completions surface but renamed `max_tokens` to `max_completion_tokens`.
+
+```yaml
+options:
+  parameterAliases:
+    - from: max_tokens
+      to: max_completion_tokens
+```
+
+#### `excludeParameters`
+
+Each entry is a body key name to delete before the request is sent. Typical use: a model rejects `top_p` or `presence_penalty` and you want to keep your app code provider-agnostic instead of conditionally stripping.
+
+```yaml
+options:
+  excludeParameters:
+    - top_p
+    - presence_penalty
+```
+
+#### `headers`
+
+A map of `name → value` HTTP header pairs attached to every upstream request. Typical uses: tenant-aware gateways (e.g. Azure API Management in front of Bedrock / Anthropic / Vertex), custom auth schemes, request tagging for cost attribution, or correlating upstream provider logs with Prisme.ai audit trails.
 
 **Static values** are sent verbatim:
 
@@ -274,7 +306,13 @@ Resolution rules for `{user.<path>}`:
 - If the path doesn't exist on the user object, the header value resolves to an empty string.
 - If the resolved value is not a string (object, array, number), it is JSON-stringified before being sent.
 
-Example LLM Gateway config (`workspaces/llm-gateway/index.yml`, under `config.value.providers.openailike`):
+<Warning>
+Substitution is **full-string only**. The value must match the placeholder pattern exactly — composite values such as `prefix-{user.id}` or `req-{correlationId}-v2` are sent as-is, without substitution. Unknown placeholders that don't match any supported pattern (e.g. `{foo.bar}`) are also sent verbatim.
+</Warning>
+
+**Examples**
+
+OpenAI-compatible (`openailike`) — typical case of routing through a custom gateway:
 
 ```yaml
 - api_key: '{{secret.myProviderApiKey}}'
@@ -290,21 +328,34 @@ Example LLM Gateway config (`workspaces/llm-gateway/index.yml`, under `config.va
       x-tenant: 'acme-corp'
 ```
 
-<Warning>
-Substitution is **full-string only**. The value must match the placeholder pattern exactly — composite values such as `prefix-{user.id}` or `req-{correlationId}-v2` are sent as-is, without substitution. Unknown placeholders that don't match any supported pattern (e.g. `{foo.bar}`) are also sent verbatim.
-</Warning>
+Anthropic — injecting an Azure API Management gateway's subscription key in front of a Claude-compatible endpoint:
 
-**Notes**:
-- Custom headers are merged on top of the default `Content-Type: application/json` and `Authorization: Bearer <api_key>` headers. Reusing a default header name will override it — typically only useful for `Authorization` when the upstream requires a non-Bearer scheme.
-- For multipart endpoints (image edits), the `Content-Type` is dropped automatically so the runtime can set the multipart boundary.
-- The feature is only available on the **OpenAI-compatible** provider type, not on the native OpenAI, Anthropic, Azure, Bedrock, Vertex, or Sagemaker providers.
+```yaml
+anthropic:
+  api_key: '{{secret.anthropicApiKey}}'
+  anthropic_version: '2023-06-01'
+  endpoint: https://my-apim.example.net/ai/anthropic/v1/messages
+  models:
+    - claude-sonnet-4-5
+  options:
+    headers:
+      x-api-key: '{{secret.anthropicApiKey}}'
+      Ocp-Apim-Subscription-Key: '{{secret.apimSubscriptionKey}}'
+      x-correlation-id: '{correlationId}'
+      x-user-email: '{user.email}'
+```
+
+**Notes on headers**:
+- Custom headers are **merged on top** of the provider's default headers (auth + content-type + provider-specific headers like `anthropic-version`). Reusing a default header name will override it — useful for `Authorization` on `openailike` when the upstream requires a non-Bearer scheme, or for `x-api-key` on `anthropic` when fronting Anthropic with an API Management gateway whose key differs from the upstream key.
+- For multipart endpoints (image edits, `openailike` only), the `Content-Type` is dropped automatically so the runtime can set the multipart boundary.
+- On Bedrock and Vertex, the standard provider auth (AWS Signature v4 / Google service account token) is **always added by the gateway**, regardless of `options.headers` — you cannot disable it through this option.
 
 ### Custom Endpoint (Anthropic)
 
 The native **Anthropic** provider supports an optional `endpoint` field. When set, it is used **verbatim** as the request URL instead of the default `https://api.anthropic.com/v1/messages`. This lets the Anthropic provider target any Anthropic-compatible host — self-hosted Claude deployments, Anthropic-compatible gateways, or **Azure AI Foundry** endpoints whose URL doesn't fit the standard `{resource}.{domain}/anthropic/v1/messages` scheme.
 
 <Note>
-Like the `openailike` headers above, this is configured in the workspace that owns the provider config — **LLM Gateway** (`config.value.providers.anthropic.endpoint`). The OpenAI app instance is a pass-through and is **not** the configuration surface.
+Like the [provider options](#provider-options) above, this is configured in the workspace that owns the provider config — **LLM Gateway** (`config.value.providers.anthropic.endpoint`). The OpenAI app instance is a pass-through and is **not** the configuration surface.
 </Note>
 
 Example LLM Gateway config (`workspaces/llm-gateway/index.yml`, under `config.value.providers.anthropic`):
@@ -322,7 +373,7 @@ anthropic:
 
 **Notes**:
 - **Additive** — omit `endpoint` and the provider behaves exactly as before, calling `https://api.anthropic.com/v1/messages`.
-- **Selectable auth scheme** — set `auth_scheme` to control how the key is sent: `x-api-key` (default, the standard Anthropic header), `api-key`, or `bearer` (sends `Authorization: Bearer <api_key>` and omits `x-api-key`). The key or token always goes in `api_key`. Omit `auth_scheme` to keep the default `x-api-key` behavior. The full custom-header mechanism described above (runtime placeholders, arbitrary headers) remains exclusive to `openailike` — `auth_scheme` only covers the auth header for Anthropic.
+- **Selectable auth scheme** — set `auth_scheme` to control how the key is sent: `x-api-key` (default, the standard Anthropic header), `api-key`, or `bearer` (sends `Authorization: Bearer <api_key>` and omits `x-api-key`). The key or token always goes in `api_key`. Omit `auth_scheme` to keep the default `x-api-key` behavior. For richer needs (multiple auth headers, gateway subscription keys, request tagging), use [`options.headers`](#headers) — it overrides anything set by `auth_scheme`.
 - **Include the full path** — the value is taken as-is; append `/v1/messages` (or whatever path the host exposes).
 - **vs Azure OpenAI `format: anthropic`** — if the URL fits `https://{resource}.{domain}/anthropic/v1/messages`, configure it as an `azure_openai.resources` entry with `format: anthropic` (you get URL forging and can co-locate GPT + Claude on one resource). Use `anthropic.endpoint` when the URL does **not** fit that scheme.
 
