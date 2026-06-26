@@ -12,7 +12,7 @@ description: 'SharePoint sites, document libraries, files, lists and permissions
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The SharePoint app provides read/write access to Microsoft SharePoint Online and OneDrive — sites, document libraries (drives), files and folders, SharePoint lists, sharing permissions, and the Azure AD directory — through the [Microsoft Graph](https://learn.microsoft.com/en-us/graph/overview) REST API (v1.0). It can be consumed two ways: as a remote MCP server that **Agent Factory** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. The MCP surface groups every operation into **seven entity tools** (`sites`, `drives`, `items`, `search`, `permissions`, `lists`, `directory`), each driven by an `action` argument, and runs in the **tenant app-instance context** (it resolves the installing workspace's own credentials). Authentication is per-user and supports several modes:
+The SharePoint app provides read/write access to Microsoft SharePoint Online and OneDrive — sites, document libraries (drives), files and folders, SharePoint lists, sharing permissions, and the Azure AD directory — through the [Microsoft Graph](https://learn.microsoft.com/en-us/graph/overview) REST API (v1.0). It can also read Excel `.xlsx` workbooks and Word `.docx` documents **natively** — cell values and document text are parsed in-process, with no download, OCR or external extraction service. It can be consumed two ways: as a remote MCP server that **Agent Factory** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. The MCP surface groups every operation into **nine entity tools** (`sites`, `drives`, `items`, `search`, `permissions`, `lists`, `directory`, `workbook`, `documents`), each driven by an `action` argument, and runs in the **tenant app-instance context** (it resolves the installing workspace's own credentials). Authentication is per-user and supports several modes:
 
 - **Per-user OAuth2 — central client** (`oauthCentral`, recommended) — one Microsoft Entra OAuth Application is registered once by the platform maintainer; every end user signs in with their own Microsoft account. Nothing to register per tenant: each workspace just installs the app and clicks *Connect*.
 - **Per-user OAuth2 — tenant client** (`oauth`) — paste your own Entra application (client) ID/secret in the connector config app. Each user signs in with their own account against your client (PKCE authorization-code flow).
@@ -21,7 +21,7 @@ The SharePoint app provides read/write access to Microsoft SharePoint Online and
 
 <CardGroup cols={3}>
   <Card title="Sites & files" icon="folder-tree">
-    Discover sites and subsites, browse document libraries and folders, read/create/move/copy files, get pre-signed download URLs, thumbnails and versions
+    Discover sites and subsites, browse document libraries and folders, read/create/move/copy files, get pre-signed download URLs, thumbnails and versions — and read Excel `.xlsx` workbooks and Word `.docx` documents natively (cell values, full text)
   </Card>
   <Card title="Lists, search & permissions" icon="list">
     Query and write SharePoint lists and list items, run Microsoft Search across drives and sites, and inspect or manage sharing permissions for access-aware RAG
@@ -199,7 +199,7 @@ https://graph.microsoft.com/User.Read
     Whichever option you pick, wiring the capability is not enough — the agent must know the MCP exists and when to use it. Copy-pasteable starter:
 
     ```text
-    You have access to the SharePoint MCP server (tools: sites, drives, items, search, permissions, lists, directory). Each tool takes an `action` argument. Use it whenever the user asks about SharePoint sites, document libraries, files and folders, SharePoint lists, sharing permissions, or who can access a document. To read a file, list its drive's children, then use the @microsoft.graph.downloadUrl the item exposes (content is not returned inline). Prefer calling a tool over guessing, and confirm with the user before any write or destructive action (create, update/move, copy, delete, invite, create link).
+    You have access to the SharePoint MCP server (tools: sites, drives, items, search, permissions, lists, directory, workbook, documents). Each tool takes an `action` argument. Use it whenever the user asks about SharePoint sites, document libraries, files and folders, SharePoint lists, sharing permissions, or who can access a document. To read a file, list its drive's children, then use the @microsoft.graph.downloadUrl the item exposes (content is not returned inline); for an Excel `.xlsx` file use the `workbook` tool and for a Word `.docx` file use the `documents` tool to read content natively. Prefer calling a tool over guessing, and confirm with the user before any write or destructive action (create, update/move, copy, delete, invite, create link, add/create worksheet or table).
     ```
 
     <Note>
@@ -229,6 +229,8 @@ https://graph.microsoft.com/User.Read
     | `permissions` | Sharing & permissions on driveItems (access-aware RAG). Actions: `list`, `get`, `invite`, `createLink`, `delete`. |
     | `lists` | SharePoint lists and list items. Actions: `listForSite`, `get`, `listItems`, `getItem`, `createItem`, `updateItemFields`, `deleteItem`. |
     | `directory` | Azure AD users & groups — resolve identities and group membership. Actions: `getUser`, `userMemberOf`, `checkUserMemberGroups`, `getGroup`, `groupMembers`. |
+    | `workbook` | Read & write Excel `.xlsx` workbooks **natively** via the Microsoft Graph Excel API — no download, no OCR; cells are returned as structured values. Target a file by `driveId` + `itemId`. Actions: `listWorksheets`, `usedRange`, `getRange`, `listTables`, `listTableRows`, `updateRange`, `addTableRow`, `addWorksheet`, `createTable`, `executeFunction`. |
+    | `documents` | Read the content of Word `.docx` documents **natively** — no external extraction service, no OCR; parses the OOXML in-process. Target a file by `driveId` + `itemId`. Actions: `getText`, `getStructure`. |
 
     ## Output Formats
 
@@ -350,6 +352,59 @@ https://graph.microsoft.com/User.Read
     | `itemId` | Yes | DriveItem id. |
     | `permId` | For get/delete | Permission id. |
     | `body` | For invite/createLink | `invite` → `{ recipients, roles, requireSignIn, sendInvitation }`; `createLink` → `{ type, scope }`. |
+
+    ### workbook
+
+    Read & write the cells of an Excel `.xlsx` file natively via the Microsoft Graph Excel API — no download, no OCR.
+
+    ```json
+    {
+      "name": "workbook",
+      "arguments": {
+        "action": "usedRange",
+        "driveId": "b!xyz...",
+        "itemId": "01ABCDEF...",
+        "worksheetId": "Sheet1"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `listWorksheets`, `usedRange`, `getRange`, `listTables`, `listTableRows`, `updateRange`, `addTableRow`, `addWorksheet`, `createTable`, `executeFunction`. |
+    | `driveId` | Yes | Drive id containing the `.xlsx` file. |
+    | `itemId` | Yes | DriveItem id of the `.xlsx` file. |
+    | `worksheetId` | For usedRange/getRange/updateRange | Worksheet id or name. |
+    | `address` | For getRange/updateRange | A1 range address, e.g. `"A1:D50"` or `"Sheet1!A1:D50"`. |
+    | `tableId` | For listTableRows/addTableRow | Table id or name. |
+    | `functionName` | For executeFunction | Excel function name, e.g. `"vlookup"`, `"sum"`, `"today"`. |
+    | `top` / `select` | No | Query options (`listTableRows` `top`, OData `$select`). |
+    | `body` | For write actions | `{ values: [[...], [...]] }` (updateRange / addTableRow), `{ name }` (addWorksheet), `{ address, hasHeaders }` (createTable), or the function's named arguments (executeFunction, e.g. `{ values: [[...]] }`). |
+
+    `addWorksheet`, `createTable` and `executeFunction` evaluate / mutate the workbook server-side. `executeFunction` returns `{ value }` — the evaluated result of the Excel function.
+
+    ### documents
+
+    Read the content of a Word `.docx` file natively — the file is downloaded and its OOXML parsed in-process (no external extraction service, no OCR).
+
+    ```json
+    {
+      "name": "documents",
+      "arguments": {
+        "action": "getText",
+        "driveId": "b!xyz...",
+        "itemId": "01ABCDEF..."
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `getText` — full plain text (paragraphs + table cells), capped ~200 KB, best for RAG / reading; or `getStructure` — the element tree (paragraphs with style/runs/formatting, tables with rows/cols/headers/cells) plus metadata and the full text. |
+    | `driveId` | Yes | Drive id containing the `.docx` file. |
+    | `itemId` | Yes | DriveItem id of the `.docx` file. |
+    | `includeContent` | No (getStructure only) | Include per-element text/runs (default `true`). Ignored by `getText`. |
+    | `maxContentLength` | No (getStructure only) | Max characters of text per element (`0` = no per-element cap). |
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
@@ -389,7 +444,7 @@ https://graph.microsoft.com/User.Read
 
     ## Available Instructions
 
-    Every instruction resolves credentials from the workspace configuration. Operations are grouped by SharePoint resource; the MCP server exposes the same operations behind the seven entity tools (see the *Agent builder* tab). Site ids use the `hostname,siteCollectionId,siteId` format.
+    Every instruction resolves credentials from the workspace configuration. Operations are grouped by SharePoint resource; the MCP server exposes the same operations behind the nine entity tools (see the *Agent builder* tab). Site ids use the `hostname,siteCollectionId,siteId` format.
 
     ### Sites
 
@@ -456,6 +511,15 @@ https://graph.microsoft.com/User.Read
     | `checkUserMemberGroups` | Check which of given group ids a user is in; `body` = `{ groupIds: [<id>] }`. | `{ value: [ <groupId> ] }` |
     | `getGroup` | Get a group by id. | A group resource. |
     | `listGroupMembers` | List members of a group. | `{ value: [ user ] }` |
+
+    ### Excel workbooks & Word documents (native content)
+
+    Reading and writing file **content** natively is exposed on the **MCP surface** as the `workbook` and `documents` entity tools (see the *Agent builder* tab) — not as separate Builder instructions, since they are routed internally. From an agent you call them by `action`:
+
+    | Tool | Actions | Purpose |
+    |------|---------|---------|
+    | `workbook` (Excel `.xlsx`) | `listWorksheets`, `usedRange`, `getRange`, `listTables`, `listTableRows`, `updateRange`, `addTableRow`, `addWorksheet`, `createTable`, `executeFunction` | Read/write cell values natively via the Microsoft Graph Excel API — no download, no OCR. `addWorksheet`/`createTable` mutate the workbook; `executeFunction` evaluates an Excel function (`functionName` + named args) and returns `{ value }`. |
+    | `documents` (Word `.docx`) | `getText`, `getStructure` | Read document content natively (OOXML parsed in-process). `getText` returns the full plain text (capped ~200 KB); `getStructure` returns the paragraph/table element tree plus metadata. |
 
     <Note>
       `Returns` shows the shape of the operation output (the underlying Microsoft Graph resource). To download a file, read the `@microsoft.graph.downloadUrl` returned by `getItem` / `listChildren` (a ~1h pre-signed link) — content is not returned inline.
