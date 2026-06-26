@@ -1,0 +1,555 @@
+---
+title: 'Confluence'
+description: 'Read and write Atlassian Confluence Cloud pages, spaces, comments, labels and attachments, with CQL search and page-hierarchy navigation, from Agent Factory agents and Builder workflows, with per-user Atlassian OAuth'
+---
+
+<img
+  src="/images/connectors/confluence.svg"
+  alt="Confluence"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The Confluence app provides read/write access to [Atlassian Confluence Cloud](https://www.atlassian.com/software/confluence) through the official REST API v2 (plus the v1 CQL search). It can be consumed two ways: as a remote MCP server that **Agent Factory** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. The MCP surface groups every operation into **eight entity tools** (`pages`, `spaces`, `search`, `content`, `comments`, `labels`, `attachments`, `versions`), each driven by an `action` argument, and runs in the **tenant app-instance context** (it resolves the installing workspace's own credentials and gates which agents may call it). Authentication is per-user and supports several modes:
+
+- **Per-user OAuth2 — central client** (`oauthCentral`, recommended) — one Atlassian 3LO OAuth app is registered once by the platform maintainer; every end user signs in with their own Atlassian account. Nothing to register per tenant: each workspace just installs the app and clicks *Connect*.
+- **Per-user OAuth2 — tenant client** (`oauth`) — paste your own Atlassian OAuth client ID/secret in the connector config app. Each user signs in with their own account against your client (PKCE authorization-code, 3LO).
+- **API token — HTTP Basic** (`apiToken`) — an Atlassian account email + API token + your `*.atlassian.net` site. A single shared service identity, no interactive sign-in.
+- **Direct access token** (`accessToken`) — a caller-managed Atlassian access token, used as-is with no exchange.
+
+<CardGroup cols={3}>
+  <Card title="Pages & spaces" icon="file-lines">
+    List, read (with body), create, update and delete wiki pages; browse spaces and read page bodies in storage or ADF format.
+  </Card>
+  <Card title="Search & hierarchy" icon="sitemap">
+    CQL search across the wiki, plus children / ancestors / descendants navigation of the page tree, comments, labels and attachments.
+  </Card>
+  <Card title="Per-user Atlassian OAuth" icon="key">
+    Per-user 3LO OAuth (central or tenant client), an HTTP Basic API token, or a direct access token — resolved server-side.
+  </Card>
+</CardGroup>
+
+## Who is this for?
+
+This connector is used by three different roles. Jump to the section that matches yours — each one is self-contained.
+
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot">
+    You build agents in **Agent Factory** and want them to read and act on Confluence. → *Agent builder* tab.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved">
+    You run the platform and set up the shared Atlassian OAuth client once for everyone. → *Platform admin setup* accordion below.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece">
+    You write Builder automations (DSUL) that call Confluence operations directly. → *Workspace builder* tab.
+  </Card>
+</CardGroup>
+
+## Prerequisites (Atlassian side)
+
+- An **Atlassian Confluence Cloud** site (`https://yoursite.atlassian.net`) and an account with permission on the spaces you intend to use.
+- For the OAuth modes: an **OAuth 2.0 (3LO) app** registered in the [Atlassian Developer Console](https://developer.atlassian.com/console/myapps/), with the **Confluence API** added and the **granular** scopes below granted. For the `apiToken` mode instead: an **Atlassian account email** + an **API token** generated at [Atlassian API Tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
+- The base URL is resolved automatically: OAuth modes call `https://api.atlassian.com/ex/confluence/{cloudId}` (the `cloudId` is discovered from the granted site); the `apiToken` mode calls `https://{site}.atlassian.net` directly.
+
+The Confluence v2 REST API **requires granular scopes** (the classic `*:confluence-content.all` scopes only authorize the legacy v1 API). The complete granular scope set requested by default — covering all 20 operations — is:
+
+```text
+read:page:confluence
+write:page:confluence
+delete:page:confluence
+read:space:confluence
+read:comment:confluence
+write:comment:confluence
+read:label:confluence
+write:label:confluence
+read:attachment:confluence
+read:content-details:confluence
+read:hierarchical-content:confluence
+read:content.metadata:confluence
+read:user:confluence
+offline_access
+```
+
+<Note>
+  A few scopes are non-obvious but required: `read:content-details:confluence` authorizes the **v1 CQL search** (`search` tool); `read:hierarchical-content:confluence` covers **children / descendants** (`content` tool); and `read:content.metadata:confluence` is required for **page ancestors**. Drop them and the corresponding operations return `403`.
+</Note>
+
+<Accordion title="Platform admin (Governance) — one-time platform setup" icon="shield-halved">
+  **Goal:** two one-time tasks — (1) configure the shared **central Atlassian OAuth client** so every workspace lets its users sign in with their own Atlassian account, and (2) expose Confluence as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
+
+  ## 1. Configure the connector
+
+  <Steps>
+    <Step title="Register the OAuth 2.0 (3LO) app at Atlassian">
+      In the [Atlassian Developer Console](https://developer.atlassian.com/console/myapps/), create an app → **Authorization > OAuth 2.0 (3LO)**, and set the **Callback URL** to the core workspace callback:
+
+      ```text
+      <api-url>/workspaces/slug:confluence-next/webhooks/oauthCallback
+      ```
+
+      (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:confluence-next/webhooks/oauthCallback` on production — `<api-url>` is the production API URL. Copy the exact URI from the connector's configuration app, which renders it for you.) Then under **Permissions**, add the **Confluence API** and enable the **granular** scopes listed in *Prerequisites*. Note the **Client ID** and **Secret** from **Settings**.
+    </Step>
+    <Step title="Confirm the scopes are granular, not classic">
+      Atlassian enforces **classic XOR granular scopes per product** in the developer console. The Confluence v2 REST API the connector uses works **only** with the granular `*:confluence` scopes; the classic Confluence scopes (e.g. `read:confluence-content.all`) authorize the legacy v1 API and will **not** appear in the granular list. Enable the full granular set from *Prerequisites* — partial sets cause `403` on the missing operations.
+
+      <Warning>
+        The connector requests exactly the scopes set in its **Scopes** field (the central scopes entered in step 3, overridable per workspace) — **not** whatever is enabled on the Atlassian app. Enabling more scopes in the Atlassian developer console has no effect until you also add them to the connector's Scopes field. Conversely the Scopes field can never grant a permission the Atlassian app does not expose.
+      </Warning>
+    </Step>
+    <Step title="Enter the credentials through the configuration app">
+      Open the central `confluence-next` workspace and launch its **Configuration app** — `<studio>/apps/confluence-next` (e.g. `https://studio.prisme.ai/apps/confluence-next`), also linked as `Configuration app` on the installed instance. Switch to the maintainer view and follow the in-app instructions to paste the **Client ID**, **Client Secret** and the **Scopes** — the app stores them in the core workspace's secrets for you. Do not edit Studio's raw Secrets by hand. These credentials stay in the `confluence-next` workspace and are never exposed to tenants or end users; token exchange is proxied through the core `centralTokenExchange` webhook so the client secret never leaves the core workspace.
+
+      <Note>
+        **One Atlassian OAuth app can serve both Confluence and Jira.** A single Atlassian app (one Client ID/Secret) can have both the Confluence API and the Jira platform REST API enabled. Each connector requests **its own** Scopes, so Confluence uses its granular scopes while Jira can stay on classic scopes on the very same app — point both connectors' config apps at the same Client ID/Secret and give each its own Scopes field.
+      </Note>
+    </Step>
+    <Step title="Tell workspaces to use the central client">
+      Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**.
+    </Step>
+  </Steps>
+
+  ## 2. Declare the capability in AI Governance
+
+  Generic connectors — broad tool surfaces meant to be shared across many agents, like Confluence — are best exposed as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
+
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) the **Confluence** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
+
+      ```text
+      context_id,agent_id,user_id
+      ```
+
+      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
+    </Step>
+    <Step title="Make it available to agent builders">
+      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant.
+    </Step>
+    <Step title="Smoke-test">
+      From an agent that has the capability, in a workspace configured for `oauthCentral`, trigger any tool. The user is prompted to connect once (Atlassian sign-in); subsequent calls reuse the stored token transparently and refresh it automatically.
+    </Step>
+  </Steps>
+
+  <Warning>
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model** — which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is also **no OAuth auth-config JSON** to attach in Governance: connect / status / disconnect are handled by the connector's own webhooks, wired automatically.
+  </Warning>
+</Accordion>
+
+---
+
+<Tabs>
+  <Tab title="Agent builder (Agent Factory)">
+    ## Agent builder
+
+    **Goal:** let an agent you build in Agent Factory read and act on Confluence through MCP tools.
+
+    <Note>
+      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Confluence app in a workspace (see the *Workspace builder* tab), and — for the central OAuth mode — a *Platform admin* must have provisioned the shared OAuth client (see the *Platform admin setup* accordion above).
+    </Note>
+
+    This connector runs in the **tenant app-instance context**: your agent is authorized two ways at once — it is identified by the `agent_id` that Agent Factory injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The Atlassian token itself is resolved server-side from the configured auth mode.
+
+    There are two ways to wire it up. Pick based on how much isolation you need.
+
+    ## Option A — Enable the shared capability from the catalog
+
+    The fastest path: a *Platform admin* has already published a **Confluence** capability (see the *Platform admin setup* accordion above, §2), so you just pick it from the catalog.
+
+    <Steps>
+      <Step title="Open your agent in Agent Factory">
+        Open the agent you want to extend and go to its capabilities / tools.
+      </Step>
+      <Step title="Add the Confluence capability">
+        Browse the capability catalog, select **Confluence**, and enable it. The MCP endpoint URL and the *Scope* (`context_id,agent_id,user_id`) are already wired by the admin — nothing to paste, and the shared instance accepts every agent, so there is no allowlist step on your side.
+      </Step>
+      <Step title="Connect an Atlassian account (OAuth modes)">
+        On the first tool call, an unconnected user is prompted to sign in — Agent Factory surfaces a `connect_url`. The `apiToken` and `accessToken` modes need no per-user sign-in.
+      </Step>
+    </Steps>
+
+    <Note>
+      Convenient, but your agent runs against a **shared, platform-managed instance**: its Atlassian credentials are owned by someone else and the instance accepts every agent that is granted the capability. Prefer Option B for anything beyond quick experiments.
+    </Note>
+
+    ## Option B — Run it from your own workspace (recommended)
+
+    For production agents, install the connector in **your own workspace** and point the agent at *that* workspace's MCP endpoint.
+
+    <Warning>
+      **Prefer this mode for security.** Because the MCP runs in *your* app-instance context, the Atlassian credentials, the per-user OAuth tokens and the authorized-agents allowlist are all **scoped to your workspace** — not shared platform-wide. You decide exactly which agents may call it and which Atlassian account / auth mode backs them, and a misconfiguration elsewhere can never expose your data. The shared catalog capability (Option A) is a broad surface many agents can reach; your own workspace is an isolated, least-privilege boundary.
+    </Warning>
+
+    <Steps>
+      <Step title="Install and configure the connector in your workspace">
+        Follow the *Workspace builder* tab: install **ConfluenceNext** in your workspace, open its **Configuration app**, choose the auth mode and connect an Atlassian account.
+      </Step>
+      <Step title="Allowlist your agent">
+        In that workspace's config app, open **Authorized agents** and tick your agent (the **Install capability** button does this for you).
+      </Step>
+      <Step title="Add the MCP capability to your agent">
+        In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
+
+        ```text
+        context_id,agent_id,user_id
+        ```
+
+        The `agent_id` is what lets the connector identify and authorize your agent — without it, every call is rejected with an explicit "agent could not be identified" message. This *Scope* is separate from the Atlassian OAuth scopes.
+      </Step>
+      <Step title="Connect an Atlassian account (OAuth modes)">
+        On the first tool call, the user is prompted to sign in (or uses **Connect** in the config app).
+      </Step>
+    </Steps>
+
+    ## Brief the agent in its system prompt
+
+    Whichever option you pick, wiring the capability is not enough — the agent must know the MCP exists and when to use it. Copy-pasteable starter:
+
+    ```text
+    You have access to the Confluence MCP server (tools: pages, spaces, search, content, comments, labels, attachments, versions). Each tool takes an `action` argument. Use `search` (action `cql`) to find content with CQL, `pages` getBody to read a page's content, and `pages` create/update/delete to manage pages. Page bodies use Confluence "storage" format (XHTML). Navigate the tree with `content` children/ancestors/descendants. Confirm with the user before any create, update, delete or comment.
+    ```
+
+    <Note>
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the config app and its identity propagated so the connector can read its `agent_id`.
+    </Note>
+
+    <Note>
+      **Restricting to read-only (least privilege).** Confluence tools cover both reads and writes (create / update / delete pages, add comments and labels). The requested OAuth scopes **are** the grant, so the connector only obtains what the **Scopes** field in the configuration app asks for. To allow only read access, drop the write/delete scopes:
+
+      ```text
+      read:page:confluence read:space:confluence read:comment:confluence read:label:confluence read:attachment:confluence read:content-details:confluence read:hierarchical-content:confluence read:content.metadata:confluence read:user:confluence offline_access
+      ```
+
+      (Removed: `write:page:confluence`, `delete:page:confluence`, `write:comment:confluence`, `write:label:confluence`.) With central OAuth (`oauthCentral`) you do **not** create your own Atlassian client — keep `oauthCentral` and just enter the read-only scopes; your tenant scope overrides the platform default (the central app must expose those read scopes). Write calls are then rejected by Atlassian with `403`. Note this is set at the workspace level — a workspace editor can widen it again; a provider-side restriction (a read-only Atlassian account/space permission) is the only hard guarantee. For the `apiToken` mode, restrict at the provider instead by backing the connection with a Confluence account that has read-only space permissions.
+    </Note>
+
+    ## Available Tools
+
+    Each tool takes an `action` argument selecting the concrete operation, plus the per-action parameters.
+
+    | Tool | Description |
+    |------|-------------|
+    | `pages` | Confluence pages (REST v2). Actions: `list`, `get`, `getBody`, `create`, `update`, `delete`. Bodies use storage (XHTML) or `atlas_doc_format`. |
+    | `spaces` | Confluence spaces (REST v2). Actions: `list`, `get`. |
+    | `search` | CQL search (REST v1). Action: `cql` — e.g. `type=page AND space=DEV AND text ~ "roadmap"`. |
+    | `content` | Page hierarchy (REST v2). Actions: `children`, `ancestors`, `descendants`. |
+    | `comments` | Page comments (REST v2). Actions: `getFooter`, `addFooter`, `getInline`. |
+    | `labels` | Page labels (read v2, add v1). Actions: `getForPage`, `addToPage`. |
+    | `attachments` | Page attachments (REST v2). Actions: `listForPage`, `get`. Metadata + `downloadLink`; binary is not inline. |
+    | `versions` | Page version history (REST v2). Action: `listForPage`. |
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
+
+    - **`verbose`** (default) — human-readable text optimized for LLM consumption
+    - **`structured`** — machine-readable JSON in `structuredContent`
+    - **`both`** — both the text and the structured content
+
+    ## Tool Details
+
+    ### search
+
+    ```json
+    {
+      "name": "search",
+      "arguments": {
+        "action": "cql",
+        "cql": "type=page AND space=DEV AND text ~ \"roadmap\"",
+        "limit": 25,
+        "excerpt": "highlight"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `cql`. |
+    | `cql` | Yes | Confluence Query Language string, e.g. `type=page AND space=DEV AND text ~ "roadmap"`. |
+    | `cqlcontext` | No | CQL context JSON (space / contentId scoping). |
+    | `limit` / `start` / `cursor` | No | Pagination controls. |
+    | `excerpt` | No | Excerpt strategy: `indexed`, `highlight`, `none`. |
+
+    ### pages
+
+    ```json
+    {
+      "name": "pages",
+      "arguments": {
+        "action": "create",
+        "body": {
+          "spaceId": "65538",
+          "status": "current",
+          "title": "Release notes 2.0",
+          "parentId": "98306",
+          "body": {
+            "representation": "storage",
+            "value": "<p>Highlights of the release.</p>"
+          }
+        }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `list`, `get`, `getBody`, `create`, `update`, `delete`. |
+    | `id` | For get/getBody/update/delete | Page id. |
+    | `spaceId` / `title` / `status` | No | Filters for `list` (or container for `create` via `body`). |
+    | `bodyFormat` | No | Body format on read: `storage`, `atlas_doc_format`, `view`. |
+    | `body` | For create/update | `{ spaceId, status, title, parentId, body: { representation, value }, version: { number } }`. Updates must echo the current `version.number` + 1. |
+
+    <Note>
+      `get` returns page metadata **without** the body; use `getBody` (or `get` with `bodyFormat`) to read the content. Updating a page is optimistic-locked: pass `version: { number }` one above the page's current version, or Confluence returns a conflict.
+    </Note>
+
+    ### content
+
+    ```json
+    {
+      "name": "content",
+      "arguments": {
+        "action": "descendants",
+        "id": "98306",
+        "depth": 3,
+        "limit": 100
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `children`, `ancestors`, `descendants`. |
+    | `id` | Yes | Page id. |
+    | `depth` | No | `descendants` only — how deep to walk the tree. |
+    | `limit` / `cursor` | No | Pagination controls. |
+
+    ### comments
+
+    ```json
+    {
+      "name": "comments",
+      "arguments": {
+        "action": "addFooter",
+        "body": {
+          "pageId": "98306",
+          "body": { "representation": "storage", "value": "<p>Reviewed and approved.</p>" }
+        }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `getFooter`, `addFooter`, `getInline`. |
+    | `id` | For getFooter/getInline | Page id. |
+    | `body` | For addFooter | `{ pageId, body: { representation, value }, parentCommentId? }` (set `parentCommentId` to reply). |
+    | `bodyFormat` / `status` / `sort` | No | Read filters for getFooter / getInline. |
+  </Tab>
+
+  <Tab title="Workspace builder (DSUL)">
+    ## Workspace builder
+
+    **Goal:** install the connector in a workspace, configure authentication and the agent allowlist, and call Confluence operations from your automations.
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **ConfluenceNext** and install it
+    3. Open the **Configuration app** (the link auto-populated on install) to choose the auth mode, provide credentials, connect, and allow the agents that may call the connector
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Configuration app** | Auto-populated on install — open this link to configure authentication (mode + credentials), connect an Atlassian account (OAuth modes), and manage the authorized-agents allowlist. |
+
+    The configuration app drives everything; the app instance itself has no per-field credential form. From it you pick one of:
+
+    | Auth mode | What you provide | Best for |
+    |-----------|------------------|----------|
+    | `oauthCentral` | Nothing — just click **Connect** | Workspaces on a platform where the admin set up the central Atlassian client |
+    | `oauth` | Your own Atlassian **Client ID + Secret** (callback URI `<api-url>/workspaces/slug:confluence-next/webhooks/oauthCallback`) + **Scopes** | You manage your own Atlassian OAuth app |
+    | `apiToken` | Atlassian **account email** + **API token** + **site** (`yoursite.atlassian.net`) | A single shared service identity, no interactive sign-in |
+    | `accessToken` | A pre-minted Atlassian **access token** | Short-lived / caller-managed tokens |
+
+    <Note>
+      Credentials are provisioned into the workspace's Secrets by the `onInstall` flow and resolved server-side. The agent allowlist (**Authorized agents**) gates which Agent Factory agents may call the MCP endpoint — see the *Agent builder* tab. The OAuth **Scopes** field is what the connector actually requests (default granular scopes; see *Prerequisites*); set a read-only list there to restrict writes.
+    </Note>
+
+    ## Available Instructions
+
+    Every instruction resolves credentials from the workspace configuration. Operations are grouped by resource; the MCP server exposes the same operations behind the eight entity tools (see the *Agent builder* tab).
+
+    ### Pages
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listPages` | List pages; filter with `spaceId`, `title`, `status`, page with `cursor`/`limit`. | `{ results: [{ id, title, spaceId, status }], _links: { next } }` |
+    | `getPage` | Get a page by `id` (metadata, no body); options `bodyFormat`, `version`, `includeLabels`. | `{ id, title, spaceId, status, version, … }` |
+    | `getPageBody` | Get a page WITH its body by `id` (`bodyFormat` defaults to `storage`; also `atlas_doc_format`). | `{ id, title, body: { storage: { value } } }` |
+    | `createPage` | Create a page; `body` = `{ spaceId, status, title, parentId, body: { representation, value } }`. | `{ id, title, spaceId, version: { number } }` |
+    | `updatePage` | Update a page by `id`; `body` echoes `{ id, status, title, body, version: { number } }` (current version + 1). | `{ id, title, version: { number } }` |
+    | `deletePage` | Delete a page by `id`; `purge: true` removes from trash, `draft: true` deletes the draft. | Empty (HTTP 204) |
+
+    ### Spaces
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listSpaces` | List spaces; filter by `ids`, `keys`, `type`, `status`, `labels`. | `{ results: [{ id, key, name, type }], _links }` |
+    | `getSpace` | Get a space by `id`; `descriptionFormat` = `plain`/`view`. | `{ id, key, name, type, status }` |
+
+    ### Search
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `searchCql` | Run a CQL search; `cql` required (e.g. `type=page AND space=DEV AND text ~ "roadmap"`), with `limit`, `start`, `excerpt`, `expand`. | `{ results: [{ content: { id, title, type } }], totalSize }` |
+
+    ### Content hierarchy
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `getPageChildren` | Direct child pages of a page `id`; page with `cursor`/`limit`. | `{ results: [{ id, title }], _links }` |
+    | `getPageAncestors` | Ancestors of a page `id` (root first). | `{ results: [{ id, title }] }` |
+    | `getPageDescendants` | All descendants of a page `id`; `depth` bounds the tree. | `{ results: [{ id, title }], _links }` |
+
+    ### Comments
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `getFooterComments` | List footer comments of a page `id`. | `{ results: [{ id, body, version }], _links }` |
+    | `addFooterComment` | Add a footer comment; `body` = `{ pageId, body: { representation, value }, parentCommentId? }`. | `{ id, body, version }` |
+    | `getInlineComments` | List inline comments of a page `id`. | `{ results: [{ id, body, resolutionStatus }], _links }` |
+
+    ### Labels
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `getPageLabels` | List the labels of a page `id`; filter by `prefix`. | `{ results: [{ id, name, prefix }] }` |
+    | `addPageLabel` | Add labels to a page `id`; `body` = a JSON array `[{ prefix: "global", name: "my-label" }]`. | `[{ id, name, prefix }]` |
+
+    ### Attachments
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `getPageAttachments` | List attachments of a page `id`; filter by `mediaType`, `filename`. | `{ results: [{ id, title, mediaType, downloadLink }], _links }` |
+    | `getAttachment` | Get an attachment's metadata by attachment `id`; `version` optional. | `{ id, title, mediaType, fileSize, downloadLink }` |
+
+    ### Versions
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `getPageVersions` | List the version history of a page `id`. | `{ results: [{ number, createdAt, authorId }], _links }` |
+
+    <Note>
+      `Returns` shows the shape of the operation output (the underlying Confluence REST resource). Attachment binaries are **not** inline — `getPageAttachments` / `getAttachment` return a `downloadLink`; fetch the bytes out-of-band. `addPageLabel` takes a JSON **array** of label objects.
+    </Note>
+
+    ## DSUL Examples
+
+    **Search the wiki with CQL:**
+
+    ```yaml
+    - ConfluenceNext.searchCql:
+        cql: 'type=page AND space=DEV AND text ~ "roadmap"'
+        limit: 25
+        excerpt: highlight
+      output: hits
+    ```
+
+    **Create a child page (storage format):**
+
+    ```yaml
+    - ConfluenceNext.createPage:
+        body:
+          spaceId: '{{spaceId}}'
+          status: current
+          title: '{{title}}'
+          parentId: '{{parentId}}'
+          body:
+            representation: storage
+            value: '<p>{{summary}}</p>'
+      output: newPage
+    ```
+
+    **Read a page body, then update it (version + 1):**
+
+    ```yaml
+    - ConfluenceNext.getPage:
+        id: '{{pageId}}'
+      output: page
+
+    - ConfluenceNext.updatePage:
+        id: '{{pageId}}'
+        body:
+          id: '{{pageId}}'
+          status: current
+          title: '{{page.title}}'
+          body:
+            representation: storage
+            value: '<p>Updated content.</p>'
+          version:
+            number: '{% {{page.version.number}} + 1 %}'
+    ```
+
+    **Label a page:**
+
+    ```yaml
+    - ConfluenceNext.addPageLabel:
+        id: '{{pageId}}'
+        body:
+          - prefix: global
+            name: reviewed
+      output: labels
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+| HTTP code | Meaning |
+|-----------|---------|
+| `400` | Bad request — malformed CQL, invalid body, or a missing required field. |
+| `401` | Unauthorized — the Atlassian token is missing, expired or revoked. The user must reconnect (OAuth modes). |
+| `403` | Forbidden — insufficient OAuth scope (e.g. a write with read-only scopes, or a missing granular scope), or the account lacks permission on the space. |
+| `404` | Not found — the page, space, comment or attachment id does not exist or is not visible to the account. |
+| `409` | Conflict — the page `version.number` is stale; re-read the page and update with the current version + 1. |
+| `429` | Rate limit — back off and retry. |
+| `500` / `503` | Atlassian service error — transient; retry shortly, no reconnection needed. |
+
+### Common Issues
+
+**"This agent is not authorized to use this connector"** — The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (or enable **Allow all agents**) and Save.
+
+**"The calling agent could not be identified"** — The MCP capability *Scope* does not declare `agent_id`, so Agent Factory never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allow the agent in the config app.
+
+**"Confluence is not connected for this user"** — No per-user OAuth token. Open the configuration app (OAuth mode) and click **Connect**, or use the agent's connect flow.
+
+**"token refresh failed … must reconnect"** — The stored refresh token was revoked or expired (Atlassian invalidated it). The connection is dropped automatically; the user must reconnect from the config app.
+
+**"OAuth is not configured"** — Neither a tenant Atlassian client nor the central platform client is available. Set the OAuth client ID/secret in the config app, or ask the platform maintainer to provision the central OAuth client.
+
+**403 on search, hierarchy or ancestors despite read access** — The Confluence v2 API needs granular scopes the classic set does not cover: `read:content-details:confluence` (CQL search), `read:hierarchical-content:confluence` (children / descendants) and `read:content.metadata:confluence` (ancestors). Add the missing scope to the connector **Scopes** field and reconnect. Confluence v2 will **not** work on classic scopes.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="Confluence Cloud REST API v2" icon="book" href="https://developer.atlassian.com/cloud/confluence/rest/v2/">
+    Official reference for the Confluence v2 REST API.
+  </Card>
+  <Card title="Confluence CQL search (v1)" icon="magnifying-glass" href="https://developer.atlassian.com/cloud/confluence/advanced-searching-using-cql/">
+    Confluence Query Language reference for the `search` tool.
+  </Card>
+  <Card title="Atlassian OAuth 2.0 (3LO) scopes" icon="key" href="https://developer.atlassian.com/cloud/confluence/scopes-for-oauth-2-3LO-and-forge-apps/">
+    Classic vs granular scopes reference for Confluence OAuth 2.0 apps.
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
+    Learn how Agent Factory agents consume MCP tools in Prisme.ai.
+  </Card>
+</CardGroup>
