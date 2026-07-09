@@ -343,10 +343,43 @@ The extractor flattens each file's metadata into namespaced keys you target with
 | Prefix | Source | Examples |
 |--------|--------|----------|
 | `file.*` | Always present (the `File` object) | `file.name`, `file.type`, `file.size` |
-| `custom.*` | Office `docProps/custom.xml` (where classification tools like TITUS write markings) | `custom.Classification`, `custom.TitusGUID` |
+| `custom.*` | Office `docProps/custom.xml` (where classification tools like TITUS write markings), and ODF `meta.xml` user-defined fields (`.odt`/`.ods`/`.odp`, incl. LibreOffice TSCP/BAILS) | `custom.Classification`, `custom.TitusGUID`, `custom.urn:bails:IntellectualProperty:BusinessAuthorizationCategory:Name` |
 | `core.*` / `app.*` | Office core / app properties | `core.title`, `app.Company` |
 | `info.*` / `xmp.*` | PDF info dictionary / XMP | `info.Subject`, `info.Keywords` |
 | `email.*` | `.eml` RFC 5322 headers | `email.X-TITUS-Classification` |
+| `mip:label:*` | Microsoft Purview / MIP sensitivity labels, normalized (see below) | `mip:label:id`, `mip:label:name` |
+| `bj:label:*` | Boldon James / Fortra Classifier SISL labels, one key per label element `uid` | `bj:label:id_classification_internal` |
+
+### Microsoft Purview / MIP sensitivity labels
+
+MIP stores its label differently depending on the Office version and the file type — in the `docMetadata/LabelInfo.xml` part (modern Office), as `MSIP_Label_<guid>_*` custom properties (legacy Office, PDF via Acrobat), or packed into a single `msip_labels` header (Outlook `.eml`). The extractor normalizes **all of them** into the same flat keys, which also match what the server-side crawler (Tika) emits — so one rule works everywhere:
+
+| Key | Value |
+|-----|-------|
+| `mip:label:id` | Label GUID, without braces (e.g. `f0445a89-d0ab-49cd-a6c6-1e21e5d4c192`) |
+| `mip:label:name` | Label name, when present (legacy properties only) |
+| `mip:label:enabled` | `1` / `true` |
+| `mip:label:method` | `Standard` (auto/default) or `Privileged` (manually selected) |
+| `mip:label:siteId` | Microsoft Entra tenant GUID, without braces |
+| `mip:label:contentBits` | Marking bitmask (header/footer/watermark/encrypt), when present |
+
+A typical gate — only documents carrying one of the approved labels may be uploaded:
+
+```json
+{
+  "property": "mip:label:id",
+  "operator": "in",
+  "allowed": ["f0445a89-d0ab-49cd-a6c6-1e21e5d4c192"],
+  "on_fail": "deny",
+  "message": "Only documents labeled 'Public' or 'General' can be uploaded."
+}
+```
+
+The label GUID is the `id` of the label in your Microsoft Purview compliance portal; you can also read it from a labeled document (`unzip -p doc.docx docMetadata/LabelInfo.xml`) or from the crawler's extracted metadata (`mip:label:id`). Removed (`removed="1"`) and disabled labels are ignored.
+
+<Note>
+Files whose metadata cannot be read in the browser — label-encrypted Office files (the label encrypts the container), Outlook `.msg`, `.pfile` — yield an empty metadata bag, so a fail-closed `deny` rule blocks them. That is the safe default: a document that cannot prove conformance does not go through.
+</Note>
 
 <Warning>
 The client gate is a **fast-fail UX convenience, not an authoritative barrier** — it runs in the user's browser. Always pair a classification policy with a **server-side** `before_file_ingest` hook (`target: http` or `workspace`) that re-checks the file, so the rule is enforced even if the browser is bypassed.
