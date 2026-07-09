@@ -1,36 +1,49 @@
 ---
 title: "Hooks"
-description: "Intercept the agent pipeline at lifecycle events to inspect, modify, allow or block messages, files and LLM calls."
+description: "Intercept the agent pipeline at lifecycle events to inspect, modify, allow or block messages, files and LLM calls — and the exact request/response contract your endpoint must implement."
 ---
 
-**Hooks** let you plug custom logic into an agent's runtime pipeline. At defined lifecycle events — when a message arrives, before/after the LLM call, when a file is ingested or about to be uploaded — a hook can **inspect**, **modify**, **allow** or **block** the payload by calling an external endpoint, a workspace automation, or by evaluating a declarative policy in the browser.
+**Hooks** let you plug custom logic into an agent's runtime pipeline. At defined lifecycle events — when a message arrives, before/after the LLM call, when a file is ingested or about to be uploaded — a hook can **inspect**, **modify**, **allow** or **block** the payload by calling an external endpoint, a platform-provided automation, or by evaluating a declarative policy in the browser.
 
 Typical uses: PII redaction, toxicity / classification blocking, citation enforcement, file MIME or watermark checks, antivirus scanning, and the **client-side file-classification gate** (block a document before it ever leaves the browser).
 
 <Note>
-Hooks exist at three levels — **agent**, **org**, and **platform**. They are merged (agent ∪ org ∪ platform). The agent UI manages the agent's own hooks and shows org/platform hooks as **read-only**. An org/platform hook can be marked **immutable** so it always applies and cannot be disabled below.
+Hooks exist at three levels — **agent**, **org**, and **platform**. They are merged (agent ∪ org ∪ platform). The agent UI manages the agent's own hooks and shows org/platform hooks as **read-only**. An org/platform hook can be marked **immutable** so it always applies and cannot be disabled or overridden below.
 </Note>
+
+## How a hook works
+
+For a **server-side** hook (`http` / `workspace` target) the platform sends your endpoint a JSON request describing the event, and your endpoint answers with a **decision** that the pipeline applies:
+
+```
+                 ┌─────────────────────────┐
+  lifecycle ───► │  POST { event, content } │ ──► your hook endpoint
+   event         └─────────────────────────┘
+                 ◄── { decision, ... } ◄────────  (allow / deny / transform / regenerate)
+```
+
+The two contracts that matter most are therefore **[what your hook receives](#what-your-hook-receives)** and **[what your hook must answer](#what-your-hook-must-answer)** — both documented in full below.
 
 ## Lifecycle events
 
 A hook subscribes to one or more events:
 
-| Event | When it fires | Typical use |
-|-------|---------------|-------------|
-| `before_upload` | In the **browser**, before a file is uploaded | Client-side file-classification gate (see below) |
-| `before_file_ingest` | Server-side, before a file is ingested | MIME/type allow-list, antivirus, virus scanning |
-| `after_file_parse` | After a file has been parsed to text | Watermark / sensitivity-marking detection |
-| `before_message` | Before a user message enters the pipeline | PII redaction, input filtering |
-| `before_llm` | Just before the LLM call | Prompt inspection, proxying |
-| `after_llm` | After the LLM response | Toxicity blocking, citation enforcement, output rewriting |
+| Event | When it fires | Where | Typical use |
+|-------|---------------|-------|-------------|
+| `before_upload` | In the **browser**, before a file is uploaded | client | Client-side file-classification gate (see below) |
+| `before_file_ingest` | Before a file enters the indexing pipeline | server | MIME/type allow-list, size cap, antivirus |
+| `after_file_parse` | After a file has been parsed to text, before chunking/embedding | server | Watermark / sensitivity-marking detection, redaction |
+| `before_message` | Before a user message enters the pipeline | server | PII redaction, input filtering |
+| `before_llm` | Just before the LLM call | server | Prompt inspection, external-agent proxy (stream) |
+| `after_llm` | After the LLM response, before it reaches the user | server | Toxicity blocking, citation enforcement, output rewriting |
 
 ## Targets
 
 The `target.type` decides **where** the hook runs.
 
-### `http` — call an external endpoint
+### `http` — call your own endpoint
 
-The hook posts the event payload to a URL and uses the response to allow / modify / block. The endpoint is most often a [Builder automation exposed as a webhook](/products/ai-builder/automations), so you stay inside Prisme.ai (RBAC, secrets, audit).
+The hook `POST`s the event payload to a URL and uses the response to allow / modify / block. The endpoint is most often a [Builder automation exposed as a webhook](/products/ai-builder/automations), so you stay inside Prisme.ai (RBAC, secrets, audit) — **this is the recommended way to run your own hook logic.**
 
 ```json
 {
@@ -39,42 +52,160 @@ The hook posts the event payload to a URL and uses the response to allow / modif
   "mode": "sync",
   "target": {
     "type": "http",
-    "url": "https://<api>/v2/workspaces/slug:my-ws/webhooks/hook-pii-redact"
+    "url": "https://api.<domain>/v2/workspaces/slug:my-ws/webhooks/hook-pii-redact"
   },
   "on_error": "allow",
   "enabled": true
 }
 ```
 
-You can add custom `headers` to the request.
+<Note>
+The request carries only `Content-Type: application/json` (plus the platform's own `x-prismeai-workspace-id`). Custom request headers and per-request auth are **not** forwarded — put any secret the endpoint needs in the workspace itself (Builder secrets / config), or in a non-guessable path segment of the URL.
+</Note>
 
-### `workspace` — call a workspace automation directly
+### `workspace` — call an automation by slug
 
-Reference a Builder automation by slug instead of a full URL.
+Reference a Builder automation by `workspace_slug` + `automation_slug` instead of a full URL — the platform builds the webhook call for you and sends the same `{ event, content, callback?, options? }` body as `http`. The target automation must declare `when: { endpoint: true }`.
 
 ```json
 {
   "target": {
     "type": "workspace",
+    "workspace_slug": "my-ws",
     "automation_slug": "scan-document",
-    "workspace_slug": "my-ws"
+    "options": { "threshold": 0.8 }
   }
 }
 ```
 
+`target.options` (optional) is forwarded verbatim so a single automation can serve several hooks with different static config — read it as `{{body.options}}`.
+
+<Note>
+`workspace` targets **fail closed**: if the target returns HTTP ≥ 400, or a body with no `decision` (e.g. the automation doesn't exist or is missing `endpoint: true`), the hook resolves to an error and your [`on_error`](#error-handling--resilience) policy applies — so `on_error: "deny"` really does block. A handful of platform test slugs (`_mock-hook-*`) are dispatched internally rather than over HTTP.
+</Note>
+
 ### `client` — declarative browser policy (file gate)
 
-A `client` hook is evaluated **in the browser** against a file's extracted metadata, before any upload. No external call, no third-party JavaScript — see [The client-side file gate](#the-client-side-file-gate). For `client` targets `mode` is ignored (it is always a synchronous, in-browser check).
+A `client` hook is evaluated **in the browser** against a file's extracted metadata, before any upload. No external call, no third-party JavaScript — see [The client-side file gate](#the-client-side-file-gate). For `client` targets `mode` is ignored (it is always a synchronous, in-browser check) and the only valid event is `before_upload`.
 
 ## Execution modes
 
-`mode` controls the **server-side timing** of `http` / `workspace` hooks:
+`mode` controls the **server-side timing** of `http` / `workspace` hooks. It is ignored for `client` targets.
 
-| Mode | Behavior |
-|------|----------|
-| `sync` | The pipeline **waits** for the hook and uses its decision (allow / deny / modified payload). Use for anything that must block or rewrite. |
-| `async` | Fire-and-forget — the pipeline does not wait. Use for logging, scanning, analytics. Combine with `sample_rate` to run it on a fraction of events. |
-| `stream` | The hook can stream a transformed response (e.g. an LLM proxy). |
+| Mode | Behavior | Valid for |
+|------|----------|-----------|
+| `sync` | The pipeline **waits** for the hook and applies its decision (allow / deny / transform / regenerate). Use for anything that must block or rewrite. | all server events |
+| `async` | Fire-and-forget — the request continues immediately; your endpoint calls back later to complete the task. Use for long-running scans. | `before_file_ingest` only |
+| `stream` | Your endpoint **takes over the LLM step** and streams the response back (external-agent proxy). | `before_llm` only |
+
+<Note>
+`async` and `stream` are advanced modes with a **callback** contract — see [Async & stream callbacks](#async--stream-callbacks). `sync` is what the vast majority of hooks use.
+</Note>
+
+## What your hook receives
+
+Every server-side hook is a `POST` with this body:
+
+```json
+{
+  "event": "before_message",
+  "content": { /* event-specific, see below */ },
+  "callback": { /* only for async / stream modes */ }
+}
+```
+
+<Note>
+When the target is a **Builder automation**, the whole POST body is available as `{{body}}` — so you read `{{body.event}}`, `{{body.content.text}}`, `{{body.callback.token}}`, etc.
+</Note>
+
+The `content` object depends on the event:
+
+| Event | `content` fields |
+|-------|------------------|
+| `before_message` | `text` (the user message), `parts` (raw A2A parts), `context_id`, `agent_id`, `user_id` |
+| `before_llm` | `messages` (full array bound for the LLM), `tools`, `model`, `context_id`, `task_id`, `agent_id` |
+| `after_llm` | `text` (the model's generated answer), `sources` (RAG citations — present only when the agent retrieved knowledge), `context_id`, `task_id`, `agent_id` |
+| `before_file_ingest` | `file_id`, `filename`, `mime_type`, `size`, `url`, `agent_id`, `conversation_id` |
+| `after_file_parse` | `file_id`, `vector_store_id`, `metadata`, `page_count`, `char_count`, `payload_mode`, and **either** `text` (when `payload_mode: "inline"`) **or** `signed_url` (when `payload_mode: "reference"`) |
+
+<Tip>
+For `after_file_parse`, large documents (over ~256&nbsp;KB of text) are sent **by reference**: `content.payload_mode` is `"reference"` and you get a `content.signed_url` to fetch instead of inline `content.text`. Handle both — a hook that only reads `content.text` will see nothing on large files.
+</Tip>
+
+## What your hook must answer
+
+A `sync` hook must return a **decision object**:
+
+```json
+{
+  "decision": "allow | deny | transform | regenerate",
+  "reason": "string — shown to the user only if expose_reason is set (deny)",
+  "transformed": {
+    "text": "replacement text",
+    "metadata": { "any": "extra fields, merged into content.metadata" }
+  },
+  "regeneration_guidance": "string — instructions for the retry (regenerate)",
+  "score": 0.99,
+  "tags": ["your", "labels"]
+}
+```
+
+| `decision` | Effect |
+|------------|--------|
+| `allow` (or an omitted `decision`) | The payload passes through unchanged. |
+| `deny` | The payload is **blocked**. The user sees a generic message unless the hook has `expose_reason: true`, in which case your `reason` is appended. The blocking hook's id is recorded in the response metadata as `blocked_by`. |
+| `transform` | The payload is **rewritten** with `transformed.text`. For `before_message` this changes the text sent onward to the LLM; for `after_llm` it **replaces the final answer** shown to the user. `transformed.metadata` is merged into the content metadata. |
+| `regenerate` | (`after_llm`) The agent **re-runs the LLM** using `regeneration_guidance` as extra instruction. |
+
+`score` and `tags` are optional — they are recorded on the `hook.invoked` analytics event but do not by themselves change the outcome.
+
+### Decision precedence
+
+When several hooks fire on the same event, their decisions are merged with this precedence:
+
+```
+deny  >  regenerate  >  transform  >  allow
+```
+
+A single `deny` blocks the payload regardless of what the other hooks returned.
+
+### Signalling an error
+
+If your endpoint cannot make a decision, return an object **with an `error` and no `decision`**:
+
+```json
+{ "error": "scanner_unavailable" }
+```
+
+The platform then applies the hook's [`on_error`](#error-handling--resilience) policy (`allow` = fail-open, `deny` = fail-closed). A thrown HTTP error, a non-JSON response, or a timeout is treated the same way.
+
+### Examples
+
+A `before_message` PII gate that blocks or redacts:
+
+```yaml
+# Builder automation exposed as a webhook
+- conditions:
+    '{{body.content.text}} matches regex("/\\b\\d{16}\\b/")':
+      - set:
+          name: output
+          value:
+            decision: deny
+            reason: A card number was detected in your message.
+            tags: [pii, card]
+    default:
+      - set:
+          name: output
+          value:
+            decision: allow
+- output: '{{output}}'
+```
+
+An `after_llm` guard that enforces citations:
+
+```json
+{ "decision": "regenerate", "regeneration_guidance": "Answer again and cite at least one source." }
+```
 
 ## Behavior controls
 
@@ -82,16 +213,88 @@ A `client` hook is evaluated **in the browser** against a file's extracted metad
 |-------|-------------|---------|
 | `enabled` | Turn the hook on/off | `true` |
 | `on_error` | What happens if the hook call fails or times out: `allow` (fail-open) or `deny` (fail-closed) | `allow` |
-| `expose_reason` | Surface the hook's block reason to the end user (otherwise a generic message) | `false` |
-| `rate_limit_per_min` | Max hook invocations per minute | `1000` |
-| `apply_output_guardrails` | Re-run the agent's output guardrails after the hook modified an `after_llm` response | `false` |
-| `payload_mode` | Send the payload `inline` or as a `reference` the endpoint fetches | `inline` |
-| `sample_rate` | Fraction (0–1) of events to run an `async` hook on | `1` |
+| `expose_reason` | Surface the hook's `reason` to the end user on a `deny` (otherwise a generic message) | `false` |
+| `rate_limit_per_min` | Max hook invocations per minute (per org, per hook) | `1000` |
 | `display_name` | Human-readable label in the UI (falls back to `id`) | — |
 
 <Warning>
 Choose `on_error` deliberately. For a **security** control (block forbidden files/content) use `on_error: "deny"` so a failing or unreachable hook never silently lets the payload through. For a **best-effort** enrichment use `allow`.
 </Warning>
+
+## Error handling & resilience
+
+Hooks are designed to never take the agent down:
+
+- **`on_error` policy** — every failure (timeout, error response, `{ "error": ... }` body) resolves to `allow` or `deny` per the hook's setting.
+- **Circuit breaker** — if a hook fails repeatedly (5 failures within 60s) it is temporarily skipped for ~60s and its `on_error` policy applies to skipped calls. It resets on the next success.
+- **Rate limiting** — beyond `rate_limit_per_min`, further calls are skipped (again honouring `on_error`).
+
+Every invocation emits a `hook.invoked` event (with `decision`, `duration_ms`, `score`, `tags`, `error`) that you can inspect in the [activity feed / analytics](./analytics).
+
+## Async & stream callbacks
+
+`async` and `stream` hooks respond in two phases: an immediate acknowledgement, then a **callback** into the task. The request body carries a `callback` object:
+
+```json
+"callback": {
+  "url":       "…/v2/workspaces/slug:agent-factory/webhooks/v1/agents/<agent>/tasks/<task>/events",
+  "patch_url": "…/v2/workspaces/slug:agent-factory/webhooks/v1/agents/<agent>/tasks/<task>",
+  "token":     "cbt_…",
+  "expires_at": 1783600000000
+}
+```
+
+Authenticate every callback with the token in an **`X-Hook-Token`** header (an `Authorization: Bearer <token>` header is also accepted).
+
+### `async` (before_file_ingest)
+
+Acknowledge immediately, then finish the task when your scan completes:
+
+```yaml
+do:
+  - wait: { timeout: 5 }          # your long-running scan
+  - fetch:
+      url: '{{body.callback.patch_url}}'
+      method: PATCH
+      headers:
+        X-Hook-Token: '{{body.callback.token}}'
+        Content-Type: application/json
+      body:
+        status: { state: completed }   # or { state: failed, message: "…" }
+output:
+  accepted: true                   # returned immediately to unblock the request
+```
+
+The token defaults to a **24h** TTL for async.
+
+### `stream` (before_llm)
+
+Your endpoint takes over the LLM step and pushes events to `callback.url`:
+
+```yaml
+# emit incremental chunks…
+- fetch:
+    url: '{{body.callback.url}}'
+    method: POST
+    headers: { X-Hook-Token: '{{body.callback.token}}', Content-Type: application/json }
+    body:
+      event: task.output.delta
+      data: { part: { text: 'Hello ' } }
+# …then a single completion event
+- fetch:
+    url: '{{body.callback.url}}'
+    method: POST
+    headers: { X-Hook-Token: '{{body.callback.token}}', Content-Type: application/json }
+    body:
+      event: task.output.completed
+      data:
+        output:
+          messages:
+            - role: agent
+              parts: [ { text: 'Hello from the external agent.' } ]
+```
+
+The agent waits for the first event (default ~2s first-byte timeout) up to a total ~60s, then uses the completed output as the LLM response. The stream token defaults to a **5-minute** TTL.
 
 ## The client-side file gate
 
@@ -146,18 +349,20 @@ The extractor flattens each file's metadata into namespaced keys you target with
 | `email.*` | `.eml` RFC 5322 headers | `email.X-TITUS-Classification` |
 
 <Warning>
-The client gate is a **fast-fail UX convenience, not an authoritative barrier** — it runs in the user's browser. Always pair a classification policy with a **server-side** `before_file_ingest` hook (e.g. `target: http` / `workspace`) that re-checks the file, so the rule is enforced even if the browser is bypassed.
+The client gate is a **fast-fail UX convenience, not an authoritative barrier** — it runs in the user's browser. Always pair a classification policy with a **server-side** `before_file_ingest` hook (`target: http` or `workspace`) that re-checks the file, so the rule is enforced even if the browser is bypassed.
 </Warning>
 
 ## Org & platform hooks
 
-Hooks defined at the **org** or **platform** level apply to every agent in scope. Set `immutable: true` to make a policy mandatory: it always applies and cannot be disabled or overridden by an agent. In the agent UI these appear as **read-only / locked**, with `locked_by` indicating `org` or `platform`.
+Hooks defined at the **org** or **platform** level apply to every agent in scope. Set `immutable: true` to make a policy mandatory: it always applies and cannot be disabled or overridden by an agent. In the agent UI these appear as **read-only / locked**, with `locked_by` indicating `org` or `platform`. Only org/platform configs may set `immutable` — an agent-level hook that tries to is rejected.
 
 ## Limits
 
 - Up to **10** hooks per agent.
+- Unique `id` per hook; each hook must declare at least one event.
 - Default rate limit: **1000** invocations/minute per hook.
+- `http` targets must use **`https://`** and may not point at internal/private addresses.
 
 ## Configuring hooks
 
-Hooks are managed from the agent's **Capabilities** page (see [Capabilities](./capabilities)). Add a hook, pick its event(s), choose the target (HTTP / workspace / client) and mode, then set the behavior controls. For HTTP/workspace targets, point it at a [Builder automation](/products/ai-builder/automations) exposed as a webhook.
+Hooks are managed from the agent's **Capabilities** page (see [Capabilities](./capabilities)). Add a hook, pick its event(s), choose the target (HTTP / workspace / client) and mode, then set the behavior controls. For HTTP targets, point it at a [Builder automation](/products/ai-builder/automations) exposed as a webhook and implement the [request](#what-your-hook-receives) / [response](#what-your-hook-must-answer) contract above.
