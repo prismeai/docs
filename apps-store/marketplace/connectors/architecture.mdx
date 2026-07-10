@@ -1,185 +1,356 @@
 ---
 title: 'Connector Architecture'
-description: 'How Prisme.ai App+MCP connectors are built: one tenant-context workspace exposing both DSUL instructions and an MCP server, with multi-mode authentication and per-agent authorization.'
+description: 'Reference architecture and security model for Prisme.ai App + MCP connectors'
 ---
 
-Every Prisme.ai connector — Jira, Salesforce, Google Workspace, SharePoint, and the rest of the marketplace — is built from the **same architecture**: a single Prisme.ai workspace, published as an app, that wraps a third-party API and exposes it through **two surfaces at once** — DSUL **App-mode instructions** for Builder workflows and an **MCP server** for Agent Factory agents. This page explains that shared model so you can reason about how a connector authenticates, authorizes agents, and routes calls — whether you consume one or build your own.
+Prisme.ai connectors integrate workspaces and AI agents with third-party APIs. A connector is built as a Prisme.ai workspace, published as an app, and installed as an **app instance** in each workspace that uses it.
+
+This page documents the **current reference architecture for App + MCP connectors**. It describes the implementation model used to build connectors, including tenant-context execution, an optional global MCP endpoint, authentication flows, trust domains, and security controls.
 
 <Note>
-This is a conceptual overview. For the user-facing setup of a specific connector, open its page (e.g. [Jira](/apps-store/marketplace/connectors/jira), [Google Workspaces](/apps-store/marketplace/connectors/google-workspaces)). To build a connector, the internal `app-mcp-implement` skill reproduces this architecture end-to-end.
+  This document describes the current reference model. It is not a compatibility matrix or an inventory of every connector already deployed.
 </Note>
 
-## The model in one picture
+## High-level architecture
 
-A connector is **never called directly**. It is published as an app and **installed as an app instance inside a tenant workspace**. Both the App-mode instructions and the MCP endpoint then run **in that tenant's app-instance context**, so the connector reads the tenant's own configuration and secrets locally — there is no central shared key and no cross-workspace credential lookup on the hot path.
+The reference architecture supports two execution topologies:
 
-<Frame>
-  <img
-    src="/images/connectors/connector-architecture.svg"
-    alt="A connector app instance runs inside the tenant workspace: an Agent Factory agent calls the MCP endpoint, a DSUL automation calls App-mode instructions, both converge on buildAppAuth then registry dispatch, then the external API."
-    width="100%"
-    noZoom
-  />
-</Frame>
+- **Tenant endpoint — default**: App calls and workspace-specific MCP calls execute in the installed app instance. The connector resolves configuration, credentials, and the agent allowlist from that tenant workspace only.
+- **Global core MCP endpoint — optional**: a connector using central per-user OAuth can expose one MCP endpoint from its core workspace for organization-wide catalog registration. This endpoint does not use a tenant workspace's configuration or agent allowlist. Its authorization gates are the end user's OAuth connection and the provider's scopes, roles, and policies.
 
-The same workspace serves both callers; only the entry point differs. A DSUL automation calls a named instruction; an agent lets the LLM pick an MCP tool. Both converge on the same authentication and dispatch code.
+The optional global MCP endpoint is distinct from the central OAuth token service. The token service can provide public OAuth metadata and proxy token exchanges without exposing the central `client_secret`, whether MCP calls use a tenant endpoint or the optional global endpoint.
 
-## Two consumption surfaces
+A connector can expose two invocation modes:
+
+- **App mode**: a Builder automation calls a connector operation directly in the installed app instance.
+- **MCP mode**: an AI agent discovers and calls entity-grouped tools through a JSON-RPC 2.0 endpoint. Depending on the connector deployment, that endpoint is tenant-specific or the optional global core endpoint.
+
+In the tenant topology, the connector calls the provider with configuration and credentials owned by the installed workspace and never retrieves credentials from another customer workspace. In the optional global topology, execution remains in the connector core and relies on per-user delegated OAuth rather than tenant-held service credentials.
+
+**Diagram legend:** `TB` identifies a trust domain; every arrow between different `TB` domains crosses a trust boundary. `F` identifies a data or control flow, and `C` identifies a security control. Arrows carry only stable flow IDs; the flow inventory below describes their content.
+
+### Control plane: configuration and secrets
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "20px"}, "flowchart": {"nodeSpacing": 45, "rankSpacing": 65, "wrappingWidth": 480}}}%%
+flowchart TB
+  Admin["<span style='display:inline-block;width:480px'><b>TB1 — User and caller domain</b><br/>Studio administrator · authenticated browser session</span>"]
+  ConfigAPI["<span style='display:inline-block;width:480px'><b>TB2 — Prisme.ai platform services</b><br/>Configuration API · session validation · workspace RBAC</span>"]
+  Stores["<span style='display:inline-block;width:480px'><b>TB3 — Tenant workspace domain</b><br/>config.value · configuration secrets · agent allowlist</span>"]
+  Connector["<span style='display:inline-block;width:480px'><b>TB3 — Tenant workspace domain</b><br/>Installed connector runtime · local reference resolution</span>"]
+
+  Admin -->|"F1"| ConfigAPI
+  ConfigAPI -->|"F2"| Stores
+  Stores -.->|"F3"| Connector
+```
+
+### Runtime data plane: tenant and optional global MCP endpoints
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "20px"}, "flowchart": {"nodeSpacing": 45, "rankSpacing": 65, "wrappingWidth": 480}}}%%
+flowchart TB
+  Caller["<span style='display:inline-block;width:480px'><b>TB2 — Prisme.ai platform services</b><br/>Agent Factory or Builder runtime</span>"]
+  Context["<span style='display:inline-block;width:480px'><b>TB2 — Prisme.ai platform services</b><br/>App: workspace identity<br/>MCP: context_id · agent_id · user_id</span>"]
+  Tenant["<span style='display:inline-block;width:480px'><b>TB3 — Tenant workspace domain</b><br/>Installed App/MCP endpoint · allowlist · tenant credentials</span>"]
+  Core["<span style='display:inline-block;width:480px'><b>TB4 — Connector core workspace domain</b><br/>Optional global MCP endpoint · per-user OAuth</span>"]
+  Provider["<span style='display:inline-block;width:480px'><b>TB5 — External provider domain</b><br/>OAuth endpoints · business API · authorization policy</span>"]
+
+  Caller -->|"F4"| Context
+  Context -->|"F5"| Tenant
+  Context -.->|"F5"| Core
+  Tenant -->|"F6"| Provider
+  Core -.->|"F6"| Provider
+```
+
+Solid arrows show the default tenant path. Dashed arrows show the optional global MCP path; App mode always follows the tenant path.
+
+### Flow inventory
+
+| Flow | Source → destination | Security-relevant content |
+| --- | --- | --- |
+| `F1` | Studio administrator → configuration API | Authenticated session, CSRF protection, requested connector configuration |
+| `F2` | Configuration API → workspace stores | RBAC-authorized configuration, secret values, and agent allowlist |
+| `F3` | Tenant workspace stores → tenant connector runtime | Local secret references resolved within the same tenant trust domain while an automation executes |
+| `F4` | Agent Factory or Builder runtime → execution context | MCP `tools/call` or explicit App instruction with business arguments |
+| `F5` | Execution context → tenant endpoint or optional global endpoint | Workspace identity; for MCP, `context_id`, `agent_id`, and `user_id` |
+| `F6` | Active connector endpoint ↔ external provider | HTTPS request with server-side credentials and the provider response |
+
+### Trust domains and boundary crossings
+
+| Trust domain | Responsibility | Security implication |
+| --- | --- | --- |
+| TB1 — User and caller domain | Submit configuration, App, or MCP requests | Business arguments are untrusted; provider credentials are never accepted from the LLM |
+| TB2 — Prisme.ai platform services | Authenticate callers, enforce platform access, and attach execution identity | MCP scope injects `context_id,agent_id,user_id`; workspace RBAC protects configuration |
+| TB3 — Tenant workspace domain | Store tenant configuration and execute the installed App or workspace-specific MCP endpoint | Tenant secrets resolve only in this workspace; the agent allowlist applies to its MCP endpoint |
+| TB4 — Connector core workspace domain | Host central OAuth services and, optionally, a global MCP endpoint | The central `client_secret` stays in the core; a global endpoint uses per-user OAuth rather than a tenant allowlist |
+| TB5 — External provider domain | Authenticate the external principal and authorize API operations | Provider scopes, roles, policies, and audit logs remain authoritative |
+
+## Core security properties
 
 <CardGroup cols={2}>
-  <Card title="App mode (DSUL)" icon="puzzle-piece">
-    Builder automations call named instructions like `Jira.searchJira()`. The caller chooses the operation; arguments and outputs are plain JSON. Best for deterministic workflows, data pipelines, and scheduled jobs.
+  <Card title="Tenant-endpoint isolation" icon="building-shield">
+    App calls and tenant-specific MCP calls run in the installed app instance, so their configuration and secrets come from the workspace that owns that instance.
   </Card>
-  <Card title="MCP mode (agents)" icon="robot">
-    Agent Factory agents connect to the MCP endpoint and discover tools automatically. The LLM selects which tool to call. Best for conversational interfaces and agentic tasks.
+  <Card title="Credentials stay server-side" icon="key">
+    The connector attaches credentials only when calling the provider. They are not included in MCP tool schemas or tool results.
+  </Card>
+  <Card title="Topology-specific authorization" icon="robot">
+    Tenant MCP endpoints validate the injected `agent_id` against the workspace allowlist. Optional global endpoints rely on per-user OAuth and provider authorization instead.
+  </Card>
+  <Card title="Deterministic API surface" icon="route">
+    Tools map to a generated registry of known methods and paths. The LLM does not construct an arbitrary outbound request.
   </Card>
 </CardGroup>
 
-Both surfaces are backed by the **same operations**. Adding an operation to a connector makes it available to Builder automations and to agents simultaneously.
+## Low-level request processing
 
-## Anatomy of a connector
+### MCP handshake and tool call
 
-A connector spans **two sibling folders**, linked one-to-one by name: the DSUL workspace (the runtime logic) and a React configuration app (the setup UI).
+Both MCP endpoint variants serve `initialize` and `tools/list` through MCP Core and return HTTP `202` for notifications without an `id`. The following flow shows the controls applied to `tools/call` in either endpoint context:
 
-```
-connector/
-├── workspaces/<slug>/        ← DSUL: runtime logic
-│   ├── index.yml             ← config schema, MCP tool definitions, secrets schema
-│   ├── automations/          ← the MCP endpoint, auth, dispatch chain, per-op wrappers
-│   ├── imports/              ← MCP Core (initialize / tools/list) + Custom Code registry
-│   └── security.yml
-└── pages/<slug>/             ← React config app (SPA): auth setup, agent allowlist
-```
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "20px"}, "flowchart": {"nodeSpacing": 45, "rankSpacing": 65, "wrappingWidth": 480}}}%%
+flowchart TB
+  Caller["<span style='display:inline-block;width:480px'><b>TB2 — Agent Factory caller</b><br/>tools/call + injected caller IDs</span>"]
+  Gate["<span style='display:inline-block;width:480px'><b>TB2 / C1 — Endpoint authorization</b><br/>Protocol validation · tenant allowlist or global OAuth gate</span>"]
+  Auth["<span style='display:inline-block;width:480px'><b>TB3 or TB4 / C2 — Credential resolver</b><br/>Workspace service auth or user OAuth</span>"]
+  Dispatch["<span style='display:inline-block;width:480px'><b>TB3 or TB4 / C3 — Request allowlist</b><br/>entity + action → registered operation and approved base source</span>"]
+  Provider["<span style='display:inline-block;width:480px'><b>TB5 — External provider domain</b><br/>Server-side credential attachment</span>"]
+  Guard["<span style='display:inline-block;width:480px'><b>TB3 or TB4 / C4 — Response guard</b><br/>Error normalization · size limits · MCP envelope</span>"]
 
-The key automations, and what each one does:
-
-| Component | Role |
-|-----------|------|
-| **MCP endpoint** | JSON-RPC 2.0 handler. Routes `tools/call` through auth + dispatch; delegates `initialize` / `tools/list` to MCP Core. |
-| **`validateAgent`** | Checks the calling agent against the per-instance allowlist before any tool runs. |
-| **`buildAppAuth`** | Resolves credentials for the tenant's configured auth mode and returns an access token + base URL. |
-| **Registry (Custom Code)** | Maps `entity + action → operation → {method, path, params}`. The single source of truth for the API surface. |
-| **Dispatch chain** | `routeToolCall → toolRestOp → executeApiCall → formatToolOutput`, with a shared `handleApiError`. |
-| **Per-operation wrappers** | Thin App-mode automations (`Connector.operation:`) reached dynamically through the registry — one per API operation. |
-
-## Request lifecycle
-
-When an agent calls a tool, the MCP endpoint runs a fixed pipeline:
-
-<Frame>
-  <img
-    src="/images/connectors/connector-request-lifecycle.svg"
-    alt="Sequence of an MCP tool call: the agent calls tools/call on the MCP endpoint, which validates the agent, resolves credentials via buildAppAuth, dispatches through the registry to the external API, then returns a bounded result to the agent."
-    width="100%"
-    noZoom
-  />
-</Frame>
-
-<Steps>
-  <Step title="Identify the agent">
-    Agent Factory injects the agent identity (`context_id`, `agent_id`, `user_id`) into the tool call. `validateAgent` checks `agent_id` against the instance allowlist. An unauthorized agent is rejected before anything runs.
-  </Step>
-  <Step title="Resolve credentials">
-    `buildAppAuth` reads the tenant's `auth` configuration and returns an access token and base URL for the request — refreshing per-user OAuth tokens on the fly when needed.
-  </Step>
-  <Step title="Dispatch through the registry">
-    The tool name (an *entity*) plus its `action` argument resolve to a concrete `{method, path, params}` through the registry, and `executeApiCall` performs the authenticated HTTP call.
-  </Step>
-  <Step title="Format and bound the result">
-    `formatToolOutput` wraps the response for the caller. Results are size-bounded (arrays capped, long text truncated on a line boundary) so a large payload never overflows the agent's context window.
-  </Step>
-</Steps>
-
-The App-mode path is the same minus the agent checks: a DSUL instruction calls `buildAppAuth` directly, dispatches through the registry, and returns the **raw API JSON** (no MCP envelope) for the automation to consume.
-
-## Entity-grouped tools
-
-Connectors do **not** expose one tool per API endpoint — that would flood an agent with hundreds of near-identical tools. Instead, related endpoints are grouped into a handful of **entity tools**, each taking an `action` enum:
-
-```json
-// One entity tool, many actions
-{
-  "name": "records",
-  "arguments": {
-    "action": "create",        // list | get | create | update | delete …
-    "sobject": "Account",
-    "fields": { "Name": "Acme Corp" }
-  }
-}
+  Caller --> Gate
+  Gate --> Auth
+  Auth --> Dispatch
+  Dispatch --> Provider
+  Provider --> Guard
 ```
 
-This keeps the tool count small and LLM-friendly (typically 6–12 entities per connector) while the registry maps each `entity + action` pair to the underlying operation. Tool schemas are authored to be strict-provider safe: no dangling `$ref`s, bounded descriptions, and typed array items — so enabling a connector never breaks an agent's completion.
+On a tenant endpoint, an allowlist failure is returned as an MCP error result with an actionable reason. On either endpoint variant, authentication errors are passed through without replacing them with a generic configuration error, so a revoked OAuth grant can trigger reconnection rather than an administrator workflow.
 
-## Authentication
+### App-mode call
 
-A connector supports one or more auth modes, all resolved by `buildAppAuth` from a single tenant configuration object. A tenant picks the mode that fits its provider setup in the config app.
+In App mode, a DSUL automation calls a public connector instruction such as `Connector.getRecord`. The instruction uses the same `buildAppAuth` and operation registry as MCP mode, but returns the provider's raw JSON data instead of the MCP `content` envelope.
 
-| Mode | How it works | Typical use |
-|------|--------------|-------------|
-| **API key** | Static key sent in a header or query parameter. | Simple APIs, service credentials. |
-| **Access token** | Caller supplies a token + base URL directly. | Quick setup and testing. |
-| **Client credentials** | OAuth2 `client_credentials` grant (service identity). | Machine-to-machine access. |
-| **JWT / service account** | Signed JWT bearer assertion. | Google domain-wide delegation, Salesforce Connected App. |
-| **OAuth2 per-user (PKCE)** | Authorization-code + PKCE, one token per end user. | User-scoped access in a chat or workflow. |
+This keeps authentication and request construction consistent across deterministic workflows and agent-driven calls.
 
-**Least privilege.** A connector never forces write scopes: it requests exactly what the auth configuration grants. Restricting the credential (a read-only API key, a read-only scope list, or a read-only provider role) makes the connection succeed while write calls return `403`. Each connector page documents the concrete read-only lever for its service.
+## Operation registry and outbound request control
 
-### Central platform OAuth
+The connector's supported API surface originates from a versioned OpenAPI specification:
 
-For OAuth connectors, tenants should not need to register their own provider OAuth client. A platform maintainer provisions **one central OAuth client** on the connector's core workspace, and tenants get a **zero-config OAuth mode**: one click on *Connect*, no client ID or secret to paste.
+| Artifact | Security function |
+| --- | --- |
+| OpenAPI specification | Source of approved provider operations and stable operation IDs |
+| `ENTITY_OPS` | Maps an MCP entity and action to one operation |
+| `OPERATIONS` | Fixes the method, path, parameter positions, content type, and, when applicable, a per-operation provider base |
+| App wrappers | Expose explicit Builder instructions and return raw API data |
+| MCP schemas and guards | Restrict LLM arguments and return bounded MCP content |
 
-Because a connector's secrets never resolve inside a tenant instance, the central client is exposed as a **token service** on the core workspace: a public endpoint returns the client ID and scopes (never the secret), and a proxy endpoint performs the token exchange server-side, injecting the central credentials. The tenant keeps the PKCE exchange locally and never sees the secret. A single provider **redirect URI** (the core callback) is registered once; per-tenant callbacks are carried in the OAuth `state` and proxied back after the exchange.
+MCP tools are grouped by business entity, for example `records`, `files`, or `messages`. Each tool accepts an `action` enum rather than exposing one LLM function for every provider endpoint. This reduces the exposed tool count and makes the permitted operation set explicit.
 
-## Agent authorization
+The runtime request builder accepts only registered operations. `OPERATIONS` fixes the method, path, parameter positions, and content type. It either fixes a per-operation provider base or selects a base returned by the authentication resolver. Depending on the provider, that base can be static, derived and normalized from a provider-issued instance URL, or supplied through administrator-managed connector configuration. Standard MCP arguments cannot override it.
 
-Two independent gates decide whether an agent can use a connector — do not confuse them with OAuth scopes:
+Tool schemas follow additional LLM-safety constraints:
+
+- no unresolved JSON Schema `$ref`;
+- descriptions remain within provider limits;
+- every array declares `items`;
+- tool responses are bounded before entering the model context;
+- binary responses are not transported inline through the DSUL fetch path.
+
+## Authentication models
+
+A tenant endpoint stores one authentication configuration object with a `mode` discriminator in the installed workspace. An optional global endpoint instead uses the connector core's central OAuth configuration and user-scoped token state. A connector exposes only the modes supported by its provider.
+
+| Mode | Principal | Credential location | Typical use |
+| --- | --- | --- | --- |
+| `oauthCentral` | End user | User-scoped tokens in the active endpoint context (tenant or core); central client secret in the connector core | Preferred delegated OAuth with no customer-managed OAuth client |
+| `oauth` | End user | User-scoped tokens and a workspace-managed OAuth client configuration | Delegated OAuth with a dedicated OAuth client |
+| `clientCredentials` | Service identity | Installed workspace secret | Machine-to-machine provider access |
+| `jwt` | Service account | Installed workspace secret, including the signing key | Signed service-account exchange |
+| `apiKey` | Service identity | Installed workspace secret | APIs using a static key in a header or query parameter |
+| `accessToken` | Configured identity | Installed workspace secret | Testing or externally managed token lifecycle |
+
+### Per-user OAuth with PKCE
+
+For delegated access, the connector uses the OAuth 2.0 authorization-code flow with PKCE and state validation:
+
+1. `oauthConnect` generates a verifier, challenge, and state in the user's scope, then redirects the browser to the provider.
+2. `oauthCallback` validates the pending state and exchanges the code using the original verifier.
+3. The access and refresh tokens are stored in user scope in the active endpoint context. On a tenant endpoint, the refresh token is also copied best-effort to a workspace secure-secret entry keyed by user ID for trusted scheduled execution. This copy requires an Owner, Editor, or SuperAdmin; interactive OAuth remains usable if the copy is not permitted.
+4. `oauthStatus` proactively checks expiry and refreshes when necessary. A non-transient refresh failure marks the connection as disconnected so the user is prompted to reconnect.
+5. `oauthDisconnect` removes local state and, when supported, revokes the provider token.
+
+The server-controlled `targetUserId` used by a scheduled automation must never come from MCP or LLM arguments.
+
+### Central OAuth token service
+
+For `oauthCentral`, a platform maintainer configures one provider OAuth client in the connector's core workspace. Installed connector instances can obtain the public client ID and scopes, but never the client secret.
+
+The core workspace exposes two narrowly scoped functions:
+
+- a public metadata endpoint that returns the client ID and default scopes;
+- a token exchange proxy that injects the central client secret server-side for authorization-code and refresh-token grants.
+
+The OAuth redirect is registered once against the core callback. For a tenant endpoint, the installed workspace callback is packed into the OAuth flow state and validated against the Prisme.ai API host before redirection, preventing the callback proxy from becoming an open redirect. The PKCE verifier and resulting user tokens remain attached to the user in the active endpoint context: the tenant workspace for a tenant endpoint, or the connector core for a global endpoint.
+
+Token exchange requests disable automatic fetch-error event emission so a provider error cannot copy a `client_secret` into runtime failure events.
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "20px"}, "flowchart": {"nodeSpacing": 45, "rankSpacing": 65, "wrappingWidth": 480}}}%%
+flowchart TB
+  Connect["<span style='display:inline-block;width:480px'><b>TB3 — Tenant workspace domain</b><br/>OAuth handler · public client ID · PKCE · packed state</span>"]
+  Authorize["<span style='display:inline-block;width:480px'><b>TB5 — External provider domain</b><br/>Authorization endpoint · user authentication and consent</span>"]
+  CoreCallback["<span style='display:inline-block;width:480px'><b>TB4 / C5 — Core callback validation</b><br/>Validate the packed tenant callback target</span>"]
+  TenantCallback["<span style='display:inline-block;width:480px'><b>TB3 / C5 — Tenant callback validation</b><br/>Validate pending state and PKCE verifier</span>"]
+  Proxy["<span style='display:inline-block;width:480px'><b>TB4 / C6 — Core token proxy</b><br/>Inject the central client secret server-side</span>"]
+  TokenEndpoint["<span style='display:inline-block;width:480px'><b>TB5 — External provider domain</b><br/>Authorization-code or refresh-token exchange</span>"]
+  Tokens["<span style='display:inline-block;width:480px'><b>TB3 — Tenant workspace domain</b><br/>User access token · refresh token · expiry</span>"]
+
+  Connect --> Authorize
+  Authorize --> CoreCallback
+  CoreCallback --> TenantCallback
+  TenantCallback --> Proxy
+  Proxy --> TokenEndpoint
+  TokenEndpoint --> Tokens
+```
+
+This diagram shows central OAuth used by a tenant endpoint. With the optional global core endpoint, OAuth pending state and user tokens also remain in TB4: there is no packed tenant callback and no TB3 agent allowlist. C5 becomes core-local state and PKCE validation, while C6 remains the only component allowed to use the central client secret.
+
+## Credential and secret boundaries
+
+### Workspace configuration binding
+
+Installed app configuration uses a two-hop reference: `app instance config.auth → workspace config.value → workspace secret`.
+
+| Security asset | Storage location | Runtime reader | Permitted exposure |
+| --- | --- | --- | --- |
+| Service credential or API key | Workspace configuration secret | `buildAppAuth` | Provider request only |
+| User OAuth tokens | User-scoped state in the active endpoint context; optional tenant runtime secure refresh token | `buildAppAuth`, `oauthStatus` | Provider token/API endpoints only |
+| Central OAuth `client_secret` | Connector core configuration secret | Central token proxy | Provider token endpoint only |
+| Agent allowlist | Workspace configuration secret | `validateAgent` | Never sent to the provider |
+
+The installation automation provisions the secret declarations, preserves the workspace's existing configuration, and writes both bindings idempotently. Secret references resolve only inside the workspace configuration context; they are not portable references to the connector core workspace.
+
+### Two separate secret mechanisms
+
+Prisme.ai connectors can use two distinct mechanisms:
+
+- **Configuration secrets** back the installed app configuration through `config.value` bindings.
+- **Runtime secure secrets** support scoped `set`, `get`, and `delete` operations, including per-user refresh-token lookup for trusted scheduled jobs.
+
+Runtime secret reads return opaque references. DSUL expressions and Custom Code cannot inspect or decrypt them. A reference must be passed directly into a supported `fetch` field, where the runtime resolves it server-side.
+
+<Warning>
+  A webhook invoked anonymously by an external provider has no Prisme.ai principal and must not be assumed to read workspace or user secret stores. Push-driven connectors require a separate threat model, authenticated or signed webhook validation where available, and an explicit review of any alternative token storage. They are not covered by the standard interactive or scheduled-call assumptions on this page.
+</Warning>
+
+## Configuration application and administrative access
+
+The connector configuration UI is a React application delivered by the published app and rendered inline in the workspace's Builder when `config.block` is supported. A direct configuration link remains available as a fallback.
+
+The UI calls Prisme.ai APIs with the administrator's existing session, including bearer, CSRF, and cookie protections. Native workspace RBAC remains authoritative for reading or changing connector secrets. The UI does not receive a privileged connector-specific backend key.
+
+Typical administrative actions include:
+
+- selecting an authentication mode and minimum provider scopes;
+- testing the provider connection;
+- connecting or disconnecting delegated OAuth;
+- selecting authorized agents, persisted immediately on each change;
+- installing the MCP capability on an agent;
+- registering the MCP server in the organization capability catalog.
+
+Central OAuth credential management is protected server-side by workspace role checks. Catalog publication is different: the connector UI exposes it only to active-organization owners and administrators, but this client-side gate is not a security boundary. The current catalog write endpoint does not enforce the same role restriction server-side. Treat this as a known control gap until the authorization gate is implemented in the capabilities API.
+
+## Authorization layers
+
+Connector access is the intersection of several independent controls:
+
+| Layer | What it controls |
+| --- | --- |
+| Prisme.ai organization and workspace RBAC | Who can install, configure, or use the app instance |
+| MCP capability scope | Which identity attributes Agent Factory injects into the call |
+| Connector agent allowlist | Which agents can use a workspace-specific MCP endpoint |
+| User OAuth session or service credential | Which external principal the connector acts as |
+| Provider scopes and roles | Which provider resources and operations that principal can access |
+| Agent tool permissions | Whether the agent can invoke the MCP automatically or requires user approval |
+
+The allowlist supports an explicit `*` option for workspaces that authorize every agent, including calls without an `agent_id`. This is a deliberate administrative choice and should be reviewed like any broad access grant.
+
+For a connector's optional global core endpoint, the workspace-specific agent allowlist is not applicable. The security gate is the end user's OAuth connection and the provider's authorization policy. Security teams should review global and workspace-specific endpoints as different exposure models.
+
+## Data flow and retention considerations
+
+A normal tool call processes the following data:
+
+1. The user's request and tool arguments enter Agent Factory.
+2. The active endpoint in the tenant workspace or connector core receives the selected tool, business arguments, and execution identity.
+3. The connector attaches credentials server-side and sends an HTTPS request to the provider.
+4. The provider response passes through the Prisme.ai runtime and is returned to the workflow or model context.
+
+Provider credentials do not need to enter the LLM context. Provider data does enter it when required to answer the user's request, so the model provider, Prisme.ai event/log retention, and the third-party system must all be included in the data-processing assessment.
+
+The reference MCP path applies three response bounds: `pageSize` and `page_size` are clamped to 100; array responses are capped at 100 items and nested reference-like objects are collapsed to a compact representation; text bodies are truncated at approximately 20,000 characters on a complete line with guidance to use narrower filters. Operations listed by `isBinaryOperation` are rejected before the provider call and must be documented as unavailable inline. These MCP bounds do not apply to App-mode wrappers, which deliberately return raw provider JSON.
+
+## Security review checklist
+
+Use this checklist for each connector and environment:
+
+- [ ] Identify every inbound endpoint: MCP, OAuth callbacks, configuration webhooks, and provider push webhooks.
+- [ ] Inventory every outbound host and classify its source as a fixed OAuth endpoint, per-operation registry base, provider-issued instance URL, or administrator-managed base. Verify connector-specific normalization or allowlisting and confirm that MCP arguments cannot override the destination.
+- [ ] Confirm all network traffic uses HTTPS and that provider certificates are validated.
+- [ ] Identify whether MCP uses a tenant endpoint, the optional global core endpoint, or both.
+- [ ] For tenant endpoints, confirm execution stays in the installed workspace and cannot fetch another customer workspace's configuration.
+- [ ] For global endpoints, confirm the tenant allowlist is not presented as a control and verify the per-user OAuth and provider authorization gates.
+- [ ] Verify the capability scope is exactly the required identity set and cannot accept a caller-supplied `targetUserId`.
+- [ ] For tenant endpoints, test allowlisted, non-allowlisted, and missing-`agent_id` calls; review the `*` allow-all option separately.
+- [ ] Review provider OAuth scopes or service-account permissions for least privilege.
+- [ ] Confirm refresh-token revocation and self-invalidation behavior after provider `4xx` responses.
+- [ ] Confirm central OAuth endpoints never return or log the `client_secret`.
+- [ ] Validate OAuth state, PKCE, and callback target checks, including exact redirect URI matching.
+- [ ] Review workspace and organization RBAC for connector configuration and catalog publication.
+- [ ] Inspect live `tools/list` output for valid schemas and an intentionally limited tool surface.
+- [ ] Verify pagination clamps and `trimToolResponse` against arrays and nested objects.
+- [ ] Exercise raw text responses and confirm they bypass `formatToolOutput` before line-safe truncation.
+- [ ] Compare `isBinaryOperation` with the OpenAPI surface and confirm binary rejection occurs before the provider call.
+- [ ] Verify events and error paths do not contain authorization headers, tokens, private keys, or provider secrets.
+- [ ] Document the model provider and platform retention controls for provider data returned to an agent.
+- [ ] Perform a dedicated review for external anonymous webhooks, if the connector exposes any.
+
+## Deployment and verification evidence
+
+The connector is maintained as two versioned artifacts:
+
+- `workspaces/<connector>/`: DSUL automations, imports, MCP Core configuration, security rules, and the OpenAPI source of truth;
+- `pages/<connector>/`: the configuration UI source and deployable bundle.
+
+The app is published before installation so installed instances receive a stable, reviewed snapshot. Frontend deployment updates both bundle pointers and republishes the app before obsolete bundles are removed.
+
+For a security handoff, provide at least:
+
+- the connector version and published app identifier;
+- the workspace-specific and optional global MCP endpoint patterns;
+- allowed outbound hosts, their provenance, and their normalization or validation rules;
+- supported authentication modes and requested provider scopes;
+- secret names, scopes, owners, and rotation procedures;
+- the live `tools/list` schema audit;
+- MCP handshake evidence, including HTTP `202` for notifications;
+- successful and denied tool-call evidence;
+- OAuth connect, refresh, revoke, and reconnect evidence;
+- relevant audit-event and incident-response procedures.
+
+## Related documentation
 
 <CardGroup cols={2}>
-  <Card title="Capability scope" icon="fingerprint">
-    The MCP capability is declared with **Scope `context_id,agent_id,user_id`**. This injects the agent and user identity into every tool call, so the connector knows *who* is calling — no API key is minted for the agent.
+  <Card title="App Store Security" icon="shield" href="/apps-store/security">
+    Review platform-wide controls and integration security practices.
   </Card>
-  <Card title="Per-instance allowlist" icon="shield-check">
-    `validateAgent` checks the injected `agent_id` against the instance's allowlist. Only allowlisted agents run tools. A wildcard (`*`) sentinel authorizes every agent when a tenant opts into it.
+  <Card title="Capabilities Catalog" icon="boxes-stacked" href="/products/ai-governance/capabilities">
+    Understand how MCP servers and other capabilities are governed.
   </Card>
-</CardGroup>
-
-Declaring the capability in a catalog makes the connector *discoverable*; the allowlist is what *authorizes* a specific agent. Both are managed from the config app — no hand-editing of platform settings.
-
-## Configuration app
-
-Each connector ships a React **configuration app** that a tenant uses to set everything up: choose the auth mode and enter credentials (or click *Connect* for OAuth), test the connection, select which agents may use the connector, and install the MCP capability onto them. It talks to the platform with the user's own session, so native RBAC applies.
-
-The config app renders in two places from the same bundle: **inline** inside the tenant's app-instance editor (the preferred surface), and at a standalone URL surfaced on the instance config. OAuth connectors additionally expose a **maintainer view** — visible only to the connector's own workspace admins — for provisioning the central OAuth client and publishing the connector into the org-wide capabilities catalog.
-
-## Deployment model
-
-A connector moves from source to a usable integration in three steps:
-
-<Steps>
-  <Step title="Publish the workspace as an app">
-    The DSUL workspace is published to the marketplace under a stable app ID. The published app snapshots the config schema, MCP tool definitions, and the config-app bundle pointer.
-  </Step>
-  <Step title="Install as an app instance">
-    A tenant installs the app into its workspace. Installation provisions the tenant's secrets and configuration bindings and surfaces the config app.
-  </Step>
-  <Step title="Configure and wire">
-    In the config app the tenant sets auth, tests it, allowlists agents, and installs the MCP capability. The connector is now callable from both DSUL automations and agents.
-  </Step>
-</Steps>
-
-## Related
-
-<CardGroup cols={2}>
-  <Card title="Browse connectors" icon="grid-2" href="/apps-store/marketplace/connectors/overview">
-    The full list of available connectors and how to choose App vs MCP mode.
+  <Card title="MCP Connections and OAuth" icon="link" href="/products/ai-securechat/mcp-connections">
+    See how end users connect delegated accounts from Chat.
   </Card>
-  <Card title="Agent capabilities" icon="plug" href="/products/agent-factory/capabilities">
-    How Agent Factory agents discover and consume MCP tools.
-  </Card>
-  <Card title="Building custom connectors" icon="tools" href="/apps-store/marketplace/extending-apps">
-    Create your own connector for any API.
-  </Card>
-  <Card title="Jira connector" icon="/images/connectors/jira-next.png" href="/apps-store/marketplace/connectors/jira">
-    A concrete tenant-context connector to see the model in practice.
+  <Card title="Connector Catalog" icon="plug" href="/apps-store/marketplace/connectors/overview">
+    Browse the connectors available in the App Store.
   </Card>
 </CardGroup>
