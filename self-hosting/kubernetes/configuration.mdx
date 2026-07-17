@@ -170,6 +170,79 @@ By default, the API gateway only accepts cross-origin requests from `CONSOLE_URL
 
 ---
 
+## Exposing several front-end domains
+
+A single Prisme.ai platform can serve its **front-end (Studio / console)** on **several domains at once** — e.g. `studio.example.com`, `team-a.example.com`, `team-b.example.com` — all backed by the same core services. This is the standard multi-tenant SaaS setup.
+
+<Info>
+  Only the **front-end** is multi-domain. The **API gateway always keeps a single public domain** (`global.apiUrl`, e.g. `https://api.example.com/v2`) — every console domain talks to that same backend URL.
+</Info>
+
+There are three things to wire, all in your `prismeai-core` values file:
+
+### 1. List every console domain in `global.consoleUrl`
+
+`global.consoleUrl` accepts a **comma-separated** list of front-end URLs. The **first entry is the default** — it's the one used for emails and sign-out when a request carries no recognizable origin. Every entry is automatically allow-listed by the api-gateway for **OIDC `redirect_uris`**, **CSP `frame-ancestors`** and **CORS**, so you don't have to repeat them anywhere else.
+
+```yaml
+global:
+  # Single backend domain, shared by every console domain below
+  apiUrl: "https://api.example.com/v2"
+
+  # Comma-separated list of front-end URLs (multi-domain SaaS). The first
+  # entry is the default used for emails/signout when no per-request origin
+  # is available. All entries are auto-allowlisted by api-gateway for OIDC
+  # redirect_uris, CSP frame-ancestors and CORS.
+  consoleUrl: "https://studio.example.com,https://team-a.example.com,https://team-b.example.com"
+```
+
+### 2. Point every domain's DNS at the load balancer
+
+Create a DNS record for **each** console domain that resolves to the **same** ingress load balancer (the ALB / NLB / nginx service that fronts the platform) — typically a `CNAME` to the LB hostname, or an `A`/`ALIAS` record to its address. All the front domains share one load balancer; the ingress routing (next step) is what dispatches each host to the right service. Don't forget your TLS certificates must cover every domain (SAN cert or one cert per domain, depending on your ingress controller).
+
+### 3. Add a front-end rule per domain on the ingress
+
+Each console domain needs its own `host` rule on the ingress, all pointing to the **same** `prismeai-console` service. Define the console backend once with a YAML anchor, then reuse it for every domain — that keeps the block DRY as the list grows:
+
+```yaml
+ingresses:
+  - name: core-ingress
+    annotations:
+      # … your ingress-controller annotations (class, TLS, redirects) …
+    rules:
+      # ── API gateway: a SINGLE domain ──────────────────────────────
+      - host: api.example.com
+        http: &API_SERVICE
+          paths:
+            - path: "/"
+              pathType: Prefix
+              backend:
+                service:
+                  name: prismeai-core-prismeai-api-gateway
+                  port:
+                    number: 80
+
+      # ── Front-end: ONE block per console domain ───────────────────
+      - host: studio.example.com          # default console (1st consoleUrl entry)
+        http: &CONSOLE_SERVICE
+          paths:
+            - path: "/"
+              pathType: Prefix
+              backend:
+                service:
+                  name: prismeai-core-prismeai-console
+                  port:
+                    number: 80
+      - host: team-a.example.com          # reuses the same console service
+        http: *CONSOLE_SERVICE
+      - host: team-b.example.com
+        http: *CONSOLE_SERVICE
+```
+
+Adding a new front domain later is then a three-line change: add it to `global.consoleUrl`, create its DNS record, and append one more `- host: … / http: *CONSOLE_SERVICE` rule.
+
+---
+
 ## Upload and request limits
 
 | Setting | Default | Description |
