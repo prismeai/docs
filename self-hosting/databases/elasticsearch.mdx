@@ -264,13 +264,62 @@ Pay attention to cluster health metrics and ensure adequate disk space for index
 
 ### Shard accounting
 
-Elasticsearch limits each node to **1000 shards** by default. List your shards and count them with:
+Elasticsearch limits each node to **1000 shards** by default. A 3-node cluster can therefore hold at most 3000 shards. The events cleanup CronJob keeps this under control; if you approach the limit on a tenant you may need to consolidate older data streams or raise the per-node cap.  
 
-```
-GET /_cat/shards
+In order to troubleshoot what patterns / apps consume the most shards, the **api-gateway** exposes a `/sys/events/*` route that returns the ES/OS `_cat/shards` as JSON. It is reserved to **super admins** (email in `SUPER_ADMIN_EMAILS`), and the gateway forwards to the events service `sys/*` APIs, so you can call it from outside the cluster:
+
+```bash
+curl -H "Authorization: Bearer $SUPERADMIN_TOKEN" "https://api.<your-domain>/sys/events/shards"
 ```
 
-A 3-node cluster can therefore hold at most 3000 shards. The events cleanup CronJob keeps this under control; if you approach the limit on a tenant you may need to consolidate older data streams or raise the per-node cap.
+<Tip>
+The same route is served directly by the **events** service under `/sys/shards` (without the `/sys/events` gateway prefix), if you'd rather call it from inside the `events` container: `curl -H "x-prismeai-api-key: $INTERNAL_API_KEY" http://localhost:80/sys/shards`.
+</Tip>
+
+It answers with the shard count and the raw shard list:
+
+```json
+{
+  "total": 1307,
+  "shards": [
+    { "index": ".ds-events-sandbox-2024.01.01-000001", "shard": "0", "prirep": "p", "state": "STARTED", "docs": "12345", "store": "1.2gb", ... },
+    ...
+  ]
+}
+```
+
+Add `?group=true` to aggregate the shards by tenant (client) and by index-pattern family :
+
+```bash
+curl -H "Authorization: Bearer $SUPERADMIN_TOKEN" "https://api.<your-domain>/sys/events/shards?group=true"
+```
+
+```json
+{
+  "totalShards": 1307,
+  "patterns": [".ds-events-%s-*", "%s-searchengine-webpages-*", "%s_aik_rag_*"],
+  "tenants": ["sandbox", "customer-a"],
+  "groups": [
+    {
+      "name": "sandbox",
+      "type": "tenant",
+      "total": 1802,
+      "families": [
+        { "name": ".ds-events-sandbox", "count": 1110 },
+        { "name": "sandbox-searchengine-webpages", "count": 508 },
+        { "name": "sandbox_aik_rag", "count": 184 }
+      ]
+    },
+    { "name": "autres", "type": "others", "total": 91, "families": [ ... ] }
+  ]
+}
+```
+
+Tenants are auto-detected from index names. When they can't be resolved (e.g. workspace-id datastreams), shards fall back to tenant-free prefix groups (`.ds-events`, `searchengine-webpages`, `aik_rag`, type `prefix`). Optional query params:
+
+- `patterns` — comma-separated pattern templates (with `%s` as the tenant placeholder) to override the defaults above.
+- `tenants` — comma-separated tenant list to force grouping (like the `TENANTS` variable in the script) when auto-detection isn't enough.
+- `index` — restrict the underlying `_cat/shards` call to a given index/pattern.
 
 ### Move an Elasticsearch node without losing redundancy
 
