@@ -89,6 +89,14 @@ The **source** platform — the runtime still running on MongoDB — exposes an 
 
 `$INTERNAL_API_KEY` is the runtime's internal API key — already present in the pod's environment, which is why the call is made from **inside** the runtime. The `/sys/collections/schema` route is internal-only and rejects any request without the matching key. Copy the resulting `collections.sql` out of the pod to where you will run `psql` (e.g. `kubectl cp <pod>:/path/collections.sql ./collections.sql`).
 
+<Warning>
+  **The route only exports the schema of collections whose workspace has been loaded at least once since the runtime started.** The runtime builds the collections schema lazily: a workspace's collection schemas are known only after that workspace has been loaded into the runtime — and as soon as it is loaded, *all* of its collection schemas become available. A freshly (re)started runtime that hasn't served any traffic will therefore return an empty or partial `collections.sql`, silently dropping tables for workspaces that were never touched.
+
+  Before calling the endpoint, **warm up the runtime**: go to the platform and actually use the modules and workspaces you care about — send a message, browse statistics, open the important/desired workspaces, etc. — so each one is loaded and appears in the exported schema. Then generate `collections.sql`. When in doubt, exercise more workspaces rather than fewer.
+
+  **Why this matters:** for any table missing from `collections.sql`, the migration script falls back to **inferring the schema from the data itself** (column types guessed from the Mongo values it sees). This inference is best-effort and lossy — it can pick a type too narrow or too loose for what the platform actually expects, which surfaces as errors either at **insertion** (a value that won't coerce into the guessed column) or, worse, at **read time** (rows load fine but the platform later fails to query or deserialize them, because the column types/constraints don't match what the ORM expects). Always prefer initializing the schema yourself, as complete as possible, on the important tables — i.e. make sure their workspaces are loaded so their real schema is exported in `collections.sql` — rather than relying on the script's inference.
+</Warning>
+
 ### Applying the schema
 
 ```bash
@@ -160,7 +168,9 @@ python ./scripts/mongo_to_postgres.py \
 
 <AccordionGroup>
   <Accordion title="Loads into the existing schema">
-    The tables already exist — created by the backends (`users`, `permissions`) or by `collections.sql`. The script reads each target table's **real** column types, defaults and constraints from `information_schema` and coerces every Mongo value to match: strings to `timestamptz`, epoch numbers to dates, objects to `jsonb`, string arrays to `text[]`, and so on. It does not design or own the schema.
+    When a table already exists — created by the backends (`users`, `permissions`) or by `collections.sql` — the script reads its **real** column types, defaults and constraints from `information_schema` and coerces every Mongo value to match: strings to `timestamptz`, epoch numbers to dates, objects to `jsonb`, string arrays to `text[]`, and so on. This is the reliable path, and the reason you should provision `collections.sql` up front.
+
+    For a collection whose table is **missing**, the script falls back to **inferring** a schema from the data it reads and creating the table itself. Treat this as a last resort: the inferred types are guessed from sample values and can be wrong, causing failures at insertion or at read time (see the warning in [Step 2](#2-import-the-collections-sql-schema)). Provision the real schema for every important table instead of relying on this fallback.
   </Accordion>
   <Accordion title="Idempotent — safe to re-run">
     Rows are UPSERTed on their primary key (`INSERT … ON CONFLICT (pk) DO UPDATE`), so ids are preserved and re-running never duplicates rows nor errors. If a run is interrupted, just run it again.
