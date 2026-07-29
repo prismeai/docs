@@ -26,13 +26,40 @@ If you inspect an agent's raw memory config, the structure is:
 {
   "session_memory": true,
   "types": [
-    { "id": "working_memory", "enabled": true, "config": { "max_tokens": 4000, "compaction_strategy": "summarize" } },
+    { "id": "working_memory", "enabled": true, "config": { "max_tokens": 4000, "compaction_strategy": "hybrid" } },
     { "id": "long_term",      "enabled": true, "config": { "max_memories": 50 } }
   ]
 }
 ```
 
 `session_memory` is a top-level toggle, separate from `types[]` which holds working memory and long-term memory side by side. The three are fully independent — you can enable any combination.
+</Note>
+
+## Working memory: budget and compaction
+
+Working memory reloads past turns of the current conversation into the prompt. Left unchecked, a long conversation — or one big tool result — would grow the prompt until every reply becomes slow, expensive, or rejected by the model. Two settings keep it under control.
+
+### `max_tokens` — how much history is reloaded
+
+Caps the amount of past conversation reloaded at the start of each turn (default: 4000 tokens, measured from the real token counts reported by the provider). When the history exceeds the cap, the **oldest whole turns are dropped first** — the most recent turn is always kept, and a turn is never cut in the middle (which would corrupt tool-call sequences). Enable session memory alongside it if you want a summary of what was dropped to survive.
+
+### `compaction_strategy` — what happens when the live conversation grows too large
+
+During a single turn, an agent can loop through many tool calls and accumulate a large context. When the context reaches **~70% of the model's context budget**, the platform compacts it mid-conversation. The user sees a *"Compacting conversation history"* step in the response, only when something was actually compacted.
+
+| Value | Behavior | When to choose it |
+|---|---|---|
+| `hybrid` *(default)* | First pass replaces old tool results with compact stubs (cheap, no LLM call). If the context is still too large on a later iteration, escalates to a summarization pass. | Best default — cheap first, thorough when needed. |
+| `summarize` | Summarizes the oldest part of the conversation with an LLM call, keeping the recent turns intact. The summary is injected back into the conversation. | Conversations where old *dialogue* (not tool output) is what grows. |
+| `compact_tool_results` | Only replaces old tool results with stubs; never summarizes. | Cost-sensitive agents where an extra LLM call per compaction is unacceptable. |
+
+Any other value falls back to `hybrid` and emits a `memory.config.invalid_strategy` warning event — it is never silently ignored.
+
+<Note>
+Two more context guards run automatically and require no configuration:
+
+- **Large tool results are offloaded.** A tool result above ~30,000 characters is stored as an artifact instead of entering the prompt. The agent sees a preview plus the artifact id, and reads further **pages** with `get_artifact` only if it needs them (~20,000 characters per page). Large documents can be edited without a full rewrite via the `patch_artifact` tool.
+- **A hard pre-flight ceiling.** Before each model call, the platform estimates the context size. If it would exceed the model's context budget and cannot be compacted enough, the turn fails with an explicit `CONTEXT_OVERFLOW` message — instead of an opaque provider error — and nothing is billed for that call.
 </Note>
 
 The rest of this page focuses on **long-term memory** — the layer that lets your agent remember a user's preferences from one week to the next, on explicit cue.
