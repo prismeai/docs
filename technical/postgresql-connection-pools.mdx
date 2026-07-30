@@ -1,5 +1,5 @@
 ---
-title: "PostgreSQL connection pools — internals"
+title: "PostgreSQL connection pools: internals"
 description: "How each Prisme.ai backend service opens connection pools against PostgreSQL: number of pools per pod, per-thread behavior, observed warm-up patterns, and tuning levers."
 ---
 
@@ -38,7 +38,7 @@ The api-gateway does **not** connect to the `permissions` database. Its AccessMa
 
 The two pools are independent `pg.Pool` instances on the same DB, which is why a single api-gateway pod typically shows \~4 connections on `users` (2 pools × \~2 warm sockets).
 
-Also, no separate pool exists for sessions, magic links, refresh tokens, or service accounts — they all share the single users storage pool.
+Also, no separate pool exists for sessions, magic links, refresh tokens, or service accounts; they all share the single users storage pool.
 
 **Total pools per pod:** 2, both targeting `users`.
 
@@ -64,7 +64,7 @@ Single-process pod.
 
 ### `prismeai-runtime`
 
-**Multi-threaded** via Node.js `worker_threads`. The number of worker threads is controlled by `RUNNER_MAX_THREADS` (`services/runtime/config/runtime.ts:7`, **default `1`**). Each worker thread fully re-initializes its database stack, so it opens **its own pools** — they are not shared with the main thread.
+**Multi-threaded** via Node.js `worker_threads`. The number of worker threads is controlled by `RUNNER_MAX_THREADS` (`services/runtime/config/runtime.ts:7`, **default `1`**). Each worker thread fully re-initializes its database stack, so it opens **its own pools**; they are not shared with the main thread.
 
 Let `W = RUNNER_MAX_THREADS`.
 
@@ -74,7 +74,7 @@ Let `W = RUNNER_MAX_THREADS`.
 | --- | --- |
 | 1 pool to **`permissions`** | `services/runtime/src/app.ts:41` → `initAccessManager()` |
 
-The main thread does **not** open a pool to `collections` — the collections modules are only started inside workers.
+The main thread does **not** open a pool to `collections`; the collections modules are only started inside workers.
 
 **Per worker thread** (×W):
 
@@ -82,7 +82,7 @@ The main thread does **not** open a pool to `collections` — the collections mo
 | --- | --- |
 | 1 pool to **`permissions`** | `services/runtime/src/services/runtime/workers/runner.ts:90` → `initAccessManager()` re-called in the worker context |
 | 1 pool to **`collections`** | `services/runtime/src/runtimeModules/collections/index.ts:133` → `DatabaseOrm.build()` in `CollectionModules.start()` |
-| 1 pool to **`collections`** (second one) | `services/runtime/src/runtimeModules/access-manager/productBindingsManager.ts:108` → `DatabaseOrm.build()` for product bindings — distinct pool, same DB |
+| 1 pool to **`collections`** (second one) | `services/runtime/src/runtimeModules/access-manager/productBindingsManager.ts:108` → `DatabaseOrm.build()` for product bindings; distinct pool, same DB |
 
 **Total pools per pod:**
 - `permissions`: `1 + W` pools
@@ -103,7 +103,7 @@ Multiplying pool count by the `pg-pool` `max=10` default gives the **theoretical
 | `prismeai-runtime` | `permissions` | `1 + RUNNER_MAX_THREADS` | \~2–3 × pools | 10 × pools |
 | `prismeai-runtime` | `collections` | `2 × RUNNER_MAX_THREADS` | \~1–2 × pools | 10 × pools |
 
-`prismeai-api-gateway` does not open any pool against the `permissions` DB — its org-level RBAC tables live alongside the user accounts in the `users` DB.
+`prismeai-api-gateway` does not open any pool against the `permissions` DB; its org-level RBAC tables live alongside the user accounts in the `users` DB.
 
 ### Total connection envelope
 
@@ -121,7 +121,7 @@ With "connections per pool" ranging from ~1 (cold) to 10 (saturated). Add HPA sc
 
 `pg-pool` is supposed to release idle sockets after `idleTimeoutMillis=10s`. Yet observed connections on the sandbox stay open for **hours**:
 
-> PID 3066265 opened at 05:00, last query at 11:47 — still open at 12:45.
+> PID 3066265 opened at 05:00, last query at 11:47, still open at 12:45.
 
 This is because Prisme.ai pods continuously emit small queries against `permissions` (RBAC checks during event subscriptions, cron-triggered automations, workspace registry refresh, etc.). Each of these queries touches a socket and resets its idle timer just often enough to keep it from being recycled. Once a pool reaches its high-water mark during a burst, it stays there indefinitely.
 
@@ -133,16 +133,16 @@ Every storage block accepts pool-sizing env vars of the form `<NAME>_STORAGE_POO
 
 | Env var | PostgreSQL (Knex/Tarn) | MongoDB (native driver) |
 | --- | --- | --- |
-| `PERMISSIONS_STORAGE_POOL_MIN` | `pool.min` (default `2`) | `minPoolSize` (default `0`) — translated by MikroORM. |
-| `PERMISSIONS_STORAGE_POOL_MAX` | `pool.max` (default `10`) | `maxPoolSize` (default `100`) — translated by MikroORM. |
-| `PERMISSIONS_STORAGE_POOL_IDLE_TIMEOUT_MS` | `pool.idleTimeoutMillis` (default `30000`) | `maxIdleTimeMS` — translated in `driverConfig.ts` (MikroORM doesn't map it). |
+| `PERMISSIONS_STORAGE_POOL_MIN` | `pool.min` (default `2`) | `minPoolSize` (default `0`), translated by MikroORM. |
+| `PERMISSIONS_STORAGE_POOL_MAX` | `pool.max` (default `10`) | `maxPoolSize` (default `100`), translated by MikroORM. |
+| `PERMISSIONS_STORAGE_POOL_IDLE_TIMEOUT_MS` | `pool.idleTimeoutMillis` (default `30000`) | `maxIdleTimeMS`, translated in `driverConfig.ts` (MikroORM doesn't map it). |
 
-The same `MIN` / `MAX` / `IDLE_TIMEOUT_MS` keys exist for `USERS_STORAGE_POOL_*` (api-gateway users pools — the org RBAC AccessManager also targets the `users` DB and respects the same vars) and `COLLECTIONS_STORAGE_POOL_*` (each runtime collections pool, one per worker). Set the same env vars on every replica of the corresponding Deployment.
+The same `MIN` / `MAX` / `IDLE_TIMEOUT_MS` keys exist for `USERS_STORAGE_POOL_*` (api-gateway users pools; the org RBAC AccessManager also targets the `users` DB and respects the same vars) and `COLLECTIONS_STORAGE_POOL_*` (each runtime collections pool, one per worker). Set the same env vars on every replica of the corresponding Deployment.
 
-For the runtime specifically, `RUNNER_MAX_THREADS` (default `1`) has the largest impact on connection count — each unit reduction removes one `permissions` pool and two `collections` pools.
+For the runtime specifically, `RUNNER_MAX_THREADS` (default `1`) has the largest impact on connection count: each unit reduction removes one `permissions` pool and two `collections` pools.
 
 <Note>
-  The legacy `<NAME>_STORAGE_OPT_<key>` env vars feed MikroORM's `driverOptions`, which are passed to the underlying client (`pg.Client` for Postgres, `MongoClient` for Mongo) — **not** to the pool on Postgres. On Postgres, setting `PERMISSIONS_STORAGE_OPT_max=5` does *not* cap the pool; use `PERMISSIONS_STORAGE_POOL_MAX=5` instead. The `*_STORAGE_OPT_*` channel is still useful as an escape hatch when a driver-specific option needs to override a `*_STORAGE_POOL_*` value (for example, `*_STORAGE_OPT_maxIdleTimeMS` wins over `*_STORAGE_POOL_IDLE_TIMEOUT_MS` on Mongo).
+  The legacy `<NAME>_STORAGE_OPT_<key>` env vars feed MikroORM's `driverOptions`, which are passed to the underlying client (`pg.Client` for Postgres, `MongoClient` for Mongo), **not** to the pool on Postgres. On Postgres, setting `PERMISSIONS_STORAGE_OPT_max=5` does *not* cap the pool; use `PERMISSIONS_STORAGE_POOL_MAX=5` instead. The `*_STORAGE_OPT_*` channel is still useful as an escape hatch when a driver-specific option needs to override a `*_STORAGE_POOL_*` value (for example, `*_STORAGE_OPT_maxIdleTimeMS` wins over `*_STORAGE_POOL_IDLE_TIMEOUT_MS` on Mongo).
 </Note>
 
 ### Typical tuning recipes
@@ -155,7 +155,7 @@ USERS_STORAGE_POOL_MAX=5
 COLLECTIONS_STORAGE_POOL_MAX=3
 ```
 
-This bounds each pod to a predictable budget while still allowing \~3–5 concurrent queries per pool — enough for most request bursts.
+This bounds each pod to a predictable budget while still allowing \~3–5 concurrent queries per pool, enough for most request bursts.
 
 **Shrink the idle floor** when many pools sit warm with no traffic:
 
@@ -189,7 +189,7 @@ GROUP BY datname
 ORDER BY nb_connexions DESC;
 ```
 
-Per-query distribution to identify hot pools (useful to spot the runtime worker fan-out — repeated identical `query_id` across N rows = N runtime threads):
+Per-query distribution to identify hot pools (useful to spot the runtime worker fan-out: repeated identical `query_id` across N rows = N runtime threads):
 
 ```sql
 SELECT
@@ -217,4 +217,4 @@ ORDER BY backend_start;
 
 ## Related
 
-- [Self-hosting / PostgreSQL](/self-hosting/databases/postgresql) — user-facing setup, sizing, and PgBouncer guidance.
+- [Self-hosting / PostgreSQL](/self-hosting/databases/postgresql): user-facing setup, sizing, and PgBouncer guidance.
