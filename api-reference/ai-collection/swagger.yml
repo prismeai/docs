@@ -1,0 +1,761 @@
+openapi: 3.0.3
+info:
+  version: 1.0.0
+  title: Collections API
+  description: |
+    Public REST API for the Prisme.ai Collections workspace: named collections
+    of structured records with typed schemas, MongoDB-style querying,
+    aggregations, and an MCP (JSON-RPC 2.0) endpoint for AI agents.
+
+    Records are isolated per owner (user or agent); a collection can be shared
+    with additional agents through its `agent_ids` list. Every write emits an
+    audit event.
+  contact:
+    name: Prisme.ai
+    url: https://prisme.ai
+servers:
+  - url: https://{host}/v2/workspaces/slug:ai-collection-v3/webhooks
+    description: Prisme.ai workspace webhooks
+    variables:
+      host:
+        default: api.studio.prisme.ai
+        description: API host (override for self-hosted or sandbox)
+security:
+  - BearerAuth: []
+  - OrgApiKeyAuth: []
+tags:
+  - name: Collections
+    description: Create, list, read, update, and delete collections (metadata and schema).
+  - name: Records
+    description: Insert, query, read, update, upsert, and delete records in a collection.
+  - name: Analytics
+    description: Count, distinct values, and aggregations (sum, avg, count with grouping).
+  - name: MCP
+    description: JSON-RPC 2.0 endpoint exposing the `data_*` tools to AI agents and MCP clients.
+paths:
+  /v1/collections:
+    get:
+      tags: [Collections]
+      operationId: listCollections
+      summary: List collections
+      description: |
+        Returns the collections owned by the caller or shared with them.
+        Rate limit: 100 requests/min per user.
+      responses:
+        '200':
+          description: Collections accessible to the caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  collections:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Collection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Collections]
+      operationId: createCollection
+      summary: Create a collection
+      description: |
+        Creates a named collection, optionally with a typed schema
+        (`properties`). Collection names are unique per owner.
+        Rate limit: 100 requests/min per user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  maxLength: 64
+                  pattern: '^[a-zA-Z0-9_-]+$'
+                  description: Collection name (alphanumeric, `-`, `_`). Unique per owner.
+                  example: products
+                description:
+                  type: string
+                  description: Human-readable description, also visible to agents.
+                  example: Product catalog, one row per SKU, prices in EUR
+                settings:
+                  $ref: '#/components/schemas/CollectionSettings'
+                properties:
+                  $ref: '#/components/schemas/SchemaProperties'
+      responses:
+        '200':
+          description: Collection created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  collection_id:
+                    type: string
+                    format: uuid
+                  name:
+                    type: string
+                  owner_id:
+                    type: string
+                  owner_type:
+                    type: string
+                    enum: [user, agent]
+                  status:
+                    type: string
+                    example: ready
+                  schema_applied:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: A collection with this name already exists for this owner.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/collections/{collection_id}:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    get:
+      tags: [Collections]
+      operationId: getCollection
+      summary: Get collection metadata
+      responses:
+        '200':
+          description: Collection metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Collection'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Collections]
+      operationId: updateCollection
+      summary: Update collection metadata
+      description: |
+        Updates the description, settings, or the `agent_ids` sharing list.
+        The schema is immutable after creation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                description:
+                  type: string
+                settings:
+                  $ref: '#/components/schemas/CollectionSettings'
+                agent_ids:
+                  type: array
+                  description: Agents granted access to this collection.
+                  items:
+                    type: string
+                  example: [agent_123, agent_456]
+      responses:
+        '200':
+          description: Updated collection metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Collection'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Collections]
+      operationId: deleteCollection
+      summary: Delete a collection
+      description: Permanently deletes the collection and **all its records**.
+      responses:
+        '200':
+          description: Collection deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/collections/{collection_id}/data:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    get:
+      tags: [Records]
+      operationId: queryRecords
+      summary: Query records
+      description: |
+        Returns records matching a MongoDB-style filter, with sorting,
+        pagination, and field projection. Operators executing code or
+        cross-referencing data (`$where`, `$function`, `$expr`, `$lookup`,
+        `$merge`, `$accumulator`, `$out`) are rejected.
+        Rate limit: 100 requests/min per user.
+      parameters:
+        - name: filter
+          in: query
+          required: false
+          description: JSON-encoded MongoDB-style filter.
+          schema:
+            type: string
+          example: '{"status":"active","deal_value":{"$gte":50000}}'
+        - name: sort
+          in: query
+          required: false
+          description: JSON-encoded sort specification.
+          schema:
+            type: string
+          example: '{"created_at":-1}'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Page'
+        - name: fields
+          in: query
+          required: false
+          description: JSON-encoded field projection.
+          schema:
+            type: string
+          example: '{"name":1,"email":1}'
+      responses:
+        '200':
+          description: Matching records.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                    description: Number of records in this page.
+                  records:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Record'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Records]
+      operationId: insertRecords
+      summary: Insert records
+      description: |
+        Inserts one record or a batch of up to 1,000 records.
+        Rate limit: 20 requests/min per user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [records]
+              properties:
+                records:
+                  description: A single record object or an array of up to 1,000 records.
+                  oneOf:
+                    - $ref: '#/components/schemas/RecordInput'
+                    - type: array
+                      maxItems: 1000
+                      items:
+                        $ref: '#/components/schemas/RecordInput'
+                ttl_days:
+                  type: integer
+                  minimum: 0
+                  description: Auto-expire the records after N days (0 = never).
+      responses:
+        '200':
+          description: Records inserted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  inserted_count:
+                    type: integer
+                  ids:
+                    type: array
+                    items:
+                      type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/collections/{collection_id}/data/count:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    get:
+      tags: [Analytics]
+      operationId: countRecords
+      summary: Count records
+      parameters:
+        - name: filter
+          in: query
+          required: false
+          description: JSON-encoded MongoDB-style filter.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Number of matching records.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/collections/{collection_id}/data/distinct:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    get:
+      tags: [Analytics]
+      operationId: distinctValues
+      summary: Get distinct values of a field
+      description: Returns up to 1,000 unique values for a field.
+      parameters:
+        - name: field
+          in: query
+          required: true
+          schema:
+            type: string
+          example: category
+        - name: filter
+          in: query
+          required: false
+          description: JSON-encoded MongoDB-style filter.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Distinct values.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  field:
+                    type: string
+                  count:
+                    type: integer
+                  values:
+                    type: array
+                    items: {}
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/collections/{collection_id}/data/aggregate:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    post:
+      tags: [Analytics]
+      operationId: aggregateRecords
+      summary: Run aggregations
+      description: |
+        Computes sums, averages, and counts over matching records, with
+        optional grouping. Maximum 10 aggregation steps per call.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [steps]
+              properties:
+                filter:
+                  type: object
+                  description: MongoDB-style filter applied before aggregating.
+                group_by:
+                  type: string
+                  description: Field to group results by.
+                  example: category
+                steps:
+                  type: array
+                  maxItems: 10
+                  items:
+                    type: object
+                    required: [type, output_field]
+                    properties:
+                      type:
+                        type: string
+                        enum: [sum, avg, count]
+                      input_field:
+                        type: string
+                        description: Numeric field to aggregate (unused for `count`).
+                      output_field:
+                        type: string
+            example:
+              filter: { status: completed }
+              group_by: category
+              steps:
+                - { type: sum, input_field: amount, output_field: total }
+                - { type: avg, input_field: amount, output_field: avg_amount }
+      responses:
+        '200':
+          description: Aggregation results (one row per group).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /v1/collections/{collection_id}/data/upsert:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    post:
+      tags: [Records]
+      operationId: upsertRecord
+      summary: Upsert a record
+      description: |
+        Inserts the record, or updates the existing one matching the
+        `match_fields` values (e.g. an email or a SKU).
+        Rate limit: 50 requests/min per user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [data, match_fields]
+              properties:
+                data:
+                  $ref: '#/components/schemas/RecordInput'
+                match_fields:
+                  type: array
+                  items:
+                    type: string
+                  description: Fields identifying the record to update if it exists.
+                  example: [email]
+                ttl_days:
+                  type: integer
+                  minimum: 0
+      responses:
+        '200':
+          description: Upsert result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operation:
+                    type: string
+                    example: upserted
+                  result:
+                    type: object
+                    additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /v1/collections/{collection_id}/data/{record_id}:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+      - name: record_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Record identifier (`_id`).
+    get:
+      tags: [Records]
+      operationId: getRecord
+      summary: Get a record
+      responses:
+        '200':
+          description: The record, if found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  found:
+                    type: boolean
+                  record:
+                    $ref: '#/components/schemas/Record'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Records]
+      operationId: updateRecord
+      summary: Update a record
+      description: |
+        Updates the record's fields. System fields (`_id`, `created_at`,
+        ownership metadata) are protected and stripped from the payload.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordInput'
+      responses:
+        '200':
+          description: Update result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated_count:
+                    type: integer
+                  matched_count:
+                    type: integer
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Records]
+      operationId: deleteRecord
+      summary: Delete a record
+      description: |
+        Deletes a single record. Bulk deletion (multiple records in one call)
+        is only available when explicitly enabled in the platform
+        configuration.
+      responses:
+        '200':
+          description: Deletion result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted_count:
+                    type: integer
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /ai-collection/mcp:
+    post:
+      tags: [MCP]
+      operationId: mcpEndpoint
+      summary: MCP endpoint (JSON-RPC 2.0)
+      description: |
+        Model Context Protocol endpoint for AI agents and MCP clients.
+        Implements `initialize`, `tools/list`, and `tools/call` over
+        JSON-RPC 2.0.
+
+        Available tools: `data_create_collection`, `data_insert`,
+        `data_query`, `data_get`, `data_update`, `data_upsert`,
+        `data_delete`, `data_count`, `data_distinct`, `data_aggregate`.
+        Tool arguments mirror the REST payloads documented above.
+        Rate limit: 100 requests/min per user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [jsonrpc, method]
+              properties:
+                jsonrpc:
+                  type: string
+                  enum: ['2.0']
+                id:
+                  oneOf:
+                    - type: string
+                    - type: integer
+                method:
+                  type: string
+                  enum: [initialize, tools/list, tools/call]
+                params:
+                  type: object
+                  description: |
+                    For `tools/call`: `{ "name": "<tool>", "arguments": { ... } }`.
+                  additionalProperties: true
+            example:
+              jsonrpc: '2.0'
+              id: 1
+              method: tools/call
+              params:
+                name: data_query
+                arguments:
+                  collection_id: 3f2a9c1e-...
+                  filter: { status: active }
+                  limit: 20
+      responses:
+        '200':
+          description: JSON-RPC 2.0 response (`result` on success, `error` on failure).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jsonrpc:
+                    type: string
+                    enum: ['2.0']
+                  id:
+                    oneOf:
+                      - type: string
+                      - type: integer
+                  result:
+                    type: object
+                    additionalProperties: true
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: integer
+                      message:
+                        type: string
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'User session JWT. Send as `Authorization: Bearer <token>`.'
+    OrgApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-prismeai-api-key
+      description: Organization-scoped API key.
+  parameters:
+    CollectionId:
+      name: collection_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Collection identifier returned at creation.
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+      description: Page size (max 100).
+    Page:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+      description: Page number.
+  responses:
+    BadRequest:
+      description: Invalid arguments (bad filter operator, batch too large, name invalid…).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid credentials.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Collection or record not found, or the caller has no access to it.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: Rate limit exceeded.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Collection:
+      type: object
+      properties:
+        collection_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: products
+        description:
+          type: string
+        owner_id:
+          type: string
+          description: User ID or agent ID owning the collection.
+        owner_type:
+          type: string
+          enum: [user, agent]
+        agent_ids:
+          type: array
+          description: Agents granted access (sharing list).
+          items:
+            type: string
+        settings:
+          $ref: '#/components/schemas/CollectionSettings'
+        schema:
+          $ref: '#/components/schemas/SchemaProperties'
+        row_count:
+          type: integer
+        status:
+          type: string
+          example: ready
+    CollectionSettings:
+      type: object
+      properties:
+        ttl_days:
+          type: integer
+          minimum: 0
+          description: Default record expiration in days (0 = never).
+        max_records:
+          type: integer
+          description: Collection size limit (default 10,000).
+    SchemaProperties:
+      type: object
+      description: 'Column definitions: field name → type descriptor.'
+      additionalProperties:
+        type: object
+        required: [type]
+        properties:
+          type:
+            type: string
+            enum: [text, integer, double, boolean, date, datetime, json, array]
+          nullable:
+            type: boolean
+      example:
+        product_name: { type: text }
+        price: { type: double }
+        stock: { type: integer, nullable: true }
+        active: { type: boolean }
+        released_at: { type: date }
+        specs: { type: json }
+    RecordInput:
+      type: object
+      description: |
+        Record fields matching the collection schema. Unknown fields are
+        accepted (flexible schema); system fields are ignored.
+      additionalProperties: true
+      example:
+        product_name: Laptop Pro 16
+        price: 2199.9
+        stock: 42
+        active: true
+    Record:
+      type: object
+      description: A stored record, including system fields.
+      properties:
+        _id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: InvalidArguments
+        message:
+          type: string
