@@ -148,7 +148,7 @@ Two payloads, one purpose:
 - `content[].text` is what the LLM sees as the tool's textual result (it can reason about what was displayed).
 - `__surface` is what the chat client renders for the user.
 
-The full list of available components (`Card`, `Column`, `Row`, `Text`, `Badge`, `Progress`, `Divider`, `TextField`, `TextArea`, `Select`, `CheckBox`, `Table`, `Button`, …) is documented in the [A2UI surfaces specification](/dsul/overview).
+The full list of available components and their props is in the [Component reference](#component-reference) below.
 
 ### Step 3: Attach the MCP server to your agent
 
@@ -173,9 +173,211 @@ Add a few lines to the agent's **Instructions** so the LLM actually reaches for 
 
 Without this nudge, most models will default to plain text because that's their training prior. The surfaces are tools; they need to be promoted as the better choice for the right situations.
 
+## Interactive surfaces
+
+A surface is **read-only by default**. To make buttons clickable and forms submittable, the tool must declare that it waits for the user:
+
+```yaml
+__surface:
+  wait_for_action: true
+```
+
+With `wait_for_action: true`, the tool call stays pending: the agent pauses, the surface becomes interactive, and the user's click resolves the call. Without it, the surface renders but every `Button` is disabled and clicks do nothing. This is the single most common mistake when a surface "renders but doesn't react".
+
+### The `action` property
+
+A `Button` (and the `Loader`) triggers an action. Exactly two forms are supported:
+
+```yaml
+action: approve            # shorthand: the action name as a string
+```
+
+```yaml
+action:
+  name: approve            # object form
+```
+
+Any other shape (an `event:` wrapper, a `sendMessage` verb, a `path` binding inside the action) is not part of the catalog and results in a button with no handler.
+
+### What the agent receives
+
+When the user clicks, the pending tool call resolves and the agent receives:
+
+```json
+{
+  "action": {
+    "name": "approve",
+    "surfaceId": "action-card-1",
+    "sourceComponentId": "btn-approve",
+    "timestamp": "2026-07-30T14:00:00.000Z"
+  },
+  "dataModel": { }
+}
+```
+
+- `action.name` is the button's action name: this is how the agent knows what was chosen
+- `dataModel` contains the full form state when the surface sets `send_data_model: true` (empty otherwise)
+
+The agent then continues the conversation with this result, exactly like any other tool output.
+
+### Example: clickable suggested questions
+
+A common pattern: propose follow-up questions as buttons, and treat the clicked one as the user's next request. The trick is to use the question text itself as the action name:
+
+```yaml
+# automations/show_related_questions.yml
+slug: show_related_questions
+private: true
+arguments:
+  arguments:
+    type: object
+do:
+  - set:
+      name: _btn_ids
+      value: []
+  - set:
+      name: _components
+      value: []
+  - repeat:
+      'on': '{{arguments.questions}}'
+      do:
+        - set:
+            name: _btn_ids[]
+            value: q-{{$index}}
+        - set:
+            name: _components[]
+            value:
+              id: q-{{$index}}
+              component: Button
+              label: '{{item}}'
+              variant: outline
+              action:
+                name: '{{item}}'   # the question text IS the action name
+  - set:
+      name: _components[]
+      value:
+        id: col
+        component: Column
+        gap: '2'
+        children: '{{_btn_ids}}'
+output:
+  content:
+    - type: text
+      text: Related questions proposed to the user.
+  isError: false
+  __surface:
+    surface_id: related-questions
+    catalog_id: prisme://blocks/v1
+    wait_for_action: true          # required, or the buttons are disabled
+    send_data_model: false
+    text: Related questions proposed to the user.
+    components: '{{_components}}'
+```
+
+In the tool's `description`, tell the LLM what comes back: *"The conversation pauses until the user clicks one; the text of the clicked question is returned to the agent as the user's new request."*
+
+### Forms and two-way binding
+
+Input components (`TextField`, `TextArea`, `Select`, `CheckBox`, `Switch`, `Slider`) bind to the `data_model` through a `{ path: ... }` value (JSON Pointer, RFC 6901):
+
+```yaml
+components:
+  - id: name-input
+    component: TextField
+    label: Your name
+    value: { path: /user/name }
+  - id: newsletter
+    component: CheckBox
+    label: Subscribe to the newsletter
+    checked: { path: /user/newsletter }
+  - id: submit
+    component: Button
+    label: Submit
+    variant: primary
+    action:
+      name: submit
+data_model:
+  user:
+    name: ''
+    newsletter: false
+```
+
+As the user types, the surface state updates in place. When they click a button, the whole `data_model` is attached to the action (set `send_data_model: true` on the surface), so the agent receives every field in one payload. Text inputs bind on `value` (or `text`); `CheckBox` and `Switch` bind on `checked` (or `value`).
+
+## Component reference
+
+The `prisme://blocks/v1` catalog. Every component shares four base properties:
+
+| Property | Type | Description |
+|---|---|---|
+| `id` | string (required) | Unique identifier within the surface |
+| `component` | string (required) | Component type, from the tables below |
+| `children` | string[] | IDs of child components (for containers) |
+| `className` | string | Extra CSS classes (Tailwind utilities) |
+
+All other props are flat siblings of `component`. Any prop value can be a static value or a binding `{ path: /json/pointer, default: ... }` resolved against the surface's `data_model`.
+
+### Layout
+
+| Component | Props | Notes |
+|---|---|---|
+| `Row` | `gap` (default `2`), `align` (`start`\|`center`\|`end`\|`stretch`, default `center`), `justify` (`start`\|`center`\|`end`\|`between`\|`around`, default `start`) | Horizontal flex container |
+| `Column` | `gap` (default `2`), `align` (default `stretch`), `justify` (default `start`) | Vertical flex container |
+
+### Containers
+
+| Component | Props | Notes |
+|---|---|---|
+| `Card` | `title`, `variant` (`default`\|`outline`\|`ghost`\|`elevated`) | Card with optional header |
+| `Tabs` | `defaultValue` | Tabbed container |
+| `Modal` | `open` | Modal container |
+
+### Display
+
+| Component | Props | Notes |
+|---|---|---|
+| `Text` | `content` (or `text`), `variant` (`body`\|`heading`\|`caption`\|`code`), `weight` (`normal`\|`medium`\|`semibold`\|`bold`) | Text span |
+| `Badge` | `label` (or `text`), `variant` (default `default`) | Status badge |
+| `Alert` | `message` (or `content`), `title`, `variant` (`default`\|`destructive`\|`success`\|`warning`\|`info`\|`error`) | Callout box |
+| `Progress` | `value` (default 0), `max` (default 100) | Progress bar |
+| `Divider` | `orientation` (default `horizontal`) | Separator line |
+| `Avatar` | `src`, `alt`, `fallback` | `src` must be http(s) or relative; unsafe protocols are blocked |
+
+### Interactive
+
+| Component | Props | Binding |
+|---|---|---|
+| `Button` | `label`, `variant` (default `outline`), `size` (default `default`), `disabled`, `action` | Triggers the [action flow](#the-action-property) |
+| `TextField` | `label`, `placeholder`, `type` (default `text`), `disabled` | `value` (or `text`) |
+| `TextArea` | `label`, `placeholder`, `rows` (default 3), `disabled` | `value` (or `text`) |
+| `Select` | `options` (string[] or `{value, label}[]`), `label`, `placeholder`, `disabled` | `value` |
+| `CheckBox` | `label`, `disabled` | `checked` (or `value`) |
+| `Switch` | `label`, `disabled` | `checked` (or `value`) |
+| `Slider` | `min` (default 0), `max` (default 100), `step` (default 1), `disabled` | `value` |
+
+### Data
+
+| Component | Props | Notes |
+|---|---|---|
+| `DataTable` | `data` (array of records), `columns` (`{key, header}[]`), `title` | Renders nothing if `data` or `columns` is empty |
+| `List` | `items` (`{id, label}[]`), `variant` (`bullet`\|`number`\|`none`, default `bullet`) | Simple list |
+
+### Media
+
+| Component | Props | Notes |
+|---|---|---|
+| `Image` | `src`, `alt`, `width`, `height` | `src` must be http(s) or relative; unsafe protocols are blocked |
+
+### Loader
+
+| Component | Props | Notes |
+|---|---|---|
+| `Loader` | `timeout` (seconds), `poll` (relative URL), `interval` (seconds, default 30, min 1), `style` (`spinner`\|`progress`\|`image`), `aspect` (`square`\|`landscape`\|`portrait`), `message`, `action` | Fires its `action` automatically on timeout or when polling completes; no user click involved |
+
+The `Loader` is the one component whose action fires without a click. In `poll` mode it fetches the URL (same-origin relative path only) every `interval` seconds; the endpoint responds with `{ done, progress, message }`, and when `done` is true the action fires with the final response attached. After 3 consecutive failed polls, a `<action>_error` action fires instead.
+
 ## Going further
 
-- **Spec & components**: [A2UI surfaces specification](/dsul/overview) lists every component, props, and event shape
 - **Boilerplate**: [`prismeai/starter-mcp`](https://github.com/prismeai/starter-mcp) is the recommended scaffold
 - **MCP authentication**: for OAuth-protected MCP servers (rare for A2UI but possible), see [MCP Connections & OAuth](/products/ai-securechat/mcp-connections)
 - **User-first activation**: if some surfaces should only be summoned by the user (e.g. a feedback form), pair the MCP with [user-first tools](./user-first-tools)
