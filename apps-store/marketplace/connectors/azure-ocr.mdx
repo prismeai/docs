@@ -12,7 +12,7 @@ description: 'Extract text and structured data from images and documents with Az
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Azure OCR app exposes two Azure AI services behind a single Prisme.ai connector: **Azure Computer Vision** for lightweight image OCR and visual analysis (Read, Caption, Tags, Objects, People) and **Azure Document Intelligence** for structured extraction of documents (layouts, invoices, receipts, ID documents). It can be consumed two ways: as a remote MCP server that **Agent Factory** agents call through two entity tools (`image`, `document`), or as a Builder app whose instructions you call directly from DSUL. It runs in the **tenant app-instance context**: each workspace pastes its own per-service Azure credentials (endpoint hostname + API key), resolved server-side and never exposed to the agent. Agents are identified by the capability **Scope** `context_id,agent_id,user_id` and gated by a per-workspace authorized-agents allowlist.
+The Azure OCR app exposes two Azure AI services behind a single Prisme.ai connector: **Azure Computer Vision** for lightweight image OCR and visual analysis (Read, Caption, Tags, Objects, People) and **Azure Document Intelligence** for structured extraction of documents (layouts, invoices, receipts, ID documents). It can be consumed two ways: as a remote MCP server that **Agent Factory** agents call through two entity tools (`image`, `document`), or as a Builder app whose instructions you call directly from DSUL. It runs in the **tenant app-instance context**: each workspace pastes its own per-service Azure credentials (endpoint hostname + API key), resolved server-side and never exposed to the agent. Agents are identified by the capability **Scope** `context_id,agent_id,user_id,attachment_urls` and gated by a per-workspace authorized-agents allowlist. For private Prisme deployments that Azure cannot reach, an optional connector-side proxy can download trusted Prisme file URLs and submit their bytes to Document Intelligence as base64.
 
 <CardGroup cols={3}>
   <Card title="Computer Vision" icon="image">
@@ -71,7 +71,7 @@ This connector is used by three different roles. Jump to the section that matche
       Set the capability's MCP server URL to the **MCP Endpoint** of the workspace running the connector, and set its **Scope** to:
 
       ```text
-      context_id,agent_id,user_id
+      context_id,agent_id,user_id,attachment_urls
       ```
 
       The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
@@ -115,10 +115,10 @@ This connector is used by three different roles. Jump to the section that matche
         In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
 
         ```text
-        context_id,agent_id,user_id
+        context_id,agent_id,user_id,attachment_urls
         ```
 
-        The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "agent could not be identified" message.
+        The `agent_id` lets the connector identify and authorize your agent. `attachment_urls` gives the connector the real URLs of files uploaded in the conversation, avoiding URLs guessed by the model. Without `agent_id`, every call is rejected with an explicit "agent could not be identified" message.
       </Step>
       <Step title="Brief the agent">
         Tell the agent the tools exist and when to use each (see *Brief the agent in its system prompt* below).
@@ -136,8 +136,8 @@ This connector is used by three different roles. Jump to the section that matche
     ```text
     You have access to the Azure OCR MCP server (tools: image, document). Each tool takes an `action: analyze` argument.
     - image: for a single image (photo, screenshot, receipt picture). Pass the public image URL as `source`. Default feature is Read (OCR); add Caption, Tags, Objects or People only when the user asks for visual analysis. Synchronous.
-    - document: for PDFs and multi-page or structured documents. Pass a document URL (or base64 with sourceType: base64) as `source`, and pick the model by intent: prebuilt-read for plain text, prebuilt-layout for tables and structure, prebuilt-invoice / prebuilt-receipt / prebuilt-idDocument for those specific document types.
-    Prefer outputContentFormat: markdown when feeding the result back into your own reasoning. Always pass a public URL when you have one; base64 inflates the request.
+    - document: for PDFs and multi-page or structured documents. Pass the document URL supplied with the conversation attachment (or base64 with sourceType: base64) as `source`, and pick the model by intent: prebuilt-read for plain text, prebuilt-layout for tables and structure, prebuilt-invoice / prebuilt-receipt / prebuilt-idDocument for those specific document types.
+    Prefer outputContentFormat: markdown when feeding the result back into your own reasoning. Do not invent or rewrite attachment URLs. The connector can proxy private Prisme file URLs as base64 when that workspace option is enabled.
     ```
 
     <Note>
@@ -220,6 +220,10 @@ This connector is used by three different roles. Jump to the section that matche
     | `outputContentFormat` | No | `text` (default) or `markdown`. |
     | `outputFormat` | No | `both` (default), `verbose`, or `structured`. |
 
+    <Note>
+      If the workspace enables **Proxy private Prisme files through base64**, keep `sourceType: url` and pass the original Prisme attachment URL. The connector downloads trusted URLs from its own Prisme API (up to 25 MB), follows the platform-issued file redirect, and submits `base64Source` to Azure. Public URLs still use Azure's normal `urlSource` flow. The model never needs to generate or handle base64.
+    </Note>
+
     Available **prebuilt models**:
 
     | Model | Use case |
@@ -241,15 +245,25 @@ This connector is used by three different roles. Jump to the section that matche
 
     1. Go to **Apps** in your workspace
     2. Search for **Azure OCR** and install it
-    3. Open the **Configuration app** (the link auto-populated on install) to paste the Azure endpoint hostname + API key for the service(s) you use, and to allow the agents that may call the connector
+    3. Open the **Configuration app** (the link auto-populated on install) to paste the Azure endpoint hostname + API key for the service(s) you use, optionally enable private-file proxying, and allow the agents that may call the connector
 
     ## Configuration
 
     | Field | Description |
     |-------|-------------|
-    | **Configuration app** | Auto-populated on install; open this link to set the per-service Azure credentials (Computer Vision and/or Document Intelligence endpoint + API key) and manage the authorized-agents allowlist. |
+    | **Configuration app** | Auto-populated on install; open this link to set the per-service Azure credentials (Computer Vision and/or Document Intelligence endpoint + API key), configure private-file proxying, and manage the authorized-agents allowlist. |
 
-    The configuration app drives everything; the app instance itself has no per-field credential form. Credentials are stored as a workspace secret (`azureOcrAuth`) shaped as `{ computervision: { endpoint, apiKey }, documentIntelligence: { endpoint, apiKey } }`, and the allowlist as a second secret (`azureOcrAuthorizedAgents`). Both are resolved server-side at call time.
+    The configuration app drives everything; the app instance itself has no per-field credential form. Credentials are stored as four flattened workspace secrets (`azureOcrComputerVisionEndpoint`, `azureOcrComputerVisionApiKey`, `azureOcrDocumentIntelligenceEndpoint`, and `azureOcrDocumentIntelligenceApiKey`), the allowlist as `azureOcrAuthorizedAgents`, and the optional proxy flag as the boolean secret `azureOcrDownloadPrivateFilesAsBase64`. All are resolved server-side at call time. The proxy flag is `false` by default.
+
+    ### Private Prisme file proxy (optional)
+
+    Enable **Proxy private Prisme files through base64** when Azure Document Intelligence cannot resolve or reach your private Prisme API hostname. With the option enabled and `sourceType: url`:
+
+    1. Public, non-Prisme URLs are still sent to Azure as `urlSource`.
+    2. URLs served by the current Prisme API are downloaded inside the connector, including platform-issued redirects.
+    3. Files up to 25 MB are encoded and submitted to Azure as `base64Source`.
+
+    The initial URL must belong to the connector's own Prisme API origin and match a native `/v2/files/...` or file-content webhook endpoint; other URLs are never downloaded by the connector. This limits the proxy to trusted platform file endpoints. The setting affects Document Intelligence only; Computer Vision image analysis continues to require a public image URL.
 
     This connector uses a single auth mode:
 
@@ -344,7 +358,7 @@ Both operations return a structured error payload (and emit an `error` event) in
 
 ```json
 {
-  "error": "ConfigurationError | ValidationError | NetworkError | AzureError | Unauthorized | Forbidden | NotFound | RateLimited | ServerError | ProcessingFailed | Timeout",
+  "error": "ConfigurationError | ValidationError | SourceDownloadError | NetworkError | AzureError | Unauthorized | Forbidden | NotFound | RateLimited | ServerError | ProcessingFailed | Timeout",
   "message": "Human-readable explanation",
   "details": {
     "service": "computervision | documentIntelligence",
@@ -359,6 +373,7 @@ Both operations return a structured error payload (and emit an `error` event) in
 |-------|---------------|
 | `ConfigurationError` | The targeted service has no endpoint or API key in the connector config |
 | `ValidationError` | `source` argument is empty |
+| `SourceDownloadError` | The optional private-file proxy could not download the Prisme file, timed out, or rejected a file larger than 25 MB |
 | `NetworkError` | Endpoint unreachable; check hostname format (no scheme, no path) |
 | `Unauthorized` | Invalid or revoked API key (HTTP 401) |
 | `Forbidden` | The resource exists but the key lacks access, or the API is not enabled (HTTP 403) |
@@ -371,11 +386,13 @@ Both operations return a structured error payload (and emit an `error` event) in
 ### Common Issues
 
 - **"This agent is not authorized to use this connector"**: The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (or enable **Allow all agents**) and Save. The **Install capability** button does this for you.
-- **"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Factory never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allow the agent in the config app.
+- **"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Factory never injects the agent identity. Set the Scope to `context_id,agent_id,user_id,attachment_urls` on the capability, then allow the agent in the config app.
 - **`ConfigurationError` ("… is not configured")**: The targeted service has no endpoint or API key in the connector configuration. Each workspace must paste its own Azure endpoint and key in the config app; there is no platform-level credential to fall back on. Configure only the service(s) you call.
 - **`Unauthorized` (401, invalid key)**: Azure rejected the key. Regenerate or copy a current key from the resource's **Keys and Endpoint** page, and confirm it matches the service you are calling (Computer Vision keys do not work on Document Intelligence and vice versa).
 - **`Forbidden` (403, API not enabled)**: The key is valid but the resource does not expose the requested API. Confirm the resource type (a Document Intelligence key cannot serve Image Analysis) and that the feature is enabled on the Azure resource.
 - **`NetworkError` / `NotFound` (404, bad endpoint)**: Almost always a malformed endpoint. Store the **hostname only** (no `https://`, no path); the connector strips a leading scheme and trailing slash but cannot recover a wrong host.
+- **Azure says it could not download a Prisme file URL**: Azure cannot reach the private Prisme hostname. Open the connector configuration app and enable **Proxy private Prisme files through base64**, then pass the original attachment URL with `sourceType: url`. The connector accepts trusted files up to 25 MB.
+- **`SourceDownloadError`**: The connector-side download failed before Azure was called. Confirm the URL is still valid and belongs to the current Prisme API, and that the file is no larger than 25 MB.
 - **`Timeout` on `document`**: Document Intelligence is asynchronous: the connector submits the document, then polls for up to 60s. Long or heavy PDFs can exceed this limit. Reduce `pages`, switch to the lighter `prebuilt-read` model, or split the document upstream.
 - **Service-specific gotcha**: `image` is synchronous and `document` is an async submit-and-poll cycle handled internally; both return their error payload instead of raising. After a DSUL call, always branch on `{{result.error}}`; a failed extraction is a normal value, not an exception, so a missing check silently passes the error object downstream.
 
