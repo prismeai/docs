@@ -160,3 +160,120 @@ Returns an array of `{ content, size }` objects:
             text: "{{item.content}}"
             size: "{{item.size}}"
 ```
+
+## search
+
+grep-like line search over a text content. Returns the matching lines with their 1-based line numbers, so an automation can act on positions without re-parsing the text.
+
+```yaml
+- run:
+    module: text
+    function: search
+    parameters:
+      content: "{{document.text}}"
+      pattern: "ERROR|WARN"
+      ignoreCase: true
+      context: 1
+    output: hits
+# hits.count             → number of matching lines
+# hits.matches[0].line   → 1-based line number
+# hits.matches[0].text   → the line (or matched substring in onlyMatching mode)
+# hits.matches[0].context → true for context-only lines
+```
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| content | string | yes | | Text to search. |
+| pattern | string | yes | | JS regular expression, or a literal string when `fixed` is true. |
+| fixed | boolean | no | false | Match `pattern` literally (grep -F). |
+| ignoreCase | boolean | no | false | Case-insensitive match (grep -i). |
+| invert | boolean | no | false | Return the lines that do NOT match (grep -v). |
+| context | number | no | 0 | Context lines before and after each match (grep -C). |
+| before / after | number | no | | Context lines before / after only (grep -B / -A). |
+| onlyMatching | boolean | no | false | Return only the matched substrings (grep -o). |
+| maxCount | number | no | | Stop after this many matching lines (grep -m). |
+
+Returns `{ matches: [{ line, text, context? }], count }` where `count` is the number of matching lines (context lines excluded).
+
+## substitute
+
+sed-like regex substitution. Use this instead of the `replace()` expression helper when you need a **regular expression** (the expression helper is literal-only). Returns the new content and the number of replacements made, so you can detect no-ops.
+
+```yaml
+- run:
+    module: text
+    function: substitute
+    parameters:
+      content: "{{document.text}}"
+      pattern: "(\\d{4})-(\\d{2})-(\\d{2})"
+      replacement: "$3/$2/$1"
+    output: result
+# result.content → text with dates reformatted
+# result.count   → number of replacements
+```
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| content | string | yes | | Text to transform. |
+| pattern | string | yes | | JS regular expression, or a literal string when `fixed` is true. |
+| replacement | string | yes | | Replacement, with `$1`..`$n` / `$<name>` / `$&` / `$$` backreferences. |
+| fixed | boolean | no | false | Match `pattern` literally. |
+| ignoreCase | boolean | no | false | Case-insensitive match. |
+| all | boolean | no | true | Replace every occurrence; set false for the first only. |
+| lineRange | [number, number] | no | | Restrict to lines in the inclusive 1-based range (sed addresses). |
+
+Returns `{ content, count }`.
+
+## diff
+
+Produces a unified diff between two texts — the complement of `applyPatch`. Feed the result to `applyPatch` to reapply the change: `applyPatch(a, diff(a, b).patch)` yields `b`.
+
+```yaml
+- run:
+    module: text
+    function: diff
+    parameters:
+      a: "{{before}}"
+      b: "{{after}}"
+    output: d
+# d.patch     → unified diff text (empty when a === b)
+# d.changed   → boolean
+# d.additions → lines added
+# d.deletions → lines removed
+```
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| a | string | yes | | Original text. |
+| b | string | yes | | Modified text. |
+| context | number | no | 3 | Context lines around each change. |
+| labelA / labelB | string | no | a / b | Labels for the `---` / `+++` header. |
+| noHeader | boolean | no | false | Emit only `@@` hunks, without the file header. |
+
+Returns `{ patch, changed, additions, deletions }`.
+
+## applyPatch
+
+Applies a unified diff to a text content. Designed for **LLM-generated patches**: hunks are located by matching their context lines, not by trusting the `@@` line numbers (models are unreliable at line arithmetic), so a patch still applies even when its line numbers are off.
+
+```yaml
+- run:
+    module: text
+    function: applyPatch
+    parameters:
+      content: "{{document.text}}"
+      patch: "{{generated_diff}}"
+    output: r
+# r.content      → patched text
+# r.hunksApplied → number of hunks applied
+# r.hunksFailed  → [{ index, reason, context }] for hunks that did not match
+```
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| content | string | yes | | Text to patch. |
+| patch | string | yes | | Unified diff (as produced by `diff` or by a model). |
+| fuzz | number | no | 1 | Whitespace tolerance when matching context: 0 exact, 1 ignore trailing whitespace, 2 ignore leading + trailing. |
+| atomic | boolean | no | false | If any hunk fails, return the original content untouched. |
+
+Returns `{ content, hunksTotal, hunksApplied, hunksFailed }`. A hunk that fails never corrupts the content — its `reason` is actionable so a model can regenerate just that hunk.
