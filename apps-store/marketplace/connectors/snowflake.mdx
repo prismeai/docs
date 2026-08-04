@@ -1,0 +1,530 @@
+---
+title: 'Snowflake'
+description: 'Run SQL and manage Snowflake databases, schemas and virtual warehouses from Agent Factory agents and Builder workflows'
+---
+
+<img
+  src="/images/connectors/snowflake.png"
+  alt="Snowflake"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The Snowflake app exposes the Snowflake SQL API and selected Snowflake REST APIs to **Agent Factory** agents through MCP and to Builder workflows through DSUL instructions. It runs in the installing workspace's tenant context and covers SQL execution, asynchronous results, databases, schemas and virtual warehouses. Authentication supports platform-managed or tenant-owned Snowflake OAuth with PKCE, key-pair JWT, programmatic access tokens and pre-minted access tokens.
+
+<CardGroup cols={3}>
+  <Card title="SQL and results" icon="terminal">
+    Execute one SQL statement, monitor or cancel asynchronous work, and retrieve paginated results
+  </Card>
+  <Card title="Database catalog" icon="database">
+    List, inspect, create, alter, drop and undrop Snowflake databases and schemas
+  </Card>
+  <Card title="Virtual warehouses" icon="server">
+    Inspect and manage warehouses, including explicit resume and suspend operations
+  </Card>
+</CardGroup>
+
+## Who is this for?
+
+This connector is used by three different roles. Jump to the section that matches yours — each one is self-contained.
+
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot">
+    You build agents in **Agent Factory** and want them to query or administer Snowflake. → *Agent builder* tab.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved">
+    You configure a shared Snowflake OAuth client and publish the capability. → *Platform admin setup* accordion below.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece">
+    You write Builder automations that call Snowflake operations directly. → *Workspace builder* tab.
+  </Card>
+</CardGroup>
+
+## Prerequisites (Snowflake side)
+
+- A **Snowflake account** and its public HTTPS account URL, for example `https://myorg-myaccount.snowflakecomputing.com`.
+- A Snowflake user or OAuth integration whose role has the privileges required by the operations you intend to expose. Use a dedicated least-privilege role rather than an account-admin role.
+- One supported credential:
+  - A [Snowflake OAuth custom-client integration](https://docs.snowflake.com/en/user-guide/oauth-custom) with refresh tokens and PKCE.
+  - A [key pair](https://docs.snowflake.com/en/user-guide/key-pair-auth) assigned to the Snowflake user.
+  - A [programmatic access token](https://docs.snowflake.com/en/user-guide/programmatic-access-tokens).
+  - A valid pre-minted OAuth or External OAuth access token.
+- A virtual warehouse for SQL that needs compute. Database and schema metadata operations may not require an active warehouse.
+
+<Accordion title="Platform admin (Governance) — one-time platform setup" icon="shield-halved">
+  **Goal:** configure a shared OAuth client for one Snowflake account, then expose the connector as a reusable capability in AI Governance.
+
+  ## 1. Configure the connector
+
+  <Steps>
+    <Step title="Create a dedicated Snowflake role">
+      Create a role containing only the database, schema, warehouse and SQL privileges that agents need. Grant it to the users who will authorize the connector. Snowflake OAuth does not allow the connector to exceed the selected role's privileges.
+    </Step>
+    <Step title="Create a Snowflake OAuth security integration">
+      In the target Snowflake account, create a confidential custom-client integration. Use the core workspace callback as its redirect URI:
+
+      ```text
+      <api-url>/workspaces/slug:snowflake/webhooks/oauthCallback
+      ```
+
+      On production, `<api-url>` is `https://api.studio.prisme.ai/v2`.
+
+      ```sql
+      CREATE SECURITY INTEGRATION PRISME_SNOWFLAKE_OAUTH
+        TYPE = OAUTH
+        ENABLED = TRUE
+        OAUTH_CLIENT = CUSTOM
+        OAUTH_CLIENT_TYPE = CONFIDENTIAL
+        OAUTH_REDIRECT_URI = '<api-url>/workspaces/slug:snowflake/webhooks/oauthCallback'
+        OAUTH_ISSUE_REFRESH_TOKENS = TRUE
+        OAUTH_ENFORCE_PKCE = TRUE
+        ALLOWED_ROLES_LIST = ('PRISME_AGENT_ROLE');
+      ```
+    </Step>
+    <Step title="Retrieve the OAuth client credentials">
+      Run the following command with a role allowed to inspect the integration. Keep the returned secret in a secrets manager.
+
+      ```sql
+      SELECT SYSTEM$SHOW_OAUTH_CLIENT_SECRETS('PRISME_SNOWFLAKE_OAUTH');
+      ```
+
+      The result contains `oauth_client_id` and two rotatable client secrets.
+    </Step>
+    <Step title="Enter the credentials through the configuration app">
+      Open the central `snowflake` workspace and launch its **Configuration app** at `<studio>/apps/snowflake` (for example `https://studio.prisme.ai/apps/snowflake`). Enter the Snowflake account URL, client ID, client secret, default role and optional warehouse. The app writes the central secret; do not edit Studio Secrets manually.
+    </Step>
+    <Step title="Tell workspaces to use the central client">
+      Each consuming workspace selects `oauthCentral` in its connector configuration. The central client is tied to the Snowflake account configured above; another account must use tenant-owned OAuth or a non-OAuth credential.
+    </Step>
+  </Steps>
+
+  ## 2. Declare the capability in AI Governance
+
+  <Steps>
+    <Step title="Create the Snowflake capability">
+      Open **AI Governance > Capabilities** and create a capability named **Snowflake**.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the MCP server URL to the connector's **MCP Endpoint** and set **Scope** to:
+
+      ```text
+      context_id,agent_id,user_id
+      ```
+
+      `agent_id` lets the connector identify and authorize the calling agent. `user_id` keeps delegated OAuth sessions user-specific.
+    </Step>
+    <Step title="Make it available to agent builders">
+      Publish the capability in the catalog. Catalog visibility follows the organization's existing RBAC; tenant-context capabilities do not require a separate per-capability role grant.
+    </Step>
+    <Step title="Smoke-test">
+      Enable the capability on an agent, authorize that agent in the connector configuration app, connect a Snowflake user and run a read-only query such as `SELECT CURRENT_USER(), CURRENT_ROLE()`.
+    </Step>
+  </Steps>
+
+  <Warning>
+    Declaring the capability makes Snowflake available; it does not authorize an agent. Each installed connector instance still applies its **Authorized agents** allowlist. There is no OAuth auth-config JSON to attach in Governance.
+  </Warning>
+</Accordion>
+
+---
+
+<Tabs>
+  <Tab title="Agent builder (Agent Factory)">
+    ## Agent builder
+
+    **Goal:** let an Agent Factory agent query and manage Snowflake through five MCP tools.
+
+    <Note>
+      A *Workspace builder* must first install and configure the Snowflake app. Platform-managed OAuth additionally requires the one-time setup in the *Platform admin* accordion.
+    </Note>
+
+    The MCP endpoint runs in the installed app instance. It resolves credentials server-side, identifies the caller from the capability scope and checks the workspace's agent allowlist.
+
+    ## Option A — Enable the shared capability from the catalog
+
+    <Steps>
+      <Step title="Open your agent">
+        Open the agent in Agent Factory and go to its capabilities.
+      </Step>
+      <Step title="Enable Snowflake">
+        Select **Snowflake** from the capability catalog. The endpoint and `context_id,agent_id,user_id` scope are already configured.
+      </Step>
+      <Step title="Connect to Snowflake">
+        With OAuth, connect on the first tool call or from the connector configuration app. Key-pair, programmatic-token and access-token modes do not need an interactive sign-in.
+      </Step>
+    </Steps>
+
+    <Note>
+      The shared capability uses credentials and an allowlist managed by the platform workspace. Use a workspace-owned instance when the agent needs an isolated Snowflake account, role or credential boundary.
+    </Note>
+
+    ## Option B — Run it from your own workspace (recommended)
+
+    <Warning>
+      Prefer a workspace-owned instance for production. Its credentials, OAuth tokens and authorized-agent list are isolated to your workspace, and its Snowflake role can be restricted to the agent's exact duties.
+    </Warning>
+
+    <Steps>
+      <Step title="Install and configure Snowflake">
+        Follow the *Workspace builder* tab. Select an authentication mode and test the credential.
+      </Step>
+      <Step title="Allowlist the agent">
+        In the configuration app, open **Authorized agents**, select the agent and save. The **Install capability** action can perform this wiring.
+      </Step>
+      <Step title="Add the MCP capability">
+        Point the capability at this app instance's **MCP Endpoint** and set **Scope** to:
+
+        ```text
+        context_id,agent_id,user_id
+        ```
+      </Step>
+      <Step title="Connect the user when using OAuth">
+        Click **Connect** in the configuration app or follow the connection prompt surfaced by Agent Factory.
+      </Step>
+    </Steps>
+
+    ## Brief the agent in its system prompt
+
+    ```text
+    You have access to the Snowflake MCP tools: sql, results, databases, schemas and warehouses.
+    Each tool requires an `action`. Prefer read operations unless the user explicitly requests a mutation.
+    Before executing DML, DDL, database/schema deletion, or warehouse resume/suspend, restate the target
+    and obtain confirmation. Narrow SQL results with SELECT columns, WHERE, aggregation and deterministic
+    keyset pagination; never assume an omitted result row can be recovered from MCP output.
+    ```
+
+    <Note>
+      **Legacy AI Knowledge agents** without the native capability picker can add an MCP tool under **Advanced > Tools > MCP** and paste the **MCP Endpoint**. The agent must still be allowlisted and its identity propagated to the connector.
+    </Note>
+
+    <Note>
+      **Restricting to read-only (least privilege).** Snowflake permissions are role-based. For OAuth, set `ALLOWED_ROLES_LIST` on the security integration and configure the connector to request a dedicated read-only role. For a programmatic access token, use `ROLE_RESTRICTION`; for key-pair or access-token modes, restrict the backing user's grants. The connector remains usable for reads while Snowflake rejects writes with `403` or a SQL privilege error. This provider-side role boundary cannot be widened from the Prisme.ai workspace.
+    </Note>
+
+    ## Available Tools
+
+    Each tool takes an `action` argument that selects the concrete operation.
+
+    | Tool | Description |
+    |------|-------------|
+    | `sql` | Execute one SQL statement, inspect its status or cancel it. MCP responses are capped at 100 rows and 80 KB. |
+    | `results` | Fetch a page from an asynchronous Snowflake Resource API result by opaque `result_handler`. |
+    | `databases` | List, get, create, create-or-alter, undrop and delete databases. |
+    | `schemas` | List, get, create, create-or-alter, undrop and delete schemas within a database. |
+    | `warehouses` | List, get, create, create-or-alter, resume, suspend and delete virtual warehouses. |
+
+    ## Output Formats
+
+    Snowflake tool calls return one bounded JSON payload in MCP text content. The connector:
+
+    - limits SQL execution to one statement;
+    - asks Snowflake for at most 100 rows and caps the final MCP response at 80 KB;
+    - omits binary cell values;
+    - adds `_mcpLimits` and, when truncation occurs, `_truncation` metadata with a refinement suggestion.
+
+    The schema accepts `outputFormat` (`verbose`, `structured` or `both`) for compatibility. The current Snowflake implementation returns the same bounded JSON text envelope for all three values.
+
+    ## Tool Details
+
+    ### sql
+
+    ```json
+    {
+      "name": "sql",
+      "arguments": {
+        "action": "execute",
+        "statement": "SELECT REGION, SUM(REVENUE) AS TOTAL FROM ANALYTICS.SALES GROUP BY REGION ORDER BY TOTAL DESC",
+        "warehouse": "ANALYTICS_WH",
+        "role": "PRISME_AGENT_ROLE",
+        "async": false
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `execute`, `status` or `cancel`. |
+    | `statement` | For `execute` | One SQL statement. It may be read-only or mutating. |
+    | `statementHandle` | For `status` / `cancel` | Handle returned by this connector's `execute` action. |
+    | `database`, `schema`, `warehouse`, `role` | No | Case-sensitive execution context. |
+    | `bindings` | No | Snowflake SQL bind values. |
+    | `async` | No | Return a statement handle without waiting for completion. |
+    | `requestId` | No | UUID used to make submission idempotent. |
+    | `partition` | For additional SQL partitions | Zero-based provider partition requested by `status`. It cannot recover rows omitted by the MCP response cap. |
+
+    ### results
+
+    ```json
+    {
+      "name": "results",
+      "arguments": {
+        "action": "get",
+        "result_handler": "opaque-result-handler",
+        "page": 0
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | Only `get`. |
+    | `result_handler` | Yes | Opaque handle returned by an asynchronous Snowflake Resource API operation. |
+    | `page` | No | Zero-based result page; defaults to `0`. |
+
+    ### databases
+
+    ```json
+    {
+      "name": "databases",
+      "arguments": {
+        "action": "list",
+        "like": "ANALYTICS_%",
+        "showLimit": 25
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `list`, `get`, `create`, `createOrAlter`, `undrop` or `delete`. |
+    | `name` | For get/createOrAlter/undrop/delete | Case-sensitive database identifier. |
+    | `body` | For create/createOrAlter | Complete Snowflake Database resource definition. |
+    | `createMode` | No | `errorIfExists`, `orReplace` or `ifNotExists`. |
+    | `like`, `startsWith`, `fromName`, `showLimit`, `history` | For list | Server-side list filters and pagination controls. |
+    | `restrict` | For delete | Keep `true` unless cascading removal is explicitly requested. |
+
+    ### schemas
+
+    ```json
+    {
+      "name": "schemas",
+      "arguments": {
+        "action": "create",
+        "database": "ANALYTICS",
+        "createMode": "ifNotExists",
+        "body": {
+          "name": "REPORTING",
+          "comment": "Curated reporting layer"
+        }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `list`, `get`, `create`, `createOrAlter`, `undrop` or `delete`. |
+    | `database` | Yes | Parent database identifier. |
+    | `name` | For get/createOrAlter/undrop/delete | Schema identifier. |
+    | `body` | For create/createOrAlter | Complete Snowflake Schema resource definition. |
+    | `kind` | No | `transient` or permanent (empty value). |
+    | `restrict` | For delete | Keep `true` unless cascading removal is explicitly requested. |
+
+    ### warehouses
+
+    ```json
+    {
+      "name": "warehouses",
+      "arguments": {
+        "action": "suspend",
+        "name": "ANALYTICS_WH",
+        "ifExists": true
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `list`, `get`, `create`, `createOrAlter`, `resume`, `suspend` or `delete`. |
+    | `name` | For all but list/create | Warehouse identifier. |
+    | `body` | For create/createOrAlter | Complete Snowflake Warehouse resource definition. |
+    | `createMode` | No | `errorIfExists`, `orReplace` or `ifNotExists`. |
+    | `ifExists` | No | Make resume, suspend or delete succeed when the warehouse is absent. |
+
+    <Warning>
+      Resuming a warehouse starts compute billing. Suspending it can interrupt workloads. Call either action only after explicit user confirmation.
+    </Warning>
+  </Tab>
+
+  <Tab title="Workspace builder (DSUL)">
+    ## Workspace builder
+
+    **Goal:** install Snowflake in a workspace, configure credentials and call its operations from automations.
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace.
+    2. Search for **Snowflake** and install it.
+    3. Open the auto-populated **Configuration app**, select an authentication mode, test it and configure **Authorized agents**.
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Configuration app** | Auto-populated on install. Opens authentication, connection testing and the authorized-agent allowlist. |
+
+    | Auth mode | What you provide | Best for |
+    |-----------|------------------|----------|
+    | `oauthCentral` | Connect a user; optional role and warehouse | A platform-managed OAuth client tied to the configured Snowflake account |
+    | `oauth` | Account URL, OAuth client ID/secret, optional role and warehouse; then Connect | A workspace-owned Snowflake OAuth integration |
+    | `keyPair` | Account URL and identifier, username, public-key fingerprint, PEM private key, optional passphrase, role and warehouse | Non-interactive service users with key-pair authentication |
+    | `programmaticAccessToken` | Account URL, programmatic access token, optional role and warehouse | Rotatable non-interactive access with Snowflake role restriction |
+    | `accessToken` | Account URL, pre-minted token, optional role and warehouse | Caller-managed OAuth or External OAuth tokens |
+
+    <Note>
+      Credentials and the allowlist are stored as workspace secrets and resolved server-side. The public account URL must be an HTTPS Snowflake account origin, not a Snowsight page URL.
+    </Note>
+
+    ## Available Instructions
+
+    Every instruction resolves credentials from the workspace configuration and returns the raw Snowflake API payload.
+
+    ### SQL and asynchronous results
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `submitStatement` | Submit one or more statements in App mode; `statement` is required and execution context is optional. | A SQL API ResultSet (`data`, `resultSetMetaData`, `statementHandle`) or QueryStatus for asynchronous work. |
+    | `getStatementStatus` | Check execution and fetch a result partition by `statementHandle`; optional `partition` is zero-based. | A ResultSet when complete or QueryStatus while running. |
+    | `cancelStatement` | Cancel a running statement by `statementHandle`; optional `requestId` identifies the request. | Snowflake cancellation status. |
+    | `fetchResult` | Fetch page `page` from a Resource API asynchronous `result_handler`. | The raw Result API page and its provider pagination metadata. |
+
+    ### Databases
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listDatabases` | List accessible databases; filter with `like`, `startsWith`, `fromName`, `showLimit` and `history`. | A collection of Snowflake Database resources or an async result handle. |
+    | `fetchDatabase` | Fetch one database by `name`. | A Snowflake Database resource. |
+    | `createDatabase` | Create a database from a complete `body`; optional `createMode` and `kind`. | The created Database resource or async result handle. |
+    | `createOrAlterDatabase` | Create or fully alter `name` from a complete `body`. | The resulting Database resource or async result handle. |
+    | `undropDatabase` | Restore a dropped database by `name` when retention permits. | Snowflake operation status. |
+    | `deleteDatabase` | Delete `name`; `restrict` defaults to `true` in the connector. | Snowflake operation status. |
+
+    ### Schemas
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listSchemas` | List schemas in `database`; supports name filters, `showLimit`, cursor and history. | A collection of Snowflake Schema resources or an async result handle. |
+    | `fetchSchema` | Fetch `database`.`name`. | A Snowflake Schema resource. |
+    | `createSchema` | Create a schema in `database` from a complete `body`. | The created Schema resource or async result handle. |
+    | `createOrAlterSchema` | Create or fully alter `database`.`name` from `body`. | The resulting Schema resource or async result handle. |
+    | `undropSchema` | Restore a dropped `database`.`name` when retention permits. | Snowflake operation status. |
+    | `deleteSchema` | Delete `database`.`name`; `restrict` defaults to `true` in the connector. | Snowflake operation status. |
+
+    ### Virtual warehouses
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listWarehouses` | List warehouses, optionally filtered by `like`. | A collection of Snowflake Warehouse resources or an async result handle. |
+    | `fetchWarehouse` | Fetch one warehouse by `name`. | A Snowflake Warehouse resource. |
+    | `createWarehouse` | Create a warehouse from a complete `body`; optional `createMode`. | The created Warehouse resource or async result handle. |
+    | `createOrAlterWarehouse` | Create or fully alter `name` from `body`. | The resulting Warehouse resource or async result handle. |
+    | `resumeWarehouse` | Resume `name`; this starts compute billing. | Snowflake operation status. |
+    | `suspendWarehouse` | Suspend `name`; this affects workload availability. | Snowflake operation status. |
+    | `deleteWarehouse` | Delete `name`; optional `ifExists` makes the operation idempotent. | Snowflake operation status. |
+
+    <Note>
+      Snowflake Resource API operations can return `202 Accepted`. Use the returned result handler with `fetchResult` until the operation completes.
+    </Note>
+
+    ## DSUL Examples
+
+    **Run a parameterized aggregate query:**
+
+    ```yaml
+    - Snowflake.submitStatement:
+        statement: |
+          SELECT REGION, SUM(REVENUE) AS TOTAL
+          FROM ANALYTICS.SALES
+          WHERE SALE_DATE >= ?
+          GROUP BY REGION
+          ORDER BY TOTAL DESC
+        warehouse: ANALYTICS_WH
+        role: PRISME_AGENT_ROLE
+        bindings:
+          "1":
+            type: TEXT
+            value: '{{startDate}}'
+      output: queryResult
+    ```
+
+    **Submit asynchronous SQL and poll it:**
+
+    ```yaml
+    - Snowflake.submitStatement:
+        statement: '{{sql}}'
+        async: true
+        requestId: '{{requestId}}'
+      output: submitted
+    - Snowflake.getStatementStatus:
+        statementHandle: '{{submitted.statementHandle}}'
+      output: status
+    ```
+
+    **Create a reporting schema if it does not exist:**
+
+    ```yaml
+    - Snowflake.createSchema:
+        database: ANALYTICS
+        createMode: ifNotExists
+        body:
+          name: REPORTING
+          comment: Curated reporting layer
+      output: schema
+    ```
+
+    **Inspect and suspend an idle warehouse:**
+
+    ```yaml
+    - Snowflake.fetchWarehouse:
+        name: ANALYTICS_WH
+      output: warehouse
+    - conditions:
+        '{{warehouse.state}} == "STARTED" and {{shouldSuspend}}':
+          - Snowflake.suspendWarehouse:
+              name: ANALYTICS_WH
+              ifExists: true
+            output: suspended
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+| HTTP code | Meaning |
+|-----------|---------|
+| `400` | Invalid account URL, SQL, identifier, request body or OAuth configuration. |
+| `401` | Missing, expired, revoked or invalid Snowflake credential. OAuth users may need to reconnect. |
+| `403` | The Snowflake role lacks the required privilege, the OAuth role is blocked, or a network policy rejects the request. |
+| `404` | The requested statement, database, schema, warehouse or result handler is absent or not visible. |
+| `409` | The resource already exists or its current state conflicts with the requested operation. |
+| `422` | Snowflake rejected the resource definition or an action for its current state. |
+| `429` | Snowflake concurrency or rate limit reached; retry with backoff. |
+| `500` / `503` | Transient Snowflake or connector failure; retry before changing credentials. |
+
+### Common Issues
+
+**"This agent is not authorized to use this connector"** — Open the configuration app, add the agent under **Authorized agents** (or enable **Allow all agents**) and save.
+
+**"The calling agent could not be identified"** — The capability scope is missing `agent_id`. Set it to `context_id,agent_id,user_id`, then authorize the agent.
+
+**"Snowflake OAuth is not connected for this user"** — Open the configuration app and click **Connect**, or follow the connection URL surfaced by Agent Factory.
+
+**"Snowflake token refresh failed … must reconnect"** — The refresh token expired or was revoked. Reconnect the user. Snowflake OAuth refresh-token validity is controlled by the security integration.
+
+**"Snowflake platform OAuth is not configured for an account"** — Ask the platform maintainer to configure the central client, or select tenant OAuth, key-pair, programmatic-token or access-token mode.
+
+**SQL output is truncated** — MCP responses are intentionally limited to 100 rows and 80 KB. Narrow the query with selected columns, `WHERE`, aggregation and deterministic keyset pagination. A provider `partition` cannot recover rows omitted locally by the connector.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="Snowflake REST APIs" icon="book" href="https://docs.snowflake.com/en/developer-guide/snowflake-rest-api/reference">
+    Official Snowflake REST API reference for databases, schemas, warehouses and asynchronous results.
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
+    Learn how Agent Factory agents consume MCP tools in Prisme.ai.
+  </Card>
+</CardGroup>
