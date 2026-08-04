@@ -1,288 +1,324 @@
 ---
-title: 'Updates'
-description: 'Learn how to safely update your self-hosted Prisme.ai platform'
+title: "Updates"
+description: "Upgrade a self-hosted Prisme.ai platform: bump the service image tags, update the products from the Platform workspace, and verify the imports."
 ---
 
-Keeping your Prisme.ai platform up to date ensures you have access to the latest features, security patches, and performance improvements. This guide covers the process for updating your self-hosted Prisme.ai installation safely and efficiently.
+Upgrading a self-hosted Prisme.ai platform to a new release always has **two phases**, in this order:
 
-## Update Strategy
+<CardGroup cols={2}>
+  <Card title="1. Services" icon="ship">
+    Bump the image tag of the 5 core microservices (and the 3 apps services) in your Helm values, then `helm upgrade`.
+  </Card>
+  <Card title="2. Products" icon="boxes-stacked">
+    From the **Platform** workspace, pull the product workspaces (Agent Creator, Knowledges, Governe, LLM Gateway, Storage, ...) group by group: `base1` → `base2` → `extended` → `one-product`.
+  </Card>
+</CardGroup>
 
-<Tabs>
-  <Tab title="Standard Updates">
-    Standard updates include minor version changes and patches that don't require significant infrastructure modifications.
-  
-    
-    These updates typically include:
-    - Bug fixes
-    - Security patches
-    - Minor feature enhancements
-    - Performance optimizations
-  </Tab>
-  
-  <Tab title="Major Updates">
-    Major updates involve significant version changes that may require database migrations, infrastructure changes, or configuration updates.
-    
-    These updates often include:
-    - Architectural changes
-    - New product capabilities
-    - Database schema modifications
-    - Configuration structure changes
-  </Tab>
-</Tabs>
+<Warning>
+  **The order is not optional.** The product workspaces are bundled inside the `prismeai-workspaces` image of the release you are upgrading to. Pulling them before every service runs the target tag imports workspaces that the running runtime cannot execute.
+</Warning>
 
-## Pre-Update Checklist
+A third step, [verifying the imports](#3-verify-the-imports), confirms the upgrade actually succeeded: an import that reports zero errors is what tells you the release is live.
 
-Before proceeding with any update, complete the following checklist:
+---
+
+## Before you start
 
 <Steps>
-  <Step title="Backup Your Environment">
-    Create complete backups of your client-managed databases and configurations.
-    
+  <Step title="Read the release notes">
+    Check [What's New](/get-started/whats-new) for the target version, and the [Prisme.ai releases page](https://gitlab.com/prisme.ai/prisme.ai/-/releases) for the full list of available tags.
+
+    Look specifically for: database version requirements, new mandatory environment variables, breaking changes in workspace configuration, and anything flagged as requiring a manual action.
+
+    <Note>
+      Versions are named `vMAJOR.MINOR.PATCH` since v27 (for example `v27.4.2`). Releases before v27 used a date-stamped form such as `v26.03.161453`.
+    </Note>
+  </Step>
+
+  <Step title="Back up your databases and storage">
+    Back up everything the platform owns before touching the tags:
+
+    - Permissions store, users store and collections store (MongoDB or PostgreSQL)
+    - Elasticsearch or OpenSearch (events, and RAG indexes if self-hosted)
+    - Redis (broker streams and caches)
+    - Object storage buckets (workspace models, uploads)
+
+    Full procedures are on the [Backup & Restore](/self-hosting/operations/backup) page.
+  </Step>
+
+  <Step title="Check database compatibility">
+    Confirm your database engines still meet the minimum versions of the target release (see the cards in [Database compatibility](#database-compatibility) below). Upgrading an engine and the platform in the same maintenance window makes failures much harder to attribute; do them separately.
+  </Step>
+
+  <Step title="Record your rollback point">
+    Note the tags you are currently running and the current Helm revisions:
+
     ```bash
-    # Back up MongoDB data
-    mongodump --uri="mongodb://username:password@hostname:port/database" --out=/path/to/backup/mongo
-    
-    # Back up Elasticsearch or OpenSearch
-    elasticdump --input=http://elasticsearch:9200/index --output=/path/to/backup/elasticsearch.json
-    
-    # Back up Redis
-    redis-cli -h redis-host -a password --rdb /path/to/backup/redis.rdb
-    
-    # Back up S3 storage
-    aws s3 sync s3://your-prisme-bucket /path/to/backup/s3-data
+    # Current image tags per pod
+    kubectl get pods -n prismeai-core \
+      -o custom-columns='POD:.metadata.name,IMAGE:.spec.containers[*].image'
+
+    # Current Helm revisions
+    helm history prismeai-core -n prismeai-core
+    helm history prismeai-apps -n prismeai-apps
     ```
-    
-    See the [Backup & Restore](/self-hosting/operations/backup) page for detailed instructions.
+
+    Keep the output. You need it for the [rollback procedure](#rollback).
   </Step>
-  
-  <Step title="Review Release Notes">
-    Carefully review the release notes for the target version to understand:
-    - Changes to Helm charts
-    - Terraform module updates
-    - Database schema changes
-    - Required infrastructure modifications
-    
-    Release notes are available in the Prisme.ai customer portal and within the release artifacts.
-  </Step>
-  
-  <Step title="Check System Requirements">
-    Verify your infrastructure meets the requirements for the new version.
-    
-    <Accordion title="System Requirements Check">
-      ```bash
-      # Run the Prisme.ai compatibility check
-      kubectl apply -f https://raw.githubusercontent.com/prisme-ai/compatibility-check/main/verify-environment.yaml
-      
-      # Check results
-      kubectl logs job/prisme-compatibility-check
-      ```
-      
-      Pay special attention to:
-      - Kubernetes version compatibility
-      - Node resource availability
-      - Database version requirements
-      - Storage capacity
-    </Accordion>
-  </Step>
-  
-  <Step title="Update Terraform Modules">
-    If you're using Terraform for infrastructure management, update your modules to the versions compatible with the new Prisme.ai release.
-    
-    ```bash
-    # Update Terraform module versions in your .tf files
-    
-    module "prisme_platform" {
-      source  = "prisme-ai/platform/aws"
-      version = "x.y.z"  # Update to match your Prisme.ai target version
-      
-      # Your existing configuration...
-    }
-    
-    # Run terraform plan to validate changes
-    terraform plan
-    ```
-  </Step>
-  
-  <Step title="Prepare Rollback Plan">
-    Document a detailed rollback plan in case issues occur during the update.
-    
-    Your rollback plan should include:
-    - Specific commands to restore databases from backup
-    - Helm rollback commands
-    - Terraform destroy/apply commands for affected resources
-    - Recovery time objectives
-    - Verification steps after rollback
+
+  <Step title="Push any local changes on product workspaces">
+    Bulk import always runs with `discardLocalChanges: true`. Any edit you made in Builder on a **product** workspace (LLM Gateway, Storage, Governe, Agent Creator, Secure-chat Agent, ...) is overwritten by the upgrade.
+
+    If you customized one of them, push it to your own Git repository first so you can replay the change afterwards. See [Versioning](/products/ai-builder/versioning#push-and-pull-operations).
   </Step>
 </Steps>
 
-## Update Process
+---
 
-<Tabs>
-  <Tab title="Helm Chart Updates">
-    <Steps>
-      <Step title="Update Helm Repository">
-        Refresh your Helm repository to get the latest charts.
-        
-        ```bash
-        helm repo update prismeai
-        ```
-      </Step>
-      
-      <Step title="Review Chart Values">
-        Compare your current values with the new chart's default values to identify changes.
-        
-        ```bash
-        # Get current values
-        helm get values prismeai-core -n prisme-system > current-values.yaml
-        
-        # Compare with new chart defaults
-        helm show values prismeai/prismeai-core --version X.Y.Z > new-defaults.yaml
-        
-        # Use a diff tool to compare
-        diff current-values.yaml new-defaults.yaml
-        ```
-      </Step>
-      
-      <Step title="Upgrade Core Components">
-        Update the core Prisme.ai components first.
-        
-        ```bash
-        helm upgrade prismeai-core prismeai/prismeai-core --version X.Y.Z \
-          -f values.yaml \
-          --namespace prisme-system
-        ```
-        
-        <Warning>
-          The core components handle compute operations and must be updated before product modules.
-        </Warning>
-      </Step>
-      
-      <Step title="Update Product Modules">
-        After the core is updated, upgrade each product module.
-        
-        ```bash
-        # Update Chat
-        helm upgrade prismeai-securechat prismeai/prismeai-securechat --version X.Y.Z \
-          -f securechat-values.yaml \
-          --namespace prisme-system
-          
-        # Update Knowledges
-        helm upgrade prismeai-knowledge prismeai/prismeai-knowledge --version X.Y.Z \
-          -f knowledge-values.yaml \
-          --namespace prisme-system
-          
-        # Repeat for other product modules: Agent Creator, Builder, Governe, etc.
-        ```
-      </Step>
-      
-      <Step title="Monitor Update Progress">
-        Watch the deployment progress to ensure all pods are successfully updated.
-        
-        ```bash
-        kubectl get pods -n prisme-system -w
-        ```
-      </Step>
-      
-      <Step title="Verify Connectivity to External Databases">
-        Ensure all services can connect to your managed databases.
-        
-        ```bash
-        # Check MongoDB connectivity
-        kubectl exec -it -n prisme-system deploy/prisme-api -- mongosh --eval "db.adminCommand('ping')"
-        
-        # Check Elasticsearch or OpenSearch connectivity
-        kubectl exec -it -n prisme-system deploy/prisme-api -- curl -s elasticsearch:9200
-        
-        # Check Redis connectivity
-        kubectl exec -it -n prisme-system deploy/prisme-api -- redis-cli -h redis-host ping
-        ```
-      </Step>
-    </Steps>
-  </Tab>
-  
-  <Tab title="Terraform Updates">
-    <Steps>
-      <Step title="Update Terraform Provider Versions">
-        Ensure your Terraform providers are compatible with the new Prisme.ai version.
-        
-        ```hcl
-        terraform {
-          required_providers {
-            aws = {
-              source  = "hashicorp/aws"
-              version = ">= 4.0.0"
-            }
-            kubernetes = {
-              source  = "hashicorp/kubernetes"
-              version = ">= 2.10.0"
-            }
-            helm = {
-              source  = "hashicorp/helm"
-              version = ">= 2.5.0"
-            }
-          }
-        }
-        ```
-      </Step>
-      
-      <Step title="Update Prisme.ai Terraform Modules">
-        Modify your Terraform configuration to use the updated Prisme.ai modules.
-        
-        ```hcl
-        module "prisme_platform" {
-          source  = "prisme-ai/platform/aws"
-          version = "X.Y.Z"  # Match your target Prisme.ai version
-          
-          # Your configuration...
-        }
-        
-        module "prisme_databases" {
-          source  = "prisme-ai/databases/aws"
-          version = "X.Y.Z"  # Match your target Prisme.ai version
-          
-          # Your database configuration...
-        }
-        ```
-      </Step>
-      
-      <Step title="Apply Infrastructure Changes">
-        Run Terraform plan and apply to update your infrastructure.
-        
-        ```bash
-        terraform init -upgrade
-        terraform plan
-        terraform apply
-        ```
-        
-        <Warning>
-          Review the plan output carefully to understand what resources will be modified, created, or destroyed.
-        </Warning>
-      </Step>
-      
-      <Step title="Update Helm Charts Through Terraform">
-        If you're managing Helm releases via Terraform, update those resources as well.
-        
-        ```hcl
-        resource "helm_release" "prisme_core" {
-          name       = "prismeai-core"
-          repository = "https://helm.prisme.ai/charts"
-          chart      = "prismeai-core"
-          version    = "X.Y.Z"  # Match your target Prisme.ai version
-          namespace  = "prisme-system"
-          
-          # Your values...
-        }
-        ```
-      </Step>
-    </Steps>
-  </Tab>
-</Tabs>
+## 1. Upgrade the platform services
 
-## Database Compatibility Considerations
+### The services to update
+
+Prisme.ai runs as two Helm releases. Every image tag in both must move to the target release.
+
+| Release / namespace | Services |
+|---|---|
+| `prismeai-core` | `prismeai-api-gateway`, `prismeai-console`, `prismeai-workspaces`, `prismeai-runtime`, `prismeai-events` |
+| `prismeai-apps` | `prismeai-functions`, `prismeai-crawler`, `prismeai-searchengine` |
+
+See [Platform microservices](/self-hosting/overview#platform-microservices) for what each one does.
+
+### Bump the tags
+
+In `prismeai-core-values.yaml`, set the same tag on all five core services:
+
+```yaml
+prismeai-api-gateway:
+  image:
+    tag: "v27.4.2"
+
+prismeai-console:
+  image:
+    tag: "v27.4.2"
+
+prismeai-workspaces:
+  image:
+    tag: "v27.4.2"
+
+prismeai-runtime:
+  image:
+    tag: "v27.4.2"
+
+prismeai-events:
+  image:
+    tag: "v27.4.2"
+```
+
+Do the same for `prismeai-functions`, `prismeai-crawler` and `prismeai-searchengine` in `prismeai-apps-values.yaml`.
+
+<Note>
+  Only the tag changes on a routine upgrade. If you are still coming from a pre-v27 platform, `prismeai-console` also needs its `image.repository` switched to the unified platform image; follow [Migration v27](/self-hosting/operations/migration-v27#11-update-the-console-image) instead of this page.
+</Note>
+
+<Warning>
+  **All services must carry the same tag.** Mixing versions leaves the runtime executing DSUL models or emitting events that another service in a different version does not understand. Symptoms are subtle: automations that silently do nothing, missing activity events, failed workspace saves.
+</Warning>
+
+<Tip>
+  If you pin tags through a GitOps pipeline, use a single YAML anchor or a templated variable so a release bump is one edit instead of eight. This is also what makes it obvious that a service was left behind.
+</Tip>
+
+### Deploy
+
+```bash
+helm repo update prismeai
+
+helm -n prismeai-core upgrade prismeai-core prismeai/prismeai-core \
+  -f prismeai-core-values.yaml
+
+helm -n prismeai-apps upgrade prismeai-apps prismeai/prismeai-apps \
+  -f prismeai-apps-values.yaml
+```
+
+<Note>
+  Keep `global.secrets.allowCreation: false` in your values, as set after the first install. See [Secret bootstrapping](/self-hosting/kubernetes/helm#secret-bootstrapping-global-secrets-allowcreation).
+</Note>
+
+### Watch the rollout
+
+```bash
+kubectl get deploy -n prismeai-core -o name \
+  | xargs -n1 -I{} kubectl rollout status {} -n prismeai-core --timeout=10m
+
+kubectl get pods -n prismeai-core -w
+```
+
+If a pod crash-loops, read the logs of the previous container instance:
+
+```bash
+kubectl logs <pod> -n prismeai-core --previous
+kubectl describe pod <pod> -n prismeai-core | tail -30
+```
+
+### Confirm every service is on the target tag
+
+This is the gate before phase 2. Verify it explicitly rather than assuming the rollout was complete:
+
+```bash
+kubectl get pods -n prismeai-core \
+  -o custom-columns='POD:.metadata.name,IMAGE:.spec.containers[*].image'
+
+kubectl get pods -n prismeai-apps \
+  -o custom-columns='POD:.metadata.name,IMAGE:.spec.containers[*].image'
+```
+
+Then check platform health:
+
+- Call the [readiness API](/self-hosting/operations/testing#platform-readiness-api): `curl -H "Authorization: Bearer YOUR_JWT" https://api.your-domain.com/v2/readiness` should return `"status": "ready"`.
+- Open **Govern** → **Infrastructure** and run the **Test** buttons in the **Services** block.
+
+Only move on once all eight services report the new tag and readiness is green.
+
+---
+
+## 2. Update the products
+
+The products are shipped as workspaces and updated through the **Platform** workspace bulk import, in **four sequential groups**.
+
+<CardGroup cols={2}>
+  <Card title="base1" icon="cube">
+    Foundation apps (Custom Code, Prisme.ai API, ...).
+  </Card>
+  <Card title="base2" icon="cubes">
+    Extended base (Crawler, RedisSearch, ...).
+  </Card>
+  <Card title="extended" icon="boxes-stacked">
+    Legacy AI products (Knowledges, AI Store, ...): still required as a dependency for the platform products. They will disappear in a future release.
+  </Card>
+  <Card title="one-product" icon="box-archive">
+    Main platform products (LLM Gateway, Storage, Governe, Agent Creator, ...).
+  </Card>
+</CardGroup>
+
+<Warning>
+  Import the groups **one at a time, in order**, and wait for `workspaces.bulkImport.completed` with no errors before starting the next one. Each group depends on the previous one.
+</Warning>
+
+### From the UI
+
+<Steps>
+  <Step title="Open the Platform workspace">
+    In **Builder**, open the **Platform** workspace. It is only visible to super admins.
+  </Step>
+  <Step title="Trigger the pull">
+    Navigate to **Settings** → **Versions** → **Platform Pull**, then select the **Release vXXX** platform repository matching the version you just deployed.
+  </Step>
+  <Step title="Select the group and start the import">
+    Pick `base1`, start the import, and close the modal.
+  </Step>
+  <Step title="Monitor progress">
+    From the **Activity** feed of the Platform workspace, wait for the `workspaces.bulkImport.completed` event and check that its `errors` list is empty.
+  </Step>
+  <Step title="Repeat for the next group">
+    Import the remaining groups in order: `base2` → `extended` → `one-product`.
+  </Step>
+</Steps>
+
+### From the API
+
+The same import can be triggered without the UI:
+
+```bash
+curl -X POST "${API_URL}/v2/workspaces/platform/versions/latest/pull" \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"repository": {"id": "release"}, "groups": ["base1"]}'
+```
+
+Repeat with `base2`, `extended`, then `one-product`.
+
+If the HTTP request times out, the response returns `{ "processing": true }` and the import keeps running; the final result is in the `workspaces.bulkImport.completed` event.
+
+### What the import actually does
+
+Behavior that matters specifically on an upgrade (full mechanics in [Bulk import](/products/ai-builder/versioning#bulk-import)):
+
+- **Already up-to-date workspaces are skipped.** The platform compares `version.name` from the repository's `.import.yml` with the workspace's `lastPull.version`. On a patch release, most workspaces are legitimately reported as `skipped`. Pass `forceReimport: true` to reimport them anyway.
+- **Local changes are discarded.** Imports always run with `discardLocalChanges: true`.
+- **Dependencies are ordered automatically.** Workspaces are topologically sorted through their `dependsOn` declarations inside each group.
+- **Only one bulk operation at a time.** The Platform workspace holds a cluster-wide write lock for the duration of the import.
+
+<Tip>
+  You can automate this on every pod start with `STARTUP_IMPORT_GROUPS` and `STARTUP_IMPORT_REPOSITORY`, which makes the product update part of the deployment itself. See [Automatic import at startup](/self-hosting/kubernetes/environment-variables#automatic-import-at-startup).
+</Tip>
+
+---
+
+## 3. Verify the imports
+
+An upgrade is only confirmed once every group imported without errors. There are two places to check.
+
+### The Platform workspace activity feed
+
+All bulk import events are emitted to the **Platform** workspace and visible from its **Activity** view:
+
+| Event | What it tells you |
+| --- | --- |
+| `workspaces.bulkImport.started` | The list of workspaces the import will process |
+| `workspaces.bulkImport.progress` | Per-workspace status (`imported`, `skipped` or `error`), file counts and percentage |
+| `workspaces.bulkImport.completed` | The final summary: created, updated, skipped, **errors**, total duration |
+
+Open the `workspaces.bulkImport.completed` event and read its payload. **An empty `errors` list is the confirmation that the group imported correctly.** If `errors` is populated, each entry names the workspace and the reason; fix the cause and re-import that group before moving on.
+
+Individual workspace events (`workspaces.imported`, `workspaces.versions.progress`) are also emitted in each product workspace's own activity feed if you need per-workspace detail.
+
+### The workspaces service logs
+
+The same detailed error list is written by the service that performs the import:
+
+```bash
+# Follow the import live
+kubectl logs -n prismeai-core deploy/prismeai-core-prismeai-workspaces -f
+
+# Or review the last lines after the fact
+kubectl logs -n prismeai-core deploy/prismeai-core-prismeai-workspaces --tail=500
+```
+
+<Note>
+  If your Helm release is not named `prismeai-core`, the deployment name follows the `<release>-prismeai-workspaces` pattern. List it with `kubectl get deploy -n prismeai-core | grep workspaces`.
+</Note>
+
+Use the logs when the activity feed is unavailable (for example when the import was triggered at startup through `STARTUP_IMPORT_GROUPS`, before anyone could open the UI), or when an import fails early enough that no `completed` event is emitted.
+
+### Functional checks
+
+Once the four groups are in, confirm the platform behaves:
+
+<Steps>
+  <Step title="Readiness and infrastructure">
+    Call `/v2/readiness` again, then run the **Test** buttons in **Govern** → **Infrastructure**, including the **Vector store** block.
+  </Step>
+  <Step title="Models">
+    In **Govern** → **Models**, open one completion model and one embedding model and click **Test**.
+  </Step>
+  <Step title="Products">
+    Confirm every enabled product still appears in the left menu, then open **Agent Creator** and run an existing agent end to end, including a document upload if you use RAG.
+  </Step>
+  <Step title="Custom code">
+    If you use Custom Code apps, run one automation that calls them: dependency installation restarts after an import.
+  </Step>
+</Steps>
+
+---
+
+## Database compatibility
 
 Per-engine upgrade notes and version requirements live on the dedicated database pages:
 
 <CardGroup cols={2}>
+  <Card title="PostgreSQL" icon="database" href="/self-hosting/databases/postgresql#updates">
+    Minimum 12+ with `sslmode=require`.
+  </Card>
   <Card title="MongoDB" icon="database" href="/self-hosting/databases/mongodb#updates">
     Minimum 6+. Schema migrations run automatically on backend startup.
   </Card>
@@ -292,129 +328,140 @@ Per-engine upgrade notes and version requirements live on the dedicated database
   <Card title="Redis" icon="server" href="/self-hosting/databases/redis#updates">
     Minimum 6.2+. Cluster mode supported since Prisme.ai v3.2.
   </Card>
-  <Card title="PostgreSQL" icon="database" href="/self-hosting/databases/postgresql#updates">
-    Minimum 12+ with `sslmode=require`.
-  </Card>
 </CardGroup>
 
-Object storage (S3-compatible / Azure Blob / GCS) follows the provider's standard upgrade lifecycle; verify bucket permissions remain consistent after upgrades.
+Object storage (S3-compatible, Azure Blob, GCS) follows the provider's standard lifecycle; verify bucket permissions remain consistent after an upgrade.
 
-## Post-Update Tasks
+---
 
-After completing the update, perform these essential post-update tasks:
+## Managing the upgrade with Terraform
+
+If your Helm releases are declared as `helm_release` resources, bump the chart version there instead of running `helm upgrade` by hand:
+
+```hcl
+resource "helm_release" "prismeai_core" {
+  name       = "prismeai-core"
+  repository = "https://helm.prisme.ai/charts"
+  chart      = "prismeai-core"
+  version    = "X.Y.Z"
+  namespace  = "prismeai-core"
+
+  # Your values, including the image tags
+}
+```
+
+```bash
+terraform init -upgrade
+terraform plan
+terraform apply
+```
+
+<Warning>
+  Review the plan output before applying: a chart version bump can rename or replace resources. Terraform only covers phase 1; the product update in phase 2 still goes through the Platform workspace.
+</Warning>
+
+---
+
+## Rollback
 
 <Steps>
-  <Step title="Verify Database Connectivity">
-    Ensure all services can connect to your managed databases.
-    
+  <Step title="Roll the services back">
+    Either roll back the Helm releases:
+
     ```bash
-    # Check from a pod within the cluster
-    kubectl exec -it -n prisme-system deploy/prisme-api -- curl -s <internal-elasticsearch-url>:9200
-    kubectl exec -it -n prisme-system deploy/prisme-api -- mongosh --eval "db.adminCommand('ping')"
+    helm history prismeai-core -n prismeai-core
+    helm rollback prismeai-core <revision> -n prismeai-core
+
+    helm history prismeai-apps -n prismeai-apps
+    helm rollback prismeai-apps <revision> -n prismeai-apps
+    ```
+
+    Or set the previous tags back in your values files and re-run `helm upgrade`. Prefer this second option when your values are the source of truth in Git.
+  </Step>
+
+  <Step title="Re-pull the products at the previous release">
+    Open the **Platform** workspace and pull the four groups again, in order (`base1` → `base2` → `extended` → `one-product`), selecting the **previous** release repository.
+
+    Up-to-date workspaces are skipped by default, which would leave the newer versions in place. Force the reimport through the API so the older versions are actually written back:
+
+    ```bash
+    curl -X POST "${API_URL}/v2/workspaces/platform/versions/latest/pull" \
+      -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d '{"repository": {"id": "release"}, "groups": ["base1"], "forceReimport": true}'
     ```
   </Step>
-  
-  <Step title="Run Database Optimization Tasks">
-    Optimize database performance after the update.
-    
-    ```bash
-    # Run MongoDB index optimization
-    kubectl exec -it -n prisme-system deploy/prisme-api -- node /app/scripts/optimize-indexes.js
-    
-    # Run Elasticsearch optimization
-    kubectl exec -it -n prisme-system deploy/prisme-api -- node /app/scripts/optimize-indices.js
-    ```
+
+  <Step title="Restore databases only if needed">
+    Restore from backup **only** if the release ran schema migrations you need to undo. Rolling back the images alone does not revert a migration. See [Backup & Restore](/self-hosting/operations/backup).
   </Step>
-  
-  <Step title="Verify Product Functionality">
-    Test each Prisme.ai product to ensure they work as expected:
-    - Chat
-    - Agent Creator
-    - Knowledges
-    - Builder
-    - Governe
-    - Insights
-  </Step>
-  
-  <Step title="Check Resource Utilization">
-    Monitor resource usage to ensure the system is functioning efficiently.
-    
-    ```bash
-    # Check pod resource usage
-    kubectl top pods -n prisme-system
-    
-    # Check node resource usage
-    kubectl top nodes
-    ```
+
+  <Step title="Verify">
+    Re-run the checks in [Verify the imports](#3-verify-the-imports).
   </Step>
 </Steps>
 
-## Rollback Procedure
+---
 
-If you encounter critical issues after an update:
+## Troubleshooting
 
-<Steps>
-  <Step title="Roll Back Helm Releases">
-    Use Helm rollback to return to the previous version.
-    
+<AccordionGroup>
+  <Accordion title="Bulk import reports errors">
+    Open the `workspaces.bulkImport.completed` event in the Platform workspace activity feed and read the `errors` payload, or check `prismeai-workspaces` logs. Resolve missing dependencies or slug conflicts, then re-import the failed group. Do not start the next group until the failed one completes cleanly.
+  </Accordion>
+
+  <Accordion title="Could not rename workspace slug ... as it is already used">
+    A workspace in the release collides with an existing one. Rename your own workspace, or exclude the conflicting index file from the import. Details in [Deployment troubleshooting](/products/ai-builder/deployment).
+  </Accordion>
+
+  <Accordion title="Every workspace is reported as skipped">
+    Expected on a patch release where the product workspaces did not change: the platform compares the repository `version.name` with `lastPull.version`. If you need to force a reimport, pass `forceReimport: true` in the pull payload.
+  </Accordion>
+
+  <Accordion title="Automations do nothing, or activity events are missing">
+    Almost always a mixed-version deployment. Re-check that all five core services and the three apps services report the same image tag, and that no pod is still running an old ReplicaSet.
+  </Accordion>
+
+  <Accordion title="Pods stay in ImagePullBackOff after the bump">
+    The tag does not exist in the registry, or the registry secret is missing. Check the tag against the [releases page](https://gitlab.com/prisme.ai/prisme.ai/-/releases). For the `prismeai-apps` namespace, recreate the pull secret:
+
     ```bash
-    # List Helm release history
-    helm history prismeai-core -n prisme-system
-    
-    # Rollback to previous revision
-    helm rollback prismeai-core [REVISION] -n prisme-system
-    
-    # Repeat for other releases
-    helm rollback prismeai-securechat [REVISION] -n prisme-system
+    kubectl create secret docker-registry registry-secret \
+      --docker-server=registry.gitlab.com \
+      --docker-username=YOUR_USERNAME \
+      --docker-password=YOUR_TOKEN \
+      --namespace prismeai-apps
     ```
-  </Step>
-  
-  <Step title="Restore Databases">
-    If necessary, restore databases from your pre-update backups.
-    
-    ```bash
-    # Restore MongoDB
-    mongorestore --uri="mongodb://username:password@hostname:port/database" /path/to/backup/mongo
-    
-    # Restore Elasticsearch or OpenSearch
-    elasticdump --input=/path/to/backup/elasticsearch.json --output=http://elasticsearch:9200/index
-    
-    # Restore Redis
-    redis-cli -h redis-host -a password SHUTDOWN SAVE
-    # Copy backup RDB file to Redis data directory
-    
-    # Restore S3 data if needed
-    aws s3 sync /path/to/backup/s3-data s3://your-prisme-bucket
-    ```
-  </Step>
-  
-  <Step title="Revert Terraform Changes">
-    If you used Terraform for the update, revert to the previous state.
-    
-    ```bash
-    # Revert to previous Terraform state
-    git checkout [previous-commit] terraform/
-    terraform plan
-    terraform apply
-    ```
-  </Step>
-</Steps>
+  </Accordion>
 
-## Next Steps
+  <Accordion title="Custom Code apps fail after the import">
+    Check `prismeai-functions` logs for dependency installation errors. If dependencies are still installing or missing, re-save the affected Custom Code app to restart installation.
+  </Accordion>
 
-<CardGroup cols={3}>
-  <Card
-    title="Backup & Restore"
-    icon="database"
-    href="/self-hosting/operations/backup"
-  >
-    Learn how to create and manage backups for your Prisme.ai platform
+  <Accordion title="A product is missing from the menu">
+    Confirm the product workspace was imported by the `one-product` group, then check the Governe menu editor and the organization access rules.
+  </Accordion>
+
+  <Accordion title="A customization disappeared after the upgrade">
+    Bulk import discards local changes. Re-apply the change from the Git repository you pushed it to, or re-run the workspace automation that produced it (for example `update-agent` for the Secure Chat agent, see [Install products](/self-hosting/install-products#51-customize-the-secure-chat-agent)).
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Backup & Restore" icon="database" href="/self-hosting/operations/backup">
+    Create and manage backups before every upgrade.
   </Card>
-  <Card
-    title="Scaling"
-    icon="arrows-up-down-left-right"
-    href="/self-hosting/operations/scaling"
-  >
-    Scale your platform to meet growing demands
+  <Card title="Install products" icon="boxes-stacked" href="/self-hosting/install-products">
+    The first-install reference for the four workspace groups and post-install configuration.
+  </Card>
+  <Card title="Migration v27" icon="arrow-right-arrow-left" href="/self-hosting/operations/migration-v27">
+    Coming from legacy products? Follow the migration guide instead.
+  </Card>
+  <Card title="Scaling" icon="arrows-up-down-left-right" href="/self-hosting/operations/scaling">
+    Scale the platform to meet growing demand.
   </Card>
 </CardGroup>
