@@ -1,0 +1,208 @@
+---
+title: "Upload a file to a Knowledge Base"
+description: "End-to-end API flow: store the file bytes, then attach them to a knowledge base for indexing"
+---
+
+The Knowledges API ingestion endpoint (`POST /v1/knowledge_bases/{knowledgeBaseId}/documents`)
+attaches a **source** to a knowledge base. It does not carry the file bytes
+themselves - it takes a *reference* to bytes that already live somewhere the
+platform can fetch.
+
+So uploading a file to a knowledge base is always a **two-step** flow:
+
+1. **Store the bytes** with the native Prisme.ai Files API. You get back a file
+   URL and a share token.
+2. **Attach the file** to the knowledge base by referencing that URL. Indexing
+   runs asynchronously.
+
+<Note>
+  Host defaults to `api.studio.prisme.ai` in the examples below. On the sandbox
+  environment use `api.sandbox.prisme.ai`. Replace `{workspaceId}` with your own
+  workspace id and `{kbId}` with the target knowledge base id (`vs_...`).
+</Note>
+
+## Prerequisites
+
+- An API token: a JWT or access token (`Authorization: Bearer <token>`) or a
+  workspace API key (`x-prismeai-api-key: <key>`). See [Authentication](/api-reference/authentication).
+- A workspace you can upload files to (to host the bytes) - typically your own.
+- A knowledge base id. Create one with `POST /v1/knowledge_bases` or list yours
+  with `GET /v1/knowledge_bases`. Attaching a document requires the `editor` role
+  (or higher) on that knowledge base.
+
+## Step 1 - Store the file bytes
+
+Upload the file to your workspace with the native Files API. Pass
+`shareToken=true` so the response returns a token that lets the Knowledges
+service download the bytes without making the file public.
+
+<CodeGroup>
+```bash cURL
+TOKEN="YOUR_ACCESS_TOKEN"
+WORKSPACE_ID="YOUR_WORKSPACE_ID"
+
+curl -X POST "https://api.studio.prisme.ai/v2/workspaces/$WORKSPACE_ID/files" \
+     -H "Authorization: Bearer $TOKEN" \
+     -F "file=@./contract.pdf" \
+     -F "shareToken=true"
+```
+```javascript Node.js
+import fs from "node:fs";
+
+const form = new FormData();
+form.append("file", new Blob([fs.readFileSync("./contract.pdf")]), "contract.pdf");
+form.append("shareToken", "true");
+
+const res = await fetch(
+  `https://api.studio.prisme.ai/v2/workspaces/${WORKSPACE_ID}/files`,
+  { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` }, body: form }
+);
+const [file] = await res.json();
+```
+</CodeGroup>
+
+The response is an array of uploaded files:
+
+```json
+[
+  {
+    "id": "abc123",
+    "name": "contract.pdf",
+    "mimetype": "application/pdf",
+    "size": 428113,
+    "url": "https://api.studio.prisme.ai/v2/files/YOUR_WORKSPACE_ID/abc123.pdf",
+    "shareToken": "eyJhbGciOi..."
+  }
+]
+```
+
+Two values matter for the next step:
+
+- **`url`** - the stable file URL (used as the deduplication identity).
+- **`url` + `?token=<shareToken>`** - the tokenized download URL the Knowledges
+  service uses to fetch the bytes.
+
+## Step 2 - Attach the file to the knowledge base
+
+Reference the file as a `remote_file` source. Send the plain `url` as
+`source_url` (the stable identity) and the tokenized URL as `fetch_url` (the
+download URL, used once at index time and never stored).
+
+<CodeGroup>
+```bash cURL
+KB_ID="vs_your_knowledge_base_id"
+FILE_URL="https://api.studio.prisme.ai/v2/files/YOUR_WORKSPACE_ID/abc123.pdf"
+SHARE_TOKEN="eyJhbGciOi..."
+
+curl -X POST "https://api.studio.prisme.ai/v2/workspaces/slug:storage/webhooks/v1/knowledge_bases/$KB_ID/documents" \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d "{
+           \"source_type\": \"remote_file\",
+           \"source_url\": \"$FILE_URL\",
+           \"fetch_url\": \"$FILE_URL?token=$SHARE_TOKEN\",
+           \"filename\": \"contract.pdf\",
+           \"mime_type\": \"application/pdf\"
+         }"
+```
+```json Request body
+{
+  "source_type": "remote_file",
+  "source_url": "https://api.studio.prisme.ai/v2/files/YOUR_WORKSPACE_ID/abc123.pdf",
+  "fetch_url": "https://api.studio.prisme.ai/v2/files/YOUR_WORKSPACE_ID/abc123.pdf?token=eyJhbGciOi...",
+  "filename": "contract.pdf",
+  "mime_type": "application/pdf"
+}
+```
+</CodeGroup>
+
+A successful call returns the document with `status: in_progress` - the bytes
+are queued for parsing and embedding:
+
+```json
+{
+  "object": "document",
+  "id": "vsf_9f2c...",
+  "knowledge_base_id": "vs_your_knowledge_base_id",
+  "source_type": "remote_file",
+  "filename": "contract.pdf",
+  "mime_type": "application/pdf",
+  "status": "in_progress"
+}
+```
+
+The endpoint is an idempotent **upsert** keyed on `source_url`:
+
+- new `source_url` -> a document is created, indexing is scheduled, **201 Created**;
+- a `source_url` already attached -> the document is refreshed and re-indexed,
+  **200 OK**.
+
+To re-sync a file whose bytes changed, POST again with the same `source_url` and
+a fresh `fetch_url`.
+
+<Note>
+  You can also pass optional fields such as `tags`, `metadata`,
+  `chunking_strategy`, `scope`, or `model`. See the
+  [Knowledges API reference](/api-reference/storage) (operation *Attach a
+  source*) for the full request schema.
+</Note>
+
+## Step 3 - Track indexing
+
+Indexing is asynchronous. Poll the document until its `status` becomes
+`completed` (or `failed`):
+
+```bash
+curl "https://api.studio.prisme.ai/v2/workspaces/slug:storage/webhooks/v1/knowledge_bases/$KB_ID/documents/$DOCUMENT_ID" \
+     -H "Authorization: Bearer $TOKEN"
+```
+
+`status` moves through `queued` -> `in_progress` -> `completed`. Once
+`completed`, the document is searchable via
+`POST /v1/knowledge_bases/{knowledgeBaseId}/search`.
+
+## Variations
+
+<AccordionGroup>
+  <Accordion title="Indexing a public web page (no upload)">
+    If your source is a reachable web page, skip Step 1 entirely and attach it
+    directly:
+
+    ```json
+    {
+      "source_type": "web_page",
+      "source_url": "https://example.com/docs/page"
+    }
+    ```
+
+    The crawler fetches and indexes the page. This is also the default when you
+    send a bare `source_url` with no `source_type`.
+  </Accordion>
+  <Accordion title="Why not native_file_id / uploaded_file?">
+    The `uploaded_file` source type (with `native_file_id`) is reserved for
+    files that already belong to the Knowledges service's **own** workspace - it
+    is how internal flows (for example chat attachments) attach bytes the service
+    itself stored. The service can only mint a download token for its own files,
+    so a `native_file_id` pointing at *your* workspace is not resolvable.
+
+    For a file you upload into your own workspace, use `remote_file` with
+    `source_url` + `fetch_url`, as shown above.
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols="2">
+  <Card title="Knowledges API" icon="file-arrow-up" href="/api-reference/storage">
+    Full schema for attaching, listing, searching, and re-indexing documents.
+  </Card>
+  <Card title="Native Files API" icon="folder" href="/api-reference/Playground">
+    The platform endpoint used in Step 1 to store the bytes.
+  </Card>
+  <Card title="Authentication" icon="key" href="/api-reference/authentication">
+    Tokens, API keys, and how to authenticate requests.
+  </Card>
+  <Card title="Knowledge bases" icon="book" href="/products/ai-knowledge/knowledge-bases">
+    Product guide to creating and managing knowledge bases.
+  </Card>
+</CardGroup>
