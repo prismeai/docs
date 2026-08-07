@@ -3,10 +3,11 @@ title: "API & MCP Access"
 description: "Programmatic access to collections via REST and MCP"
 ---
 
-Everything you do in the Collections UI is available programmatically, through two interfaces:
+Everything you do in the Collections UI is available programmatically, through three interfaces:
 
 - A **REST API** for applications and scripts, fully documented with an interactive playground
 - An **MCP endpoint** (JSON-RPC 2.0) for AI agents and MCP-compatible clients
+- The **AI Collection App**, a reusable Builder app that exposes the API as ready-made instructions inside your own workspaces (see [In the Builder](#in-the-builder-app) below)
 
 <Card title="Collections API Reference" icon="code" href="/api-reference/ai-collection">
   Full endpoint documentation with request/response schemas and a live playground: collections CRUD, records, analytics, and the MCP endpoint.
@@ -16,9 +17,13 @@ Everything you do in the Collections UI is available programmatically, through t
 
 | Area | What you can do |
 |------|-----------------|
-| **Collections** | List, create (with a typed schema), read, update metadata and sharing, delete |
-| **Records** | Query with MongoDB-style filters, insert in batches (up to 1,000), read, update, upsert, delete |
+| **Collections** | List (paginated, optional estimated row counts), create (with a typed schema), read, update metadata and sharing, delete |
+| **Records** | Query with MongoDB-style filters, insert in batches (up to 1,000), bulk-insert for large imports (up to 5,000 per call), read, update, upsert, delete |
 | **Analytics** | Count, distinct values, aggregations (sum, avg, count, group by) |
+| **Schema** | Add columns and apply indexes or unique constraints after creation |
+| **AI** | Suggest a schema from a description, ask a plain-language question about a collection |
+| **Sharing** | Grant, list, change, and revoke access for users, groups, or the whole org |
+| **API Keys** | Mint, list, rotate, and revoke org API keys scoped to a collection |
 
 Queries accept MongoDB-style filters:
 
@@ -44,7 +49,9 @@ Protocol: **JSON-RPC 2.0** (`initialize`, `tools/list`, `tools/call`). The endpo
 
 | Tool | Purpose |
 |------|---------|
+| `data_discover` | Return the schema, row count, and a few sample rows (call this first) |
 | `data_create_collection` | Create a named collection, optionally with a typed schema |
+| `suggest_schema` | Propose a typed schema from a plain-language description |
 | `data_insert` | Insert one or more records |
 | `data_query` | Search records with filter, sort, and pagination |
 | `data_get` | Fetch a single record by ID |
@@ -56,6 +63,16 @@ Protocol: **JSON-RPC 2.0** (`initialize`, `tools/list`, `tools/call`). The endpo
 | `data_aggregate` | Sum / average / count with grouping |
 
 Tool arguments mirror the REST payloads; see the [API Reference](/api-reference/ai-collection) for the schemas.
+
+To bind an agent to a **single** collection, point it at the per-collection endpoint instead; the `collection_id` is then implicit on every call:
+
+```
+POST /v2/workspaces/slug:ai-collection-v3/webhooks/v1/collections/{collection_id}/mcp
+```
+
+<Note>
+Text filters match exactly and are case-sensitive: `informatique` will not match a stored `Informatique`. For case-insensitive matching use a regex such as `{"category":{"$regex":"^informatique$","$options":"i"}}`, or call `data_distinct` first to get the exact value. The `ask` tool and endpoint handle this for you.
+</Note>
 
 ### Schema Format
 
@@ -77,16 +94,58 @@ When creating a collection programmatically, columns are declared as:
 
 Supported types: `text`, `integer`, `double`, `boolean`, `date`, `datetime`, `json`, `array`.
 
+## In the Builder (App)
+
+For workflows built in **Prisme.ai Builder**, you do not need to call the REST API with raw `fetch`. Import the **AI Collection App** and call its instructions directly, the same way you would use any other app.
+
+<Steps>
+  <Step title="Install the app">
+    In your workspace, open **Apps**, add **AI Collection App**, and (optionally) set an API key in its configuration. When an automation runs in a user context, the user's identity is propagated automatically, so a key is only needed for headless flows (crons, event listeners).
+  </Step>
+  <Step title="Call an instruction">
+    Each REST endpoint is exposed as a clean instruction, grouped into folders in the editor:
+
+    | Folder | Instructions |
+    |--------|--------------|
+    | **Collections** | `listCollections`, `createCollection`, `getCollection`, `updateCollection`, `deleteCollection` |
+    | **Data** | `insertData`, `bulkInsert`, `queryData`, `countData`, `distinctData`, `aggregateData`, `upsertData`, `getRecord`, `updateRecord`, `deleteRecord` |
+    | **Schema & AI** | `updateSchema`, `addIndexes`, `suggestSchema`, `ask` |
+    | **Charts** | `getCharts`, `saveCharts` |
+    | **Sharing** | `listAccess`, `share`, `revokeAccess` |
+    | **API Keys** | `listApiKeys`, `createApiKey`, `deleteApiKey`, `rotateApiKey` |
+  </Step>
+</Steps>
+
+For example, to create a collection and query it from an automation:
+
+```yaml
+- ai-collection.createCollection:
+    name: leads
+    properties:
+      email: { type: text }
+      score: { type: integer }
+    output: created
+- ai-collection.queryData:
+    collection_id: '{{created.collection_id}}'
+    filter:
+      score: { $gte: 80 }
+    output: hotLeads
+```
+
+Every instruction returns the same payload as its REST counterpart, and forwards errors as `{ error: true, status, message }` so you can branch on failures.
+
 ## Limits
 
 | Limit | Value |
 |-------|-------|
 | Batch insert | 1,000 records per call |
+| Bulk insert | 5,000 records per call (all-or-nothing per batch) |
 | Query page size | 100 records max per call (default 20); paginate for more |
 | Aggregation steps | 10 per call |
 | Distinct values | 1,000 max returned |
+| Saved charts | 50 per collection |
 | Collection name | 64 characters, alphanumeric plus `-` and `_` |
-| Rate limits | 100 requests/min for reads and most operations; 20/min for inserts; 50/min for upserts |
+| Rate limits | 100 requests/min for reads and most operations; 20/min for inserts; 120/min for bulk inserts; 50/min for upserts |
 
 ## Behavior Notes
 

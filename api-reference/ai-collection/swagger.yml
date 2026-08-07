@@ -30,8 +30,16 @@ tags:
     description: Insert, query, read, update, upsert, and delete records in a collection.
   - name: Analytics
     description: Count, distinct values, and aggregations (sum, avg, count with grouping).
+  - name: Schema
+    description: Evolve a collection after creation (add columns, apply indexes and unique constraints).
+  - name: AI
+    description: LLM-assisted helpers (schema suggestion, plain-language question answering).
+  - name: Sharing
+    description: Grant, list, update, and revoke access bindings on a collection (user, group, org).
+  - name: API Keys
+    description: Mint, list, rotate, and revoke org API keys scoped to a collection.
   - name: MCP
-    description: JSON-RPC 2.0 endpoint exposing the `data_*` tools to AI agents and MCP clients.
+    description: JSON-RPC 2.0 endpoint exposing the collection tools to AI agents and MCP clients.
 paths:
   /v1/collections:
     get:
@@ -39,20 +47,40 @@ paths:
       operationId: listCollections
       summary: List collections
       description: |
-        Returns the collections owned by the caller or shared with them.
+        Returns the collections owned by the caller within their organization,
+        paginated. Set `with_counts=true` to include an estimated `row_count`
+        per collection (from database statistics, near-free, ideal for
+        dashboards; the exact count is available via the count endpoint).
         Rate limit: 100 requests/min per user.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Page'
+        - name: with_counts
+          in: query
+          required: false
+          description: Include an estimated `row_count` on each returned collection.
+          schema:
+            type: boolean
+          example: true
       responses:
         '200':
-          description: Collections accessible to the caller.
+          description: Collections accessible to the caller (paginated).
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  collections:
+                  items:
                     type: array
                     items:
                       $ref: '#/components/schemas/Collection'
+                  total:
+                    type: integer
+                    description: Total number of collections for the caller.
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
         '401':
           $ref: '#/components/responses/Unauthorized'
     post:
@@ -85,6 +113,16 @@ paths:
                   $ref: '#/components/schemas/CollectionSettings'
                 properties:
                   $ref: '#/components/schemas/SchemaProperties'
+                indexes:
+                  type: array
+                  description: Indexes to create on the collection.
+                  items:
+                    $ref: '#/components/schemas/IndexDefinition'
+                uniques:
+                  type: array
+                  description: 'Unique constraints. A unique on a column is required to use it as an upsert key in bulk import.'
+                  items:
+                    $ref: '#/components/schemas/IndexDefinition'
       responses:
         '200':
           description: Collection created.
@@ -138,7 +176,8 @@ paths:
       summary: Update collection metadata
       description: |
         Updates the description, settings, or the `agent_ids` sharing list.
-        The schema is immutable after creation.
+        To evolve the schema after creation, use the schema and indexes
+        endpoints instead.
       requestBody:
         required: true
         content:
@@ -194,6 +233,11 @@ paths:
         pagination, and field projection. Operators executing code or
         cross-referencing data (`$where`, `$function`, `$expr`, `$lookup`,
         `$merge`, `$accumulator`, `$out`) are rejected.
+
+        Text equality is exact and case-sensitive: `{"category":"informatique"}`
+        will not match a stored `Informatique`. For case-insensitive matching use
+        a regex, e.g. `{"category":{"$regex":"^informatique$","$options":"i"}}`, or
+        call the distinct endpoint first to get the exact stored value.
         Rate limit: 100 requests/min per user.
       parameters:
         - name: filter
@@ -528,6 +572,548 @@ paths:
                     type: integer
         '404':
           $ref: '#/components/responses/NotFound'
+  /v1/collections/{collection_id}/data/bulk:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    post:
+      tags: [Records]
+      operationId: bulkInsertRecords
+      summary: Bulk-insert records (large imports)
+      description: |
+        Batch-inserts up to 5,000 records in a single call, built for large CSV
+        imports (the client streams the file and posts batches). A batch is a
+        single database flush and is all-or-nothing: if one record violates a
+        column type or constraint the whole batch is rejected with `422` and no
+        per-row error list, so validate and coerce types client-side before
+        posting. Provide `upsert_key` (a column with a unique constraint) for an
+        idempotent re-import that updates instead of duplicating.
+        Rate limit: 120 requests/min per user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [records]
+              properties:
+                records:
+                  type: array
+                  maxItems: 5000
+                  items:
+                    $ref: '#/components/schemas/RecordInput'
+                upsert_key:
+                  type: string
+                  description: Unique column used as the conflict key (idempotent upsert).
+                  example: sku
+      responses:
+        '201':
+          description: Batch inserted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  inserted:
+                    type: integer
+                  mode:
+                    type: string
+                    enum: [append, upsert]
+                  collection_id:
+                    type: string
+        '400':
+          description: 'Validation error (empty batch, or more than 5,000 records).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: Batch rejected (all-or-nothing) due to a type or constraint violation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/collections/{collection_id}/schema:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    patch:
+      tags: [Schema]
+      operationId: updateSchema
+      summary: Add or merge columns
+      description: |
+        Adds new typed columns to an existing collection by merging the provided
+        `properties` into the current schema. Existing indexes and unique
+        constraints are preserved.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [properties]
+              properties:
+                properties:
+                  $ref: '#/components/schemas/SchemaProperties'
+      responses:
+        '200':
+          description: Updated schema.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/collections/{collection_id}/indexes:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    post:
+      tags: [Schema]
+      operationId: applyIndexes
+      summary: Apply indexes and unique constraints
+      description: |
+        Applies indexes and unique constraints to an existing collection. Provide
+        the full desired set; the constraints are persisted so a later schema
+        change re-applies them. A unique constraint is required to use a column as
+        an upsert key in bulk import.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                indexes:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/IndexDefinition'
+                uniques:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/IndexDefinition'
+      responses:
+        '200':
+          description: Indexes applied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  applied:
+                    type: boolean
+                  collection_id:
+                    type: string
+                  indexes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/IndexDefinition'
+                  uniques:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/IndexDefinition'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/collections/{collection_id}/charts:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    get:
+      tags: [Collections]
+      operationId: getCharts
+      summary: Get saved charts
+      description: Returns the collection's saved chart specs (shared at the collection level).
+      responses:
+        '200':
+          description: Saved charts.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  collection_id:
+                    type: string
+                  charts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ChartSpec'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Collections]
+      operationId: saveCharts
+      summary: Replace saved charts
+      description: 'Replaces the full set of chart specs (max 50). Send the whole array.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [charts]
+              properties:
+                charts:
+                  type: array
+                  maxItems: 50
+                  items:
+                    $ref: '#/components/schemas/ChartSpec'
+      responses:
+        '200':
+          description: Charts saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  saved:
+                    type: boolean
+                  collection_id:
+                    type: string
+                  charts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ChartSpec'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /v1/collections/{collection_id}/ask:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    post:
+      tags: [AI]
+      operationId: askCollection
+      summary: Ask a plain-language question
+      description: |
+        Answers a natural-language question about a collection. The org default
+        LLM turns the question into a query or aggregation plan using only the
+        schema, a few sample rows, and the row count (never the full dataset);
+        the plan runs server-side; a short natural-language answer is generated
+        from the bounded result. Returns `answer`, `plan`, and `data`.
+        Rate limit: 20 requests/min per user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question:
+                  type: string
+                  example: How many products are in the Informatique category?
+      responses:
+        '200':
+          description: Answer, the executed plan, and the bounded result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  answer:
+                    type: string
+                  plan:
+                    type: object
+                    additionalProperties: true
+                  data:
+                    type: object
+                    additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/suggest-schema:
+    post:
+      tags: [AI]
+      operationId: suggestSchema
+      summary: Suggest a schema from a description
+      description: |
+        Suggests a typed `properties` schema from a plain-language description of
+        the data to store, using the org default LLM. Feed the result to the
+        collection create endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [description]
+              properties:
+                description:
+                  type: string
+                  example: A CRM of companies with name, industry, website and annual revenue in EUR
+      responses:
+        '200':
+          description: Suggested schema.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      properties:
+                        $ref: '#/components/schemas/SchemaProperties'
+                      model:
+                        type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /v1/collections/{collection_id}/access:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    get:
+      tags: [Sharing]
+      operationId: listAccess
+      summary: List access bindings
+      description: Lists who the collection is shared with (owner, users, groups, org).
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Page'
+      responses:
+        '200':
+          description: Access bindings.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object:
+                    type: string
+                    example: list
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AccessBinding'
+                  total:
+                    type: integer
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Sharing]
+      operationId: grantAccess
+      summary: Grant access
+      description: |
+        Grants a role to a principal within the same organization. The principal
+        must be a member of the caller's org (users and groups are verified via
+        governance). Cross-org principals are rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [principal_type, principal_id, role]
+              properties:
+                principal_type:
+                  type: string
+                  enum: [user, group, org]
+                principal_id:
+                  type: string
+                  description: 'For `user`: a member user id. For `group`: `orgSlug:group`. For `org`: the org slug.'
+                role:
+                  type: string
+                  enum: [reader, editor, admin]
+      responses:
+        '201':
+          description: Binding created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessBinding'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/collections/{collection_id}/access/{principal_type}/{principal_id}:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+      - name: principal_type
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [user, group, org]
+      - name: principal_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Sharing]
+      operationId: getAccessBinding
+      summary: Get an access binding
+      responses:
+        '200':
+          description: The binding.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessBinding'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Sharing]
+      operationId: updateAccessBinding
+      summary: Change a binding role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  type: string
+                  enum: [reader, editor, admin]
+      responses:
+        '200':
+          description: Updated binding.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessBinding'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Sharing]
+      operationId: revokeAccess
+      summary: Revoke access
+      responses:
+        '200':
+          description: Binding revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/collections/{collection_id}/api-keys:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    get:
+      tags: [API Keys]
+      operationId: listApiKeys
+      summary: List API keys
+      description: Lists the API keys scoped to this collection. Raw keys are never returned.
+      responses:
+        '200':
+          description: API keys.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object:
+                    type: string
+                    example: list
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ApiKey'
+                  total:
+                    type: integer
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [API Keys]
+      operationId: createApiKey
+      summary: Mint an API key
+      description: |
+        Mints an org API key scoped to this collection. The raw key is returned
+        exactly once, in the `secret` field: store it now, it cannot be retrieved
+        again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, slug]
+              properties:
+                name:
+                  type: string
+                slug:
+                  type: string
+                  description: Unique identifier for the key within the org.
+                permissions:
+                  type: array
+                  items:
+                    type: string
+                  example: [collections:read]
+      responses:
+        '201':
+          description: 'API key created. `secret` is shown only once.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyWithSecret'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /v1/collections/{collection_id}/api-keys/{key_id}:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+      - name: key_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [API Keys]
+      operationId: getApiKey
+      summary: Get an API key
+      responses:
+        '200':
+          description: The API key metadata (no secret).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKey'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [API Keys]
+      operationId: deleteApiKey
+      summary: Revoke an API key
+      responses:
+        '200':
+          description: Key revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/collections/{collection_id}/api-keys/{key_id}/rotate:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+      - name: key_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [API Keys]
+      operationId: rotateApiKey
+      summary: Rotate an API key
+      description: 'Regenerates the key. The new raw key is returned once, in `secret`.'
+      responses:
+        '200':
+          description: 'Key rotated. `secret` is shown only once.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyWithSecret'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /ai-collection/mcp:
     post:
       tags: [MCP]
@@ -538,10 +1124,15 @@ paths:
         Implements `initialize`, `tools/list`, and `tools/call` over
         JSON-RPC 2.0.
 
-        Available tools: `data_create_collection`, `data_insert`,
-        `data_query`, `data_get`, `data_update`, `data_upsert`,
-        `data_delete`, `data_count`, `data_distinct`, `data_aggregate`.
+        Available tools: `data_discover` (schema + sample rows, call first),
+        `data_create_collection`, `data_insert`, `data_query`, `data_get`,
+        `data_update`, `data_upsert`, `data_delete`, `data_count`,
+        `data_distinct`, `data_aggregate`, `suggest_schema`.
         Tool arguments mirror the REST payloads documented above.
+
+        A per-collection scoped endpoint is also available at
+        `/v1/collections/{collection_id}/mcp`: it binds an agent to a single
+        collection (no `collection_id` argument needed on each call).
         Rate limit: 100 requests/min per user.
       requestBody:
         required: true
@@ -689,12 +1280,28 @@ components:
           description: Agents granted access (sharing list).
           items:
             type: string
+        orgSlug:
+          type: string
+          description: Organization the collection belongs to (tenant boundary).
         settings:
           $ref: '#/components/schemas/CollectionSettings'
         schema:
           $ref: '#/components/schemas/SchemaProperties'
+        indexes:
+          type: array
+          items:
+            $ref: '#/components/schemas/IndexDefinition'
+        uniques:
+          type: array
+          items:
+            $ref: '#/components/schemas/IndexDefinition'
+        charts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChartSpec'
         row_count:
           type: integer
+          description: 'On list with `with_counts=true`, an estimated count; null otherwise.'
         status:
           type: string
           example: ready
@@ -751,6 +1358,89 @@ components:
           type: string
           format: date-time
       additionalProperties: true
+    IndexDefinition:
+      type: object
+      description: An index or unique constraint over one or more columns.
+      required: [properties]
+      properties:
+        properties:
+          type: array
+          items:
+            type: string
+          example: [sku]
+    ChartSpec:
+      type: object
+      description: |
+        A saved chart specification, stored and returned verbatim (opaque to the
+        API). Executed client-side or via the aggregate endpoint.
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          example: bar
+          description: 'e.g. kpi, bar, line.'
+        title:
+          type: string
+        agg:
+          type: string
+          example: count
+        field:
+          type: string
+        dimension:
+          type: string
+      additionalProperties: true
+    AccessBinding:
+      type: object
+      properties:
+        object:
+          type: string
+          example: collection.access
+        collection_id:
+          type: string
+        principal_type:
+          type: string
+          enum: [user, group, org]
+        principal_id:
+          type: string
+        role:
+          type: string
+          enum: [owner, reader, editor, admin]
+        email:
+          type: string
+    ApiKey:
+      type: object
+      description: API key metadata. The raw key is never included here.
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          example: collection.api_key
+        collection_id:
+          type: string
+        slug:
+          type: string
+        name:
+          type: string
+        scope:
+          type: string
+          example: ai-collection-v3:collections:3f2a9c1e-...
+        permissions:
+          type: array
+          items:
+            type: string
+        expires_at:
+          type: integer
+          description: Unix seconds.
+    ApiKeyWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/ApiKey'
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: 'The raw API key (`iak_...`). Returned only once, on create and rotate.'
     Error:
       type: object
       properties:
