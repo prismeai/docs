@@ -95,6 +95,30 @@ Despite the "cache" naming, the runtime contexts cache and the crawler search en
 
 If you co-locate several of these on a single Redis instance (via distinct `db` numbers), the **strictest** policy, `noeviction`, wins, so plan capacity accordingly. The recommended layout is 2 separate instances for broker & everything else.  
 
+### Cluster mode (hash tag)
+
+When the **broker** Redis runs in **cluster mode** — notably **Azure Managed Redis**, which is clustered by default (even on a single shard), as well as Redis Enterprise or OSS Redis Cluster — you **must** set the `BROKER_CLUSTER_HASH_TAG` environment variable on every service that consumes the broker (`api-gateway`, `workspaces`, `events`, `runtime`).
+
+The broker subscribes to many event streams at once and reads them in a single `XREAD` / `XREADGROUP` command. In cluster mode, a multi-key command requires **all** keys to hash to the **same slot**; otherwise Redis rejects it:
+
+```
+CROSSSLOT Keys in request don't hash to the same slot
+```
+
+Setting `BROKER_CLUSTER_HASH_TAG` wraps every broker stream key in a shared `{tag}` [hash tag](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/#hash-tags), forcing them all onto the same slot so batched reads stay legal:
+
+```dotenv
+BROKER_CLUSTER_HASH_TAG=prismeai
+```
+
+Any non-empty value works. With `prismeai`, stream keys become `streams:{prismeai}<topic>`.
+
+<Note>
+- **Leave it unset on single-node / non-cluster Redis** (standard Redis, Azure Cache for Redis non-clustered, ElastiCache non-cluster mode). Those enforce no slot constraint, and setting the tag would only rename the stream keys unnecessarily.
+- All broker streams then live on a **single slot**, hence a single shard. This is expected and fine for the event broker; it trades horizontal sharding of the broker keyspace for cluster compatibility. Other Redis usages (cache, sessions) are unaffected.
+- Changing the value **renames** the stream keys: existing streams, consumer groups and pending entries under the old names are abandoned. Set it once, before going live on a cluster.
+</Note>
+
 ## Backup & restore
 
 ### RDB snapshots
