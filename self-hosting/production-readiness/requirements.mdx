@@ -1,0 +1,193 @@
+---
+title: "Production Readiness"
+description: "Requirements, responsibilities, and the go/no-go acceptance checklist before running a self-hosted Prisme.ai in production."
+---
+
+Running Prisme.ai self-hosted means your teams operate its infrastructure services. A managed service does not just provide a running binary: it provides a **service level** (availability, verified backups, monitoring, security patches, upgrades, capacity, support). When you self-host, **you take on those commitments**.
+
+This page is the **requirements and acceptance** layer. It defines what you must guarantee and who owns it. The **how-to** lives elsewhere and is linked throughout: [backup](/self-hosting/operations/backup), [updates](/self-hosting/operations/updates), [scaling](/self-hosting/operations/scaling), and the per-engine [databases](/self-hosting/databases/overview) pages, which are authoritative for versions, topology, and sizing.
+
+<Note>
+Prisme.ai support commitments (response times, application diagnosis) assume these requirements are met. An infrastructure service operated outside them should be treated as a written exception and excluded from the corresponding application SLA scope.
+</Note>
+
+## Managed vs self-managed responsibilities
+
+Who owns what, depending on whether a service is subscribed as managed or operated by you.
+
+| Domain | Managed service | Self-managed |
+|---|---|---|
+| Installation, high availability, failover | Provider | You |
+| Backup, restore, PITR | Provider (to enable) | You |
+| Security patches, engine upgrades | Provider (chosen window) | You |
+| Infra monitoring, alerting, on-call | Provider (metrics) / You (alerts) | You |
+| Capacity planning, scaling | You (decide) | You (decide and execute) |
+| Prisme.ai minimum version compliance | You | You |
+| Prisme.ai application diagnosis | Prisme.ai | Prisme.ai |
+
+In self-managed mode, everything that touches the **health of the service** (availability, backup, patching, monitoring) moves to you. Prisme.ai stays responsible for the **application diagnosis** of its platform.
+
+## Cross-cutting requirements
+
+These apply to every self-hosted infrastructure service.
+
+### Availability and resilience
+
+| # | Requirement | Level |
+|---|---|---|
+| T1 | Multi-AZ / multi-rack deployment, **minimum 3 nodes** for any quorum service (ES/OS, MongoDB, Redis Sentinel/Cluster); primary + 1 standby minimum for PostgreSQL | Mandatory |
+| T2 | **Automatic, tested failover** with transparent endpoint switch (DNS/VIP/proxy), no manual pod reconfiguration | Mandatory |
+| T3 | Strict anti-affinity: two replicas of a service never share the same hypervisor, K8s node, or single zone | Mandatory |
+| T4 | PodDisruptionBudget on every self-hosted stateful workload | Mandatory |
+| T5 | Resource separation: datastores do not share nodes with Prisme.ai application workloads | Recommended |
+
+The goal: a zone or node failure is a non-event for the platform. The switch is automatic, tested, and invisible to Prisme.ai pods.
+
+### Security
+
+| # | Requirement | Level |
+|---|---|---|
+| S1 | Encryption in transit on all connections (TLS 1.2+), including intra-cluster ES/OS and replication | Mandatory |
+| S2 | Encryption at rest for volumes and backups; keys managed by a KMS/HSM with documented rotation | Mandatory |
+| S3 | No public exposure: private endpoints / VPC peering / network policies; admin via bastion or VPN | Mandatory |
+| S4 | Least privilege: custom MongoDB roles, ES/OS privileges restricted to the 3 index patterns, non-superuser PostgreSQL role | Mandatory |
+| S5 | No long-lived static secrets when an alternative exists: IRSA/IAM, Workload Identity, Entra ID passwordless | Strongly recommended |
+| S6 | Credential rotation documented and tested: 12 months or less, immediate on departure or suspicion | Mandatory |
+| S7 | Audit log on each datastore (connections, DDL, admin access), exported off-service, retention 12 months or more | Mandatory |
+| S8 | Semi-annual access review of technical and human accounts | Mandatory |
+| S9 | Certificate lifecycle (internal included): inventory, expiry alert at D-30, automated renewal | Mandatory |
+| S10 | NTP time synchronization on all nodes (affects TLS, quorum, log correlation) | Mandatory |
+
+### Backup and recovery
+
+| # | Requirement | Level |
+|---|---|---|
+| B1 | RPO/RTO defined per service, validated by the business, consistent with the backup mechanism | Mandatory |
+| B2 | Backups stored **off the source service** and **off the production account/tenant** | Mandatory |
+| B3 | Backup immutability (Object Lock / WORM / soft-delete) over the retention window | Mandatory |
+| B4 | Encrypted backups, keys separate from the data | Mandatory |
+| B5 | Real restore test: monthly on a component, semi-annual end-to-end, timed with a written report | Mandatory |
+| B6 | Backup monitoring: alert if no successful backup for more than 1 nominal interval, alert on job failure | Mandatory |
+| B7 | Cross-region copy for services with irreversible loss (structured DB, object storage) if regional DR is in scope | Per DR plan |
+| B8 | Tested restore runbook, including the restart order of dependent Prisme.ai services | Mandatory |
+
+<Warning>
+The most common failure mode is a backup that fails silently. The "no successful backup" alert (B6) is what surfaces it before the day you need the backup.
+</Warning>
+
+### Monitoring and alerting
+
+| # | Requirement | Level |
+|---|---|---|
+| M1 | Metrics of each datastore collected (exporters or cloud-native), retention 13 months or more for capacity planning | Mandatory |
+| M2 | Centralized logs per datastore (slow queries, errors, GC, failover) | Mandatory |
+| M3 | Alerting routed to on-call, two levels (warning / critical). An alert with no named recipient is not an alert | Mandatory |
+| M4 | Per-service dashboards: saturation, latency, errors, replication, backups | Mandatory |
+| M5 | Predictive disk saturation alerts ("full within 7 days" on trend), not only fixed thresholds | Strongly recommended |
+| M6 | Synthetic end-to-end probes on `api.<domain>` and `studio.<domain>` (login + simple query), from outside the cluster | Mandatory |
+| M7 | Alert on failure of the Prisme.ai ES maintenance CronJobs (`cleanup-es-indices`, `cleanup-exec-events`) | Mandatory |
+
+Warning and critical thresholds per service are detailed in [Monitoring thresholds](./monitoring-thresholds).
+
+### Operations
+
+| # | Requirement | Level |
+|---|---|---|
+| O1 | Named on-call with rotation, escalation procedure, and a documented Prisme.ai contact | Mandatory |
+| O2 | Written and tested runbooks: failover, restore, disk saturation, restart, emergency purge | Mandatory |
+| O3 | Incident management: P1 to P4 classification, MTTR objective, systematic post-mortem on P1/P2 | Mandatory |
+| O4 | Planned and communicated maintenance windows, with a rollback procedure | Mandatory |
+| O5 | Version policy: EOL watch, no end-of-support version in production, respect Prisme.ai minimums (see [databases](/self-hosting/databases/overview)) | Mandatory |
+| O6 | Infrastructure as Code for all infra services, remote versioned state, drift detection | Mandatory |
+| O7 | Pre-production iso-prod (same versions, reduced topology) where every upgrade is played first | Mandatory |
+| O8 | Quarterly capacity review and load test before any significant expansion of usage | Strongly recommended |
+| O9 | DR drill: semi-annual (component), annual (regional failover if applicable), documented | Mandatory if DR is contractual |
+| O10 | Up-to-date inventory of services, versions, endpoints, owners, and Prisme.ai dependencies | Mandatory |
+
+## Criticality and RPO/RTO per service
+
+Nature of the loss, recovery objectives, and operational load in self-managed mode.
+
+| Service | Data loss | RPO | RTO | Key mechanism | Self-managed load |
+|---|---|---|---|---|---|
+| PostgreSQL / MongoDB | Irreversible | 5 min or less | 1 h or less | PITR / oplog + replication | High |
+| Redis (broker) | Replayable | 24 h | 30 min or less | Redundancy over backup | Medium |
+| Redis (cache / sessions / crawler) | Reconstructible | 24 h | 30 min or less | Tested reconstruction procedures | Medium |
+| ES / OS (events) | Audit / compliance loss | 24 h or less | 4 h or less | Snapshots + ILM + cleanup CronJobs | High |
+| ES / OS (vector store) | Reconstructible but costly | 24 h or less | 4 h or less | Snapshots (cheaper than re-vectorizing) | High |
+| Object storage | Irreversible | 24 h or less | 4 h or less | Versioning + replication + Object Lock | Low (managed) / High (self-hosted) |
+| RWX filesystem | Partially reconstructible | 24 h or less | 4 h or less | Native backup + zone redundancy | Low to medium |
+
+Two services concentrate the irreversible risk: the **structured database** and **object storage**. For Redis the stake is **availability**; for ES/OS it is **compliance** and the **cost of reconstruction**.
+
+<Warning>
+Never format or empty the Elasticsearch volume without first stopping `prismeai-events` (replicas to 0, HPA removed). An automatically inferred mapping causes data loss and `Limit of total fields [1000] has been exceeded` errors.
+</Warning>
+
+<Note>
+The ES CronJobs `cleanup-es-indices` (weekly) and `cleanup-exec-events` (daily) are **production components**, not options: GDPR retention, purge of inactive workspaces, and execution-event trimming depend on them. Their failure must alert (M7).
+</Note>
+
+## Go / No-Go acceptance checklist
+
+Validate per service. Any "no" on a mandatory line is blocking, or requires a written exception with exclusion from the corresponding SLA scope.
+
+**Resilience**
+
+- [ ] Multi-AZ topology compliant (3 nodes or more for quorum services)
+- [ ] Automatic failover tested in the last 3 months, with timing
+- [ ] Endpoint switch transparent to Prisme.ai pods
+
+**Backup**
+
+- [ ] PITR active on the structured database
+- [ ] ES/OS snapshots scheduled to an external repository
+- [ ] Versioning + Object Lock active on object storage
+- [ ] Backups off the production account, encrypted, immutable
+- [ ] Real restore performed and documented in the last 6 months
+- [ ] "No successful backup" alert in place and tested
+
+**Monitoring**
+
+- [ ] Metrics and logs of each datastore collected, kept 13 months or more
+- [ ] Per-service alerts configured and routed to on-call
+- [ ] Alert on the `cleanup-es-indices` and `cleanup-exec-events` CronJobs
+- [ ] External synthetic probes on `api.` and `studio.`
+- [ ] Per-service capacity dashboards
+
+**Security**
+
+- [ ] TLS everywhere, encryption at rest, keys managed by a KMS
+- [ ] No public endpoint; admin access via bastion / VPN
+- [ ] Least privilege applied and verified per service
+- [ ] Secret rotation documented and tested
+- [ ] Audit logs exported, retention 12 months or more
+- [ ] Certificate inventory and expiry alerting
+
+**Operations**
+
+- [ ] Named on-call with escalation procedure
+- [ ] Runbooks written and tested (failover, restore, saturation, purge)
+- [ ] Infrastructure as Code, with drift detection
+- [ ] Pre-production iso-prod available
+- [ ] Versions compliant with Prisme.ai minimums, no EOL version
+- [ ] Maintenance windows defined and communicated
+- [ ] Retention / purge policy GDPR-compliant (event retention configured)
+- [ ] Quarterly capacity review planned
+
+## References
+
+<CardGroup cols={2}>
+  <Card title="Monitoring thresholds" icon="gauge-high" href="./monitoring-thresholds">
+    Warning and critical values per service
+  </Card>
+  <Card title="Databases" icon="database" href="/self-hosting/databases/overview">
+    Versions, topology, and sizing per engine (authoritative)
+  </Card>
+  <Card title="Backup & Restore" icon="floppy-disk" href="/self-hosting/operations/backup">
+    Backup strategy, commands, and restore procedures
+  </Card>
+  <Card title="Updates" icon="arrow-up-right-dots" href="/self-hosting/operations/updates">
+    Platform and service upgrades, order, and precautions
+  </Card>
+</CardGroup>
