@@ -1,0 +1,502 @@
+---
+title: 'Knowledges'
+description: 'Create knowledge bases, ingest documents and web sources, and run semantic search from Agent Creator agents and Builder workflows'
+---
+
+<img
+  src="/images/connectors/knowledges.png"
+  alt="Knowledges"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The Knowledges app exposes the **Prisme.ai Knowledges API** (`/v1/knowledge_bases*`) — the RAG layer where documents and crawled web pages are chunked, embedded and searched. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. Unlike third-party connectors, **there is no credential to paste**: the connector runs in the installing workspace's app-instance context and forwards the caller's own Prisme.ai identity to the Knowledges backend, which applies that caller's permissions. An agent therefore sees exactly the knowledge bases its user is allowed to see. Three entity tools cover 20 operations: knowledge bases, their documents and their web crawl sources.
+
+<CardGroup cols={3}>
+  <Card title="Knowledge bases" icon="database">
+    Create, list, update and delete knowledge bases; tune embedding model, chunking and parsing.
+  </Card>
+  <Card title="Documents" icon="file-lines">
+    Attach files and URLs, follow indexing status, inspect chunks, reindex, resolve download links.
+  </Card>
+  <Card title="Search & crawl" icon="magnifying-glass">
+    Semantic search with tag filters, plus web crawl seeds with per-seed metrics and recrawl.
+  </Card>
+</CardGroup>
+
+## Who is this for?
+
+This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
+
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot">
+    You build agents in **Agent Creator** and want them to manage or search knowledge bases. → *Agent builder* tab.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved">
+    You run the platform and want to publish Knowledges as a reusable capability. → *Platform admin setup* accordion below.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece">
+    You write Builder automations (DSUL) that manage knowledge bases directly. → *Workspace builder* tab.
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- A Prisme.ai account on the same instance as the workspace running the connector. **No API key, OAuth client or third-party account is required** — the connector calls the platform's own Knowledges backend.
+- Permission on the knowledge bases you intend to reach. Every call inherits the caller's own permissions: a user sees the knowledge bases they own or that were shared with them, and nothing else.
+- (Optional) A **service access token**, if you want the connector to act under a fixed identity instead of the caller's — for example an unattended automation that must always reach the same knowledge base.
+
+<Note>
+  Knowledge bases created through this connector are the same objects you see in the **Knowledges** product UI. The connector adds automation and agent access on top of them; it does not create a separate store.
+</Note>
+
+<Note>
+  Knowledges replaces the deprecated [Storage connector](/apps-store/marketplace/connectors/storage-client), which exposed the same knowledge bases under the older `vectorStores` naming. Two things live only on that older connector: per-knowledge-base **API keys** and **RBAC access bindings**, and **agent skills** plus admin diagnostics. Keep it installed if you need those; use Knowledges for everything else.
+</Note>
+
+<Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
+  **Goal:** Knowledges needs **no platform-level credential**. There is no OAuth client to register and no shared secret to provision: the connector authenticates every call as the caller. The only platform task is to publish Knowledges as a reusable **capability** in AI Governance, so agent builders can enable it from the catalog instead of pasting a raw MCP endpoint.
+
+  <Note>
+    Each workspace that installs the app gets its own MCP endpoint and its own agent allowlist. A capability you declare here points at one workspace's endpoint; that workspace still decides which agents may call it.
+  </Note>
+
+  ## Declare the capability in AI Governance (optional)
+
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) the **Knowledges** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the connector's **MCP Endpoint** (the workspace running the connector), and set its **Scope** to:
+
+      ```text
+      context_id,agent_id,user_id,attachment_urls
+      ```
+
+      `agent_id` is what lets Agent Creator identify the calling agent, and `attachment_urls` passes the URLs of files the user uploaded in the chat so the agent can ingest them.
+    </Step>
+    <Step title="Make it available to agent builders">
+      Once created, the capability appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
+    </Step>
+  </Steps>
+
+  <Warning>
+    Declaring the capability makes the connector **available**; it does not authorize a specific agent. Per-agent gating is the **Authorized agents** allowlist in the connector's configuration app (see the *Agent builder* tab). There is no OAuth auth-config JSON to attach here, since authentication forwards the caller's own identity rather than a per-user OAuth token.
+  </Warning>
+</Accordion>
+
+---
+
+<Tabs>
+  <Tab title="Agent builder (Agent Creator)">
+    ## Agent builder
+
+    **Goal:** let an agent you build in Agent Creator create knowledge bases, ingest documents and search them through MCP tools.
+
+    <Note>
+      Before an agent can call the connector, a *Workspace builder* must have installed the Knowledges app in a workspace (see the *Workspace builder* tab). Optionally, a *Platform admin* may have published a Knowledges capability in AI Governance (see the *Platform admin setup* accordion above).
+    </Note>
+
+    No credential is pasted into the agent. The connector forwards the calling user's Prisme.ai identity to the Knowledges backend, which applies that user's permissions — so an agent can only reach knowledge bases its user is allowed to reach.
+
+    <Steps>
+      <Step title="Install the connector in your workspace">
+        Follow the *Workspace builder* tab: install **Knowledges** in your workspace. The default authentication mode needs no configuration.
+      </Step>
+      <Step title="Add the MCP capability to your agent">
+        In your agent, add a capability pointing at your workspace's **MCP Endpoint** URL, and set its **Scope** to:
+
+        ```text
+        context_id,agent_id,user_id,attachment_urls
+        ```
+
+        `agent_id` lets Agent Creator identify the calling agent — without it the connector cannot tell which agent is calling and rejects the call. `attachment_urls` carries the URLs of files the user uploaded in the conversation, which the document tools can ingest directly.
+      </Step>
+      <Step title="Authorize the agent">
+        Open the connector's **configuration app** from the app instance, go to **Authorized agents**, tick your agent and save — or enable **Allow all agents**. The **Install capability** button does both steps (declare the capability, allow the agent) in one click.
+      </Step>
+      <Step title="Brief the agent in its system prompt">
+        Wiring the capability is not enough: the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+
+        ```text
+        You have access to the Knowledges MCP server through three tools — `knowledges` (knowledge bases), `documents` (their sources) and `webSources` (web crawl seeds) — each taking an `action` argument. Use `knowledges` with action `search` to answer questions from an existing knowledge base, `documents` with action `add` to ingest a file the user uploaded (pass its native_file_id) or a URL (source_url), and `documents` with action `get` to report indexing status. Always confirm with the user before `delete` on a knowledge base or a document.
+        ```
+
+        Refine the trigger keywords (knowledge base names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
+      </Step>
+    </Steps>
+
+    <Note>
+      **Restricting to read-only (least privilege).** The connector never forces write permissions: it acts as the caller, so what an agent may do is exactly what its user may do on each knowledge base. To make an agent read-only, share the target knowledge bases with the calling users in a **read** role rather than as owners — write calls then fail with `403` while search keeps working (the connection itself stays healthy, since every check is a read). When the workspace uses the **service token** mode instead, back the token with an account that only holds read bindings. This is enforced by the Knowledges backend on every call, not by the connector, so it is a hard boundary rather than a declarative hint.
+    </Note>
+
+    <Note>
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. Identity is still resolved server-side.
+    </Note>
+
+    ## Available Tools
+
+    The MCP server exposes three entity-level tools, each dispatching across its actions through an `action` argument.
+
+    ### `knowledges`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List knowledge bases. `scope` accepts `owned`, `shared`, `all`, `agents` (comma-separable); filter by `name` substring or `status`. |
+    | `create` | Create a knowledge base. Only `name` is required; `embedding`, `chunking_strategy`, `parser` and `provider` default to the platform settings. |
+    | `get` | Get a knowledge base by `knowledge_id`. Pass `include: "processing"` to probe live crawler status and metrics. |
+    | `update` | Update metadata (`name`, `description`, `chunking_strategy`, `parser`, `file_parsing`) and `crawl_settings`. |
+    | `delete` | Delete a knowledge base. Cascades to its documents and vectors; native platform files are preserved. |
+    | `search` | Semantic search. Hits carry `document_id`, which `documents.download` resolves into a link. |
+
+    ### `documents`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List a knowledge base's documents; filter by `status`, `source_type`, `origin`, `web_source_id` or a `search` substring. |
+    | `add` | Attach a source: `source_url` (a URL to ingest) and/or `native_file_id` (an already-uploaded platform file). Idempotent — re-adding the same source refreshes it. |
+    | `get` | Get a document, including its indexing state (`status`, `last_error`, `indexed_at`). |
+    | `update` | Edit `tags`, `metadata`, `expires_at` or `filename`. Source fields are immutable. |
+    | `delete` | Detach the source and delete its vectors. The native file is never deleted. |
+    | `getChunks` | List the chunks produced for a document (paginated). |
+    | `reindex` | Re-run indexing on an existing document, optionally overriding `parser` or `chunking_strategy`. |
+    | `download` | Resolve a browser-usable URL: a short-lived link for uploads, the original `source_url` otherwise. |
+
+    ### `webSources`
+
+    | Action | Description |
+    |--------|-------------|
+    | `list` | List the knowledge base's crawl seeds, each with its metrics, plus a knowledge-base-wide summary. |
+    | `add` | Register a crawl start URL. URL-idempotent: re-adding a known URL returns the existing seed. |
+    | `get` | Get a seed's configuration and metrics. |
+    | `update` | Update a seed's `crawler_options`. The URL is immutable. |
+    | `delete` | Delete a seed. Only pages attributed solely to it are removed. |
+    | `recrawl` | Trigger an immediate crawl of the seed. Returns `409` if a crawl is already running for the knowledge base. |
+
+    <Warning>
+      Direct binary upload is not available over MCP. Upload the file to the platform first, then pass its `native_file_id` to `documents.add`. When the capability declares `attachment_urls`, files the user drops in the conversation are reachable as URLs and can be passed as `source_url`.
+    </Warning>
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
+
+    - **`verbose`** (default): human-readable text for LLM consumption.
+    - **`structured`**: machine-readable JSON in `structuredContent`.
+    - **`both`**: both text and structured content.
+
+    ## Tool Details
+
+    ### `knowledges` (action: `create`)
+
+    ```json
+    {
+      "name": "knowledges",
+      "arguments": {
+        "action": "create",
+        "name": "Product documentation",
+        "description": "Public docs and release notes",
+        "embedding": { "model": "text-embedding-3-small", "dimensions": 1536 },
+        "chunking_strategy": { "type": "static", "max_chunk_size_tokens": 1500, "chunk_overlap_tokens": 200 }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | Must be `create`. |
+    | `name` | Yes | Display name of the knowledge base. |
+    | `description` | No | Free-text description. |
+    | `embedding` | No | Object `{ model, dimensions }`. Defaults to the platform's embedding settings. |
+    | `dimensions` | No | Shorthand for `embedding.dimensions`. |
+    | `chunking_strategy` | No | `{ type: "auto" }` (default) or `{ type: "static", max_chunk_size_tokens, chunk_overlap_tokens }`. |
+    | `parser` | No | Parsing backend override: `tika`, `tika-ocr`, `unstructured`, `unstructured-ocr`, `llm`. |
+    | `provider` | No | Vector index backend. Defaults to the platform setting. |
+
+    ### `knowledges` (action: `search`)
+
+    ```json
+    {
+      "name": "knowledges",
+      "arguments": {
+        "action": "search",
+        "knowledge_id": "vs_81c2e3ae9d3c4d9989e3c06b95f01a3f",
+        "query": "What is the retention policy for exports?",
+        "limit": 8,
+        "min_score": 0.35,
+        "filter": { "op": "eq", "field": "tags.department", "value": "legal" }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | Must be `search`. |
+    | `knowledge_id` | Yes | The knowledge base to search. |
+    | `query` | Yes | Natural-language query (max 2048 characters). |
+    | `limit` | No | Maximum number of hits. |
+    | `min_score` | No | Score threshold below which hits are dropped. |
+    | `filter` | No | Structured filter AST over `tags.*` fields: a leaf `{ op, field, value }` (`op` = `eq`, `ne`, `in`, `nin`, `gt`, `gte`, `lt`, `lte`) composed with `{ and: [...] }`, `{ or: [...] }`, `{ not: {...} }`. |
+    | `scope` | No | `knowledge` (default) or `conversation`. |
+
+    ### `documents` (action: `add`)
+
+    ```json
+    {
+      "name": "documents",
+      "arguments": {
+        "action": "add",
+        "knowledge_id": "vs_81c2e3ae9d3c4d9989e3c06b95f01a3f",
+        "source_url": "https://docs.example.com/handbook.pdf",
+        "filename": "handbook.pdf",
+        "tags": { "department": "hr", "year": "2026" }
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | Must be `add`. |
+    | `knowledge_id` | Yes | Target knowledge base. |
+    | `source_url` | No* | Stable URL to ingest. Also the dedup key for non-native sources. |
+    | `native_file_id` | No* | Id of a file already uploaded to the platform. |
+    | `filename` | No | Display name of the document. |
+    | `mime_type` | No | Content type hint for the ingested URL. |
+    | `tags` | No | Key/value **object** (not an array), used later as search filters. |
+    | `metadata` | No | Free-form key/value object. |
+    | `expires_at` | No | Unix seconds or ISO date after which the document is dropped. |
+
+    <Note>
+      \* At least one of `source_url` / `native_file_id` is required. Adding a source that already exists returns `200` with the same document id and reschedules indexing, so re-running an ingestion never creates duplicates.
+    </Note>
+
+    ### `documents` (action: `get`)
+
+    ```json
+    {
+      "name": "documents",
+      "arguments": {
+        "action": "get",
+        "knowledge_id": "vs_81c2e3ae9d3c4d9989e3c06b95f01a3f",
+        "document_id": "vsf_6b19d0f0a3f2417ea6c9a1a4b7a2c8de"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | Must be `get`. |
+    | `knowledge_id` | Yes | Knowledge base the document belongs to. |
+    | `document_id` | Yes | The document id returned by `add` / `list`. |
+
+    Returns the document with its indexing state: `status` (`queued`, `in_progress`, `completed`, `failed`, `fetch_expired`, `rejected`), `last_error` and `indexed_at`. This is the call to make when a user asks "is my file ready?".
+
+    ### `webSources` (action: `add`)
+
+    ```json
+    {
+      "name": "webSources",
+      "arguments": {
+        "action": "add",
+        "knowledge_id": "vs_81c2e3ae9d3c4d9989e3c06b95f01a3f",
+        "url": "https://docs.example.com/"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | Must be `add`. |
+    | `knowledge_id` | Yes | Knowledge base that owns the crawl. |
+    | `url` | Yes | Crawl start URL. Immutable once created, and SSRF-validated. |
+    | `crawler_options` | No | Advanced per-seed crawler tuning. |
+
+    <Warning>
+      Crawl volume and scheduling (`webpages_limit`, `periodicity`, `paused`) are **not** per-seed: there is one crawler per knowledge base, configured through `knowledges` action `update` with a `crawl_settings` object. Adding a seed to a paused knowledge base does not resume the crawler.
+    </Warning>
+  </Tab>
+
+  <Tab title="Workspace builder (DSUL)">
+    ## Workspace builder
+
+    **Goal:** install the connector in a workspace, pick an authentication mode, and call knowledge-base operations from your automations.
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **Knowledges** and install it
+    3. Open the app instance configuration — the default mode works with no further input
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Configuration app** | Opens the connector's configuration app: authentication mode, authorized agents, capability install. |
+    | **MCP Endpoint** | Auto-populated on install: URL of the MCP endpoint for this instance. |
+
+    Everything else is driven from the configuration app. Pick one of the two authentication modes:
+
+    | Auth mode | What you provide | Best for |
+    |-----------|------------------|----------|
+    | **Caller identity** (default) | Nothing | Agents and automations that should see exactly what their user sees. Permissions are enforced per call by the Knowledges backend. |
+    | **Service token** | A Prisme.ai **access token** | Unattended flows (crons, webhooks triggered by anonymous callers) that must always act under one fixed identity, regardless of who triggered them. |
+
+    <Note>
+      In caller-identity mode the connector sends no credential of its own: the platform forwards the caller's user and workspace identity on cross-workspace calls, and the Knowledges backend authorizes from there. A cron or an anonymous webhook has no user to forward — that is when the service-token mode is needed.
+    </Note>
+
+    ## Available Instructions
+
+    Every instruction resolves authentication from the workspace configuration and targets the Knowledges API of the current environment.
+
+    ### Knowledge bases
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listKnowledges` | List knowledge bases; `scope` = `owned,shared,all,agents`, plus `name`, `status`, `limit`, `page`. | `{ data: [KnowledgeBase], total, page, limit }` |
+    | `createKnowledge` | Create a knowledge base by `name`; optional `embedding`, `chunking_strategy`, `parser`, `provider`, `expires_after`. | `KnowledgeBase` (HTTP 201, `status: active`) |
+    | `getKnowledge` | Get one by `knowledge_id`; `include: "processing"` probes live crawler status and metrics. | `KnowledgeBase` |
+    | `updateKnowledge` | Update `name`, `description`, `chunking_strategy`, `parser`, `file_parsing` and `crawl_settings`. | `KnowledgeBase` |
+    | `deleteKnowledge` | Delete by `knowledge_id`; cascades documents, vectors and bindings (native files preserved). | `{ status: "deleting" }` (HTTP 202) |
+    | `searchKnowledge` | Semantic search by `query`; optional `limit`, `min_score`, `filter` AST, `scope`, `conversation_id`. | `{ data: [{ document_id, score, content, tags }] }` |
+
+    ### Documents
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listDocuments` | List a knowledge base's documents; filters `status`, `source_type`, `origin`, `web_source_id`, `search`, `scope`, `conversation_id`. | `{ data: [Document], total, page, limit }` |
+    | `addDocument` | Attach `source_url` and/or `native_file_id`; optional `filename`, `mime_type`, `tags`, `metadata`, `expires_at`, `chunking_strategy`. | `Document` (201 new, 200 refreshed) |
+    | `getDocument` | Get a document by `document_id`, with `status`, `last_error`, `indexed_at`. | `Document` |
+    | `updateDocument` | Edit `tags`, `metadata`, `expires_at`, `filename`. | `Document` |
+    | `deleteDocument` | Detach the source and delete its vectors; the native file survives. | Empty (HTTP 204) |
+    | `getDocumentChunks` | List the document's chunks; `limit` defaults to 50, capped at 100. | `{ data: [{ id, content, position }], total, page, limit }` |
+    | `reindexDocument` | Re-index an existing document; optional `parser`, `chunking_strategy`, `reason`. | `Document` |
+    | `getDocumentSourceUrl` | Resolve a download URL: short-lived share link for uploads, `source_url` as-is otherwise. | `{ url, expires_at }` |
+
+    ### Web sources
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listWebSources` | List crawl seeds with per-seed metrics, plus a knowledge-base-wide `summary`. | `{ data: [WebSource], summary, total, page, limit }` |
+    | `addWebSource` | Register a crawl start `url` (SSRF-validated, idempotent); optional `crawler_options`. | `WebSource` |
+    | `getWebSource` | Get a seed by `seed_id`, with its configuration and metrics. | `WebSource` |
+    | `updateWebSource` | Update `crawler_options`. The `url` is immutable. | `WebSource` |
+    | `deleteWebSource` | Delete a seed; only pages attributed solely to it are removed. | Empty (HTTP 204) |
+    | `recrawlWebSource` | Trigger an immediate crawl of the seed. | `WebSource` (HTTP 202, `metrics.last_run_status: running`) |
+
+    ## DSUL Examples
+
+    ### Search a knowledge base and keep the best hits
+
+    ```yaml
+    - Knowledges.searchKnowledge:
+        knowledge_id: '{{config.knowledgeId}}'
+        query: '{{body.question}}'
+        limit: 8
+        min_score: 0.3
+        output: hits
+    ```
+
+    ### Ingest a document and tag it
+
+    ```yaml
+    - Knowledges.addDocument:
+        knowledge_id: '{{config.knowledgeId}}'
+        source_url: '{{document.url}}'
+        filename: '{{document.name}}'
+        tags:
+          department: '{{document.department}}'
+          year: '{{run.year}}'
+        output: created
+    ```
+
+    ### Poll a document until indexing completes
+
+    ```yaml
+    - repeat:
+        until: 10
+        do:
+          - Knowledges.getDocument:
+              knowledge_id: '{{config.knowledgeId}}'
+              document_id: '{{created.id}}'
+              output: doc
+          - conditions:
+              '{{doc.status}} == "completed"':
+                - break:
+                    scope: all
+          - wait:
+              timeout: 5
+    ```
+
+    ### Register a crawl seed and cap the crawl
+
+    ```yaml
+    - Knowledges.addWebSource:
+        knowledge_id: '{{config.knowledgeId}}'
+        url: 'https://docs.example.com/'
+        output: seed
+    - Knowledges.updateKnowledge:
+        knowledge_id: '{{config.knowledgeId}}'
+        crawl_settings:
+          webpages_limit: 500
+          periodicity: weekly
+    ```
+
+    ### Rebuild a document with a different parser
+
+    ```yaml
+    - Knowledges.reindexDocument:
+        knowledge_id: '{{config.knowledgeId}}'
+        document_id: '{{doc.id}}'
+        parser: 'unstructured-ocr'
+        reason: 'scanned PDF, OCR required'
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+The Knowledges API uses standard HTTP status codes.
+
+| HTTP Status | Meaning | Typical Cause |
+|-------------|---------|----------------|
+| `400` | Bad Request | Missing `action`, unknown action for the entity, malformed `filter` AST, `tags` sent as an array instead of an object. |
+| `401` | Unauthorized | No identity could be forwarded (anonymous or cron caller) and no service token is configured. |
+| `403` | Forbidden | The caller has no permission on this knowledge base, or only a read binding on a write call. |
+| `404` | Not Found | Unknown `knowledge_id`, `document_id` or `seed_id` — or a `native_file_id` that does not exist. |
+| `409` | Conflict | `webSources` action `recrawl` while a crawl is already running for this knowledge base. |
+| `413` | Payload Too Large | The ingested source exceeds the platform's document size limit. |
+| `429` | Rate Limited | Too many indexing or search calls in a short window. |
+| `500` / `503` | Server Error | Transient backend or indexing-pipeline error. Retry with exponential backoff. |
+
+### Common Issues
+
+**"This agent is not authorized to use this connector"**: the calling agent is not in the connector's allowlist. Open the configuration app → **Authorized agents**, tick the agent and save, or enable **Allow all agents**. The **Install capability** button does this for you.
+
+**"The calling agent could not be identified"**: the MCP capability does not inject the agent id. Set its **Scope** to `context_id,agent_id,user_id,attachment_urls` and retry.
+
+**`401` from a cron or a webhook**: scheduled runs and anonymous webhooks carry no user identity to forward. Switch the app instance to the **service token** mode so the connector acts under a fixed identity.
+
+**A search returns nothing while the UI shows documents**: check the documents' `status` with `documents.get`. Sources still `queued` or `in_progress` are not searchable yet, and a `failed` document reports why in `last_error`.
+
+**A filter matches nothing**: only `tags.*` fields are filterable, the match is exact, and tags must have been set as a key/value **object** at ingestion time (`{"department": "hr"}`, not `["hr"]`).
+
+**Re-adding a file creates no new document**: this is intended. `documents.add` is an idempotent upsert on the source key — the same `source_url` or native file returns the existing document id and reschedules indexing.
+
+**Deleting a document leaves the file in place**: also intended. `documents.delete` detaches the source and drops its vectors; the native platform file is never deleted by the connector.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="Knowledges" icon="book" href="/products/ai-knowledge/overview">
+    How knowledge bases, ingestion and RAG work in the Knowledges product.
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
+    Learn how Agent Creator agents consume MCP tools in Prisme.ai.
+  </Card>
+</CardGroup>
