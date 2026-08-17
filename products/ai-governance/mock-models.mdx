@@ -1,0 +1,143 @@
+---
+title: 'Mock Models'
+description: 'Built-in fake LLM and embedding models for load testing, without calling any real provider'
+---
+
+Load testing an agentic platform is awkward when every request bills a real provider and takes seconds to answer. The LLM Gateway ships with **mock models**: fake models that return fabricated responses instantly, without ever reaching an LLM provider. Use them to exercise the application chain — runtime, broker, streaming, front-end — under load, at zero cost.
+
+<Note>
+Mock models are a **testing facility**, not a governed model. They deliberately bypass the governance pipeline, so they measure your infrastructure, not your model policy. See [Limitations](#limitations).
+</Note>
+
+## Quick start
+
+There is **nothing to declare**. No provider entry, no catalog row, no allowlist grant. Send a request to the LLM Gateway with a model name containing `mock`:
+
+```bash
+curl -X POST \
+  "https://api.example.com/v2/workspaces/slug:llm-gateway/webhooks/v1/chat/completions" \
+  -H "Authorization: Bearer $PRISMEAI_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mock",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+The response follows the standard OpenAI chat completion shape, so any client that talks to the gateway works unchanged:
+
+```json
+{
+  "id": "chatcmpl-mock-<correlationId>",
+  "object": "chat.completion",
+  "model": "mock",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "This is a mock response from the LLM Gateway test endpoint. ..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60 }
+}
+```
+
+The only access control that still applies is the standard gateway authorization (`models` / `chat-completions`). Everything else — model access checks, routing, quota resolution, provider lookup — is short-circuited before it runs.
+
+## Available variants
+
+| Model | Latency | Streaming chunks | Notes |
+|-------|---------|------------------|-------|
+| `mock` | Instant | 2 (SSE) / 3 (WebSocket) | Used as the default when `model` is empty |
+| `mock-fast` | Instant | Same as `mock` | Currently **identical to `mock`** in every respect |
+| `mock-slow` | 50 ms per chunk | 9 (SSE) / 10 (WebSocket) | Latency applies on the **REST/SSE path only** |
+| `mock-embedding` | Instant | — | For `v1/embeddings`; dimensions 256, 768 or 1536 (default 1536) |
+
+<Warning>
+Two variant behaviours regularly surprise people:
+
+- **`mock-fast` is not differentiated.** Only `mock-slow` is special-cased in the gateway. `mock-fast` produces exactly the same latency and the same chunks as `mock` — the only difference is the model name echoed back in the response.
+- **`mock-slow` only slows down the REST/SSE path.** On the WebSocket path the chunks are returned as an array with no delay applied, so a `mock-slow` call made from an agent completes instantly. See [Streaming behaviour](#streaming-behaviour).
+</Warning>
+
+## Model name detection
+
+A request is routed to the mock endpoint when the resolved model name **contains** the string `mock`:
+
+```yaml
+conditions:
+  '{{selectedModel}} matches "mock"':
+```
+
+In DSUL, `matches` between two strings is a plain substring test. Two consequences matter in practice:
+
+- It is **case-sensitive**. `mock-slow` is intercepted; `Mock-Slow` and `MOCK` are not — they are treated as ordinary model names and will fail to resolve against the catalog.
+- It matches **anywhere in the name**, not just as a prefix. Any model whose id happens to contain `mock` — `mockProd`, `gpt-4o-mock`, `my-mockup-model` — is silently redirected to the mock endpoint and never reaches its real provider.
+
+<Tip>
+On a shared environment, avoid naming any genuine model with `mock` in its id. A real model that contains that substring becomes unreachable through the gateway.
+</Tip>
+
+The same check runs a second time after governance resolution, so if a quota downgrade or failover mapping substitutes a mock model, the request still lands on the mock endpoint.
+
+## Streaming behaviour
+
+Both mock endpoints support `stream: true`, but the two transports differ:
+
+| Transport | Condition | Behaviour |
+|-----------|-----------|-----------|
+| **REST / SSE** | HTTP request with streaming | Emits A2A `task.output.delta` events chunk by chunk, applying the per-chunk delay |
+| **WebSocket** | Called from an automation or agent | Returns the chunks as an array for the caller to iterate — **no delay is applied** |
+
+This is why `mock-slow` appears to do nothing when driven from an agent: the delay lives only in the SSE branch. To measure latency-sensitive behaviour with `mock-slow`, drive the gateway over HTTP with `stream: true`.
+
+In streaming mode, `completion_tokens` reports the **number of chunks** (2 or 9), not a token count.
+
+## Derived behaviours
+
+The mock honours a few request parameters so that clients exercising these code paths still get a well-formed answer:
+
+- **JSON mode** — with `response_format: { "type": "json_object" }`, the content becomes a valid JSON object: `{"mock": true, "model": "...", "timestamp": "...", "message_count": N}`.
+- **Tool calls** — if `tools` is non-empty, the mock returns one fabricated tool call against the *first* declared tool, with `arguments` set to `{"mock": true}` and `finish_reason: "tool_calls"`. The message content is then `null`.
+- **Embeddings** — `v1/embeddings` returns a fixed 256-float vector, replicated to reach 768 or 1536 dimensions with sign and scale variations. The values are meaningless; they are only valid numeric arrays for the pipeline to process. `batchSize` and `batchParallel` are accepted for API compatibility and ignored.
+
+## Limitations
+
+| Limitation | Detail |
+|------------|--------|
+| Token counts are fabricated | `prompt_tokens` is the **number of messages** × 10, not a real token count; `completion_tokens` is 50 (non-streaming) |
+| `temperature` and `max_tokens` ignored | Accepted for API compatibility, never applied |
+| No analytics or billing | The mock path emits no `analytics.llm.completion` event, computes no cost or carbon footprint, and consumes no quota |
+| No image mock | Only chat completions and embeddings have a mock path; image generation does not |
+| `mock-fast` not differentiated | Behaves exactly like `mock` |
+| Response content is fixed | The same sentence is returned regardless of the prompt |
+
+Because no analytics event is emitted, a load test against a mock model exercises the application chain but leaves [Observability](/products/ai-governance/observability) and quota enforcement untested.
+
+## Making a mock model selectable in an agent
+
+The steps above cover direct API calls, which is what a load test needs. If you also want a mock to appear in an agent's model picker, it must exist as a model specification in the products catalog — the gateway short-circuit works regardless, but the UI only lists declared models.
+
+```yaml
+mockProd:
+  maxContext: 128000
+  description:
+    en: Mock model used for tests
+  pricing:
+    input: 2.5
+    output: 10
+  display:
+    brand: Open AI
+    name: Mock
+  capabilities:
+    - text
+```
+
+## Related
+
+- [Model Governance](/products/ai-governance/model-governance) — routing, failover and quota policies that mock models bypass
+- [Available Models](/products/ai-governance/available-models) — the catalog of real models
+- [LLM Gateway API](/api-reference/llm-gateway) — full endpoint reference
