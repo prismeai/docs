@@ -242,7 +242,56 @@ To switch back to "everything through the api-gateway", simply **unset** the `UP
 | OIDC_STUDIO_CLIENT_SECRET      | api-gateway                          | Studio OIDC client secret (known only by api-gateway)                   | local-client-id                                                |
 | OIDC_CLIENT_REGISTRATION_TOKEN | api-gateway                          | Access token required for OIDC clients registration API                 | local-client-id                                                |
 | OIDC_WELL_KNOWN_URL            | api-gateway                          | OIDC provider configuration discovery URL (only for external providers) |                                                                |
+| OIDC_EXTERNAL_CLIENTS          | api-gateway                          | JSON array of extra OIDC clients to declare, e.g. native mobile apps (see note below). Each entry needs at least `client_id` and `redirect_uris`; the rest defaults to a public PKCE native client. | `[]`                                                           |
 | JWKS_URL                       | api-gateway                          | Endpoint for retrieving JWKS as part of the JWKS strategy               | OIDC_INTERNAL_PROVIDER_URL/oidc/jwks                           |
+
+#### Declaring external OIDC clients (native mobile apps)
+
+By default the only public first-party client is the studio, whose `redirect_uris`
+are web console URLs — so a native redirect such as `ai.prisme.app://oauth/callback`
+would be rejected with `invalid_redirect_uri`. Use `OIDC_EXTERNAL_CLIENTS` to declare
+additional public clients (typically a native mobile app) directly from configuration.
+
+The value is a **JSON array** of [oidc-provider client metadata](https://github.com/panva/node-oidc-provider/blob/main/docs/README.md#clients)
+objects. Only `client_id` and `redirect_uris` are required; the api-gateway applies
+defaults so every entry is treated as a **public PKCE native client**:
+
+| Field                        | Default                                                                                      | Overridable |
+| ---------------------------- | -------------------------------------------------------------------------------------------- | ----------- |
+| `application_type`           | `native` (allows custom URI schemes and https claimed links)                                 | yes         |
+| `grant_types`                | `["authorization_code", "refresh_token"]`                                                    | yes         |
+| `response_types`             | `["code"]`                                                                                    | yes         |
+| `allowedResources`           | the platform API resource server                                                             | yes         |
+| `resourceScopes`             | same broad scope set as the studio client                                                    | yes         |
+| `token_endpoint_auth_method` | `none` (public client) — **forced, not configurable**                                        | no          |
+| `isInternalClient`           | `false` — **forced**                                                                          | no          |
+
+PKCE is automatically required for these public clients — no extra setting needed.
+
+<Warning>
+For a native client, `oidc-provider` validates the `redirect_uris` per RFC 8252:
+
+- **Custom URI scheme** → must be **reverse-domain** (the scheme must contain a `.`).
+  `ai.prisme.app://oauth/callback` is accepted, `prisme://oauth/callback` is **rejected**.
+- **https** → accepted (universal / claimed link), non-loopback hostname.
+- **http** → only for loopback addresses (`127.0.0.1`, `[::1]`).
+
+An invalid `redirect_uri` makes the api-gateway fail to boot, so validate the value before deploying.
+</Warning>
+
+Example:
+
+```bash
+OIDC_EXTERNAL_CLIENTS='[
+  {
+    "client_id": "prismeai-mobile",
+    "redirect_uris": ["ai.prisme.app://oauth/callback"],
+    "post_logout_redirect_uris": ["ai.prisme.app://oauth/logout"]
+  }
+]'
+```
+
+The mobile app then drives the flow with PKCE (e.g. `ASWebAuthenticationSession(callbackURLScheme: "ai.prisme.app")` on iOS). Universal / app links (Apple `apple-app-site-association`, Android `assetlinks.json`) are **not** required for a custom scheme.
 
 ### Session & Token Configuration
 
