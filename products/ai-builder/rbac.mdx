@@ -331,6 +331,16 @@ RBAC controls access to various resource types through subject and action combin
     - `manage` : allows all above actions    
   </Accordion>
 
+  <Accordion title="Secure secrets" icon="lock">
+    **Subject :** `secure_secrets`
+
+    **Actions :**
+    - `create` / `update` : allows a member to deposit their own credential
+    - `read` : allows the reserved `schedules` role to replay them, and nothing else
+
+    Secure secrets hold credentials, so this subject is deliberately narrower than the others. A rule may grant writing them, never reading them back: values are resolved by the runtime through `{{secret.*}}` and never handed to a caller. See [Secure secrets](#secure-secrets) below.
+  </Accordion>
+
   <Accordion title="Apps" icon="rocket">
     **Subject :** `apps` 
 
@@ -342,6 +352,67 @@ RBAC controls access to various resource types through subject and action combin
     - `manage` : allows all above actions    
   </Accordion>
 </AccordionGroup>
+
+## Secure secrets
+
+Secure secrets store credentials: an OAuth refresh token a member deposits when connecting their account, an API key a connector needs. Two rules describe their lifecycle, and they are deliberately asymmetric.
+
+### Letting members deposit their own credential
+
+```yaml
+authorizations:
+  rules:
+    - action:
+        - create
+        - update
+      subject: secure_secrets
+      conditions:
+        name:
+          $regex: '^spnRefresh_[a-f0-9]{16}_${user.id}$'
+```
+
+The name condition is what isolates members from each other, so it is mandatory and checked when the workspace is saved. It must pin `${user.id}`, anchored, with every other character a literal. Without it, one rule would let any member overwrite every other member's credential.
+
+A single fixed-width character class such as `[a-f0-9]{16}` is allowed, so a connector can hold one credential per remote account rather than one per person. Its width must be fixed: with a variable one, two different pairs could spell the same name.
+
+`read` is never grantable here. A rule that asks for it is refused.
+
+### Letting your scheduled runs replay them
+
+A scheduled run carries no user. It cannot read a credential under anyone's permissions, which is why a nightly synchronisation cannot replay the tokens the workspace's own members deposited. The `schedules` role is how a workspace grants that, to itself:
+
+```yaml
+authorizations:
+  roles:
+    schedules: {}
+  rules:
+    - action:
+        - create
+        - update
+      subject: secure_secrets
+      conditions:
+        name:
+          $regex: '^spnRefresh_[a-f0-9]{16}_${user.id}$'
+
+    - role: schedules
+      action: read
+      subject: secure_secrets
+      conditions:
+        name:
+          $regex: '^spnRefresh_[a-f0-9]{16}_'
+```
+
+The read rule names a family rather than a person, because a synchronisation serves everyone. It must still carry a literal prefix of at least six characters ending on a separator such as `_`, and it can never reach the reserved `prismeai_` namespace. Without that prefix the rule would hand a scheduled run every secret the workspace owns, including its own OAuth client secrets.
+
+<Warning>
+`schedules` is a reserved role and declaring any `auth` on it is refused. That refusal is what the whole grant rests on: an API key bound to this role would read every member's credential through the ordinary API.
+</Warning>
+
+The platform grants the role only to a run its own scheduler started, and only to the workspace that scheduled it. Three consequences worth knowing:
+
+- A workspace called by another workspace's schedule gains nothing. The grant follows the workspace whose scheduler fired, not whoever is executing.
+- A run that adopts a user, or one reached through an HTTP request, loses it. Those are no longer runs nobody asked for.
+- Secrets of `scope: user` stay out of reach. They belong to a person, and a schedule is nobody.
 
 ## Securing Automations
 
