@@ -63,11 +63,12 @@ output: "{{greeting}}"
 | `slug` | URL-safe identifier. Must be unique inside the workspace. Used in API paths and event sources. |
 | `name` | Human-readable label shown in the sidebar. |
 | `description` | Optional free text shown in the workspace overview and app store. |
-| `arguments` | Schema for the inputs the automation expects when called directly (see [Arguments](#arguments)). |
+| `schemas` | Conditional input/output schemas — the current way to declare the inputs (and outputs) an automation expects (see [Input & output schemas](#input--output-schemas)). Takes precedence over `arguments` for validation. |
+| `arguments` | Legacy map of the inputs the automation expects. Still accepted and auto-converted into a single `schemas` branch on save (see [Input & output schemas](#input--output-schemas)). |
 | `when` | Trigger configuration: `endpoint`, `events`, `schedules` (see [Triggers](#triggers)). |
 | `do` | Ordered list of instructions to execute. |
 | `output` | Expression returned to the caller after `do` completes. |
-| `validateArguments` | When `true`, the runtime rejects calls whose inputs do not match the `arguments` schema. |
+| `validateArguments` | When `true`, the runtime rejects calls whose inputs do not match the active `schemas` branch (or the branch derived from `arguments`). |
 | `private` | When `true`, the automation cannot be called from outside the workspace (only via `runWorkflow` from another automation). |
 | `disabled` | When `true`, the automation is registered but never executes. |
 | `labels` | Free-form tags used for organization. |
@@ -1318,7 +1319,7 @@ Calls another automation in the same workspace.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `workflow` | string (required) | - | Slug of the target automation. |
-| `parameters` | object | `{}` | Inputs passed to the target's `arguments`. |
+| `parameters` | object | `{}` | Inputs passed to the target automation (validated against its `schemas`, or the branch derived from `arguments`). |
 | `output` | string | - | Variable receiving the target's `output`. |
 | `wait` | boolean | `true` | When `false`, fire-and-forget; the parent continues without waiting. |
 
@@ -1648,56 +1649,151 @@ Or directly access a specific field :
 URL("https://user:password@www.google.fr/some/path/?query=string&foo=bar#anchor").hostname # www.google.fr
 ```
 
-## Arguments
+## Input & output schemas
 
-When calling a native instruction or another automation, different arguments can be transmitted. These graphical inputs are not reserved to native instructions, but can also be configured for your own custom automations by specifying expected arguments and their types.
+An automation declares the inputs it expects — and, optionally, the shape of its output — through the `schemas` field. `schemas` is a list of **conditional branches**, each carrying up to three keys:
+
+| Key | Purpose |
+|---|---|
+| `conditions` | Dot-path map matched against the incoming payload. The first branch whose conditions all match is active; a branch with no `conditions` is the default. |
+| `payload` | Schema describing the inputs for this branch (a JSON-Schema-like object). |
+| `output` | Schema describing the output for this branch. |
+
+`payload` and `output` are described with the same typed-field format used across Prisme.ai (`type`, `properties`, `items`, `required`, `format`, `title`, `description`, plus the `secret` / `redact` markers below). Supported `type` values are `string`, `number`, `integer`, `boolean`, `object`, `array`, and the `localized:*` variants.
+
+### Declaring inputs
+
+The simplest case is a single branch describing the payload. These fields also power the graphical inputs shown when the automation is called from another automation or from the execute modal.
 
 ```yaml
-testArguments:  
-  do: []  
+testArguments:
+  do: []
   name: testArguments
-  arguments:
-    someString:
-      type: string
-    someNumber:
-      type: number
-    someObject:
-      type: object
-      properties:
-        someStringField:
-          type: string
-    someOtherObject:
-      type: object
-      properties:
-        nestedObject:
-          type: object
-          properties:
-            someField:
-              type: number
-    someStringArray:
-      type: array
-      items:
-        type: string
-    someObjectArray:
-      type: array
-      items:
+  schemas:
+    - payload:
         type: object
         properties:
-          fieldA:
+          someString:
             type: string
-    someRawJSON:
-      type: object
-      additionalProperties: true          
-    someToken:
-      type: string        
-      secret: true
+          someNumber:
+            type: number
+          someObject:
+            type: object
+            properties:
+              someStringField:
+                type: string
+          someOtherObject:
+            type: object
+            properties:
+              nestedObject:
+                type: object
+                properties:
+                  someField:
+                    type: number
+          someStringArray:
+            type: array
+            items:
+              type: string
+          someObjectArray:
+            type: array
+            items:
+              type: object
+              properties:
+                fieldA:
+                  type: string
+          someRawJSON:
+            type: object
+            additionalProperties: true
+          someToken:
+            type: string
+            secret: true
 ```
 
-The `someToken` argument defined with `secret: true` is automatically redacted from native runtime events to avoid accidental leaks of sensitive information.
+The `someToken` field defined with `secret: true` is automatically redacted from native runtime events to avoid accidental leaks of sensitive information (see [Protecting sensitive fields](#protecting-sensitive-fields)).
 
-### Arguments Validation
+### Conditional branches
 
-Automation arguments can be validated during execution by enabling `validateArguments: true`:
+When an automation is exposed as an HTTP endpoint (or handles more than one call shape), you can declare a branch per case and let the runtime route to the matching one:
+
+```yaml
+handleRequest:
+  do: []
+  name: handleRequest
+  when:
+    endpoint: true
+  schemas:
+    - conditions:
+        method: POST
+      payload:
+        type: object
+        required:
+          - document
+        properties:
+          document:
+            type: string
+    - conditions:
+        method: GET
+      output:
+        type: object
+        properties:
+          content:
+            type: string
+    - payload:
+        type: object
+        additionalProperties: true
+```
+
+Branch resolution rules:
+
+- **First match wins.** Branches are evaluated top to bottom; the first one whose conditions all match becomes active.
+- **`conditions` are dot-paths** resolved from the payload root (`method`, `body.kind`, `query.version`…). Each entry must equal the corresponding payload value.
+- **`method` is matched case-insensitively** (`POST` matches `post`). Other keys are case-sensitive.
+- **Values are compared as strings after scalar coercion** — `version: 2` matches `?version=2`, since query parameters always arrive as strings. An object, an array, or a null condition value (YAML's valueless `key:`) never matches.
+- **A branch without `conditions` is the default** and always matches — put it last as a catch-all.
+
+### Protecting sensitive fields
+
+Two markers can be placed on any field of a `payload` or `output` schema:
+
+| Marker | Effect |
+|---|---|
+| `secret: true` | Value-based scrubbing. **Only string values are tracked** — the string is masked everywhere it surfaces downstream, across the whole automation call chain. Objects, arrays, and numbers are ignored. |
+| `redact: true` | Path-based redaction. The field is stripped from runtime execution events (`runtime.automations.executed`), whatever its type or size. |
+
+```yaml
+redactBoth:
+  do: []
+  name: redactBoth
+  when:
+    endpoint: true
+  schemas:
+    - payload:
+        type: object
+        properties:
+          token:
+            type: string
+            secret: true
+          document:
+            type: string
+            redact: true
+      output:
+        type: object
+        properties:
+          content:
+            type: string
+            redact: true
+```
+
+Notes:
+
+- **`secret` only protects strings.** To hide an object or an array (a whole JSON body, a structured credential…), use `redact: true` on that field instead — `secret: true` would silently do nothing.
+- **`redact` does not follow the value across automations.** Unlike `secret`, which tracks a string value wherever it flows, `redact` is purely path-based: it only strips the field from the events of the automation that declares it. You must therefore repeat `redact: true` on **every** automation the object passes through — declaring it once upstream does not protect it downstream.
+- `secret` takes precedence over `redact`: a field marked both is value-tracked **and** path-redacted.
+- `redact` only applies to fields reachable through `properties`. A marker placed inside `items`, `additionalProperties`, or a `oneOf`-style keyword is ignored; redact the parent field instead.
+
+### Validation
+
+Set `validateArguments: true` to have the runtime validate incoming payloads against the active branch's `payload` schema:
 
 ```yaml
 slug: test
@@ -1706,29 +1802,50 @@ do: []
 when:
   endpoint: true
 output: '{{body}}'
-arguments:
-  body:
-    type: object
-    required:
-      - str
-    properties:
-      str:
-        type: string
-      uri:
-        type: string
-        format: uri
-      obj:
-        type: object
-        required:
-          - un
-        properties:
-          un:
-            type: string
-            pattern: '^[a-z]+$'
 validateArguments: true
+schemas:
+  - payload:
+      type: object
+      required:
+        - str
+      properties:
+        str:
+          type: string
+        uri:
+          type: string
+          format: uri
+        obj:
+          type: object
+          required:
+            - un
+          properties:
+            un:
+              type: string
+              pattern: '^[a-z]+$'
 ```
 
-Arguments support various validation formats including date, url, time, password, etc. Validation errors immediately stop current and parent automations.
+Schemas support various validation formats including date, url, time, password, etc. Validation errors immediately stop the current and parent automations.
+
+When `validateArguments` is `true` and **no branch matches** the payload, the call is rejected. Declare an unconditioned branch (one with no `conditions`) to accept internal calls or unlisted HTTP methods. Output schemas are never validation-enforced — they only document the output and drive `redact`.
+
+### Backward compatibility with `arguments`
+
+Automations historically declared their inputs through a top-level `arguments` map. That format is still fully supported: on save it is automatically converted into a single, unconditioned `schemas` branch (`{ payload: { type: object, properties: <arguments> } }`), and collapsed back to `arguments` when loaded so the editor keeps rendering it. `secret` and `redact` markers ride along unchanged.
+
+```yaml
+# Legacy form — still valid, equivalent to a single-branch schema
+legacyArguments:
+  do: []
+  name: legacyArguments
+  arguments:
+    someString:
+      type: string
+    someToken:
+      type: string
+      secret: true
+```
+
+You never need to migrate existing automations by hand. Reach for `schemas` when you need what `arguments` cannot express: conditional branches, an `output` schema, or `redact` markers. When both `arguments` and `schemas` are present, `schemas` drives validation, while the `secret` / `redact` markers declared on `arguments` stay enforced on every branch.
 
 ## Advanced Automation Patterns
 
