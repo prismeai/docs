@@ -335,10 +335,10 @@ RBAC controls access to various resource types through subject and action combin
     **Subject :** `secure_secrets`
 
     **Actions :**
-    - `create` / `update` : allows a member to deposit their own credential
-    - `read` : allows the reserved `schedules` role to replay them, and nothing else
+    - `create` / `update` : allows depositing a credential
+    - `read` : allows replaying one, which only an automation taking on a role can do
 
-    Secure secrets hold credentials, so this subject is deliberately narrower than the others. A rule may grant writing them, never reading them back: values are resolved by the runtime through `{{secret.*}}` and never handed to a caller. See [Secure secrets](#secure-secrets) below.
+    Secure secrets hold credentials, so this subject is narrower than the others: values are resolved by the runtime through `{{secret.*}}` and never handed back to a caller, whatever the rule says. What a rule must prove depends on who it applies to. See [Secure secrets](#secure-secrets) below.
   </Accordion>
 
   <Accordion title="Apps" icon="rocket">
@@ -377,14 +377,16 @@ A single fixed-width character class such as `[a-f0-9]{16}` is allowed, so a con
 
 `read` is never grantable here. A rule that asks for it is refused.
 
-### Letting your scheduled runs replay them
+### Letting an automation replay them
 
-A scheduled run carries no user. It cannot read a credential under anyone's permissions, which is why a nightly synchronisation cannot replay the tokens the workspace's own members deposited. The `schedules` role is how a workspace grants that, to itself:
+A scheduled synchronisation, or any automation acting for the workspace rather than for its caller, has no user behind it. It cannot read a credential under anyone's permissions, which is exactly the problem: the tokens the workspace's own members deposited are unreadable to its own sync.
+
+Nothing about the shape of a run answers that. An unauthenticated cron and an unauthenticated HTTP call are indistinguishable, so the workspace states it instead: it declares a role, and the automation takes that role on for the one call that needs it.
 
 ```yaml
 authorizations:
   roles:
-    schedules: {}
+    tokenResolver: {}
   rules:
     - action:
         - create
@@ -394,25 +396,43 @@ authorizations:
         name:
           $regex: '^spnRefresh_[a-f0-9]{16}_${user.id}$'
 
-    - role: schedules
-      action: read
+    - role: tokenResolver
+      action:
+        - read
+        - create
+        - update
       subject: secure_secrets
       conditions:
         name:
-          $regex: '^spnRefresh_[a-f0-9]{16}_'
+          $regex: '^spnRefresh_'
 ```
 
-The read rule names a family rather than a person, because a synchronisation serves everyone. It must still carry a literal prefix of at least six characters ending on a separator such as `_`, and it can never reach the reserved `prismeai_` namespace. Without that prefix the rule would hand a scheduled run every secret the workspace owns, including its own OAuth client secrets.
+```yaml
+- run:
+    function: secret.get
+    assumeRole: tokenResolver
+    parameters:
+      name: 'spnRefresh_{{targetUserId}}'
+      scope: workspace
+```
+
+`assumeRole` applies to that single call. Everything around it keeps the caller's own rights, and nothing is carried to the automations it calls, to an `emit`, or across a workspace boundary.
+
+### What each rule has to prove
+
+The two rules above look alike and answer different questions.
+
+A rule carried by **no role** lands on `default`, which applies to every member. Writing a name they choose would let one member overwrite another's credential, so `${user.id}` is mandatory there: it is the only thing keeping members apart.
+
+A rule carried by **a role** applies to whoever takes it on, which is an automation acting for the workspace. It may name a **family** of secrets instead, for reads and writes alike. Reads, because a synchronisation serves everyone and there is no user to bind to. Writes, because providers that rotate their refresh tokens hand back a new one that has to be stored for a member who is not there.
+
+A family pattern must carry a literal prefix of at least six characters ending on a separator, and can never reach the reserved `prismeai_` namespace.
 
 <Warning>
-`schedules` is a reserved role and declaring any `auth` on it is refused. That refusal is what the whole grant rests on: an API key bound to this role would read every member's credential through the ordinary API.
+Anything holding that role can read and overwrite every credential in the family. That is the price of servicing absent users, and it is why the role should be declared for that purpose alone: do not grant it to a person, and do not give it an `auth` block. An API key bound to it would hand every member's credential to whoever holds the key. The platform does not prevent either: it is yours to decide.
 </Warning>
 
-The platform grants the role only to a run its own scheduler started, and only to the workspace that scheduled it. Three consequences worth knowing:
-
-- A workspace called by another workspace's schedule gains nothing. The grant follows the workspace whose scheduler fired, not whoever is executing.
-- A run that adopts a user, or one reached through an HTTP request, loses it. Those are no longer runs nobody asked for.
-- Secrets of `scope: user` stay out of reach. They belong to a person, and a schedule is nobody.
+Two things remain out of reach whatever the role. Secrets of `scope: user` belong to a person, and a run without one is refused before permissions are even consulted. And `owner` cannot be assumed at all, so a developer has to declare a role that states what it opens rather than reaching for everything.
 
 ## Securing Automations
 
