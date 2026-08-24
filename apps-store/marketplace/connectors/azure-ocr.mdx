@@ -47,10 +47,19 @@ This connector is used by three different roles. Jump to the section that matche
 - An **Azure subscription** with access to Azure AI services.
 - A **Computer Vision** (or Multi-Service Cognitive) resource, for the `image` tool. From the Azure portal, under the resource's **Keys and Endpoint** page, note its **endpoint hostname** (e.g. `az-aismsa-xxx.cognitiveservices.azure.com`) and one of its **API keys**.
 - A **Document Intelligence** resource, for the `document` tool. Same **Keys and Endpoint** page: note the **endpoint hostname** (e.g. `az-di-xxx.cognitiveservices.azure.com`) and an **API key**.
+- A **publicly accessible URL** for the files you analyze (see below), or base64 content for documents.
 
 <Note>
   You can configure only one of the two services; each tool only requires the service it targets to be configured. The Computer Vision and Document Intelligence keys are independent and not interchangeable.
 </Note>
+
+## The `source` URL must be publicly accessible
+
+<Warning>
+  Azure downloads the file itself: the connector only forwards the URL. Intranet hosts, `localhost` and anything behind a login or an `Authorization` header fail. Microsoft requires a [publicly accessible image URL](https://learn.microsoft.com/en-us/azure/ai-services/computer-vision/how-to/call-analyze-image-40) for Computer Vision, and for Document Intelligence a blob URL with a **SAS token** on a storage account open to public networks — never one behind a VNet or firewall ([FAQ](https://learn.microsoft.com/en-us/azure/ai-services/document-intelligence/faq)).
+
+  Use a signed URL (SAS, S3 pre-signed) for private files, or `sourceType: base64` on `document`. The `image` tool has **no base64 mode**, so an unreachable image must first be made reachable.
+</Warning>
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
   **Goal:** Azure OCR is a **per-workspace** connector: each workspace pastes its own Azure endpoints and API keys in the connector's configuration app (see the *Workspace builder* tab), so there is **no platform-wide credential to provision** and **no central OAuth client**.
@@ -135,9 +144,9 @@ This connector is used by three different roles. Jump to the section that matche
 
     ```text
     You have access to the Azure OCR MCP server (tools: image, document). Each tool takes an `action: analyze` argument.
-    - image: for a single image (photo, screenshot, receipt picture). Pass the public image URL as `source`. Default feature is Read (OCR); add Caption, Tags, Objects or People only when the user asks for visual analysis. Synchronous.
-    - document: for PDFs and multi-page or structured documents. Pass a document URL (or base64 with sourceType: base64) as `source`, and pick the model by intent: prebuilt-read for plain text, prebuilt-layout for tables and structure, prebuilt-invoice / prebuilt-receipt / prebuilt-idDocument for those specific document types.
-    Prefer outputContentFormat: markdown when feeding the result back into your own reasoning. Always pass a public URL when you have one; base64 inflates the request.
+    - image: for a single image (photo, screenshot, receipt picture). Pass a PUBLICLY ACCESSIBLE image URL as `source` — Azure downloads it itself, so intranet or login-protected URLs fail. Default feature is Read (OCR); add Caption, Tags, Objects or People only when the user asks for visual analysis. Synchronous.
+    - document: for PDFs and multi-page or structured documents. Pass a publicly accessible document URL (or base64 with sourceType: base64 when the file is private) as `source`, and pick the model by intent: prebuilt-read for plain text, prebuilt-layout for tables and structure, prebuilt-invoice / prebuilt-receipt / prebuilt-idDocument for those specific document types.
+    Prefer outputContentFormat: markdown when feeding the result back into your own reasoning. Always pass a public URL when you have one; base64 inflates the request. Never retry an unreachable URL — ask for a signed link, or fall back to document + base64.
     ```
 
     <Note>
@@ -150,8 +159,8 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Tool | Description |
     |------|-------------|
-    | `image` | Azure Computer Vision: image OCR and visual analysis. `action: analyze` sends a public image URL and returns the extracted read text, captions, tags, objects and people. Synchronous. |
-    | `document` | Azure Document Intelligence: structured document extraction. `action: analyze` submits a document (URL or base64) to a prebuilt model, polls for completion, and returns the analysis (content, pages, tables, key-value pairs, paragraphs). Asynchronous. |
+    | `image` | Azure Computer Vision: image OCR and visual analysis. `action: analyze` sends a **publicly accessible** image URL and returns the extracted read text, captions, tags, objects and people. Synchronous. |
+    | `document` | Azure Document Intelligence: structured document extraction. `action: analyze` submits a document (**publicly accessible** URL, or base64) to a prebuilt model, polls for completion, and returns the analysis (content, pages, tables, key-value pairs, paragraphs). Asynchronous. |
 
     ## Output Formats
 
@@ -187,7 +196,7 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `action` | Yes | `analyze`. |
-    | `source` | Yes | Public URL of the image to analyze. |
+    | `source` | Yes | **Publicly accessible** URL of the image to analyze. No base64 alternative on this tool. |
     | `features` | No | Comma-separated Computer Vision features (default `Read`). Accepted: `Read`, `Caption`, `Tags`, `Objects`, `People`. |
     | `language` | No | Language hint (default `en`, e.g. `fr`). |
     | `outputFormat` | No | `both` (default), `verbose`, or `structured`. |
@@ -212,8 +221,8 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `action` | Yes | `analyze`. |
-    | `source` | Yes | Document URL, or base64 content when `sourceType` is `base64`. |
-    | `sourceType` | No | `url` (default) or `base64`. |
+    | `source` | Yes | **Publicly accessible** document URL, or base64 content when `sourceType` is `base64`. |
+    | `sourceType` | No | `url` (default) or `base64`. Use `base64` whenever the document is not reachable from Azure's network. |
     | `model` | No | Document Intelligence model (default `prebuilt-layout`); see model table below. |
     | `pages` | No | Pages to analyze, e.g. `1-3,5,7-9`. |
     | `locale` | No | Locale hint, e.g. `fr-FR`. |
@@ -269,13 +278,13 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `analyzeImage` | Synchronous OCR and visual analysis of an image by public URL (`source`). `features` selects analysis (default `Read`; also `Caption`, `Tags`, `Objects`, `People`); `language` is a hint. | Raw Azure Image Analysis body: `{ readResult, captionResult, tagsResult, objectsResult, peopleResult }` (subset per requested features) |
+    | `analyzeImage` | Synchronous OCR and visual analysis of an image by **publicly accessible** URL (`source`). `features` selects analysis (default `Read`; also `Caption`, `Tags`, `Objects`, `People`); `language` is a hint. | Raw Azure Image Analysis body: `{ readResult, captionResult, tagsResult, objectsResult, peopleResult }` (subset per requested features) |
 
     ### Document Intelligence
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `analyzeDocument` | Submit a document (`source` URL, or base64 when `sourceType: base64`) to a prebuilt `model`, poll to completion, and return the extraction. `pages`, `locale`, `outputContentFormat` (`text`/`markdown`) and `outputFormat` (`simple`/`raw`) tune the output. | `simple`: flattened text/markdown + key fields. `raw`: full Azure `analyzeResult` `{ pages, tables, keyValuePairs, paragraphs, content }` |
+    | `analyzeDocument` | Submit a document (**publicly accessible** `source` URL, or base64 when `sourceType: base64`) to a prebuilt `model`, poll to completion, and return the extraction. `pages`, `locale`, `outputContentFormat` (`text`/`markdown`) and `outputFormat` (`simple`/`raw`) tune the output. | `simple`: flattened text/markdown + key fields. `raw`: full Azure `analyzeResult` `{ pages, tables, keyValuePairs, paragraphs, content }` |
 
     <Note>
       `Returns` shows the shape of the operation output. These DSUL instructions return the provider body directly (or, on failure, a structured error payload; see *Error Handling*). The MCP `image` / `document` tools wrap the same operations in an MCP tool-result envelope.
@@ -304,7 +313,7 @@ This connector is used by three different roles. Jump to the section that matche
         output: invoice
     ```
 
-    Analyze a base64 document with a page range:
+    Analyze a base64 document with a page range — the fallback when the file has no public URL:
 
     ```yaml
     - Azure OCR.analyzeDocument:
@@ -359,6 +368,7 @@ Both operations return a structured error payload (and emit an `error` event) in
 |-------|---------------|
 | `ConfigurationError` | The targeted service has no endpoint or API key in the connector config |
 | `ValidationError` | `source` argument is empty |
+| `AzureError` | Azure rejected the request (typically HTTP 400); often a `source` URL Azure could not download |
 | `NetworkError` | Endpoint unreachable; check hostname format (no scheme, no path) |
 | `Unauthorized` | Invalid or revoked API key (HTTP 401) |
 | `Forbidden` | The resource exists but the key lacks access, or the API is not enabled (HTTP 403) |
@@ -376,6 +386,7 @@ Both operations return a structured error payload (and emit an `error` event) in
 - **`Unauthorized` (401, invalid key)**: Azure rejected the key. Regenerate or copy a current key from the resource's **Keys and Endpoint** page, and confirm it matches the service you are calling (Computer Vision keys do not work on Document Intelligence and vice versa).
 - **`Forbidden` (403, API not enabled)**: The key is valid but the resource does not expose the requested API. Confirm the resource type (a Document Intelligence key cannot serve Image Analysis) and that the feature is enabled on the Azure resource.
 - **`NetworkError` / `NotFound` (404, bad endpoint)**: Almost always a malformed endpoint. Store the **hostname only** (no `https://`, no path); the connector strips a leading scheme and trailing slash but cannot recover a wrong host.
+- **Azure cannot download the `source` URL**: a URL that works in your browser is not necessarily one Azure can reach. Symptom: a 4xx in `details.body`, e.g. `InvalidRequest - Image URL is badly formatted or not accessible`. Check it needs no authentication, is not on an intranet, and — for blob storage — carries an unexpired SAS token on a publicly reachable account. For documents, `sourceType: base64` sidesteps it.
 - **`Timeout` on `document`**: Document Intelligence is asynchronous: the connector submits the document, then polls for up to 60s. Long or heavy PDFs can exceed this limit. Reduce `pages`, switch to the lighter `prebuilt-read` model, or split the document upstream.
 - **Service-specific gotcha**: `image` is synchronous and `document` is an async submit-and-poll cycle handled internally; both return their error payload instead of raising. After a DSUL call, always branch on `{{result.error}}`; a failed extraction is a normal value, not an exception, so a missing check silently passes the error object downstream.
 
@@ -395,6 +406,13 @@ Both operations return a structured error payload (and emit an `error` event) in
     href="https://learn.microsoft.com/en-us/azure/ai-services/document-intelligence/overview"
   >
     Document Intelligence overview, prebuilt models and the analyze API.
+  </Card>
+  <Card
+    title="Image URL requirements"
+    icon="link"
+    href="https://learn.microsoft.com/en-us/azure/ai-services/computer-vision/how-to/call-analyze-image-40"
+  >
+Microsoft's Analyze API guide: the image URL must be publicly accessible.
   </Card>
   <Card
     title="Tool Agents"
