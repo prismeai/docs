@@ -124,18 +124,22 @@ Advanced model configuration:
 |---------|-------------|
 | **Model** | Primary AI model to use |
 | **Fallback Models** | Backup models if primary fails |
-| **Temperature** | Creativity level (0 = deterministic, 1 = creative) |
-| **Max Tokens** | Limit on response length |
+| **Temperature** | Randomness of the output (0 = deterministic, 1 = balanced, 2 = creative) |
+| **Max Response Tokens** | Maximum length of a **single reply** (one LLM call). Different from Message Token Budget, which limits a whole message |
 
 ### Budget Limits
 
-Control resource usage. Each limit is checked **at the start of every turn**, before the next LLM call — a turn already in flight is never killed mid-way. Leave a field empty to fall back to the profile default (see below); if no `Max Turns` is set at all, the platform's built-in 50-turn hard cap still applies.
+Control resource usage **per message**. Each of these budgets resets at the start of every new user message and is checked at the start of each internal turn, before the next LLM call — a turn already in flight is never killed mid-way. Leave a field empty to fall back to the profile default (see below); if no **Max Turns** is set at all, the platform's built-in 50-turn hard cap still applies.
 
 | Limit | Unit | Default (global) | Description |
 |-------|------|------------------|-------------|
-| **Max Turns** | LLM round-trips | 10 | Number of think→act→observe cycles in the agentic loop before it stops and hands off to the fallback |
-| **Token Budget** | Cumulative input + output tokens | 20,000 | Total tokens across the whole conversation. Cached input reads are weighted at **0.1**, so re-reading cached context is cheap against the budget |
-| **Tool Call Budget** | Tool invocations | 15 | Total tool calls across the whole conversation |
+| **Max Turns** | LLM round-trips | 10 | Number of think→act→observe cycles the agent runs to answer **one message** before it stops and hands off to the fallback |
+| **Message Token Budget** | Cumulative input + output tokens | 20,000 | Total tokens spent answering **one message**, summed across every internal turn and tool call. Cached input reads are weighted at **0.1×**. Resets for each new message |
+| **Tool Call Budget** | Tool invocations | 15 | Total tool calls the agent may make while answering **one message** |
+
+<Note>
+These budgets are **per message**, not per conversation — they bound the work an agent does to answer a single user turn (which may span many internal reasoning steps and tool calls), and start fresh on the next message. The conversation-wide ceiling is a separate mechanism, [`context_budget`](#conversation-context-ceiling), below.
+</Note>
 
 <Note>
 The "global" defaults above are the platform baseline. In practice each agent inherits the defaults of its **profile** (Simple, Workflow, Light, Full, Orchestrator), which the table below spells out. Values you set on the agent override both.
@@ -145,8 +149,8 @@ The "global" defaults above are the platform baseline. In practice each agent in
 
 Higher profiles unlock more autonomy and therefore ship with larger budgets:
 
-| Profile | Max Turns | Token Budget | Tool Calls | Cost Budget |
-|---------|-----------|--------------|------------|-------------|
+| Profile | Max Turns | Message Token Budget | Tool Calls | Cost Budget |
+|---------|-----------|----------------------|------------|-------------|
 | **Simple** | 1 | 50,000 | 0 | — |
 | **Workflow** | 10 | 100,000 | 10 | — |
 | **Light Agent** | 10 | 100,000 | 15 | — |
@@ -154,6 +158,15 @@ Higher profiles unlock more autonomy and therefore ship with larger budgets:
 | **Orchestrator** | 50 | 300,000 | 100 | $5 |
 
 Orchestrators also cap **delegation depth** at 3 levels (Agent A → B → C) to prevent runaway sub-agent chains.
+
+#### Conversation context ceiling
+
+Separate from the per-message budgets above, **`context_budget`** (default **120,000** tokens) caps how large a single conversation's live context can grow — the accumulated history + current request + tool schemas sent to the model on any one call. It is **not** exposed in the settings UI today; it comes from the profile / platform default.
+
+- At **70%** of the ceiling, the runtime compacts the oldest context proactively.
+- At **100%**, it attempts one emergency compaction; if the request still doesn't fit, the turn fails with a *"Request too large… start a new conversation"* message instead of an opaque provider error.
+
+Because context accumulates across turns, this is effectively the limit on how long one conversation can run before you need to start a fresh one — distinct from the per-message **Message Token Budget**, which caps the work done on a single message.
 
 See [Runtime Safeguards](./runtime-safeguards) for what happens when a budget is reached and the other built-in protections that don't require configuration.
 
