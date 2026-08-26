@@ -1,6 +1,6 @@
 ---
 title: 'Tableau'
-description: 'Let Agent Creator agents and Builder automations read and act on Tableau Cloud / Server (REST API 3.x, Metadata GraphQL, VizQL Data Service and Pulse), authenticated with a Personal Access Token.'
+description: 'Let Agent Creator agents and Builder automations read and act on Tableau Cloud or Tableau Server (REST API 3.x, Metadata GraphQL, VizQL Data Service and Pulse), authenticated with a Personal Access Token stored as a workspace secret.'
 ---
 
 <img
@@ -12,73 +12,96 @@ description: 'Let Agent Creator agents and Builder automations read and act on T
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Tableau connector exposes the full Tableau platform (REST API 3.x, Metadata GraphQL, VizQL Data Service and Pulse) to your Prisme.ai workspaces. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions (`Tableau.<operation>`) you call directly from DSUL. Authentication is a Tableau **Personal Access Token** (PAT) you paste into the app configuration; the connector exchanges it server-side for a short-lived `X-Tableau-Auth` session token, so credentials are never exposed to the agent.
+The Tableau connector exposes the Tableau platform (REST API 3.x, Metadata GraphQL, VizQL Data Service and Pulse) to your Prisme.ai workspaces. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions (`Tableau.<operation>`) you call directly from DSUL. Authentication is a Tableau **Personal Access Token** (PAT) stored as a workspace secret; the connector exchanges it server side for a short-lived `X-Tableau-Auth` session token, so the credential is never exposed to the agent.
 
 <CardGroup cols={3}>
-  <Card icon="folder-open" title="Content & Permissions">
-    Browse, publish, download and govern projects, workbooks, views, datasources and Prep flows. Manage tags, permissions and revisions site-wide.
+  <Card icon="folder-open" title="Content and permissions">
+    Browse, publish and govern projects, workbooks, views, datasources and Prep flows. Manage tags, permissions and revisions site wide.
   </Card>
-  <Card icon="chart-line" title="Pulse & Subscriptions">
-    Manage Tableau Pulse metrics and definitions, retrieve BAN insights, and orchestrate email and Pulse subscriptions for end-users.
+  <Card icon="chart-line" title="Pulse and subscriptions">
+    Manage Tableau Pulse metrics and definitions, retrieve Basic Analytics Narrative (BAN) insights, and orchestrate email and Pulse subscriptions.
   </Card>
-  <Card icon="diagram-project" title="Metadata & VizQL Queries">
-    Run arbitrary Metadata API GraphQL queries, search assets, walk workbook/datasource lineage and query published datasources via VizQL Data Service.
+  <Card icon="diagram-project" title="Metadata and VizQL queries">
+    Run Metadata API GraphQL queries, search assets by exact name, walk workbook and datasource lineage, and query published datasources through VizQL Data Service.
   </Card>
 </CardGroup>
 
 ## Who is this for?
 
-This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
+This connector involves three roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to use Tableau. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to use Tableau. Go to Agent builder (Agent Creator).
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and want to know what one-time setup Tableau needs. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and want to know what one-time setup Tableau needs. Go to Platform admin (Governance).
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call `Tableau.<operation>` directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You install the app and write Builder automations (DSUL) that call `Tableau.<operation>`. Go to Workspace builder (DSUL).
   </Card>
 </CardGroup>
 
+## Operating model and runtime identity
+
+Tableau ships a single authentication mode, so there is no credential decision to make: the connector always authenticates with one **Tableau Personal Access Token** per installing workspace. Read this table before you configure anything.
+
+| Question | Answer for this connector |
+|---|---|
+| Credential model | Shared service credential (a Tableau Personal Access Token), one set per installing workspace |
+| Runtime identity at Tableau | The **Tableau user who owns the PAT**, never the invoking end user or the agent builder |
+| Where the credential lives | Four workspace secrets in the installing workspace: `tableauServerUrl`, `tableauSiteContentUrl`, `tableauPatName`, `tableauPatSecret` |
+| What the agent sees | Tool results only. The PAT and the session token are resolved server side |
+| Permission enforcement point | Tableau, based on the site role and content permissions of the PAT owner |
+| Audit attribution at Tableau | All reads and writes are attributed to the PAT owner, not to the person who asked |
+| Supported deployments | Tableau Cloud and Tableau Server. Site administration and server schedule operations are Tableau Server only |
+
+<Warning>
+  Because every call uses one shared PAT, Tableau attributes all activity to that single account, and every agent wired to this connector inherits that account's permissions, including writes and deletes. Create the PAT on a Tableau user whose site role and content permissions are the narrowest that cover your use case, and treat the four workspace secrets as production credentials.
+</Warning>
+
+## How a tool call is resolved
+
+The MCP endpoint is **shared by every workspace that installs the connector**. Tenants are told apart by a signed key, not by a per-workspace URL.
+
+1. On install, the app instance asks the central Tableau workspace for a signed **MCP API Key**. The key encodes the installing workspace id and the URL of that instance's credential webhook, and is signed with an HMAC secret that only the central workspace holds.
+2. On every `tools/call`, the endpoint verifies the key, decodes the workspace id, and calls that workspace's credential webhook.
+3. The credential webhook resolves the four secrets, signs in to Tableau with `POST /api/{apiVersion}/auth/signin`, and returns a short-lived `X-Tableau-Auth` session token plus the resolved `siteId`, `userId`, `serverUrl` and `apiVersion`.
+4. The endpoint caches those credentials for 10 minutes per workspace and dispatches the tool call.
+5. A Tableau PAT allows only one active session. If a concurrent sign-in revoked the cached token, the call returns `401`; the endpoint then forces a fresh sign-in and replays the call once.
+
+`initialize` and `tools/list` are answered without the key. Only `tools/call` requires it. The MCP server announces itself as `tableau-mcp` version `1.0.0`.
+
 ## Prerequisites
 
-- A **Tableau Cloud** site or a **Tableau Server** installation reachable from Prisme.ai.
-- A **Personal Access Token** (PAT) created on the target site under **My Account Settings → Personal Access Tokens**. You need its **name** and its **secret** (the secret is shown only once, at creation).
-- The PAT belongs to a Tableau user; that user must exist on the site and own the rights you want to expose (the connector acts as that user).
-- The site `contentUrl` if you are not on the *Default* site (the segment after `/site/` in the browser URL).
-- Optionally, the **REST API version** to target (defaults to `3.21`; pin only if your Tableau Server release requires it).
+- A **Tableau Cloud** site or a **Tableau Server** installation reachable from Prisme.ai over HTTPS.
+- A **Personal Access Token** created on the target site under **My Account Settings > Personal Access Tokens**. You need its **name** and its **secret**; the secret is displayed only once, at creation.
+- The Tableau user who owns the PAT must exist on the target site and already hold the site role and content permissions you want to expose. The connector never elevates beyond that account.
+- The site `contentUrl` when you are not on the *Default* site: the segment after `/site/` in the Tableau browser URL.
+- Optional: the **REST API version** to target. It defaults to `3.21`.
+- In Prisme.ai, the workspace role required to install an app and to write workspace secrets in Builder.
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
   <Note>
-    **No platform-level credential is required.** Tableau uses the per-workspace credential model: each workspace pastes its own Personal Access Token in the app configuration, and the connector resolves it server-side. There is no shared platform key, no central OAuth client, and no per-user OAuth flow to register.
+    **No platform-level Tableau credential is required.** Every installing workspace supplies its own Personal Access Token, and the connector resolves it server side. There is no shared Tableau account, no central OAuth client and no per-user OAuth flow to register, so [Central OAuth client](/apps-store/marketplace/connectors/central-oauth) does not apply to Tableau. The only platform-side secret is the HMAC signing secret used to mint MCP API keys, and the central workspace generates and stores it automatically on the first key request.
   </Note>
 
-  ## Declare the capability in AI Governance (optional)
+  Publishing a capability is optional. Do it when you want agent builders to pick **Tableau** from the capability catalog instead of wiring an MCP endpoint by hand.
 
-  To let agent builders pick Tableau from the capability catalog instead of pasting an MCP endpoint URL by hand, declare it once as a named capability.
+  Tableau ships no configuration app, so the button-driven paths of the shared guide do not exist here: there is no **Install capability** action and no **Add to catalog** action. Use the manual path, [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance), and enter these Tableau values:
 
-  <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) a **Tableau** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to a Tableau app instance's **MCP Endpoint**, and set its **Scope** to:
+  | Capability field | Value for Tableau |
+  |---|---|
+  | Capability type | `mcp` |
+  | Server URL (**SSE/WebSocket URL**) | The **MCP Endpoint** field of an installed Tableau app instance. It is the same shared URL for every workspace |
+  | **Scope** | `context_id,agent_id,user_id`. See [What the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means) |
+  | Request header | The workspace's **MCP API Key**, added exactly as shown in [Agent builder (Agent Creator)](#agent-builder-agent-creator). The key, not the URL, is what selects the workspace whose Tableau credentials are used |
+  | Authorization block | None. Tableau has no per-user OAuth flow, so no `oauth2` block is added |
 
-      ```text
-      context_id,agent_id,user_id
-      ```
-
-      The `agent_id` in the scope lets the connector identify the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
-    </Step>
-  </Steps>
+  Because the endpoint is shared and the key carries the workspace identity, a capability you publish here always resolves to the credentials of the workspace whose key it carries. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
 
   <Warning>
-    Declaring the capability makes the connector **discoverable**; the Tableau credentials still live in the workspace that owns the app instance the capability points at. Each workspace that installs Tableau supplies its own PAT; there is no OAuth auth-config JSON to attach in Governance.
+    This connector has no per-agent allowlist. The final step of the shared guide, allowlisting each agent at the connector, has no equivalent for Tableau: any agent that holds the endpoint URL and a valid workspace key can call every tool with that workspace's PAT, and [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization) therefore collapses into a single gate here. Publish a capability only for a workspace whose PAT you are comfortable exposing to every builder in the organization, and keep the key out of agent instructions, prompts and logs.
   </Warning>
 </Accordion>
 
@@ -91,115 +114,135 @@ This connector is used by three different roles. Jump to the section that matche
     **Goal:** let an agent you build in Agent Creator query and act on Tableau through MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Tableau app in a workspace (see the *Workspace builder* tab) so a PAT and an **MCP Endpoint** exist. The *Platform admin setup* accordion above is optional (it only publishes a reusable capability).
+      Before an agent can call the connector, a workspace builder must have installed the Tableau app in a workspace and filled the four Tableau secrets, as described in [Workspace builder (DSUL)](#workspace-builder-dsul). Installation is what generates the **MCP Endpoint** and the **MCP API Key** you need here.
     </Note>
 
-    The Tableau credential is resolved server-side from the app configuration, never exposed to the agent. Your agent is identified by the `agent_id` that Agent Creator injects through the capability *Scope*.
+    The Tableau credential is resolved server side from the installing workspace's secrets and is never exposed to the agent. Tableau sees the PAT owner, not the end user, so the agent inherits exactly that account's permissions.
 
     <Steps>
-      <Step title="Install and configure Tableau in a workspace">
-        Follow the *Workspace builder* tab: install **Tableau** in a workspace and paste your Personal Access Token (`patName`, `patSecret`) plus `serverUrl` (and `siteContentUrl` if not the Default site). On install, an **MCP Endpoint** is generated automatically.
+      <Step title="Collect the endpoint and the key">
+        Ask the workspace builder for the two read-only values in the Tableau app instance configuration: **MCP Endpoint** and **MCP API Key**. Treat the key as a secret: it grants full use of that workspace's Tableau credential.
       </Step>
       <Step title="Add the MCP capability to your agent">
-        In your agent in Agent Creator, add a capability pointing at that workspace's **MCP Endpoint** URL, and set its **Scope** to:
+        In your agent in Agent Creator, add a capability pointing at the **MCP Endpoint** URL, set its **Scope** to:
 
         ```text
         context_id,agent_id,user_id
         ```
 
-        If a *Platform admin* has published a **Tableau** capability in the catalog (see the accordion above), pick it instead; the endpoint and Scope are already wired.
+        and add the **MCP API Key** value as this request header:
+
+        ```text
+        mcp-api-key: <MCP API Key value>
+        ```
+
+        The **Scope** field lists the identifiers Agent Creator injects into every call; it is not a list of Tableau permissions. See [What the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means).
+
+        If a platform admin published a **Tableau** capability in the catalog, as described in [Platform admin (Governance): one-time platform setup](#platform-admin-governance-one-time-platform-setup), pick it instead; the endpoint, the scope and the header are already wired.
       </Step>
-      <Step title="Use it">
-        Ask the agent a Tableau question. It calls the relevant tool (`workbooks`, `views`, `vizqlData`, …) and grounds its answer on the result.
+      <Step title="Save and publish the agent">
+        Select **Save**, then publish the agent so the capability is active outside the playground.
+      </Step>
+      <Step title="Verify with a read-only call">
+        Ask the agent a question that resolves to a read, for example "List the workbooks in the Marketing project". A correct setup returns a workbook list. Missing or malformed header values fail before Tableau is contacted, with the JSON-RPC errors listed in [MCP endpoint errors](#mcp-endpoint-errors).
       </Step>
     </Steps>
 
     ## Brief the agent in its system prompt
 
-    Wiring the capability is not enough: the agent must know the tools exist and when to use them. Copy-pasteable starter:
+    Wiring the capability is not enough: the agent must know the tools exist and when to use them. Use this as a starting point and adapt the trigger words to your context.
 
     ```text
-    You have access to the Tableau MCP server. Use it whenever the user asks about Tableau content (workbooks, views, datasources, projects, Prep flows, schedules, jobs, subscriptions, Pulse metrics or insights) or wants to query a published datasource via VizQL Data Service or run a Metadata API GraphQL query. Examples: "List the workbooks in the Marketing project", "Refresh the Sales datasource now", "Show the BAN insight for the Revenue metric", "What datasources feed the Quarterly Review workbook?". Prefer the vizqlData tool for analytical questions (aggregations, top N, filters). Prefer calling the tools directly over guessing, and confirm with the user before any destructive action (delete a workbook, cancel a job, remove a permission).
+    You have access to the Tableau MCP server. Use it whenever the user asks about Tableau content (workbooks, views, datasources, projects, Prep flows, schedules, jobs, subscriptions, Pulse metrics or insights), wants to query a published datasource, or wants to trace lineage. Prefer the vizqlData tool for analytical questions (aggregations, top N, filters) and call vizqlData with action readMetadata before queryDatasource to discover the exact field captions. To read a single view, use views with action getByPath or a name filter instead of listing the whole site. Never claim you can attach an image, PDF or file: those actions are not available, so call the matching get action and share the webpageUrl instead. Ask the user to confirm before any destructive action (deleting a workbook, datasource, project, group or schedule, cancelling a job, removing a permission).
     ```
 
-    Refine the trigger keywords (site names, project names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
-
     <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL of the Tableau app instance.
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP**, paste the **MCP Endpoint** URL, and add the same request header.
     </Note>
 
-    ## Available Tools
+    ## Available tools
 
-    The Tableau MCP follows a dispatcher pattern: each tool exposes multiple operations selected by an `action` argument. The argument list per action is documented in the tool's own `description`.
+    The Tableau MCP server exposes **20 entity tools**. Each tool takes a required `action` argument that selects the concrete operation, plus the parameters for that action. The per-action parameter list is documented in each tool's own `description`, which the agent reads at `tools/list` time.
 
-    ### Sites & Users
+    `siteId` and `userId` are injected from the resolved session whenever you omit them, so an agent normally never passes them.
 
-    | Tool | Description |
-    |------|-------------|
-    | `sites` | Manage Tableau sites (Server-only ops; on Tableau Cloud most actions return 403). Actions: `list`, `create`, `get`, `update`, `delete`, `getRecentlyViewed`. |
-    | `users` | Manage users on a site. Actions: `list`, `get`, `addToSite`, `update`, `removeFromSite`, `getGroups`. |
-    | `groups` | Manage user groups. Actions: `list`, `create`, `update`, `delete`, `addUser`, `removeUser`, `getUsers`. |
+    ### Sites, users and groups
 
-    ### Content (Projects, Workbooks, Views)
+    | Tool | Actions |
+    |------|---------|
+    | `sites` | `list`, `create`, `get`, `update`, `delete`, `getRecentlyViewed`. Site administration is Tableau Server only; on Tableau Cloud those actions are rejected by Tableau. |
+    | `users` | `list`, `get`, `addToSite`, `update`, `removeFromSite`, `getGroups`. |
+    | `groups` | `list`, `create`, `update`, `delete`, `addUser`, `removeUser`, `getUsers`. |
 
-    | Tool | Description |
-    |------|-------------|
-    | `projects` | Manage Tableau content projects (folders). Actions: `list`, `create`, `update`, `delete`. |
-    | `workbooks` | Manage workbooks: CRUD, downloads (twb/twbx, PDF, PowerPoint, preview), revisions, connections, permissions, tags. Binary downloads are not inline; call `get` and share `webpageUrl`. |
-    | `views` | Manage views: image/PDF/CSV/Excel exports, lookup by id or path, server-side data filters, permissions and tags. |
+    ### Projects, workbooks and views
 
-    ### Datasources & Flows
+    | Tool | Actions |
+    |------|---------|
+    | `projects` | `list`, `create`, `update`, `delete`. |
+    | `workbooks` | `list`, `get`, `queryViews`, `getConnections`, `getRevisions`, `queryPermissions`, `publish`, `update`, `updateNow`, `updateConnection`, `delete`, `addPermissions`, `deletePermission`, `addTags`, `deleteTag`, plus the binary `download`, `downloadPdf`, `downloadPowerPoint`, `downloadPreviewImage`, `downloadRevision`. |
+    | `views` | `list`, `get`, `getByPath`, `getData`, `getSummaryData`, `queryPermissions`, `addPermissions`, `deletePermission`, `addTags`, `deleteTag`, plus the binary `getImage`, `getPdf`, `getCrosstabExcel`. |
 
-    | Tool | Description |
-    |------|-------------|
-    | `datasources` | Manage published datasources: CRUD, downloads, revisions, connections, permissions, tags, immediate extract refresh (`updateNow`). |
-    | `flows` | Manage Tableau Prep flows: CRUD, run, run history, downloads, connections, permissions. |
+    ### Datasources and flows
 
-    ### Scheduling, Jobs & Refresh Tasks
+    | Tool | Actions |
+    |------|---------|
+    | `datasources` | `list`, `get`, `getConnections`, `getRevisions`, `queryPermissions`, `publish`, `update`, `updateNow` (triggers an extract refresh), `updateConnection`, `delete`, `addPermissions`, `deletePermission`, `addTags`, `deleteTag`, plus the binary `download`, `downloadRevision`. |
+    | `flows` | `list`, `get`, `run`, `getRunStatus`, `listRuns`, `getConnections`, `queryPermissions`, `addPermissions`, `deletePermission`, `delete`, plus the binary `download`. |
 
-    | Tool | Description |
-    |------|-------------|
-    | `schedules` | Server schedules + add workbook/datasource/flow tasks to them. |
-    | `jobs` | Inspect background jobs: `list`, `get` status, `cancel`. |
-    | `extractRefreshTasks` | Manage extract refresh tasks (one-shot or scheduled): `list`, `get`, `run`, `delete`. |
+    ### Scheduling, jobs and refresh tasks
 
-    ### Subscriptions, Webhooks & Favorites
+    | Tool | Actions |
+    |------|---------|
+    | `schedules` | `list`, `get`, `create`, `update`, `delete`, `addWorkbook`, `addDatasource`, `addFlowTask`. Server schedules are Tableau Server only. |
+    | `jobs` | `list`, `get`, `cancel`. |
+    | `extractRefreshTasks` | `list`, `get`, `run`, `delete`. |
 
-    | Tool | Description |
-    |------|-------------|
-    | `subscriptions` | Email subscriptions to views/workbooks. Actions: `list`, `get`, `create`, `update`, `delete`. |
-    | `webhooks` | Tableau webhooks (event notifications). Actions: `list`, `get`, `create`, `update`, `delete`, `test`. |
-    | `favorites` | Per-user favorites. Actions: `list`, `add`, `delete`. |
+    ### Subscriptions, webhooks and favorites
+
+    | Tool | Actions |
+    |------|---------|
+    | `subscriptions` | `list`, `get`, `create`, `update`, `delete`. |
+    | `webhooks` | `list`, `get`, `create`, `update`, `delete`, `test`. |
+    | `favorites` | `list`, `add`, `delete`. |
 
     ### Tableau Pulse
 
-    | Tool | Description |
-    |------|-------------|
-    | `metrics` | Pulse metrics (instances). Actions: `list`, `get`, `create`, `delete`. |
-    | `metricDefinitions` | Pulse metric definitions (templates). Actions: `list`, `get`, `create`, `update`, `delete`. |
-    | `pulseSubscriptions` | Pulse subscriptions to metrics. Actions: `list`, `create`, `delete`. |
-    | `insights` | Get a Pulse Basic Analytics Narrative (BAN) insight for a metric. Action: `get`. |
+    | Tool | Actions |
+    |------|---------|
+    | `metrics` | `list`, `get`, `create`, `delete`. |
+    | `metricDefinitions` | `list`, `get`, `create`, `update`, `delete`. |
+    | `pulseSubscriptions` | `list`, `create`, `delete`. |
+    | `insights` | `get` (Basic Analytics Narrative bundle for a metric). |
 
-    ### Metadata & VizQL Data Service
+    ### Metadata and VizQL Data Service
 
-    | Tool | Description |
-    |------|-------------|
-    | `metadata` | Tableau Metadata API (GraphQL). Actions: `query`, `search`, `workbookLineage`, `datasourceLineage`. |
-    | `vizqlData` | Query a published datasource via VizQL Data Service, the preferred tool for analytical questions. Actions: `readMetadata`, `queryDatasource`. |
+    | Tool | Actions |
+    |------|---------|
+    | `metadata` | `query`, `search`, `workbookLineage`, `datasourceLineage`. |
+    | `vizqlData` | `readMetadata`, `queryDatasource`. Preferred for analytical questions. |
 
-    ## Output Formats
+    ## Output formats and payload limits
 
     Every tool accepts an `outputFormat` argument that controls the MCP response shape:
 
-    - **`verbose`** (default): human-readable text for LLM consumption.
-    - **`structured`**: machine-readable JSON in `structuredContent`.
-    - **`both`**: both text and structured content.
+    - `verbose` (default): human-readable text for LLM consumption.
+    - `structured`: JSON in `structuredContent`.
+    - `both`: text and structured content.
 
-    <Note>
-      Binary outputs (workbook/view image, PDF, PowerPoint, crosstab Excel, file downloads) cannot be returned inline. The connector instead returns metadata; call `get` and share the `webpageUrl`, or use `views`/`getData` and `vizqlData` for the underlying data.
-    </Note>
+    Responses are bounded before they reach the agent:
 
-    ## Tool Details
+    | Limit | Value | Effect |
+    |---|---|---|
+    | Page size | `100` | `pageSize` and `page_size` are clamped to `100`. Read `pagination.totalAvailable` to know how much is left. |
+    | Array items | `100` | Every array in a response is truncated to its first 100 items. |
+    | Text responses | `20000` characters | CSV from `views` `getData` and `getSummaryData` is cut on the last complete row, and the reply states how many rows were kept out of the total. |
+    | Nested objects | Reference collapsing | Nested objects that look like references are reduced to `id`, `name`, `type` and `contentUrl`. |
+
+    <Warning>
+      **Binary content is not available through MCP.** These operations are short-circuited with an explanatory message instead of a file: `views` `getImage`, `getPdf`, `getCrosstabExcel`; `workbooks` `download`, `downloadPdf`, `downloadPreviewImage`, `downloadPowerPoint`, `downloadRevision`; `datasources` `download`, `downloadRevision`; `flows` `download`. To give a user access to that content, call the matching `get` action and share the asset `webpageUrl`. For the underlying numbers, use `views` `getData` or the `vizqlData` tool.
+    </Warning>
+
+    ## Tool details
 
     ### `workbooks`
 
@@ -216,11 +259,13 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | Yes | One of `list`, `get`, `queryViews`, `getConnections`, `getRevisions`, `queryPermissions`, `publish`, `update`, `updateNow`, `updateConnection`, `delete`, `addPermissions`, `deletePermission`, `addTags`, `deleteTag`, plus the binary `download*` actions. |
+    | `action` | Yes | One of the actions listed above. |
     | `workbookId` | Conditional | Required for any per-workbook action. |
-    | `request_payload` | Conditional | Required for `publish`. The workbook XML metadata. |
-    | `permissions` | Conditional | Required for `addPermissions`. Tableau capabilities granted to grantees. |
-    | `tags` | Conditional | Required for `addTags`. Tag set object. |
+    | `request_payload` | Conditional | Required for `publish`. XML metadata describing the workbook. |
+    | `permissions` | Conditional | Required for `addPermissions`. A `granteeCapabilities` array, where each entry carries a `user` or `group` object with its `id`, and a `capabilities.capability` array of `{"name": "Read", "mode": "Allow"}` entries. |
+    | `granteeType`, `granteeId`, `capabilityName`, `capabilityMode` | Conditional | All four are required for `deletePermission`. |
+    | `tags` / `tagName` | Conditional | `tags` for `addTags`, `tagName` for `deleteTag`. |
+    | `filter`, `sort`, `fields`, `pageSize`, `pageNumber` | No | Tableau REST list parameters. |
 
     ### `views`
 
@@ -229,7 +274,7 @@ This connector is used by three different roles. Jump to the section that matche
       "name": "views",
       "arguments": {
         "action": "getData",
-        "viewId": "{{viewId}}",
+        "viewId": "<view LUID>",
         "viewFilters": { "Region": "EMEA" }
       }
     }
@@ -237,10 +282,10 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | Yes | One of `list`, `get`, `getByPath`, `getData`, `getSummaryData`, `queryPermissions`, `addPermissions`, `deletePermission`, `addTags`, `deleteTag`, plus the binary `getImage` / `getPdf` / `getCrosstabExcel`. |
-    | `viewId` | Conditional | Required for any action targeting a view by id. |
-    | `viewUrl` | Conditional | Required for `getByPath` (`Workbook/sheets/Sheet`). |
-    | `viewFilters` | No | Server-side filters for `getData` / `getSummaryData`: `{"Field": "value"}` sent as `vf_<field>=<value>`. |
+    | `action` | Yes | One of the actions listed above. |
+    | `viewId` | Conditional | Required for any action that targets a view by id. |
+    | `viewUrl` | Conditional | Required for `getByPath`, in the form `Workbook/sheets/Sheet`. Only the last segment is matched, as a `viewUrlName:eq:` filter. |
+    | `viewFilters` | No | Server-side filters for `getData` and `getSummaryData`: `{"Field name": "value"}` is sent as `vf_<field>=<value>`. Field names are the column captions shown in the view; run one unfiltered `getData` to read them from the CSV header. |
 
     ### `datasources`
 
@@ -249,17 +294,17 @@ This connector is used by three different roles. Jump to the section that matche
       "name": "datasources",
       "arguments": {
         "action": "updateNow",
-        "datasourceId": "{{datasourceId}}"
+        "datasourceId": "<datasource LUID>"
       }
     }
     ```
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | Yes | One of `list`, `get`, `getConnections`, `getRevisions`, `queryPermissions`, `publish`, `update`, `updateNow` (triggers an extract refresh), `updateConnection`, `delete`, `addPermissions`, `deletePermission`, `addTags`, `deleteTag`, plus binary `download*`. |
+    | `action` | Yes | One of the actions listed above. |
     | `datasourceId` | Conditional | Required for any per-datasource action. |
-    | `connectionId` | Conditional | Required for `updateConnection`. |
-    | `datasource` | Conditional | Required for `update`. Datasource settings object. |
+    | `connectionId` and `connection` | Conditional | Both required for `updateConnection`. |
+    | `datasource` | Conditional | Required for `update`: `name`, `projectId`, `isCertified`, `certificationNote`. |
 
     ### `metadata`
 
@@ -268,19 +313,21 @@ This connector is used by three different roles. Jump to the section that matche
       "name": "metadata",
       "arguments": {
         "action": "search",
-        "name": "Sales"
+        "name": "Quarterly Review"
       }
     }
     ```
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | Yes | One of `query`, `search`, `workbookLineage`, `datasourceLineage`. |
+    | `action` | Yes | `query`, `search`, `workbookLineage` or `datasourceLineage`. |
     | `query` | Conditional | GraphQL document. Required for `query`. |
-    | `variables` | No | Variables map for the GraphQL query. |
-    | `name` | Conditional | Exact-name match used by `search` (the Metadata API has no fuzzy search). |
-    | `workbookLuid` | Conditional | Required for `workbookLineage`. |
-    | `datasourceLuid` | Conditional | Required for `datasourceLineage`. |
+    | `variables` | No | Variables map, used with `query` only. |
+    | `name` | Conditional | Required for `search`. The Metadata API has no fuzzy search, so the match is on the **exact** asset name. For anything else, use `query` with your own filter. |
+    | `workbookLuid` | Conditional | Required for `workbookLineage`. Returns `upstreamDatasources` and `upstreamDatabases`. |
+    | `datasourceLuid` | Conditional | Required for `datasourceLineage`. Returns `upstreamDatabases` and `downstreamWorkbooks`. |
+
+    The Metadata API can return non-fatal warnings in `errors` alongside valid `data`, for example when results were filtered because the PAT owner cannot see some assets. The connector treats `errors` as fatal only when no `data` came back.
 
     ### `vizqlData`
 
@@ -289,11 +336,14 @@ This connector is used by three different roles. Jump to the section that matche
       "name": "vizqlData",
       "arguments": {
         "action": "queryDatasource",
-        "datasource": { "datasourceLuid": "{{datasourceLuid}}" },
+        "datasource": { "datasourceLuid": "<datasource LUID>" },
         "query": {
           "fields": [
             { "fieldCaption": "Region" },
-            { "fieldCaption": "Sales", "function": "SUM" }
+            { "fieldCaption": "Sales", "function": "SUM", "fieldAlias": "Total" }
+          ],
+          "filters": [
+            { "field": { "fieldCaption": "Region" }, "filterType": "SET", "values": ["EMEA"] }
           ]
         }
       }
@@ -302,10 +352,12 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | Yes | `readMetadata` or `queryDatasource`. Always `readMetadata` first to discover exact field captions. |
-    | `datasource` | Yes | Object with `datasourceLuid` (from `workbooks`/`getConnections` or `datasources`/`list`). |
-    | `query` | Conditional | Required for `queryDatasource`. Must contain a `fields` array; supports `filters` (SET, QUANTITATIVE_*, MATCH, TOP) and aggregation `function` (SUM, AVG, COUNTD, …). |
-    | `options` | No | `returnFormat` (`OBJECTS` / `ARRAYS`), `debug`. |
+    | `action` | Yes | `readMetadata` or `queryDatasource`. Call `readMetadata` first to discover the exact field captions. |
+    | `datasource` | Yes | Object with `datasourceLuid`, taken from `workbooks` `getConnections` (field `datasource.id`) or `datasources` `list`. |
+    | `query` | Conditional | Required for `queryDatasource`. Must contain `fields`; supports `filters` and per-field `function`, `fieldAlias`, `sortDirection`, `sortPriority`. |
+    | `options` | No | `returnFormat` (`OBJECTS` or `ARRAYS`) and `debug`. |
+
+    Supported aggregation functions: `SUM`, `AVG`, `MEDIAN`, `COUNT`, `COUNTD`, `MIN`, `MAX`, `STDEV`, `VAR`, `YEAR`, `QUARTER`, `MONTH`, `WEEK`, `DAY`. Supported `filterType` values: `SET` (`values`, `exclude`), `QUANTITATIVE_NUMERICAL` and `QUANTITATIVE_DATE` (`quantitativeFilterType` `MIN`, `MAX`, `RANGE`, `ONLY_NULL`, `ONLY_NON_NULL`, plus `min`, `max`, `minDate`, `maxDate`), `MATCH` (`contains`, `startsWith`, `endsWith`), `DATE`, and `TOP` (`howMany`, `direction`).
 
     ### `pulseSubscriptions`
 
@@ -315,8 +367,8 @@ This connector is used by three different roles. Jump to the section that matche
       "arguments": {
         "action": "create",
         "subscription": {
-          "metric_id": "{{metricId}}",
-          "user_id": "{{userId}}"
+          "metric_id": "<metric id>",
+          "user_id": "<user id>"
         }
       }
     }
@@ -325,218 +377,261 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `action` | Yes | `list`, `create` or `delete`. |
-    | `subscription` | Conditional | Required for `create`. Must include `metric_id` and `user_id`. |
+    | `subscription` | Conditional | Required for `create`, with `metric_id` and `user_id`. |
     | `subscriptionId` | Conditional | Required for `delete`. |
-    | `metric_id` / `user_id` | No | Filters for `list`. |
+    | `metric_id`, `user_id`, `page_size`, `page_token` | No | Filters and paging for `list`. |
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
     ## Workspace builder
 
+    **Goal:** install the connector in a workspace, supply the Tableau Personal Access Token, and call Tableau operations from your automations.
+
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **Tableau** and install it
-    3. Open the app instance configuration and fill in the Personal Access Token fields (`patName`, `patSecret`, `serverUrl`, and `siteContentUrl` if you are not on the Default site)
+    <Note>
+      Tableau does **not** follow the standard flow described in [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace). Three differences change what you do here:
+
+      - **No configuration app.** Credentials are typed into the workspace **Secrets** in Builder, not into a configuration app, so the warning on the shared page about never editing secrets by hand does not apply to this connector.
+      - **No authorized-agents allowlist.** Tableau provisions no `AuthorizedAgents` secret and performs no per-agent check, so [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector) has no equivalent step and the `This agent is not authorized to use this connector.` error never occurs.
+      - **A shared MCP endpoint.** The endpoint is not derived from your workspace slug; it is one central URL, and your workspace's **MCP API Key** is what identifies you on it.
+
+      Follow the steps below instead. The Tableau equivalent of [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall) is the last section of this tab.
+    </Note>
+
+    <Steps>
+      <Step title="Install the app">
+        In your workspace, open **Apps**, search for **Tableau** and install it. Installation generates the read-only **MCP Endpoint** and **MCP API Key** values, and provisions four empty Tableau secrets in the workspace.
+      </Step>
+      <Step title="Fill the Tableau secrets">
+        Open **Secrets** in the workspace and fill `tableauServerUrl`, `tableauPatName` and `tableauPatSecret`. Fill `tableauSiteContentUrl` only when you are not on the *Default* site. Each secret carries a description explaining what it expects. Select **Save**.
+      </Step>
+      <Step title="Optional: pin the REST API version">
+        In the app instance configuration, set **REST API Version** only when your Tableau Server release requires a version other than `3.21`.
+      </Step>
+      <Step title="Verify with a read-only call">
+        Run an automation containing a single `Tableau.listProjects` instruction. A correct setup returns the Tableau REST response body listing your projects. A workspace with unfilled secrets returns `{ "error": "Tableau auth not configured. Required: patName, patSecret, serverUrl." }` without contacting Tableau.
+      </Step>
+    </Steps>
+
+    <Note>
+      The four credential fields in the app instance configuration (`serverUrl`, `siteContentUrl`, `patName`, `patSecret`) are bound to the workspace secrets on install. Edit the values in **Secrets**, not in the app configuration form, so the binding is preserved.
+    </Note>
 
     ## Configuration
 
     | Field | Type | Required | Description |
     |-------|------|----------|-------------|
-    | `serverUrl` | string | Yes | Full URL of the Tableau pod / Server (e.g. `https://10ax.online.tableau.com`). No trailing slash. |
-    | `siteContentUrl` | string | No | Site identifier from the URL (after `/site/`). Leave empty for the *Default* site on Tableau Server. |
-    | `patName` | string | Yes | Personal Access Token **name** (My Account Settings → Personal Access Tokens). |
-    | `patSecret` | string (secret) | Yes | Personal Access Token **secret value**. Stored as a workspace secret. Shown only once at creation. |
+    | `serverUrl` | string | Yes | Full URL of the Tableau Cloud pod or Tableau Server instance, for example `https://<pod>.online.tableau.com` or `https://tableau.example.com`. Trailing slashes are stripped. Bound to the `tableauServerUrl` secret. |
+    | `siteContentUrl` | string | No | Site identifier from the Tableau URL, the segment after `/site/`. Leave empty for the *Default* site on Tableau Server. Bound to the `tableauSiteContentUrl` secret. |
+    | `patName` | string | Yes | Personal Access Token name. Bound to the `tableauPatName` secret. |
+    | `patSecret` | string (secret) | Yes | Personal Access Token secret value, shown only once at creation. Bound to the `tableauPatSecret` secret. |
     | `apiVersion` | string | No | REST API version. Defaults to `3.21`. |
-    | `mcpEndpoint` | string | Auto-populated on install | Endpoint URL of this app instance's MCP server; give this to the *Agent builder* tab. |
+    | `mcpEndpoint` | string | Read-only | URL of the shared MCP endpoint. Hand this to the [agent builder](#agent-builder-agent-creator). |
+    | `mcpApiKey` | string | Read-only | Signed key identifying this workspace on the shared MCP endpoint. Auto-generated on install. Hand this to the [agent builder](#agent-builder-agent-creator) and treat it as a secret. |
 
-    The connector exchanges the PAT for an `X-Tableau-Auth` session token via `POST /api/{apiVersion}/auth/signin` and caches it (~3h). The auth mode is fixed:
+    ### Authentication
 
-    | Auth mode | What you provide | Best for |
-    |-----------|------------------|----------|
-    | **Personal Access Token (PAT)** | `patName` + `patSecret` for a Tableau user | All Tableau Cloud and Server setups; no per-user OAuth flow needed |
+    | Auth mode | What you provide | When to use it |
+    |-----------|------------------|----------------|
+    | **Personal Access Token** (only mode) | `patName` and `patSecret` for a Tableau user, plus `serverUrl` and, off the Default site, `siteContentUrl` | Every Tableau Cloud and Tableau Server setup. There is no per-user OAuth flow and no alternative mode |
+
+    The connector exchanges the PAT for an `X-Tableau-Auth` session token with `POST /api/{apiVersion}/auth/signin` and caches the token for 3 hours, keyed on the PAT name, the server URL and the site, so several PATs or sites stay isolated.
 
     <Note>
-      A Tableau PAT allows a single active session, so a concurrent sign-in elsewhere (a script, another tool, a parallel agent run) revokes the cached token. The connector handles this with a retry-on-401 that forces a fresh sign-in; occasional revocations are transparent.
+      A Tableau PAT allows a single active session, so a concurrent sign-in elsewhere (a script, another tool, a parallel agent run) revokes the cached token. The connector detects the resulting `401`, forces a fresh sign-in and replays the call once, so occasional revocations are transparent. Persistent `401` responses mean the PAT itself is wrong or expired.
     </Note>
 
-    ## Available Instructions
+    ### API surfaces reached
 
-    Every instruction resolves credentials from the workspace configuration and reuses the cached `X-Tableau-Auth` session token.
+    | Surface | Path | Version handling |
+    |---|---|---|
+    | REST API | `/api/{apiVersion}/...` | Follows the `apiVersion` setting, default `3.21` |
+    | Metadata API (GraphQL) | `/api/metadata/graphql` | Unversioned |
+    | VizQL Data Service | `/api/v1/vizql-data-service/read-metadata` and `/query-datasource` | Fixed at `v1` |
+    | Tableau Pulse | `/api/-/pulse/...` | Unversioned |
 
-    ### Sites & Users
+    ## Available instructions
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `Tableau.listSites` | List sites the current user can access. `pageNumber`, `pageSize` paginate. | `{ sites: [{ id, name, contentUrl }], pagination }` |
-    | `Tableau.createSite` | Create a site (Tableau Server only): `site` = `{ name, contentUrl, adminMode, state }`. | `{ site }` |
-    | `Tableau.getSite` | Get a site by `key`. | `{ site }` |
-    | `Tableau.updateSite` | Update site settings: `site`. | `{ site }` |
-    | `Tableau.deleteSite` | Delete a site by `siteId`. | Empty (HTTP 204) |
-    | `Tableau.getRecentlyViewed` | Recently viewed content for the current user. | `{ recentlyViewed: { recents } }` |
-    | `Tableau.listUsers` | List users on the site: `filter`, `sort`, `fields`, pagination. | `{ users: [{ id, name, siteRole }], pagination }` |
-    | `Tableau.getUser` | Get a user by `userId`. | `{ user }` |
-    | `Tableau.addUserToSite` | Add a user: `user` = `{ name, siteRole, authSetting }`. | `{ user }` |
-    | `Tableau.updateUser` | Update a user (`userId`, `user`). | `{ user }` |
-    | `Tableau.removeUserFromSite` | Remove a user (`userId`, optional `mapAssetsTo`). | Empty (HTTP 204) |
-    | `Tableau.getUserGroups` | List groups a user belongs to (`userId`). | `{ groups, pagination }` |
-    | `Tableau.listGroups` | List groups: `filter`, `sort`, pagination. | `{ groups, pagination }` |
-    | `Tableau.createGroup` | Create a local or AD/SCIM group: `group`, `asJob`. | `{ group }` |
-    | `Tableau.updateGroup` | Update a group (`groupId`, `group`, `asJob`). | `{ group }` |
-    | `Tableau.deleteGroup` | Delete a group (`groupId`). | Empty (HTTP 204) |
-    | `Tableau.addUserToGroup` | Add a user to a group (`groupId`, `user`). | `{ user }` |
-    | `Tableau.removeUserFromGroup` | Remove a user from a group (`groupId`, `userId`). | Empty (HTTP 204) |
-    | `Tableau.getGroupUsers` | List users in a group (`groupId`). | `{ users, pagination }` |
+    The app exposes **131 instructions**, one per Tableau operation, callable as `Tableau.<operation>`. Every instruction resolves the credential from the workspace secrets and reuses the cached session token.
 
-    ### Projects, Workbooks & Views
+    On success, an instruction returns the **Tableau API response body unchanged**: REST 3.x JSON for REST operations, the GraphQL envelope `{ "data": { ... } }` for Metadata operations, and Pulse JSON for Pulse operations. On an API failure it returns `{ success: false, error: { isError: true, content: [...] }, data, status }`, and when the credential cannot be resolved it returns `{ error: "..." }`. Test `success` or `error` before you read the payload.
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `Tableau.listProjects` | List projects: `filter`, `sort`, pagination. | `{ projects: [{ id, name, parentProjectId }], pagination }` |
-    | `Tableau.createProject` | Create a project: `project`, `publishSamples`. | `{ project }` |
-    | `Tableau.updateProject` | Update a project (`projectId`, `project`). | `{ project }` |
-    | `Tableau.deleteProject` | Delete a project (`projectId`). | Empty (HTTP 204) |
-    | `Tableau.listWorkbooks` | List workbooks: `filter`, `sort`, `fields`, pagination. | `{ workbooks: [{ id, name, projectId, webpageUrl }], pagination }` |
-    | `Tableau.getWorkbook` | Get a workbook by `workbookId`. | `{ workbook }` |
-    | `Tableau.publishWorkbook` | Publish a workbook: file payload + `request_payload` XML, `overwrite`, `asJob`. | `{ workbook }` |
-    | `Tableau.updateWorkbook` | Update a workbook (`workbookId`, `workbook`). | `{ workbook }` |
-    | `Tableau.updateWorkbookNow` | Trigger an immediate extract refresh (`workbookId`). | `{ job }` |
-    | `Tableau.deleteWorkbook` | Delete a workbook (`workbookId`). | Empty (HTTP 204) |
-    | `Tableau.downloadWorkbook` | Download `.twb` / `.twbx` (`workbookId`, `includeExtract`). | Binary (twb/twbx) |
-    | `Tableau.downloadWorkbookPdf` | Render workbook as PDF (`workbookId`, `type`, `orientation`, `maxAge`). | Binary (PDF) |
-    | `Tableau.downloadWorkbookPreviewImage` | Workbook preview image (`workbookId`). | Binary (image) |
-    | `Tableau.downloadWorkbookPowerPoint` | Export workbook to PowerPoint (`workbookId`, `maxAge`). | Binary (pptx) |
-    | `Tableau.downloadWorkbookRevision` | Download a specific revision (`workbookId`, `revisionNumber`). | Binary (twb/twbx) |
-    | `Tableau.getWorkbookRevisions` | List workbook revisions (`workbookId`). | `{ revisions, pagination }` |
-    | `Tableau.queryViewsForWorkbook` | Views in a workbook (`workbookId`, `includeUsageStatistics`). | `{ views: [{ id, name }] }` |
-    | `Tableau.getWorkbookConnections` | Data connections of a workbook (`workbookId`). | `{ connections: [{ id, datasource }] }` |
-    | `Tableau.updateWorkbookConnection` | Update a connection (`workbookId`, `connectionId`, `connection`). | `{ connection }` |
-    | `Tableau.queryWorkbookPermissions` | Permissions on a workbook (`workbookId`). | `{ permissions }` |
-    | `Tableau.addWorkbookPermissions` | Grant permissions (`workbookId`, `permissions`). | `{ permissions }` |
-    | `Tableau.deleteWorkbookPermission` | Revoke one capability (`workbookId`, `granteeType`, `granteeId`, `capabilityName`, `capabilityMode`). | Empty (HTTP 204) |
-    | `Tableau.addTagsToWorkbook` | Add tags (`workbookId`, `tags`). | `{ tags }` |
-    | `Tableau.deleteTagFromWorkbook` | Remove a tag (`workbookId`, `tagName`). | Empty (HTTP 204) |
-    | `Tableau.listViewsForSite` | List views site-wide: `filter`, `includeUsageStatistics`, pagination. | `{ views, pagination }` |
-    | `Tableau.getView` | Get a view by `viewId` (returns `webpageUrl`). | `{ view }` |
-    | `Tableau.getViewByPath` | Resolve a view by URL path (`viewUrl`). | `{ view }` |
-    | `Tableau.getViewImage` | Render a view as PNG (`viewId`, `resolution`, `maxAge`). | Binary (image) |
-    | `Tableau.getViewPdf` | Render a view as PDF (`viewId`, `type`, `orientation`, `maxAge`). | Binary (PDF) |
-    | `Tableau.getViewData` | View underlying data as CSV (`viewId`, server-side `viewFilters`). | CSV text |
-    | `Tableau.getViewCrosstabExcel` | View crosstab as Excel (`viewId`, `maxAge`). | Binary (xlsx) |
-    | `Tableau.getViewSummaryData` | View summary data as CSV (`viewId`). | CSV text |
-    | `Tableau.queryViewPermissions` | Permissions on a view (`viewId`). | `{ permissions }` |
-    | `Tableau.addViewPermissions` | Grant permissions (`viewId`, `permissions`). | `{ permissions }` |
-    | `Tableau.deleteViewPermission` | Revoke one capability (`viewId`, `granteeType`, `granteeId`, `capabilityName`, `capabilityMode`). | Empty (HTTP 204) |
-    | `Tableau.addTagsToView` | Add tags (`viewId`, `tags`). | `{ tags }` |
-    | `Tableau.deleteTagFromView` | Remove a tag (`viewId`, `tagName`). | Empty (HTTP 204) |
+    ### Sites, users and groups
 
-    ### Datasources & Flows
+    | Instruction | Description | Key arguments |
+    |-------------|-------------|---------------|
+    | `Tableau.listSites` | List sites the PAT owner can access. | `pageSize`, `pageNumber` |
+    | `Tableau.createSite` | Create a site (Tableau Server only). | `site` (`name`, `contentUrl`, `adminMode`, `state`) |
+    | `Tableau.getSite` | Get a site. | `siteId`, `key` |
+    | `Tableau.updateSite` | Update site settings. | `siteId`, `site` |
+    | `Tableau.deleteSite` | Delete a site. | `siteId` |
+    | `Tableau.getRecentlyViewed` | Recently viewed content for the PAT owner. | `siteId` |
+    | `Tableau.listUsers` | List users on the site. | `filter`, `sort`, `fields`, `pageSize`, `pageNumber` |
+    | `Tableau.getUser` | Get a user. | `userId` |
+    | `Tableau.addUserToSite` | Add a user to the site. | `user` (`name`, `siteRole`, `authSetting`) |
+    | `Tableau.updateUser` | Update a user. | `userId`, `user` |
+    | `Tableau.removeUserFromSite` | Remove a user from the site. | `userId`, `mapAssetsTo` |
+    | `Tableau.getUserGroups` | List the groups a user belongs to. | `userId`, `pageSize`, `pageNumber` |
+    | `Tableau.listGroups` | List groups. | `filter`, `sort`, `pageSize`, `pageNumber` |
+    | `Tableau.createGroup` | Create a local or directory-backed group. | `group` (`name`, `minimumSiteRole`), `asJob` |
+    | `Tableau.updateGroup` | Update a group. | `groupId`, `group`, `asJob` |
+    | `Tableau.deleteGroup` | Delete a group. | `groupId` |
+    | `Tableau.addUserToGroup` | Add a user to a group. | `groupId`, `user` (`id`) |
+    | `Tableau.removeUserFromGroup` | Remove a user from a group. | `groupId`, `userId` |
+    | `Tableau.getGroupUsers` | List the users in a group. | `groupId`, `pageSize`, `pageNumber` |
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `Tableau.listDatasources` | List published datasources: `filter`, `sort`, pagination. | `{ datasources: [{ id, name, projectId }], pagination }` |
-    | `Tableau.getDatasource` | Get a datasource by `datasourceId`. | `{ datasource }` |
-    | `Tableau.publishDatasource` | Publish a datasource: file payload + `request_payload`, `overwrite`, `append`, `asJob`. | `{ datasource }` |
-    | `Tableau.updateDatasource` | Update a datasource (`datasourceId`, `datasource`). | `{ datasource }` |
-    | `Tableau.updateDatasourceNow` | Trigger an immediate extract refresh (`datasourceId`). | `{ job }` |
-    | `Tableau.deleteDatasource` | Delete a datasource (`datasourceId`). | Empty (HTTP 204) |
-    | `Tableau.downloadDatasource` | Download `.tds` / `.tdsx` (`datasourceId`, `includeExtract`). | Binary (tds/tdsx) |
-    | `Tableau.downloadDatasourceRevision` | Download a specific revision (`datasourceId`, `revisionNumber`). | Binary (tds/tdsx) |
-    | `Tableau.getDatasourceRevisions` | List revisions (`datasourceId`). | `{ revisions, pagination }` |
-    | `Tableau.getDatasourceConnections` | Data connections (`datasourceId`). | `{ connections }` |
-    | `Tableau.updateDatasourceConnection` | Update a connection (`datasourceId`, `connectionId`, `connection`). | `{ connection }` |
-    | `Tableau.queryDatasourcePermissions` | Permissions on a datasource (`datasourceId`). | `{ permissions }` |
-    | `Tableau.addDatasourcePermissions` | Grant permissions (`datasourceId`, `permissions`). | `{ permissions }` |
-    | `Tableau.deleteDatasourcePermission` | Revoke one capability (`datasourceId`, `granteeType`, `granteeId`, `capabilityName`, `capabilityMode`). | Empty (HTTP 204) |
-    | `Tableau.addTagsToDatasource` | Add tags (`datasourceId`, `tags`). | `{ tags }` |
-    | `Tableau.deleteTagFromDatasource` | Remove a tag (`datasourceId`, `tagName`). | Empty (HTTP 204) |
-    | `Tableau.listFlows` | List Prep flows: `filter`, `sort`, pagination. | `{ flows, pagination }` |
-    | `Tableau.getFlow` | Get a flow by `flowId`. | `{ flow }` |
-    | `Tableau.downloadFlow` | Download a flow file (`flowId`). | Binary (tfl/tflx) |
-    | `Tableau.deleteFlow` | Delete a flow (`flowId`). | Empty (HTTP 204) |
-    | `Tableau.runFlow` | Start a flow run (`flowId`, `flowRunSpec`). | `{ flowRun }` |
-    | `Tableau.getFlowRunStatus` | Status of a flow run (`flowRunId`). | `{ flowRun }` |
-    | `Tableau.listFlowRuns` | List flow runs: `filter`, pagination. | `{ flowRuns, pagination }` |
-    | `Tableau.getFlowConnections` | Connections of a flow (`flowId`). | `{ connections }` |
-    | `Tableau.queryFlowPermissions` | Permissions on a flow (`flowId`). | `{ permissions }` |
-    | `Tableau.addFlowPermissions` | Grant permissions (`flowId`, `permissions`). | `{ permissions }` |
-    | `Tableau.deleteFlowPermission` | Revoke one capability (`flowId`, `granteeType`, `granteeId`, `capabilityName`, `capabilityMode`). | Empty (HTTP 204) |
+    ### Projects, workbooks and views
 
-    ### Scheduling, Jobs & Refresh Tasks
+    | Instruction | Description | Key arguments |
+    |-------------|-------------|---------------|
+    | `Tableau.listProjects` | List projects. | `filter`, `sort`, `pageSize`, `pageNumber` |
+    | `Tableau.createProject` | Create a project. | `project` (`name`, `description`, `parentProjectId`, `contentPermissions`), `publishSamples` |
+    | `Tableau.updateProject` | Update a project. | `projectId`, `project`, `publishSamples` |
+    | `Tableau.deleteProject` | Delete a project. | `projectId` |
+    | `Tableau.listWorkbooks` | List workbooks. | `filter`, `sort`, `fields`, `pageSize`, `pageNumber` |
+    | `Tableau.getWorkbook` | Get a workbook, including its `webpageUrl`. | `workbookId` |
+    | `Tableau.publishWorkbook` | Publish a workbook. | `request_payload`, `tableau_workbook`, `overwrite`, `skipConnectionCheck`, `asJob`, `workbookType` |
+    | `Tableau.updateWorkbook` | Update a workbook. | `workbookId`, `workbook` (`name`, `description`, `projectId`, `showTabs`) |
+    | `Tableau.updateWorkbookNow` | Trigger an immediate extract refresh. | `workbookId` |
+    | `Tableau.deleteWorkbook` | Delete a workbook. | `workbookId` |
+    | `Tableau.downloadWorkbook` | Download the workbook file. | `workbookId`, `includeExtract` |
+    | `Tableau.downloadWorkbookPdf` | Render the workbook as PDF. | `workbookId`, `type`, `orientation`, `maxAge` |
+    | `Tableau.downloadWorkbookPreviewImage` | Workbook preview image. | `workbookId` |
+    | `Tableau.downloadWorkbookPowerPoint` | Export the workbook to PowerPoint. | `workbookId`, `maxAge` |
+    | `Tableau.downloadWorkbookRevision` | Download one revision. | `workbookId`, `revisionNumber`, `includeExtract` |
+    | `Tableau.getWorkbookRevisions` | List workbook revisions. | `workbookId`, `pageSize`, `pageNumber` |
+    | `Tableau.queryViewsForWorkbook` | List the views in a workbook. | `workbookId`, `includeUsageStatistics` |
+    | `Tableau.getWorkbookConnections` | List the data connections of a workbook. | `workbookId` |
+    | `Tableau.updateWorkbookConnection` | Update one connection. | `workbookId`, `connectionId`, `connection` |
+    | `Tableau.queryWorkbookPermissions` | Read permissions on a workbook. | `workbookId` |
+    | `Tableau.addWorkbookPermissions` | Grant permissions on a workbook. | `workbookId`, `permissions` |
+    | `Tableau.deleteWorkbookPermission` | Revoke one capability. | `workbookId`, `granteeType`, `granteeId`, `capabilityName`, `capabilityMode` |
+    | `Tableau.addTagsToWorkbook` | Add tags. | `workbookId`, `tags` |
+    | `Tableau.deleteTagFromWorkbook` | Remove one tag. | `workbookId`, `tagName` |
+    | `Tableau.listViewsForSite` | List views site wide. | `filter`, `sort`, `fields`, `includeUsageStatistics`, `pageSize`, `pageNumber` |
+    | `Tableau.getView` | Get a view, including its `webpageUrl`. | `viewId`, `includeUsageStatistics` |
+    | `Tableau.getViewByPath` | Resolve a view from a `Workbook/sheets/Sheet` path. | `viewUrl` |
+    | `Tableau.getViewImage` | Render a view as an image. | `viewId`, `resolution`, `maxAge` |
+    | `Tableau.getViewPdf` | Render a view as PDF. | `viewId`, `type`, `orientation`, `maxAge` |
+    | `Tableau.getViewData` | View data as CSV, filtered server side. | `viewId`, `viewFilters`, `maxAge` |
+    | `Tableau.getViewCrosstabExcel` | View crosstab as Excel. | `viewId`, `maxAge` |
+    | `Tableau.getViewSummaryData` | View summary data as CSV. | `viewId`, `viewFilters`, `maxAge` |
+    | `Tableau.queryViewPermissions` | Read permissions on a view. | `viewId` |
+    | `Tableau.addViewPermissions` | Grant permissions on a view. | `viewId`, `permissions` |
+    | `Tableau.deleteViewPermission` | Revoke one capability. | `viewId`, `granteeType`, `granteeId`, `capabilityName`, `capabilityMode` |
+    | `Tableau.addTagsToView` | Add tags. | `viewId`, `tags` |
+    | `Tableau.deleteTagFromView` | Remove one tag. | `viewId`, `tagName` |
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `Tableau.listSchedules` | List server-wide schedules (pagination). | `{ schedules, pagination }` |
-    | `Tableau.getSchedule` | Get a schedule (`scheduleId`). | `{ schedule }` |
-    | `Tableau.createSchedule` | Create a server schedule: `schedule` = `{ name, priority, type, frequency, frequencyDetails }`. | `{ schedule }` |
-    | `Tableau.updateSchedule` | Update a schedule (`scheduleId`, `schedule`). | `{ schedule }` |
-    | `Tableau.deleteSchedule` | Delete a schedule (`scheduleId`). | Empty (HTTP 204) |
-    | `Tableau.addWorkbookToSchedule` | Add a workbook task to a schedule (`scheduleId`, `task`). | `{ task }` |
-    | `Tableau.addDatasourceToSchedule` | Add a datasource task to a schedule (`scheduleId`, `task`). | `{ task }` |
-    | `Tableau.addFlowTaskToSchedule` | Add a flow run task to a schedule (`scheduleId`, `task`). | `{ task }` |
-    | `Tableau.listJobs` | List background jobs: `filter`, pagination. | `{ backgroundJobs, pagination }` |
-    | `Tableau.getJob` | Get a job's status (`jobId`). | `{ job }` |
-    | `Tableau.cancelJob` | Cancel a running job (`jobId`). | Empty (HTTP 204) |
-    | `Tableau.listExtractRefreshTasks` | List extract refresh tasks (pagination). | `{ tasks, pagination }` |
-    | `Tableau.getExtractRefreshTask` | Get an extract refresh task (`taskId`). | `{ task }` |
-    | `Tableau.runExtractRefreshTask` | Run an extract refresh task now (`taskId`). | `{ job }` |
-    | `Tableau.deleteExtractRefreshTask` | Delete an extract refresh task (`taskId`). | Empty (HTTP 204) |
+    ### Datasources and flows
 
-    ### Subscriptions, Webhooks & Favorites
+    | Instruction | Description | Key arguments |
+    |-------------|-------------|---------------|
+    | `Tableau.listDatasources` | List published datasources. | `filter`, `sort`, `fields`, `pageSize`, `pageNumber` |
+    | `Tableau.getDatasource` | Get a datasource. | `datasourceId` |
+    | `Tableau.publishDatasource` | Publish a datasource. | `request_payload`, `tableau_datasource`, `overwrite`, `append`, `asJob`, `datasourceType` |
+    | `Tableau.updateDatasource` | Update a datasource. | `datasourceId`, `datasource` |
+    | `Tableau.updateDatasourceNow` | Trigger an immediate extract refresh. | `datasourceId` |
+    | `Tableau.deleteDatasource` | Delete a datasource. | `datasourceId` |
+    | `Tableau.downloadDatasource` | Download the datasource file. | `datasourceId`, `includeExtract` |
+    | `Tableau.downloadDatasourceRevision` | Download one revision. | `datasourceId`, `revisionNumber`, `includeExtract` |
+    | `Tableau.getDatasourceRevisions` | List revisions. | `datasourceId`, `pageSize`, `pageNumber` |
+    | `Tableau.getDatasourceConnections` | List the data connections. | `datasourceId` |
+    | `Tableau.updateDatasourceConnection` | Update one connection. | `datasourceId`, `connectionId`, `connection` |
+    | `Tableau.queryDatasourcePermissions` | Read permissions. | `datasourceId` |
+    | `Tableau.addDatasourcePermissions` | Grant permissions. | `datasourceId`, `permissions` |
+    | `Tableau.deleteDatasourcePermission` | Revoke one capability. | `datasourceId`, `granteeType`, `granteeId`, `capabilityName`, `capabilityMode` |
+    | `Tableau.addTagsToDatasource` | Add tags. | `datasourceId`, `tags` |
+    | `Tableau.deleteTagFromDatasource` | Remove one tag. | `datasourceId`, `tagName` |
+    | `Tableau.listFlows` | List Prep flows. | `filter`, `sort`, `pageSize`, `pageNumber` |
+    | `Tableau.getFlow` | Get a flow. | `flowId` |
+    | `Tableau.downloadFlow` | Download the flow file. | `flowId` |
+    | `Tableau.deleteFlow` | Delete a flow. | `flowId` |
+    | `Tableau.runFlow` | Start a flow run. | `flowId`, `flowRunSpec` |
+    | `Tableau.getFlowRunStatus` | Status of a flow run. | `flowRunId` |
+    | `Tableau.listFlowRuns` | List flow runs. | `filter`, `pageSize`, `pageNumber` |
+    | `Tableau.getFlowConnections` | List the connections of a flow. | `flowId` |
+    | `Tableau.queryFlowPermissions` | Read permissions. | `flowId` |
+    | `Tableau.addFlowPermissions` | Grant permissions. | `flowId`, `permissions` |
+    | `Tableau.deleteFlowPermission` | Revoke one capability. | `flowId`, `granteeType`, `granteeId`, `capabilityName`, `capabilityMode` |
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `Tableau.listSubscriptions` | List subscriptions: `filter`, pagination. | `{ subscriptions, pagination }` |
-    | `Tableau.getSubscription` | Get a subscription (`subscriptionId`). | `{ subscription }` |
-    | `Tableau.createSubscription` | Create a subscription: `subscription` = `{ subject, content, schedule, user }`. | `{ subscription }` |
-    | `Tableau.updateSubscription` | Update a subscription (`subscriptionId`, `subscription`). | `{ subscription }` |
-    | `Tableau.deleteSubscription` | Delete a subscription (`subscriptionId`). | Empty (HTTP 204) |
-    | `Tableau.listWebhooks` | List webhooks (pagination). | `{ webhooks }` |
-    | `Tableau.getWebhook` | Get a webhook (`webhookId`). | `{ webhook }` |
-    | `Tableau.createWebhook` | Create a webhook: `webhook` = `{ name, event, destination }`. | `{ webhook }` |
-    | `Tableau.updateWebhook` | Update a webhook (`webhookId`, `webhook`). | `{ webhook }` |
-    | `Tableau.deleteWebhook` | Delete a webhook (`webhookId`). | Empty (HTTP 204) |
-    | `Tableau.testWebhook` | Fire a test event for a webhook (`webhookId`). | `{ webhookTestResult }` |
-    | `Tableau.listFavoritesForUser` | List a user's favorites (`userId`). | `{ favorites }` |
-    | `Tableau.addFavorite` | Add a favorite (`userId`, `favorite`). | `{ favorites }` |
-    | `Tableau.deleteFavorite` | Remove a favorite (`userId`, `contentType`, `contentId`). | Empty (HTTP 204) |
+    ### Scheduling, jobs and refresh tasks
+
+    | Instruction | Description | Key arguments |
+    |-------------|-------------|---------------|
+    | `Tableau.listSchedules` | List server-wide schedules. | `pageSize`, `pageNumber` |
+    | `Tableau.getSchedule` | Get a schedule. | `scheduleId` |
+    | `Tableau.createSchedule` | Create a server schedule. | `schedule` (`name`, `priority`, `type`, `frequency`, `frequencyDetails`) |
+    | `Tableau.updateSchedule` | Update a schedule. | `scheduleId`, `schedule` |
+    | `Tableau.deleteSchedule` | Delete a schedule. | `scheduleId` |
+    | `Tableau.addWorkbookToSchedule` | Add a workbook task to a schedule. | `scheduleId`, `task` |
+    | `Tableau.addDatasourceToSchedule` | Add a datasource task to a schedule. | `scheduleId`, `task` |
+    | `Tableau.addFlowTaskToSchedule` | Add a flow run task to a schedule. | `scheduleId`, `task` |
+    | `Tableau.listJobs` | List background jobs. | `filter`, `pageSize`, `pageNumber` |
+    | `Tableau.getJob` | Get a job status. | `jobId` |
+    | `Tableau.cancelJob` | Cancel a running job. | `jobId` |
+    | `Tableau.listExtractRefreshTasks` | List extract refresh tasks. | `pageSize`, `pageNumber` |
+    | `Tableau.getExtractRefreshTask` | Get an extract refresh task. | `taskId` |
+    | `Tableau.runExtractRefreshTask` | Run an extract refresh task now. | `taskId` |
+    | `Tableau.deleteExtractRefreshTask` | Delete an extract refresh task. | `taskId` |
+
+    ### Subscriptions, webhooks and favorites
+
+    | Instruction | Description | Key arguments |
+    |-------------|-------------|---------------|
+    | `Tableau.listSubscriptions` | List email subscriptions. | `filter`, `pageSize`, `pageNumber` |
+    | `Tableau.getSubscription` | Get a subscription. | `subscriptionId` |
+    | `Tableau.createSubscription` | Create a subscription. | `subscription` (`subject`, `content`, `schedule`, `user`) |
+    | `Tableau.updateSubscription` | Update a subscription. | `subscriptionId`, `subscription` |
+    | `Tableau.deleteSubscription` | Delete a subscription. | `subscriptionId` |
+    | `Tableau.listWebhooks` | List webhooks. | `pageSize`, `pageNumber` |
+    | `Tableau.getWebhook` | Get a webhook. | `webhookId` |
+    | `Tableau.createWebhook` | Create a webhook. | `webhook` (`webhook-name`, `webhook-source-api-event-name`, `webhook-destination`) |
+    | `Tableau.updateWebhook` | Update a webhook. | `webhookId`, `webhook` |
+    | `Tableau.deleteWebhook` | Delete a webhook. | `webhookId` |
+    | `Tableau.testWebhook` | Fire a test event. | `webhookId` |
+    | `Tableau.listFavoritesForUser` | List a user's favorites. | `userId` |
+    | `Tableau.addFavorite` | Add a favorite. | `userId`, `favorite` (`label` plus `workbook`, `view`, `datasource` or `project`) |
+    | `Tableau.deleteFavorite` | Remove a favorite. | `userId`, `contentType`, `contentId` |
 
     ### Tableau Pulse
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `Tableau.listMetrics` | List Pulse metrics: `definition_id`, `page_size`, `page_token`. | `{ metrics, next_page_token }` |
-    | `Tableau.getMetric` | Get a Pulse metric (`metricId`). | `{ metric }` |
-    | `Tableau.createMetric` | Create a Pulse metric: `metric` = `{ definition_id, specification }`. | `{ metric }` |
-    | `Tableau.deleteMetric` | Delete a Pulse metric (`metricId`). | Empty (HTTP 204) |
-    | `Tableau.listMetricDefinitions` | List Pulse metric definitions: `view`, `page_size`, `page_token`. | `{ definitions, next_page_token }` |
-    | `Tableau.getMetricDefinition` | Get a metric definition (`definitionId`, `view`). | `{ definition }` |
-    | `Tableau.createMetricDefinition` | Create a metric definition: `definition` = `{ name, specification }`. | `{ definition }` |
-    | `Tableau.updateMetricDefinition` | Update a metric definition (`definitionId`, `definition`). | `{ definition }` |
-    | `Tableau.deleteMetricDefinition` | Delete a metric definition (`definitionId`). | Empty (HTTP 204) |
-    | `Tableau.getInsight` | Get a Pulse BAN insight: `bundle_request`. | `{ bundle_response }` |
-    | `Tableau.listPulseSubscriptions` | List Pulse subscriptions: `metric_id`, `user_id`, paging. | `{ subscriptions, next_page_token }` |
-    | `Tableau.createPulseSubscription` | Create a Pulse subscription: `subscription` = `{ metric_id, user_id }`. | `{ subscription }` |
-    | `Tableau.deletePulseSubscription` | Delete a Pulse subscription (`subscriptionId`). | Empty (HTTP 204) |
+    | Instruction | Description | Key arguments |
+    |-------------|-------------|---------------|
+    | `Tableau.listMetrics` | List Pulse metrics. | `definition_id`, `page_size`, `page_token` |
+    | `Tableau.getMetric` | Get a Pulse metric. | `metricId` |
+    | `Tableau.createMetric` | Create a Pulse metric. | `metric` (`definition_id`, `specification`) |
+    | `Tableau.deleteMetric` | Delete a Pulse metric. | `metricId` |
+    | `Tableau.listMetricDefinitions` | List Pulse metric definitions. | `view`, `page_size`, `page_token` |
+    | `Tableau.getMetricDefinition` | Get a metric definition. | `definitionId`, `view` |
+    | `Tableau.createMetricDefinition` | Create a metric definition. | `definition` (`name`, `specification`) |
+    | `Tableau.updateMetricDefinition` | Update a metric definition. | `definitionId`, `definition` |
+    | `Tableau.deleteMetricDefinition` | Delete a metric definition. | `definitionId` |
+    | `Tableau.getInsight` | Get a Basic Analytics Narrative insight. | `bundle_request` |
+    | `Tableau.listPulseSubscriptions` | List Pulse subscriptions. | `metric_id`, `user_id`, `page_size`, `page_token` |
+    | `Tableau.createPulseSubscription` | Create a Pulse subscription. | `subscription` (`metric_id`, `user_id`) |
+    | `Tableau.deletePulseSubscription` | Delete a Pulse subscription. | `subscriptionId` |
 
-    ### Metadata & VizQL Data Service
+    ### Metadata and VizQL Data Service
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `Tableau.metadataQuery` | Execute an arbitrary Metadata API GraphQL query (`query`, `variables`). | `{ data }` (GraphQL response) |
-    | `Tableau.searchAssets` | Find workbooks/datasources by exact name (`name`, `first`). | `{ data: { … } }` |
-    | `Tableau.getWorkbookLineage` | Upstream lineage of a workbook (`workbookLuid`). | `{ data: { workbooks } }` |
-    | `Tableau.getDatasourceLineage` | Upstream/downstream lineage of a datasource (`datasourceLuid`). | `{ data: { publishedDatasources } }` |
-    | `Tableau.readMetadata` | VizQL: discover field captions of a datasource (`datasource`, `options`). | `{ data: [{ fieldCaption, dataType }] }` |
-    | `Tableau.queryDatasource` | VizQL: query a published datasource (`datasource`, `query`, `options`). | `{ data: [{ … }] }` |
+    | Instruction | Description | Key arguments |
+    |-------------|-------------|---------------|
+    | `Tableau.metadataQuery` | Run your own Metadata API GraphQL query. | `query`, `variables` |
+    | `Tableau.searchAssets` | Find workbooks and published datasources by **exact** name. Returns `data.workbooks` and `data.publishedDatasources`, each with `luid`, `name` and `projectName`. | `name` |
+    | `Tableau.getWorkbookLineage` | Upstream lineage of a workbook: `upstreamDatasources` and `upstreamDatabases`. | `workbookLuid` |
+    | `Tableau.getDatasourceLineage` | Lineage of a datasource: `upstreamDatabases` and `downstreamWorkbooks`. | `datasourceLuid` |
+    | `Tableau.readMetadata` | Discover the field captions of a published datasource. | `datasource`, `options` |
+    | `Tableau.queryDatasource` | Query a published datasource through VizQL Data Service. | `datasource`, `query`, `options` |
 
-    <Note>
-      `Returns` shows the shape of the operation output. Binary instructions (`download*`, `getViewImage`, `getViewPdf`, `getViewCrosstabExcel`) return file content, not JSON.
-    </Note>
+    <Warning>
+      `Tableau.downloadWorkbook`, `downloadWorkbookPdf`, `downloadWorkbookPowerPoint`, `downloadWorkbookPreviewImage`, `downloadWorkbookRevision`, `downloadDatasource`, `downloadDatasourceRevision`, `downloadFlow`, `getViewImage`, `getViewPdf` and `getViewCrosstabExcel` target endpoints that answer with a binary body. The platform's HTTP client cannot carry binary payloads, so these instructions return an empty body rather than a file. Use `Tableau.getWorkbook` or `Tableau.getView` and share the `webpageUrl`, or use `Tableau.getViewData` for the underlying rows.
+    </Warning>
 
-    ## DSUL Examples
+    `siteId` and `userId` are injected from the resolved session when you omit them, so pass them only to target a different site or user than the PAT owner's default.
 
-    ### List the workbooks in a project
+    ## DSUL examples
+
+    ### List the workbooks of a project
 
     ```yaml
     - Tableau.listWorkbooks:
@@ -545,7 +640,9 @@ This connector is used by three different roles. Jump to the section that matche
       output: workbooks
     ```
 
-    ### Trigger an immediate extract refresh on a datasource
+    `filter`, `sort` and `fields` use the Tableau REST filter syntax, and `pageSize` is clamped to `100`.
+
+    ### Trigger an extract refresh and follow the job
 
     ```yaml
     - Tableau.updateDatasourceNow:
@@ -557,22 +654,30 @@ This connector is used by three different roles. Jump to the section that matche
       output: jobStatus
     ```
 
-    ### Search assets and walk the workbook lineage
+    `updateDatasourceNow` returns the Tableau REST response body, whose `job` object identifies the background job it queued.
+
+    ### Find an asset and walk its lineage
 
     ```yaml
     - Tableau.searchAssets:
-        name: 'Sales Performance'
-        first: 10
+        name: 'Quarterly Review'
       output: matches
 
     - Tableau.getWorkbookLineage:
-        workbookLuid: '{{matches.0.luid}}'
+        workbookLuid: '{{workbookLuid}}'
       output: lineage
     ```
 
-    ### Query a published datasource via VizQL Data Service
+    `searchAssets` matches the **exact** asset name, so pass the name as it appears in Tableau. Read `matches.data.workbooks` and `matches.data.publishedDatasources` to pick the `luid` you pass as `workbookLuid`. For partial matching, write your own filter with `Tableau.metadataQuery`.
+
+    ### Query a published datasource
 
     ```yaml
+    - Tableau.readMetadata:
+        datasource:
+          datasourceLuid: '{{datasourceLuid}}'
+      output: fields
+
     - Tableau.queryDatasource:
         datasource:
           datasourceLuid: '{{datasourceLuid}}'
@@ -584,7 +689,9 @@ This connector is used by three different roles. Jump to the section that matche
       output: rows
     ```
 
-    ### Create a Pulse subscription for a user
+    Always call `readMetadata` first: `fieldCaption` values must match the datasource captions exactly.
+
+    ### Create a Pulse subscription
 
     ```yaml
     - Tableau.createPulseSubscription:
@@ -593,42 +700,101 @@ This connector is used by three different roles. Jump to the section that matche
           user_id: '{{userId}}'
       output: subscription
     ```
+
+    ## Rotate, revoke and remove
+
+    - **Rotate the Personal Access Token:** create a new PAT in Tableau under **My Account Settings > Personal Access Tokens**, update `tableauPatName` and `tableauPatSecret` in the workspace **Secrets**, select **Save**, then revoke the old PAT in Tableau. Calls made with the cached old session token fail with `401` until the new values are saved, then recover automatically.
+    - **Revoke access immediately:** revoke the PAT in Tableau. Every workspace and agent using it starts failing with `401` on the next call, including cached sessions once they are replayed.
+    - **Cut off one agent:** because the connector has no per-agent allowlist, remove the capability from the agent and rotate the workspace's MCP API Key by reinstalling the app. Rotating the Tableau PAT alone does not stop an agent that still holds a valid key.
+    - **Uninstall the connector:** uninstall the Tableau app from the workspace, then clear the four Tableau secrets in **Secrets**, then revoke the PAT in Tableau. Uninstalling alone leaves the secrets in the workspace.
   </Tab>
 </Tabs>
 
 ---
 
-## Error Handling
+## Error handling
 
-| HTTP code | Meaning | Typical cause |
-|-----------|---------|---------------|
-| 400 | Bad Request | Missing or malformed `action`, invalid filter, missing required parameter for the chosen action. |
-| 401 | Unauthorized | The PAT was rejected or the session token expired/was revoked. Check `patName` / `patSecret`; a concurrent sign-in with the same PAT revokes the session. |
-| 403 | Forbidden | The PAT's user lacks the right, or the action is Tableau Server-only and you are on Tableau Cloud (e.g. site CRUD). |
-| 404 | Not Found | The targeted resource does not exist on this site, or `siteContentUrl` is wrong. |
-| 409 | Conflict | Trying to `publish` over an existing asset without `overwrite: true`, or a name collision. |
-| 429 | Too Many Requests | Tableau API rate limit hit. Retry with exponential backoff. |
-| 500 | Internal Server Error | Transient Tableau Server error. Retry; if it persists, check the Tableau status page. |
+### Errors raised before Tableau is contacted
 
-### Common Issues
+These are returned by the connector itself, so no Tableau call is made.
 
-**"Tableau auth not configured"**: The app instance has no PAT. Create a Personal Access Token on your Tableau site (My Account Settings → Personal Access Tokens) and paste `patName`, `patSecret` and `serverUrl` in the app configuration.
+| Message | Where | Cause and fix |
+|---|---|---|
+| `Tableau auth not configured. Required: patName, patSecret, serverUrl.` | App instructions and MCP | One of the three mandatory secrets is empty. Fill them in the workspace **Secrets**. |
+| `Tableau signin failed (<status>): <summary> <detail>` | App instructions and MCP | Tableau rejected the sign-in. Re-copy the PAT secret, check `serverUrl` and `siteContentUrl`, and confirm the PAT has not expired. |
+| ``Missing required argument `action` for <tool>. Available: ...`` | MCP | The tool call omitted `action`. The message lists the valid actions. |
+| ``Unknown action `<action>` for <tool>. Available: ...`` | MCP | The action does not exist on that tool. |
+| `Unknown entity: <tool>` | MCP | The tool name is not one of the 20 entity tools. |
+| `Missing required path param: <param> (or <camelCaseParam>)` | App instructions and MCP | A required identifier was not supplied and could not be injected from the session, for example `workbookId`. |
+| ``getViewByPath requires `viewUrl` `` | App instructions and MCP | Pass `viewUrl` in the form `MyWorkbook/sheets/MySheet`. |
+| ``searchAssets requires `name` (exact asset name to match)`` | App instructions and MCP | Pass the exact asset name. |
+| ``metadataQuery requires a `query` argument`` | App instructions and MCP | Pass a GraphQL document in `query`. |
 
-**"Tableau signin failed (401)"**: The provided PAT was rejected by Tableau, or the cached session was revoked. A Tableau PAT allows only one active session, so a parallel sign-in (a script, another tool) invalidates it. Re-copy the secret, or retry; the connector forces a fresh sign-in on a 401.
+### MCP endpoint errors
 
-**"Site not found" / wrong site**: Check `siteContentUrl`. On Tableau Cloud it is the segment after `/site/` in the browser URL; on Tableau Server's *Default* site, leave it empty.
+These are JSON-RPC errors with code `-32001`, returned before any Tableau call:
 
-**Tableau Server-only operation on Tableau Cloud**: Several site- and schedule-management actions (`sites.create`, `sites.update`, `schedules.create`, …) are only available on Tableau Server and return `403` on Tableau Cloud. Check the Tableau REST API reference for the current allow-list.
+```text
+Missing required header: mcp-api-key
+Invalid API key: Invalid key format
+Invalid API key: Invalid signature
+Invalid API key: Invalid payload
+Credentials lookup failed (<status>): <error>
+```
 
-**VizQL `queryDatasource` returns `403 "API access permission"`**: A Tableau administrator must grant **API Access** on the published datasource before the VizQL Data Service can query it.
+The first four mean the request header carrying the workspace's **MCP API Key** is absent or does not verify. Re-copy the value from the app instance configuration. `Credentials lookup failed` means the endpoint reached the installing workspace but could not obtain credentials, usually because the Tableau secrets there are empty or Tableau refused the sign-in.
 
-## External Resources
+### Tableau API errors
+
+Tableau failures are normalized into a single message that always names the operation and appends Tableau's own `code`, `summary` and `detail`.
+
+| HTTP code | Message pattern | Typical cause |
+|-----------|-----------------|---------------|
+| 400 | `Bad request while <operation>` | Invalid filter, malformed body, or a parameter the operation does not accept. |
+| 401 | `401 while <operation>` | The session token was rejected or revoked, or the operation is Tableau Server only. The connector retries once with a fresh sign-in before surfacing this. |
+| 403 | `Forbidden while <operation>. Check Tableau permissions for the user behind the PAT.` | The PAT owner lacks the required content permission or site role. |
+| 404 | `Resource not found while <operation>` | The resource does not exist on this site, or `siteContentUrl` points at the wrong site. |
+| 405 | `Method not allowed while <operation>` | The operation is not available on this Tableau release. |
+| 409 | `Conflict while <operation>` | Publishing over an existing asset without `overwrite`, a name collision, or a concurrent update. |
+| 429 | `Rate limit exceeded while <operation>. Wait and retry.` | Tableau throttled the request. Back off and retry. |
+| 500 | `Tableau server error while <operation>` | Transient Tableau failure. Retry, then check Tableau's own status. |
+
+<Note>
+  The `401` message names "Connected App credentials". This connector authenticates with a Personal Access Token, so read that wording as "the credentials the connector signed in with".
+</Note>
+
+### Common issues
+
+**Every call fails with `401` even after retrying.** The PAT name or secret is wrong, the PAT expired, or it was revoked in Tableau. A Tableau PAT also allows only one active session, so a script or another tool signing in with the same PAT revokes the connector's session. Give the connector its own dedicated PAT.
+
+**A site or schedule action returns an error on Tableau Cloud.** Site administration (`sites` `list`, `create`, `update`, `delete`) and server schedule creation are Tableau Server features. Tableau Cloud rejects them. Check the operation in the Tableau REST API reference before relying on it.
+
+**Reads return nothing although the content exists.** The connector sees only what the PAT owner sees. Grant that Tableau user access to the project or asset, or point the connector at a PAT owned by an account that already has it. `siteContentUrl` pointing at the wrong site produces the same symptom, with `404` on direct lookups.
+
+**`vizqlData` `queryDatasource` returns `403` mentioning API access permission.** A Tableau administrator must grant **API Access** on the published datasource before VizQL Data Service can query it.
+
+**A `getData` reply is cut short.** CSV responses are truncated at 20000 characters on the last complete row, and the reply states how many rows were kept. Narrow the result with `viewFilters`, or run the aggregation through `vizqlData` instead.
+
+**A list looks incomplete.** `pageSize` and `page_size` are clamped to `100`, and arrays are truncated to 100 items. Page through the results with `pageNumber` or `page_token`, using `pagination.totalAvailable` to size the loop.
+
+**An agent claims it will send a chart image or PDF.** Binary responses are not available. Instruct the agent to call the matching `get` action and share the `webpageUrl` instead.
+
+## External resources
 
 <CardGroup cols={2}>
-  <Card icon="book" title="Tableau REST API Reference" href="https://help.tableau.com/current/api/rest_api/en-us/REST/rest_api.htm">
-    Official documentation for the Tableau REST API 3.x, Metadata API, VizQL Data Service and Pulse.
+  <Card icon="book" title="Tableau REST API reference" href="https://help.tableau.com/current/api/rest_api/en-us/REST/rest_api.htm">
+    Official reference for the Tableau REST API 3.x, including filter syntax and which operations are Tableau Server only.
   </Card>
-  <Card icon="robot" title="Tool Agents" href="/products/agent-factory/capabilities">
-    Learn how Agent Creator agents consume MCP tools and capabilities in Prisme.ai.
+  <Card icon="key" title="Tableau Personal Access Tokens" href="https://help.tableau.com/current/online/en-us/security_personal_access_tokens.htm">
+    How to create, use, expire and revoke a Personal Access Token on a Tableau site.
+  </Card>
+  <Card icon="diagram-project" title="Tableau VizQL Data Service" href="https://help.tableau.com/current/api/vizql-data-service/en-us/index.html">
+    Query model, field and filter reference for the VizQL Data Service endpoints the `vizqlData` tool calls.
+  </Card>
+  <Card icon="robot" title="Agent capabilities" href="/products/agent-factory/capabilities">
+    How Agent Creator agents consume MCP tools and capabilities in Prisme.ai.
+  </Card>
+  <Card icon="plug" title="Declare a connector capability" href="/apps-store/marketplace/connectors/declare-capability">
+    The shared capability flow. Tableau uses only its manual AI Governance path, because it ships no configuration app.
   </Card>
 </CardGroup>

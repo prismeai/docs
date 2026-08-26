@@ -12,7 +12,7 @@ description: 'Run SQL and manage Snowflake databases, schemas and virtual wareho
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Snowflake app exposes the Snowflake SQL API and selected Snowflake REST APIs to **Agent Creator** agents through MCP and to Builder workflows through DSUL instructions. It runs in the installing workspace's tenant context and covers SQL execution, asynchronous results, databases, schemas and virtual warehouses. Authentication supports platform-managed or tenant-owned Snowflake OAuth with PKCE, key-pair JWT, programmatic access tokens and pre-minted access tokens.
+The Snowflake app exposes the Snowflake SQL API and selected Snowflake REST APIs to **Agent Creator** agents through MCP and to Builder workflows through DSUL instructions. It runs in the installing workspace's tenant context: credentials are stored as workspace secrets and resolved server-side, and the MCP capability carries no API key. The connector covers SQL execution, asynchronous results, databases, schemas and virtual warehouses.
 
 <CardGroup cols={3}>
   <Card title="SQL and results" icon="terminal">
@@ -31,45 +31,78 @@ The Snowflake app exposes the Snowflake SQL API and selected Snowflake REST APIs
 This connector is used by three different roles. Jump to the section that matches yours, each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to query or administer Snowflake. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to query or administer Snowflake. Go to Agent builder.
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You configure a shared Snowflake OAuth client and publish the capability. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You configure a shared Snowflake OAuth client and publish the capability. Go to Platform admin setup.
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations that call Snowflake operations directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations that call Snowflake operations directly. Go to Workspace builder.
   </Card>
 </CardGroup>
 
+The generic procedures these roles share are documented once, on their own pages: [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace), [Central OAuth client](/apps-store/marketplace/connectors/central-oauth), and [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability). This page carries the Snowflake-specific values those procedures ask for.
+
+## Choose an authentication mode
+
+Every call reaches Snowflake with one resolved credential. The mode you select decides which Snowflake identity the account sees, and therefore which privileges apply and who appears in the Snowflake query history. Pick the mode before installing anything.
+
+| Mode | Identity Snowflake sees | Scope of the credential | Choose it when |
+|------|-------------------------|-------------------------|----------------|
+| `oauthCentral` | The signed-in Prisme.ai user, after they authorize Snowflake themselves | Per user, on the single Snowflake account configured by the connector maintainer | Interactive chat use on the platform-managed Snowflake account. This is the default when no mode is set. |
+| `oauth` | The signed-in Prisme.ai user, after they authorize Snowflake themselves | Per user, on the workspace's own Snowflake account and OAuth client | Interactive chat use on a Snowflake account the workspace owns |
+| `keyPair` | The Snowflake service user backing the key pair | Shared by every caller in the workspace | Unattended automations that must run without an interactive sign-in |
+| `programmaticAccessToken` | The Snowflake user the token was issued for | Shared by every caller in the workspace | Unattended automations that need a rotatable token with a Snowflake role restriction |
+| `accessToken` | The Snowflake identity encoded in the supplied token | Shared by every caller in the workspace | An OAuth or External OAuth access token minted and rotated outside Prisme.ai |
+
+<Warning>
+  `keyPair`, `programmaticAccessToken` and `accessToken` are shared service credentials. Every agent and automation allowed to reach the app instance acts as that single Snowflake user, Snowflake attributes all queries to it, and per-user attribution is lost. Restrict the backing Snowflake role to the exact objects and privileges the workspace needs, and prefer an OAuth mode whenever an agent reads or writes data on behalf of a person.
+</Warning>
+
+In both OAuth modes the connector performs an authorization-code flow with PKCE, stores the resulting access and refresh tokens per user, and refreshes the access token about two minutes before it expires. It requests the `refresh_token` scope plus a `session:role:<ROLE>` scope when a default role is configured; a role that is not made only of letters, digits, `_` or `$` is requested as `session:role-encoded:<url-encoded role>` instead.
+
 ## Prerequisites (Snowflake side)
 
-- A **Snowflake account** and its public HTTPS account URL, for example `https://myorg-myaccount.snowflakecomputing.com`.
+- A **Snowflake account** and its public HTTPS account origin, for example `https://myorg-myaccount.snowflakecomputing.com`. The connector accepts only an `https://` URL whose host ends with `.snowflakecomputing.com` or `.snowflakecomputing.cn` and carries no embedded credentials. A Snowsight page URL is rejected.
 - A Snowflake user or OAuth integration whose role has the privileges required by the operations you intend to expose. Use a dedicated least-privilege role rather than an account-admin role.
 - One supported credential:
-  - A [Snowflake OAuth custom-client integration](https://docs.snowflake.com/en/user-guide/oauth-custom) with refresh tokens and PKCE.
-  - A [key pair](https://docs.snowflake.com/en/user-guide/key-pair-auth) assigned to the Snowflake user.
-  - A [programmatic access token](https://docs.snowflake.com/en/user-guide/programmatic-access-tokens).
+  - A [Snowflake OAuth custom-client integration](https://docs.snowflake.com/en/user-guide/oauth-custom) that issues refresh tokens and enforces PKCE.
+  - A [key pair](https://docs.snowflake.com/en/user-guide/key-pair-auth) assigned to the Snowflake user, together with the account identifier, the user name and the public-key fingerprint.
+  - A [programmatic access token](https://docs.snowflake.com/en/user-guide/programmatic-access-tokens). Snowflake requires the token owner to be covered by a network policy, and `ROLE_RESTRICTION` pins the token to one role.
   - A valid pre-minted OAuth or External OAuth access token.
-- A virtual warehouse for SQL that needs compute. Database and schema metadata operations may not require an active warehouse.
+- A virtual warehouse for SQL that needs compute. Database, schema and warehouse metadata operations go through the Snowflake REST resource endpoints and do not need a running warehouse.
 
-<Accordion title="Platform admin (Governance), one-time platform setup" icon="shield-halved">
+### OAuth endpoints and redirect URIs
+
+The connector derives the Snowflake OAuth endpoints from the account origin: `<account-url>/oauth/authorize` for authorization and `<account-url>/oauth/token-request` for token exchange and refresh. The redirect URI depends on the mode. Throughout, `<api-url>` is your environment's API URL (`https://api.studio.prisme.ai/v2` on production) and `<studio>` is your Studio URL.
+
+| Mode | Redirect URI to register in Snowflake |
+|------|----------------------------------------|
+| `oauthCentral` | `<api-url>/workspaces/slug:snowflake/webhooks/oauthCallback` |
+| `oauth` | `<api-url>/workspaces/slug:<workspace-slug>/webhooks/<app-instance-slug>.oauthCallback` |
+
+With `oauthCentral`, this is the only redirect URI to register: the core `snowflake` workspace receives the authorization code and proxies it back to the workspace that started the flow. With `oauth`, the exact value is written into the app instance configuration on install and shown by the configuration app. The two shapes are not interchangeable, and registering the wrong one is the most common failure in this flow; see [Callback URLs](/apps-store/marketplace/connectors/central-oauth#callback-urls).
+
+<Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
   **Goal:** configure a shared OAuth client for one Snowflake account, then expose the connector as a reusable capability in AI Governance.
 
-  ## 1. Configure the connector
+  The platform-wide procedure, the role check on the core workspace, and what changes about agent authorization are documented in [Central OAuth client](/apps-store/marketplace/connectors/central-oauth). The steps below cover only what is specific to Snowflake, and assume you have read [Before you begin](/apps-store/marketplace/connectors/central-oauth#before-you-begin).
+
+  ## 1. Configure the central OAuth client
 
   <Steps>
     <Step title="Create a dedicated Snowflake role">
-      Create a role containing only the database, schema, warehouse and SQL privileges that agents need. Grant it to the users who will authorize the connector. Snowflake OAuth does not allow the connector to exceed the selected role's privileges.
+      Create a role containing only the database, schema, warehouse and SQL privileges that agents need, and grant it to the users who will authorize the connector. Snowflake OAuth cannot grant a session more privileges than the consented role holds.
     </Step>
     <Step title="Create a Snowflake OAuth security integration">
-      In the target Snowflake account, create a confidential custom-client integration. Use the core workspace callback as its redirect URI:
+      In the target Snowflake account, create a confidential custom-client integration whose redirect URI is the core workspace callback:
 
       ```text
       <api-url>/workspaces/slug:snowflake/webhooks/oauthCallback
       ```
 
-      On production, `<api-url>` is `https://api.studio.prisme.ai/v2`.
+      The statement below uses the parameter names documented in the Snowflake reference for [CREATE SECURITY INTEGRATION (Snowflake OAuth)](https://docs.snowflake.com/en/sql-reference/sql/create-security-integration-oauth-snowflake). The connector always sends PKCE and authenticates the client with HTTP Basic, so a confidential client that issues refresh tokens is required.
 
       ```sql
       CREATE SECURITY INTEGRATION PRISME_SNOWFLAKE_OAUTH
@@ -84,47 +117,41 @@ This connector is used by three different roles. Jump to the section that matche
       ```
     </Step>
     <Step title="Retrieve the OAuth client credentials">
-      Run the following command with a role allowed to inspect the integration. Keep the returned secret in a secrets manager.
+      Run the following command with a role allowed to inspect the integration, then keep the returned secret in a secrets manager.
 
       ```sql
       SELECT SYSTEM$SHOW_OAUTH_CLIENT_SECRETS('PRISME_SNOWFLAKE_OAUTH');
       ```
 
-      The result contains `oauth_client_id` and two rotatable client secrets.
+      The result contains the client id and two rotatable client secrets.
     </Step>
-    <Step title="Enter the credentials through the configuration app">
-      Open the central `snowflake` workspace and launch its **Configuration app** at `<studio>/apps/snowflake` (for example `https://studio.prisme.ai/apps/snowflake`). Enter the Snowflake account URL, client ID, client secret, default role and optional warehouse. The app writes the central secret; do not edit Studio Secrets manually.
+    <Step title="Store the client in the core workspace">
+      Open the core `snowflake` workspace configuration app at `<studio>/apps/snowflake` and enter the **Snowflake account URL**, **client id**, **client secret**, **default role** and optional **warehouse**, then save. Snowflake has no free-form scope field here: the connector derives its OAuth scopes from the default role, as described in [Choose an authentication mode](#choose-an-authentication-mode).
+
+      The maintainer view is served only to a user holding `owner`, `editor` or `admin` on the core workspace, or the platform `superadmin` role; anyone else gets `Core workspace editor access is required.` The saved profile is written to the core workspace secret `snowflakeCentralOAuth`. Do not edit the workspace secrets by hand. See [Configure the central client](/apps-store/marketplace/connectors/central-oauth#configure-the-central-client) for the full maintainer-view procedure and its role checks.
     </Step>
     <Step title="Tell workspaces to use the central client">
-      Each consuming workspace selects `oauthCentral` in its connector configuration. The central client is tied to the Snowflake account configured above; another account must use tenant-owned OAuth or a non-OAuth credential.
+      Each consuming workspace selects `oauthCentral` in its connector configuration, as described in [Select the central client in a workspace](/apps-store/marketplace/connectors/central-oauth#select-the-central-client-in-a-workspace). Installed workspaces receive only the account URL, client id, default role and warehouse; the client secret never leaves the core workspace, and every authorization-code and refresh exchange is proxied through the core token-service endpoint (see [How the client secret stays in the core workspace](/apps-store/marketplace/connectors/central-oauth#how-the-client-secret-stays-in-the-core-workspace)). The central client is tied to the Snowflake account configured above, so another account must use `oauth`, `keyPair`, `programmaticAccessToken` or `accessToken`.
     </Step>
   </Steps>
 
   ## 2. Declare the capability in AI Governance
 
-  <Steps>
-    <Step title="Create the Snowflake capability">
-      Open **AI Governance > Capabilities** and create a capability named **Snowflake**.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the MCP server URL to the connector's **MCP Endpoint** and set **Scope** to:
+  Follow [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability) for the publishing and manual paths. Snowflake needs these values:
 
-      ```text
-      context_id,agent_id,user_id
-      ```
+  | Capability field | Value for Snowflake |
+  |------------------|---------------------|
+  | Name | **Snowflake** |
+  | Server URL | The connector's **MCP Endpoint** |
+  | **Scope** | `context_id,agent_id,user_id` |
+  | Authorization block | None to attach by hand. There is no OAuth auth-config JSON for Snowflake in Governance. |
 
-      `agent_id` lets the connector identify and authorize the calling agent. `user_id` keeps delegated OAuth sessions user-specific.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Publish the capability in the catalog. Catalog visibility follows the organization's existing RBAC; tenant-context capabilities do not require a separate per-capability role grant.
-    </Step>
-    <Step title="Smoke-test">
-      Enable the capability on an agent, authorize that agent in the connector configuration app, connect a Snowflake user and run a read-only query such as `SELECT CURRENT_USER(), CURRENT_ROLE()`.
-    </Step>
-  </Steps>
+  `agent_id` lets the connector identify and authorize the calling agent. `user_id` keeps delegated OAuth sessions user-specific. This scope is unrelated to the Snowflake OAuth scopes; see [What the scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means).
+
+  To smoke-test, enable the capability on an agent, authorize that agent in the connector configuration app, connect a Snowflake user and run a read-only query such as `SELECT CURRENT_USER(), CURRENT_ROLE()`. Then work through [Verify the connection](#verify-the-connection).
 
   <Warning>
-    Declaring the capability makes Snowflake available; it does not authorize an agent. Each installed connector instance still applies its **Authorized agents** allowlist. There is no OAuth auth-config JSON to attach in Governance.
+    Declaring the capability makes Snowflake available; it does not authorize an agent. A workspace-owned app instance always applies its **Authorized agents** allowlist. The core workspace endpoint behaves differently: once the central OAuth client is configured there, that endpoint accepts every calling agent and the per-user Snowflake authorization is the only gate. There is no OAuth auth-config JSON to attach in Governance. Read [Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint) before publishing the core endpoint to the catalog.
   </Warning>
 </Accordion>
 
@@ -137,10 +164,10 @@ This connector is used by three different roles. Jump to the section that matche
     **Goal:** let an Agent Creator agent query and manage Snowflake through five MCP tools.
 
     <Note>
-      A *Workspace builder* must first install and configure the Snowflake app. Platform-managed OAuth additionally requires the one-time setup in the *Platform admin* accordion.
+      A [Workspace builder](#workspace-builder-dsul) must first install and configure the Snowflake app. Platform-managed OAuth additionally requires the one-time setup in [Platform admin (Governance)](#platform-admin-governance-one-time-platform-setup).
     </Note>
 
-    The MCP endpoint runs in the installed app instance. It resolves credentials server-side, identifies the caller from the capability scope and checks the workspace's agent allowlist.
+    The MCP endpoint runs in the installed app instance. It resolves credentials server-side, identifies the caller from the capability scope and checks the workspace's agent allowlist before any Snowflake call.
 
     ## Option A, Enable the shared capability from the catalog
 
@@ -152,12 +179,12 @@ This connector is used by three different roles. Jump to the section that matche
         Select **Snowflake** from the capability catalog. The endpoint and `context_id,agent_id,user_id` scope are already configured.
       </Step>
       <Step title="Connect to Snowflake">
-        With OAuth, connect on the first tool call or from the connector configuration app. Key-pair, programmatic-token and access-token modes do not need an interactive sign-in.
+        With an OAuth mode, connect on the first tool call or from the connector configuration app. Key-pair, programmatic-token and access-token modes do not need an interactive sign-in.
       </Step>
     </Steps>
 
     <Note>
-      The shared capability uses credentials and an allowlist managed by the platform workspace. Use a workspace-owned instance when the agent needs an isolated Snowflake account, role or credential boundary.
+      The shared capability runs on the platform account and OAuth client. That endpoint accepts any agent, so access is controlled entirely by each user's own Snowflake authorization; see [Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint). Use a workspace-owned instance when the agent needs an isolated Snowflake account, role or credential boundary, or when you need a per-agent allowlist.
     </Note>
 
     ## Option B, Run it from your own workspace (recommended)
@@ -168,20 +195,22 @@ This connector is used by three different roles. Jump to the section that matche
 
     <Steps>
       <Step title="Install and configure Snowflake">
-        Follow the *Workspace builder* tab. Select an authentication mode and test the credential.
+        Follow [Workspace builder](#workspace-builder-dsul). Select an authentication mode and test the credential.
       </Step>
-      <Step title="Allowlist the agent">
-        In the configuration app, open **Authorized agents**, select the agent and save. The **Install capability** action can perform this wiring.
+      <Step title="Allowlist the agent and attach the tool">
+        In the configuration app, open **Authorized agents** and select **Install capability** on the agent's row. That single action allowlists the agent and attaches the MCP tool with the endpoint and **Scope** already set. See [Install the capability on one agent](/apps-store/marketplace/connectors/declare-capability#install-the-capability-on-one-agent).
       </Step>
-      <Step title="Add the MCP capability">
+      <Step title="Or wire the capability by hand">
         Point the capability at this app instance's **MCP Endpoint** and set **Scope** to:
 
         ```text
         context_id,agent_id,user_id
         ```
+
+        See [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance). Ticking the agent in **Authorized agents** is still required.
       </Step>
       <Step title="Connect the user when using OAuth">
-        Click **Connect** in the configuration app or follow the connection prompt surfaced by Agent Creator.
+        Select **Connect** in the configuration app, or follow the connection prompt surfaced by Agent Creator.
       </Step>
     </Steps>
 
@@ -196,37 +225,40 @@ This connector is used by three different roles. Jump to the section that matche
     ```
 
     <Note>
-      **Legacy AI Knowledge agents** without the native capability picker can add an MCP tool under **Advanced > Tools > MCP** and paste the **MCP Endpoint**. The agent must still be allowlisted and its identity propagated to the connector.
+      **Legacy AI Knowledge agents** without the native capability picker can add an MCP tool under **Advanced > Tools > MCP** and paste the **MCP Endpoint**. The agent must still be allowlisted and its identity propagated to the connector. See [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance).
     </Note>
 
     <Note>
-      **Restricting to read-only (least privilege).** Snowflake permissions are role-based. For OAuth, set `ALLOWED_ROLES_LIST` on the security integration and configure the connector to request a dedicated read-only role. For a programmatic access token, use `ROLE_RESTRICTION`; for key-pair or access-token modes, restrict the backing user's grants. The connector remains usable for reads while Snowflake rejects writes with `403` or a SQL privilege error. This provider-side role boundary cannot be widened from the Prisme.ai workspace.
+      **Restricting to read-only (least privilege).** Snowflake permissions are role-based, and the connector cannot widen them. For OAuth, list only a read-only role in `ALLOWED_ROLES_LIST` on the security integration and configure that role in the connector. For a programmatic access token, set `ROLE_RESTRICTION`; for key-pair or access-token modes, restrict the backing user's grants. Reads keep working while Snowflake rejects writes, which the connector surfaces as `Forbidden while <operation>.`
     </Note>
 
-    ## Available Tools
+    ## Available tools
 
     Each tool takes an `action` argument that selects the concrete operation.
 
     | Tool | Description |
     |------|-------------|
-    | `sql` | Execute one SQL statement, inspect its status or cancel it. MCP responses are capped at 100 rows and 80 KB. |
-    | `results` | Fetch a page from an asynchronous Snowflake Resource API result by opaque `result_handler`. |
+    | `sql` | Execute one SQL statement, inspect its status or cancel it. |
+    | `results` | Fetch a page from an asynchronous Snowflake resource API result by opaque `result_handler`. |
     | `databases` | List, get, create, create-or-alter, undrop and delete databases. |
     | `schemas` | List, get, create, create-or-alter, undrop and delete schemas within a database. |
     | `warehouses` | List, get, create, create-or-alter, resume, suspend and delete virtual warehouses. |
 
-    ## Output Formats
+    ## Response limits and truncation
 
-    Snowflake tool calls return one bounded JSON payload in MCP text content. The connector:
+    Snowflake tool calls return one bounded JSON payload in MCP text content. Over MCP the connector:
 
-    - limits SQL execution to one statement;
-    - asks Snowflake for at most 100 rows and caps the final MCP response at 80 KB;
-    - omits binary cell values;
-    - adds `_mcpLimits` and, when truncation occurs, `_truncation` metadata with a refinement suggestion.
+    - forces `multi_statement_count=1`, `rows_per_resultset=100` and `client_result_chunk_size=16` on SQL execution, so a single statement runs and Snowflake returns at most 100 rows;
+    - clamps `showLimit` to the range 1 to 100 on every list action, whatever the schema maximum suggests;
+    - caps the serialized MCP response at 80 KB, shortening long strings, then dropping trailing columns, then trailing rows until the payload fits;
+    - replaces values in `BINARY` columns with `[binary value omitted by connector]`;
+    - adds `_mcpLimits` and, when anything was cut, `_truncation` metadata carrying `omittedDataRecoverable: false` and a refinement suggestion.
 
-    The schema accepts `outputFormat` (`verbose`, `structured` or `both`) for compatibility. The current Snowflake implementation returns the same bounded JSON text envelope for all three values.
+    Statement handles, result handles and error codes are never truncated, so a follow-up `status` or `results` call always works. A provider `partition` addresses Snowflake-side partitions only; it cannot recover rows the connector omitted locally.
 
-    ## Tool Details
+    The schema accepts `outputFormat` (`verbose`, `structured` or `both`) for compatibility. The Snowflake implementation returns the same bounded JSON text envelope for all three values.
+
+    ## Tool details
 
     ### sql
 
@@ -247,12 +279,15 @@ This connector is used by three different roles. Jump to the section that matche
     |-----------|----------|-------------|
     | `action` | Yes | `execute`, `status` or `cancel`. |
     | `statement` | For `execute` | One SQL statement. It may be read-only or mutating. |
-    | `statementHandle` | For `status` / `cancel` | Handle returned by this connector's `execute` action. |
-    | `database`, `schema`, `warehouse`, `role` | No | Case-sensitive execution context. |
+    | `statementHandle` | For `status` and `cancel` | Handle returned by this connector's `execute` action. |
+    | `database`, `schema`, `warehouse`, `role` | No | Case-sensitive execution context. `role` and `warehouse` fall back to the values configured on the connector. |
     | `bindings` | No | Snowflake SQL bind values. |
-    | `async` | No | Return a statement handle without waiting for completion. |
-    | `requestId` | No | UUID used to make submission idempotent. |
-    | `partition` | For additional SQL partitions | Zero-based provider partition requested by `status`. It cannot recover rows omitted by the MCP response cap. |
+    | `parameters` | No | Session parameters. The MCP limits above always win. |
+    | `timeout` | No | Execution timeout in seconds. |
+    | `async` | No | Return a statement handle without waiting. When omitted or `false`, Snowflake returns the first result if execution completes within 45 seconds, and a statement handle otherwise. |
+    | `nullable` | No | When `false`, Snowflake returns the string `null` instead of a null value. |
+    | `requestId` | No | UUID that makes submission idempotent. |
+    | `partition` | For additional SQL partitions | Zero-based provider partition requested by `status`. |
 
     ### results
 
@@ -270,7 +305,7 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `action` | Yes | Only `get`. |
-    | `result_handler` | Yes | Opaque handle returned by an asynchronous Snowflake Resource API operation. |
+    | `result_handler` | Yes | Opaque handle returned by an asynchronous Snowflake resource API operation. |
     | `page` | No | Zero-based result page; defaults to `0`. |
 
     ### databases
@@ -289,11 +324,13 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `action` | Yes | `list`, `get`, `create`, `createOrAlter`, `undrop` or `delete`. |
-    | `name` | For get/createOrAlter/undrop/delete | Case-sensitive database identifier. |
-    | `body` | For create/createOrAlter | Complete Snowflake Database resource definition. |
-    | `createMode` | No | `errorIfExists`, `orReplace` or `ifNotExists`. |
-    | `like`, `startsWith`, `fromName`, `showLimit`, `history` | For list | Server-side list filters and pagination controls. |
-    | `restrict` | For delete | Keep `true` unless cascading removal is explicitly requested. |
+    | `name` | For `get`, `createOrAlter`, `undrop` and `delete` | Case-sensitive database identifier. |
+    | `body` | For `create` and `createOrAlter` | Complete Snowflake database resource definition. `createOrAlter` replaces the whole definition. |
+    | `createMode` | No | `errorIfExists` (default), `orReplace` or `ifNotExists`. |
+    | `kind` | No | `transient`, or the empty string for a permanent database. |
+    | `like`, `startsWith`, `fromName`, `showLimit`, `history` | For `list` | Server-side filters and pagination controls. |
+    | `ifExists` | For `delete` | Return success instead of an error when the database is absent. |
+    | `restrict` | For `delete` | Defaults to `true` in the connector, which refuses to drop a database still referenced by foreign keys. Set it to `false` only on explicit cascading-removal intent. |
 
     ### schemas
 
@@ -316,10 +353,13 @@ This connector is used by three different roles. Jump to the section that matche
     |-----------|----------|-------------|
     | `action` | Yes | `list`, `get`, `create`, `createOrAlter`, `undrop` or `delete`. |
     | `database` | Yes | Parent database identifier. |
-    | `name` | For get/createOrAlter/undrop/delete | Schema identifier. |
-    | `body` | For create/createOrAlter | Complete Snowflake Schema resource definition. |
-    | `kind` | No | `transient` or permanent (empty value). |
-    | `restrict` | For delete | Keep `true` unless cascading removal is explicitly requested. |
+    | `name` | For `get`, `createOrAlter`, `undrop` and `delete` | Schema identifier. |
+    | `body` | For `create` and `createOrAlter` | Complete Snowflake schema resource definition. |
+    | `createMode` | No | `errorIfExists` (default), `orReplace` or `ifNotExists`. |
+    | `kind` | No | `transient`, or the empty string for a permanent schema. |
+    | `like`, `startsWith`, `fromName`, `showLimit`, `history` | For `list` | Server-side filters and pagination controls. |
+    | `ifExists` | For `delete` | Return success instead of an error when the schema is absent. |
+    | `restrict` | For `delete` | Defaults to `true` in the connector. Set it to `false` only on explicit cascading-removal intent. |
 
     ### warehouses
 
@@ -337,10 +377,11 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `action` | Yes | `list`, `get`, `create`, `createOrAlter`, `resume`, `suspend` or `delete`. |
-    | `name` | For all but list/create | Warehouse identifier. |
-    | `body` | For create/createOrAlter | Complete Snowflake Warehouse resource definition. |
-    | `createMode` | No | `errorIfExists`, `orReplace` or `ifNotExists`. |
-    | `ifExists` | No | Make resume, suspend or delete succeed when the warehouse is absent. |
+    | `name` | For every action except `list` and `create` | Warehouse identifier. |
+    | `body` | For `create` and `createOrAlter` | Complete Snowflake warehouse resource definition. |
+    | `createMode` | No | `errorIfExists` (default), `orReplace` or `ifNotExists`. |
+    | `like` | For `list` | Case-insensitive name filter. |
+    | `ifExists` | For `resume`, `suspend` and `delete` | Return success instead of an error when the warehouse is absent. |
 
     <Warning>
       Resuming a warehouse starts compute billing. Suspending it can interrupt workloads. Call either action only after explicit user confirmation.
@@ -354,9 +395,18 @@ This connector is used by three different roles. Jump to the section that matche
 
     ## Installation
 
-    1. Go to **Apps** in your workspace.
-    2. Search for **Snowflake** and install it.
-    3. Open the auto-populated **Configuration app**, select an authentication mode, test it and configure **Authorized agents**.
+    Snowflake follows the standard App + MCP installation flow: [install the app](/apps-store/marketplace/connectors/install-in-workspace#install-the-app) by searching for **Snowflake** in **Apps**, then [configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app) and [authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector). Choose the authentication mode from [Choose an authentication mode](#choose-an-authentication-mode) before you start, and satisfy the [Snowflake-side prerequisites](#prerequisites-snowflake-side) first.
+
+    Snowflake-specific values for that flow:
+
+    | Item | Value for Snowflake |
+    |------|---------------------|
+    | Workspace secrets provisioned | `snowflakeAuth` for the mode and its credentials, `snowflakeAuthorizedAgents` for the allowlist |
+    | Per-user OAuth token secret | `snfRefresh_<userId>` |
+    | Capability **Scope** | `context_id,agent_id,user_id` |
+    | Test connection call | `GET /api/v2/databases?showLimit=1` with the resolved credential |
+
+    Installing writes the app instance bindings that resolve those secrets. Reinstalling or reconfiguring the app is idempotent and preserves existing values; see [What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions).
 
     ## Configuration
 
@@ -366,37 +416,37 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Auth mode | What you provide | Best for |
     |-----------|------------------|----------|
-    | `oauthCentral` | Connect a user; optional role and warehouse | A platform-managed OAuth client tied to the configured Snowflake account |
-    | `oauth` | Account URL, OAuth client ID/secret, optional role and warehouse; then Connect | A workspace-owned Snowflake OAuth integration |
-    | `keyPair` | Account URL and identifier, username, public-key fingerprint, PEM private key, optional passphrase, role and warehouse | Non-interactive service users with key-pair authentication |
-    | `programmaticAccessToken` | Account URL, programmatic access token, optional role and warehouse | Rotatable non-interactive access with Snowflake role restriction |
+    | `oauthCentral` | Connect a user; optional role and warehouse | A platform-managed OAuth client tied to the configured Snowflake account. Applied when no mode is set. |
+    | `oauth` | Account URL, OAuth client id and secret, optional role and warehouse; then connect | A workspace-owned Snowflake OAuth integration |
+    | `keyPair` | Account URL, account identifier, username, public-key fingerprint, PEM private key, optional passphrase, role and warehouse | Non-interactive service users with key-pair authentication |
+    | `programmaticAccessToken` | Account URL, programmatic access token, optional role and warehouse | Rotatable non-interactive access with a Snowflake role restriction |
     | `accessToken` | Account URL, pre-minted token, optional role and warehouse | Caller-managed OAuth or External OAuth tokens |
 
     <Note>
-      Credentials and the allowlist are stored as workspace secrets and resolved server-side. The public account URL must be an HTTPS Snowflake account origin, not a Snowsight page URL.
+      Credentials and the allowlist are stored as workspace secrets and resolved server-side. Each request carries the resolved bearer token plus the `X-Snowflake-Authorization-Token-Type` header set to `OAUTH`, `KEYPAIR_JWT` or `PROGRAMMATIC_ACCESS_TOKEN`. In `keyPair` mode the connector signs a fresh RS256 JWT valid for 59 minutes on every call, so no key material is sent to Snowflake.
     </Note>
 
-    ## Available Instructions
+    ## Available instructions
 
-    Every instruction resolves credentials from the workspace configuration and returns the raw Snowflake API payload.
+    Every instruction resolves credentials from the workspace configuration and returns the raw Snowflake API payload. `role` and `warehouse` default to the values configured on the connector when the call does not set them.
 
     ### SQL and asynchronous results
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `submitStatement` | Submit one or more statements in App mode; `statement` is required and execution context is optional. | A SQL API ResultSet (`data`, `resultSetMetaData`, `statementHandle`) or QueryStatus for asynchronous work. |
+    | `submitStatement` | Submit a statement; `statement` is required and the execution context is optional. `multi_statement_count` defaults to `1` and can be overridden through `parameters` in App mode. | A SQL API ResultSet (`data`, `resultSetMetaData`, `statementHandle`) or QueryStatus for asynchronous work. |
     | `getStatementStatus` | Check execution and fetch a result partition by `statementHandle`; optional `partition` is zero-based. | A ResultSet when complete or QueryStatus while running. |
     | `cancelStatement` | Cancel a running statement by `statementHandle`; optional `requestId` identifies the request. | Snowflake cancellation status. |
-    | `fetchResult` | Fetch page `page` from a Resource API asynchronous `result_handler`. | The raw Result API page and its provider pagination metadata. |
+    | `fetchResult` | Fetch page `page` from a resource API asynchronous `result_handler`. | The raw result page and its provider pagination metadata. |
 
     ### Databases
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `listDatabases` | List accessible databases; filter with `like`, `startsWith`, `fromName`, `showLimit` and `history`. | A collection of Snowflake Database resources or an async result handle. |
-    | `fetchDatabase` | Fetch one database by `name`. | A Snowflake Database resource. |
-    | `createDatabase` | Create a database from a complete `body`; optional `createMode` and `kind`. | The created Database resource or async result handle. |
-    | `createOrAlterDatabase` | Create or fully alter `name` from a complete `body`. | The resulting Database resource or async result handle. |
+    | `listDatabases` | List accessible databases; filter with `like`, `startsWith`, `fromName`, `showLimit` and `history`. | A collection of Snowflake database resources or an async result handle. |
+    | `fetchDatabase` | Fetch one database by `name`. | A Snowflake database resource. |
+    | `createDatabase` | Create a database from a complete `body`; optional `createMode` and `kind`. | The created database resource or async result handle. |
+    | `createOrAlterDatabase` | Create or fully alter `name` from a complete `body`. | The resulting database resource or async result handle. |
     | `undropDatabase` | Restore a dropped database by `name` when retention permits. | Snowflake operation status. |
     | `deleteDatabase` | Delete `name`; `restrict` defaults to `true` in the connector. | Snowflake operation status. |
 
@@ -404,30 +454,34 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `listSchemas` | List schemas in `database`; supports name filters, `showLimit`, cursor and history. | A collection of Snowflake Schema resources or an async result handle. |
-    | `fetchSchema` | Fetch `database`.`name`. | A Snowflake Schema resource. |
-    | `createSchema` | Create a schema in `database` from a complete `body`. | The created Schema resource or async result handle. |
-    | `createOrAlterSchema` | Create or fully alter `database`.`name` from `body`. | The resulting Schema resource or async result handle. |
-    | `undropSchema` | Restore a dropped `database`.`name` when retention permits. | Snowflake operation status. |
-    | `deleteSchema` | Delete `database`.`name`; `restrict` defaults to `true` in the connector. | Snowflake operation status. |
+    | `listSchemas` | List schemas in `database`; supports name filters, `showLimit`, cursor and history. | A collection of Snowflake schema resources or an async result handle. |
+    | `fetchSchema` | Fetch `name` inside `database`. | A Snowflake schema resource. |
+    | `createSchema` | Create a schema in `database` from a complete `body`. | The created schema resource or async result handle. |
+    | `createOrAlterSchema` | Create or fully alter `name` inside `database` from `body`. | The resulting schema resource or async result handle. |
+    | `undropSchema` | Restore a dropped schema when retention permits. | Snowflake operation status. |
+    | `deleteSchema` | Delete `name` inside `database`; `restrict` defaults to `true` in the connector. | Snowflake operation status. |
 
     ### Virtual warehouses
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `listWarehouses` | List warehouses, optionally filtered by `like`. | A collection of Snowflake Warehouse resources or an async result handle. |
-    | `fetchWarehouse` | Fetch one warehouse by `name`. | A Snowflake Warehouse resource. |
-    | `createWarehouse` | Create a warehouse from a complete `body`; optional `createMode`. | The created Warehouse resource or async result handle. |
-    | `createOrAlterWarehouse` | Create or fully alter `name` from `body`. | The resulting Warehouse resource or async result handle. |
+    | `listWarehouses` | List warehouses, optionally filtered by `like`. | A collection of Snowflake warehouse resources or an async result handle. |
+    | `fetchWarehouse` | Fetch one warehouse by `name`. | A Snowflake warehouse resource. |
+    | `createWarehouse` | Create a warehouse from a complete `body`; optional `createMode`. | The created warehouse resource or async result handle. |
+    | `createOrAlterWarehouse` | Create or fully alter `name` from `body`. | The resulting warehouse resource or async result handle. |
     | `resumeWarehouse` | Resume `name`; this starts compute billing. | Snowflake operation status. |
     | `suspendWarehouse` | Suspend `name`; this affects workload availability. | Snowflake operation status. |
     | `deleteWarehouse` | Delete `name`; optional `ifExists` makes the operation idempotent. | Snowflake operation status. |
 
     <Note>
-      Snowflake Resource API operations can return `202 Accepted`. Use the returned result handler with `fetchResult` until the operation completes.
+      Snowflake resource API operations can return `202 Accepted`. Use the returned result handler with `fetchResult` until the operation completes. `showLimit` is clamped to the range 1 to 100 in App mode as well, so page through large listings with `fromName`.
     </Note>
 
-    ## DSUL Examples
+    <Warning>
+      App-mode instructions output the provider payload only. When credential resolution fails, the instruction produces an empty output instead of an error object, so branch on a field you expect in the response rather than assuming a successful call.
+    </Warning>
+
+    ## DSUL examples
 
     **Run a parameterized aggregate query:**
 
@@ -491,38 +545,94 @@ This connector is used by three different roles. Jump to the section that matche
 
 ---
 
+## Verify the connection
+
+Run these checks after configuring the connector and before letting an agent write to Snowflake. Each one is independent of the setup screens. They are the Snowflake instances of the generic checks in [Verify the installation](/apps-store/marketplace/connectors/install-in-workspace#verify-the-installation); run that page's non-allowlisted-agent check as well, and [Verify the central client](/apps-store/marketplace/connectors/central-oauth#verify-the-central-client) when using `oauthCentral`.
+
+<Steps>
+  <Step title="Test the stored credential">
+    In the configuration app, run the connection test. It performs `GET /api/v2/databases?showLimit=1` with the resolved credential and returns the normalized account origin on success. A failure reports the HTTP status without echoing the credential.
+  </Step>
+  <Step title="Confirm the runtime identity">
+    Call the `sql` tool with `action: execute` and the statement `SELECT CURRENT_USER(), CURRENT_ROLE(), CURRENT_ACCOUNT()`, or run the same statement through `Snowflake.submitStatement`. In an OAuth mode the result must name the signed-in user; in `keyPair`, `programmaticAccessToken` and `accessToken` modes it names the shared service user that every query in the workspace will be attributed to.
+  </Step>
+  <Step title="Run a read-only listing">
+    Call `databases` with `action: list` and `showLimit: 5`. Only databases visible to the resolved role are returned.
+  </Step>
+  <Step title="Check that unauthorized access is blocked">
+    Call `databases` with `action: get` on a database the role must not see. The call fails with `Resource not found while fetchDatabase.` or `Forbidden while fetchDatabase.` instead of returning data.
+  </Step>
+  <Step title="Check the write path last">
+    Only once the reads behave as expected, create a throwaway schema with `schemas` `create` and `createMode: ifNotExists`, confirm it appears in Snowflake, then remove it with `schemas` `delete`. If the connector is scoped read-only, Snowflake rejects the write and the tool returns `Forbidden while createSchema.`
+  </Step>
+</Steps>
+
+## Revoke, rotate and remove
+
+The generic lifecycle is documented in [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall) and, for the platform client, in [Rotate and revoke the central client](/apps-store/marketplace/connectors/central-oauth#rotate-and-revoke-the-central-client). Snowflake differs on these points:
+
+- **Disconnect one user.** From the configuration app, disconnect. The connector deletes that user's stored access and refresh tokens and the workspace-scoped copy of the refresh token. Snowflake exposes no generic token-revocation endpoint to the connector, so provider-side revocation must be done in Snowflake, for example by removing the user's role grants or by disabling the security integration.
+- **Offboard a user.** Disconnect them before their Prisme.ai account is removed. Their refresh token is stored under a workspace secret named `snfRefresh_<userId>`, which the disconnect flow deletes.
+- **Force a reconnection.** Changing the account URL, the OAuth client id or the default role invalidates every cached delegated token. The next call fails with `Snowflake OAuth settings changed. Reconnect to authorize the new account, client, or role.` and each user reconnects once.
+- **Plan for refresh-token expiry.** Snowflake refresh tokens live for `OAUTH_REFRESH_TOKEN_VALIDITY` seconds, which the [Snowflake security integration reference](https://docs.snowflake.com/en/sql-reference/sql/create-security-integration-oauth-snowflake) documents as 90 days by default and at most. Users must reconnect at least that often.
+- **Rotate the central client secret.** Generate a new secret in Snowflake, then re-enter the client id and secret in the maintainer view of the configuration app. Every token exchange uses the stored secret, so refreshes fail until the stored value matches the one Snowflake expects.
+- **Rotate a key pair, programmatic access token or access token.** Replace the value in the configuration app. No user re-consent is required because these modes have no per-user connection.
+- **Revoke an agent's access.** Untick the agent in **Authorized agents**, or clear **Allow all agents**. The next call is rejected with `This agent is not authorized to use this connector.`
+- **Uninstall.** Remove the app instance from the workspace. Uninstalling does not delete the workspace secrets the install flow provisioned (`snowflakeAuth`, `snowflakeAuthorizedAgents`) or the per-user `snfRefresh_<userId>` secrets; delete them from the workspace secrets to purge the stored credentials.
+
 ## Error Handling
 
-| HTTP code | Meaning |
-|-----------|---------|
-| `400` | Invalid account URL, SQL, identifier, request body or OAuth configuration. |
-| `401` | Missing, expired, revoked or invalid Snowflake credential. OAuth users may need to reconnect. |
-| `403` | The Snowflake role lacks the required privilege, the OAuth role is blocked, or a network policy rejects the request. |
-| `404` | The requested statement, database, schema, warehouse or result handler is absent or not visible. |
-| `409` | The resource already exists or its current state conflicts with the requested operation. |
-| `422` | Snowflake rejected the resource definition or an action for its current state. |
-| `429` | Snowflake concurrency or rate limit reached; retry with backoff. |
-| `500` / `503` | Transient Snowflake or connector failure; retry before changing credentials. |
+Snowflake responses are normalized into one message per status, carrying the failing operation name and a compact detail extracted from the provider body (`code`, `message` and `request_id`, or `error` and `error_description` on the token endpoints). An unrecognized body is reported as `(no further detail)` rather than dumped, so credentials are never echoed back.
+
+| HTTP code | Returned message |
+|-----------|------------------|
+| `400` | `Bad request while <operation>: <detail>` Invalid SQL, identifier, request body or OAuth request. |
+| `401` | `Authentication failed while <operation>. Check Snowflake credentials.` The connector first retries once with a freshly refreshed token. |
+| `403` | `Forbidden while <operation>. Check the active Snowflake role and object privileges.` Also returned when a network policy rejects the request. |
+| `404` | `Resource not found while <operation>.` The statement, database, schema, warehouse or result handle does not exist or is not visible to the role. |
+| `429` | `Rate limit / org limit exceeded while <operation>. Wait and retry.` Marked transient. |
+| `500`, `503`, `504` | `Snowflake server error while <operation>.` `503` and `504` are marked transient. |
+| Other | `Error <status> while <operation>: <detail>` |
 
 ### Common Issues
 
-**"This agent is not authorized to use this connector"**, Open the configuration app, add the agent under **Authorized agents** (or enable **Allow all agents**) and save.
+Install, allowlist and capability failures that are not specific to Snowflake are covered in [Install troubleshooting](/apps-store/marketplace/connectors/install-in-workspace#troubleshooting), [Central OAuth troubleshooting](/apps-store/marketplace/connectors/central-oauth#troubleshooting) and [Capability troubleshooting](/apps-store/marketplace/connectors/declare-capability#troubleshooting).
 
-**"The calling agent could not be identified"**, The capability scope is missing `agent_id`. Set it to `context_id,agent_id,user_id`, then authorize the agent.
+**"This agent is not authorized to use this connector."**: The calling agent is not in the allowlist. Open the configuration app, go to **Authorized agents**, tick this agent and save, or enable **Allow all agents**. The **Install capability** button does this for you.
 
-**"Snowflake OAuth is not connected for this user"**, Open the configuration app and click **Connect**, or follow the connection URL surfaced by Agent Creator.
+**"The calling agent could not be identified, so it cannot be authorized."**: The MCP capability *Scope* does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allow the agent in the configuration app.
 
-**"Snowflake token refresh failed … must reconnect"**, The refresh token expired or was revoked. Reconnect the user. Snowflake OAuth refresh-token validity is controlled by the security integration.
+**"Snowflake OAuth is not connected for this user."**: No per-user token is stored. Open the connector configuration and select **Connect**, or follow the connection prompt surfaced by Agent Creator.
 
-**"Snowflake platform OAuth is not configured for an account"**, Ask the platform maintainer to configure the central client, or select tenant OAuth, key-pair, programmatic-token or access-token mode.
+**"Snowflake rejected the OAuth refresh token. Reconnect from the connector configuration."**: The refresh token expired or was revoked. The stored connection is dropped automatically and the user must reconnect.
 
-**SQL output is truncated**, MCP responses are intentionally limited to 100 rows and 80 KB. Narrow the query with selected columns, `WHERE`, aggregation and deterministic keyset pagination. A provider `partition` cannot recover rows omitted locally by the connector.
+**"Snowflake OAuth settings changed. Reconnect to authorize the new account, client, or role."**: The configured account URL, OAuth client id or role no longer matches the cached token. Reconnect once to authorize the new combination.
+
+**"Snowflake OAuth token endpoint is temporarily unavailable (status …). Retry shortly."**: The Snowflake token endpoint returned a `5xx`. This is transient and requires no reconnection.
+
+**"Snowflake platform OAuth is not configured for an account."**: No central client is available. Ask the connector maintainer to configure it in the core workspace, or select `oauth`, `keyPair`, `programmaticAccessToken` or `accessToken`.
+
+**"Snowflake authentication is incomplete. Configure all required fields in the connector configuration app."**: The selected mode is missing a required credential field, for example a programmatic access token or an access token that was never stored.
+
+**"Invalid Snowflake account URL. Use https://organization-account.snowflakecomputing.com."**: The account URL is not an `https://` origin on `snowflakecomputing.com` or `snowflakecomputing.cn`, or it carries embedded credentials. Enter the bare account origin, not a Snowsight page URL.
+
+**"Snowflake key-pair JWT generation failed: …"**: The account identifier, username, public-key fingerprint or PEM private key is missing or unusable. The connector uppercases the account identifier and username, replaces dots in the account identifier with dashes, and prefixes the fingerprint with `SHA256:` when absent; supply the passphrase when the key is encrypted.
+
+**"Core workspace editor access is required."**: The maintainer view of the configuration app was opened without `owner`, `editor` or `admin` on the core workspace or the platform `superadmin` role.
+
+**SQL output is truncated**: MCP responses are limited to 100 rows and 80 KB. Narrow the query with selected columns, `WHERE`, aggregation and deterministic keyset pagination. A provider `partition` cannot recover rows omitted locally by the connector.
 
 ## External Resources
 
 <CardGroup cols={2}>
   <Card title="Snowflake REST APIs" icon="book" href="https://docs.snowflake.com/en/developer-guide/snowflake-rest-api/reference">
     Official Snowflake REST API reference for databases, schemas, warehouses and asynchronous results.
+  </Card>
+  <Card title="Snowflake SQL API" icon="terminal" href="https://docs.snowflake.com/en/developer-guide/sql-api/index">
+    Official reference for statement submission, asynchronous execution and result partitions.
+  </Card>
+  <Card title="Snowflake OAuth for custom clients" icon="key" href="https://docs.snowflake.com/en/user-guide/oauth-custom">
+    Official guide to creating the security integration, its role lists and its refresh-token settings.
   </Card>
   <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
     Learn how Agent Creator agents consume MCP tools in Prisme.ai.

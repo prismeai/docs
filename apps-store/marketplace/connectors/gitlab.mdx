@@ -1,6 +1,6 @@
 ---
 title: 'GitLab'
-description: 'Let Agent Creator agents manage GitLab projects, issues, merge requests and CI/CD pipelines through MCP, with per-user OAuth resolved server-side'
+description: 'Let Agent Creator agents and Builder automations manage GitLab.com projects, issues, merge requests and CI/CD pipelines, with per-user OAuth resolved server-side'
 ---
 
 <img
@@ -12,21 +12,31 @@ description: 'Let Agent Creator agents manage GitLab projects, issues, merge req
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The GitLab connector exposes the [GitLab](https://gitlab.com) DevOps platform (REST v4 API) to **Agent Creator** agents (through MCP) and to Builder automations (through the `GitLab.op:` App instructions), covering projects, issues, merge requests, pipelines, jobs, environments, branches, commits, tags, releases, labels, milestones, wikis, CI/CD variables, deploy keys, webhooks, groups and users. The 90+ GitLab operations are grouped into **16 entity tools**, each driven by an `action` argument. The MCP server runs in the **tenant app-instance context**: it resolves the installing workspace's own credentials and authorizes the calling agent against that workspace's allowlist. Authentication is per-user and supports several modes:
+The GitLab connector exposes the [GitLab](https://gitlab.com) DevOps platform (REST v4 API) to **Agent Creator** agents (through MCP) and to Builder automations (through the `GitLab.<instruction>:` App instructions), covering projects, issues, merge requests, pipelines, jobs, environments, branches, commits, tags, releases, labels, milestones, wikis, CI/CD variables, deploy keys, webhooks, project uploads, groups and users. The MCP surface groups the GitLab operations into **17 entity tools**, each driven by an `action` argument; the App surface exposes **99 instructions**, one per operation. The MCP server runs in the **tenant app-instance context**: it resolves the installing workspace's own credentials and authorizes the calling agent against that workspace's allowlist.
 
-- **Per-user OAuth2, central client** (`oauthCentral`, recommended): one GitLab OAuth application is registered once by the platform maintainer; every end user signs in with their own GitLab account. Nothing to register per workspace: each one just installs the app and clicks *Connect*.
-- **Per-user OAuth2, tenant client** (`oauth`): paste your own GitLab OAuth client ID/secret in the connector config app. Each user signs in with their own account against your client (authorization-code flow).
-- **Direct access token** (`accessToken`): a caller-managed GitLab token (e.g. a Personal Access Token with the `api` scope), used as-is with no exchange.
+<Warning>
+  This connector targets **GitLab SaaS (gitlab.com) only**. The API base URL (`https://gitlab.com/api/v4`) and the OAuth authorize, token and revoke endpoints are fixed to `gitlab.com`, and no field overrides them, so a self-managed or GitLab Dedicated instance cannot be used.
+</Warning>
+
+Authentication is resolved server-side and supports three modes, selected by the `mode` field of the workspace's `gitlabAuth` secret through the configuration app:
+
+- **Per-user OAuth2, central client** (`oauthCentral`, recommended): one GitLab OAuth application is registered once by the platform maintainer in the core `gitlab` workspace; every end user signs in with their own GitLab account. Nothing to register per workspace: each one just installs the app and connects. GitLab sees the invoking user, and applies that user's own project permissions.
+- **Per-user OAuth2, tenant client** (`oauth`, the default when no mode is stored): the workspace provides its own GitLab OAuth Application ID and Secret in the configuration app. Each user signs in with their own account against that client (authorization code + PKCE). GitLab still sees the invoking user.
+- **Direct access token** (`accessToken`): a caller-managed GitLab token (for example a personal access token with the `api` scope), used as-is with no exchange. GitLab sees the **single account that owns the token**, for every user of the workspace.
+
+<Warning>
+  `accessToken` is a **shared credential**. Every agent and automation in the workspace acts as the token owner, GitLab audit logs attribute all writes to that one account, and the blast radius is everything that account can reach. Use it only for unattended automation or an intentionally shared service account, and prefer a dedicated GitLab service account over a personal one. For interactive chat use, pick one of the per-user OAuth modes.
+</Warning>
 
 <CardGroup cols={3}>
-  <Card title="Project Management" icon="diagram-project">
-    Projects, issues, merge requests, labels, milestones and wikis
+  <Card title="Project management" icon="diagram-project">
+    Projects, issues, merge requests, labels, milestones, wikis and file uploads
   </Card>
-  <Card title="CI/CD & DevOps" icon="rocket">
+  <Card title="CI/CD and DevOps" icon="rocket">
     Pipelines, jobs, environments, CI variables, deploy keys and webhooks
   </Card>
   <Card title="Per-user auth" icon="key">
-    Per-user OAuth (central or tenant client) resolved server-side, or a direct access token
+    Per-user OAuth (central or tenant client) resolved server-side, or a shared access token
   </Card>
 </CardGroup>
 
@@ -35,78 +45,86 @@ The GitLab connector exposes the [GitLab](https://gitlab.com) DevOps platform (R
 This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to use GitLab. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to use GitLab. Go to Agent builder.
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and set up the shared GitLab OAuth client once for everyone. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and set up the shared GitLab OAuth client once for everyone. Go to Platform admin setup.
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call GitLab operations directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations (DSUL) that call GitLab operations directly. Go to Workspace builder.
   </Card>
 </CardGroup>
 
+Each role's section keeps the GitLab-specific values it needs. The generic, connector-agnostic procedures live on three shared pages: [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace), [Central OAuth client](/apps-store/marketplace/connectors/central-oauth), and [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability).
+
 ## Prerequisites
 
-- A **GitLab** account (gitlab.com or a self-hosted instance).
-- For the **OAuth modes**: a GitLab OAuth application created at **User Settings > Applications** (`https://gitlab.com/-/user_settings/applications`) with the `api` scope (or `read_api` for read-only agents); copy its Application ID and Secret. The platform maintainer registers one app for the central mode; a workspace can also register its own for the tenant mode.
-- For the **access-token mode**: a Personal Access Token created at **User Settings > Access Tokens** (`https://gitlab.com/-/user_settings/personal_access_tokens`) with the `api` scope.
-- Base URL: `https://gitlab.com/api/v4`.
+- A **gitlab.com** account for every person who will use the connector, already able to open the projects and groups the connector must reach. GitLab enforces that account's own role on every call, so a user never sees more through the connector than in the GitLab UI.
+- For the **OAuth modes** (`oauthCentral`, `oauth`): a GitLab OAuth application created at **User Settings > Applications** (`https://gitlab.com/-/user_settings/applications`) with the `api` scope (or `read_api` for read-only usage); copy its **Application ID** and **Secret**. The platform maintainer registers one application for the central mode; a workspace registers its own for the tenant mode.
+- For the **access-token mode** (`accessToken`): a personal access token created at **User Settings > Access Tokens** (`https://gitlab.com/-/user_settings/personal_access_tokens`) with the `api` scope (or `read_api` for read-only usage).
+- In Prisme.ai: workspace **editor** or **owner** access on the workspace where the connector is installed, to open the configuration app and store credentials.
+- API base URL used by every operation: `https://gitlab.com/api/v4`. Authorize endpoint `https://gitlab.com/oauth/authorize`, token endpoint `https://gitlab.com/oauth/token`, revocation endpoint `https://gitlab.com/oauth/revoke`.
+
+<Note>
+  **Which mode should you choose?** Use `oauthCentral` when the platform maintainer has provisioned the shared GitLab application: it is the least work per workspace and each action is attributed to the person who triggered it. Use `oauth` when you must keep the GitLab OAuth application under your own organization's control. Use `accessToken` only for unattended automation that has no interactive user to sign in, accepting that every call runs as the token owner.
+</Note>
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
   **Goal:** two one-time tasks: (1) configure the shared **central OAuth client** so every workspace lets its users sign in with their own GitLab account, and (2) optionally expose GitLab as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs. Throughout, `<api-url>` is your environment's API URL (`https://api.studio.prisme.ai/v2` on production).
 
+  The procedure itself is the standard one documented in [Central OAuth client](/apps-store/marketplace/connectors/central-oauth). This section supplies only the GitLab values that procedure asks for.
+
   ## 1. Configure the connector
 
-  <Steps>
-    <Step title="Register the OAuth application at GitLab">
-      Open `https://gitlab.com/-/user_settings/applications` and click **Add new application**. Set the single authorized redirect URI (callback URL) to the **core workspace** callback:
+  Follow [Configure the central client](/apps-store/marketplace/connectors/central-oauth#configure-the-central-client) with these values:
 
-      ```text
-      <api-url>/workspaces/slug:gitlab/webhooks/oauthCallback
-      ```
+  | The shared procedure asks for | GitLab value |
+  |---|---|
+  | Provider console where the OAuth application is registered | **User Settings > Applications** at `https://gitlab.com/-/user_settings/applications`, using **Add new application** |
+  | The single authorized redirect URI to register | `<api-url>/workspaces/slug:gitlab/webhooks/oauthCallback` (for example `https://api.studio.prisme.ai/v2/workspaces/slug:gitlab/webhooks/oauthCallback` on production) |
+  | Scopes granted on the application | `api` for read and write, or `read_api` for a read-only platform |
+  | Credentials to copy | **Application ID** and **Secret**. GitLab shows the secret only once |
+  | Core workspace holding the maintainer view | The `gitlab` workspace. Open its configuration app at `<studio>/apps/gitlab`, for example `https://studio.prisme.ai/apps/gitlab` |
+  | Value stored when the **Scopes** field is left empty | `api` |
+  | Core workspace secret written | `gitlabCentralOAuth` |
+  | Auth mode a consuming workspace then selects | `oauthCentral`, with no Application ID or Secret on its side |
 
-      (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:gitlab/webhooks/oauthCallback` on production). Add the `api` scope (or `read_api` for read-only). Save and copy the **Application ID** and **Secret** (the secret is shown only once).
-    </Step>
-    <Step title="Enter the credentials through the configuration app">
-      Open the central `gitlab` workspace and launch its **Configuration app** at `<studio>/apps/gitlab` (e.g. `https://studio.prisme.ai/apps/gitlab`). Loaded from the core workspace, the app shows the **maintainer view** (org owner / editor / admin only); paste the **Application ID** and **Secret** there and Save; the app stores them in the core workspace's secrets for you. Do not edit Studio's raw Secrets by hand. These credentials stay in the `gitlab` workspace and are never exposed to tenants or end users; token exchange is proxied through the core `centralTokenExchange` webhook so the client secret never leaves the core workspace.
-    </Step>
-    <Step title="Tell workspaces to use the central client">
-      Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**.
-    </Step>
-    <Step title="(Optional) Publish to the Capabilities catalog">
-      From that same maintainer view, the **Add to catalog** button publishes GitLab to the org-wide **Capabilities catalog** in one click (org owner / admin only; it stays disabled until the central client is saved). Once published, every agent builder in the org can enable GitLab from the catalog without pasting an endpoint; see *Option A* in the *Agent builder* tab.
-    </Step>
-  </Steps>
+  The core redirect URI above is the **only** one to register: tenant workspaces reuse it, and the core workspace proxies the authorization code back to the workspace that started the flow. Hand each consuming workspace [Select the central client in a workspace](/apps-store/marketplace/connectors/central-oauth#select-the-central-client-in-a-workspace); a workspace can still narrow the requested scopes, because the **Scopes** value stored on the workspace overrides the central default.
+
+  <Note>
+    The central credentials never leave the `gitlab` workspace. Tenant workspaces only ever read the public part (client ID and scopes) through the core `getOAuthClientPublic` webhook, and every token exchange is proxied through the core `centralTokenExchange` webhook. See [How the client secret stays in the core workspace](/apps-store/marketplace/connectors/central-oauth#how-the-client-secret-stays-in-the-core-workspace).
+  </Note>
+
+  From that same maintainer view, the **Add to catalog** button publishes GitLab to the org-wide **Capabilities catalog** in one click (org owner or admin only; it stays disabled until the central client is saved). The flow is [Publish the connector to the Capabilities catalog](/apps-store/marketplace/connectors/declare-capability#publish-the-connector-to-the-capabilities-catalog). Once published, every agent builder in the org can enable GitLab from the catalog without pasting an endpoint; see [Use the shared catalog capability](#use-the-shared-catalog-capability).
 
   ## 2. Declare the capability in AI Governance
 
-  As an alternative to (or in addition to) the catalog button, you can declare GitLab as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
+  As an alternative to (or in addition to) the catalog button, declare GitLab as a named **capability** by hand, following [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance). Point the capability at the connector's **MCP Endpoint** and set its **Scope** to:
 
-  <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) the **GitLab** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
+  ```text
+  context_id,agent_id,user_id
+  ```
 
-      ```text
-      context_id,agent_id,user_id
-      ```
+  The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
 
-      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant.
-    </Step>
-    <Step title="Smoke-test">
-      From an agent that has the capability, in a workspace configured for `oauthCentral`, trigger any tool (e.g. `users` with `action: "getCurrent"`). The user is prompted to connect once (GitLab sign-in); subsequent calls reuse the stored token transparently and refresh it automatically.
-    </Step>
-  </Steps>
+  **Smoke-test.** From an agent that has the capability, in a workspace configured for `oauthCentral`, trigger a read-only tool call: `users` with `action: "getCurrent"`. The user is prompted to connect once (GitLab sign-in); the response must carry the **connecting user's own** GitLab `username`, which confirms that the runtime identity is the end user and not a shared account. Subsequent calls reuse the stored token and refresh it automatically.
 
   <Warning>
-    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model**: which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is also **no OAuth auth-config JSON** to attach in Governance: connect / status / disconnect are handled by the connector's own webhooks, wired automatically.
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model**: which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the [Workspace builder](#workspace-builder-dsul) tab and [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization)). There is also **no OAuth auth-config JSON** to attach in Governance: connect, status and disconnect are handled by the connector's own webhooks, wired automatically.
   </Warning>
+
+  <Warning>
+    The **core `gitlab` workspace's own MCP endpoint bypasses the allowlist.** As soon as the central OAuth client is stored there, that endpoint accepts every calling agent, on the assumption that per-user OAuth is the real access gate. Publish the core endpoint as a capability only if you accept that any agent in the organization may call it; otherwise publish a capability that points at a dedicated tenant workspace, which does enforce its allowlist. The mechanism is described in [Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint).
+  </Warning>
+
+  ## 3. Rotate or revoke the central client
+
+  [Rotate and revoke the central client](/apps-store/marketplace/connectors/central-oauth#rotate-and-revoke-the-central-client) covers the general flow. The GitLab specifics:
+
+  - **Rotate the secret.** Generate a new secret on the GitLab application, then reopen the maintainer view of the configuration app, paste the new **Application ID** and **Secret**, and Save. Tokens already issued keep working until they expire; refreshes then run against the new secret.
+  - **Revoke the client.** Delete the application at `https://gitlab.com/-/user_settings/applications`. Every stored per-user token becomes invalid, `oauthStatus` starts reporting `connected: false`, and agents re-propose the connect flow. Workspaces that must keep working should switch to auth mode `oauth` with their own application first.
+  - **Withdraw the central client without touching the GitLab application.** Delete the `gitlabCentralOAuth` secret from the core `gitlab` workspace **Secrets**. The maintainer view has no withdraw action, so this is the removal path.
 </Accordion>
 
 ---
@@ -118,47 +136,37 @@ This connector is used by three different roles. Jump to the section that matche
     **Goal:** let an agent you build in Agent Creator use GitLab through MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the GitLab app in a workspace (see the *Workspace builder* tab), and, for the central OAuth mode, a *Platform admin* must have provisioned the shared OAuth client (see the *Platform admin setup* accordion above).
+      Before an agent can call the connector, a workspace builder must have installed and configured the GitLab app in a workspace (see [Workspace builder](#workspace-builder-dsul)), and, for the central OAuth mode, a platform admin must have provisioned the shared OAuth client (see [Platform admin setup](#platform-admin-governance-one-time-platform-setup)).
     </Note>
 
-    This connector runs in the **tenant app-instance context**: your agent is authorized two ways at once: it is identified by the `agent_id` that Agent Creator injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The GitLab access token itself is resolved server-side from the configured auth mode.
+    This connector runs in the **tenant app-instance context**: your agent is authorized two ways at once: it is identified by the `agent_id` that Agent Creator injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The GitLab access token itself is resolved server-side from the configured auth mode. [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization) explains why both gates exist.
 
     There are two ways to wire it up. Pick based on how much isolation you need.
 
-    ## Option A: Enable the shared capability from the catalog
+    ## Use the shared catalog capability
 
-    The fastest path: a *Platform admin* has already published a **GitLab** capability to the Capabilities catalog (see the *Platform admin setup* accordion above, the **Add to catalog** button, or §2), so you just pick it from the catalog.
+    The fastest path: a platform admin has already published a **GitLab** capability to the Capabilities catalog (see [Platform admin setup](#platform-admin-governance-one-time-platform-setup)), so you just pick it from the catalog. Attaching a catalog capability to an agent is the standard flow in [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability).
 
-    <Steps>
-      <Step title="Open your agent in Agent Creator">
-        Open the agent you want to extend and go to its capabilities / tools.
-      </Step>
-      <Step title="Add the GitLab capability">
-        Browse the capability catalog, select **GitLab**, and enable it. The MCP endpoint URL and the *Scope* (`context_id,agent_id,user_id`) are already wired by the admin; nothing to paste, and the shared instance accepts every agent, so there is no allowlist step on your side.
-      </Step>
-      <Step title="Connect a GitLab account">
-        On the first tool call, an unconnected user is prompted to sign in: Agent Creator surfaces a `connect_url` to GitLab's authorization page. After sign-in the per-user token is stored and reused on subsequent calls; refresh is automatic.
-      </Step>
-    </Steps>
+    GitLab specifics for this path: the MCP endpoint URL and the *Scope* (`context_id,agent_id,user_id`) are already wired by the admin, so there is nothing to paste. The shared instance is the core `gitlab` workspace endpoint, which accepts every agent, so there is no allowlist step on your side either. On the first tool call, an unconnected user is prompted to sign in: Agent Creator surfaces a `connect_url` to GitLab's authorization page. After sign-in the per-user token is stored and reused on subsequent calls; refresh is automatic.
 
     <Note>
-      Convenient, but your agent runs against a **shared, platform-managed instance**: its GitLab credentials are owned by someone else and the instance accepts every agent that is granted the capability. Prefer Option B for anything beyond quick experiments.
+      Convenient, but your agent runs against a **shared, platform-managed instance**: its GitLab credentials are owned by someone else and the instance accepts every agent that is granted the capability, as described in [Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint). Prefer [running the connector from your own workspace](#run-the-connector-from-your-own-workspace-recommended) for anything beyond quick experiments.
     </Note>
 
-    ## Option B: Run it from your own workspace (recommended)
+    ## Run the connector from your own workspace (recommended)
 
     For production agents, install the connector in **your own workspace** and point the agent at *that* workspace's MCP endpoint.
 
     <Warning>
-      **Prefer this mode for security.** Because the MCP runs in *your* app-instance context, the GitLab credentials, the per-user OAuth tokens and the authorized-agents allowlist are all **scoped to your workspace**, not shared platform-wide. You decide exactly which agents may call it and which GitLab account / auth mode backs them, and a misconfiguration elsewhere can never expose your data. The shared catalog capability (Option A) is a broad surface many agents can reach; your own workspace is an isolated, least-privilege boundary.
+      **Prefer this mode for security.** Because the MCP runs in *your* app-instance context, the GitLab credentials, the per-user OAuth tokens and the authorized-agents allowlist are all **scoped to your workspace**, not shared platform-wide. You decide exactly which agents may call it and which GitLab account / auth mode backs them, and a misconfiguration elsewhere can never expose your data. The shared catalog capability is a broad surface many agents can reach; your own workspace is an isolated, least-privilege boundary.
     </Warning>
 
     <Steps>
       <Step title="Install and configure the connector in your workspace">
-        Follow the *Workspace builder* tab: install **GitLab** in your workspace, open its **Configuration app**, choose the auth mode and connect a GitLab account.
+        Install **GitLab** in your workspace, open its **Configuration app**, choose the auth mode and connect a GitLab account. The GitLab values are in the [Workspace builder](#workspace-builder-dsul) tab; the procedure is [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace#install-the-app).
       </Step>
       <Step title="Allowlist your agent">
-        In that workspace's config app, open **Authorized agents** and tick your agent (the **Install capability** button does this for you), or enable **Allow all agents**.
+        In that workspace's config app, open **Authorized agents** and tick your agent, or enable **Allow all agents**. Selecting **Install capability** on the agent's row allowlists it and attaches the MCP tool in one action; see [Install the capability on one agent](/apps-store/marketplace/connectors/declare-capability#install-the-capability-on-one-agent).
       </Step>
       <Step title="Add the MCP capability to your agent">
         In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
@@ -167,7 +175,11 @@ This connector is used by three different roles. Jump to the section that matche
         context_id,agent_id,user_id
         ```
 
-        The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "agent could not be identified" message. This *Scope* is separate from the GitLab OAuth scopes.
+        The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "agent could not be identified" message. This *Scope* is separate from the GitLab OAuth scopes ([what the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means)). If the agent must attach files that users drop in the conversation to a GitLab project, declare `attachment_urls` as well, which the `uploads` tool requires:
+
+        ```text
+        context_id,agent_id,user_id,attachment_urls
+        ```
       </Step>
       <Step title="Connect a GitLab account">
         On the first tool call, the user is prompted to sign in (or uses **Connect** in the config app). The per-user token is stored and reused; refresh is automatic.
@@ -179,7 +191,7 @@ This connector is used by three different roles. Jump to the section that matche
     Whichever option you pick, wiring the capability is not enough: the agent must know the connector exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
 
     ```text
-    You have access to the GitLab MCP server. Use it whenever the user asks about GitLab content: projects, issues, merge requests, pipelines, jobs, branches, commits, tags, releases, milestones or members. Examples: "List my open merge requests", "What's failing in pipeline #1234?", "Create an issue in project X with label bug", "Show the latest release of my main project". Each tool is an entity that takes an `action` argument. Prefer calling tools over guessing, and confirm with the user before any destructive action (close an issue, merge or revert an MR, delete a branch, cancel a pipeline).
+    You have access to the GitLab MCP server. Use it whenever the user asks about GitLab content: projects, issues, merge requests, pipelines, jobs, branches, commits, tags, releases, milestones or members. Examples: "List my open merge requests", "What is failing in pipeline #1234?", "Create an issue in project X with label bug", "Show the most recent release of my main project". Each tool is an entity that takes an `action` argument. Prefer calling tools over guessing, and confirm with the user before any destructive action (close an issue, merge or revert a merge request, delete a branch, cancel a pipeline).
     ```
 
     Refine the trigger keywords (project names, group names, label conventions) so the agent reliably picks up the right intent in your context.
@@ -189,12 +201,12 @@ This connector is used by three different roles. Jump to the section that matche
     </Note>
 
     <Note>
-      **Restricting to read-only (least privilege).** GitLab tools cover both reads and writes (create/update issues, merge requests, etc.). The connector requests the GitLab `api` scope (full read + write) by default. To allow only read access, set the **Scopes** field in the configuration app to `read_api`. With central OAuth (`oauthCentral`) you do **not** create your own GitLab application; keep `oauthCentral` and enter `read_api`; your tenant scope overrides the platform default (the central application must allow `read_api`). Write calls are then rejected by GitLab with `403 Forbidden`. The scope is set at the workspace level (a workspace editor can widen it); a GitLab personal access token limited to `read_api` is the hard-guarantee alternative.
+      **Restricting to read-only (least privilege).** GitLab tools cover both reads and writes (create and update issues, merge requests, pipelines, and more). The connector requests the GitLab `api` scope (full read and write) when no scope is stored. To allow only read access, set the **Scopes** field in the configuration app to `read_api`. With central OAuth (`oauthCentral`) you do **not** create your own GitLab application: keep `oauthCentral` and enter `read_api`, and the workspace scope overrides the platform default (the central application must itself allow `read_api`). Write calls are then rejected by GitLab with `403 Forbidden`. The scope is set at the workspace level, so a workspace editor can widen it again; a GitLab personal access token limited to `read_api`, used in `accessToken` mode, is the alternative that cannot be widened from Prisme.ai.
     </Note>
 
     ## Available Tools
 
-    Tools are grouped by resource. Each MCP tool takes an `action` argument selecting the operation, plus the parameters for that action. Every tool also accepts an `outputFormat` parameter (see *Output Formats*).
+    The MCP server advertises itself as `gitlab-mcp`. Tools are grouped by resource. Each MCP tool takes an `action` argument selecting the operation, plus the parameters for that action. Every tool also accepts an `outputFormat` parameter (see [Output formats](#output-formats)). Tool names and action names are case-sensitive; an unknown `action` returns an error listing the accepted values for that tool.
 
     ### Projects
 
@@ -246,6 +258,16 @@ This connector is used by three different roles. Jump to the section that matche
     |------|-------------|
     | `groups` | Groups (namespaces). Actions: `list` (pass `owned:true` for *my* groups), `get`, `create`, `update`. |
     | `users` | Users. Actions: `list`, `get`, `search`, `getCurrent`. |
+
+    ### Attachments
+
+    | Tool | Description |
+    |------|-------------|
+    | `uploads` | Project uploads. Action: `create` only. Uploads the files attached to the current chat message to a project and returns one `{ ok, markdown, url, filename }` entry per file, to embed in an issue description or a note body. |
+
+    <Note>
+      `uploads` requires the capability *Scope* to declare [`attachment_urls`](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means), which is how Agent Creator passes the URLs of the files the user dropped in the conversation. Pass the project in `id` as a **raw** namespaced path (`group/subgroup/repo`) or a numeric project ID; do not URL-encode it. Files larger than 25 MB are rejected, and each filename is transliterated to ASCII before upload.
+    </Note>
 
     ## Output Formats
 
@@ -377,6 +399,28 @@ This connector is used by three different roles. Jump to the section that matche
     ```
 
     Accepts `merge_commit_message`, `squash_commit_message`, `merge_when_pipeline_succeeds`, `sha` (to fail if HEAD changed).
+
+    ### uploads (create)
+
+    Upload the files attached to the current chat message to a project, then embed the returned markdown in an issue or a note.
+
+    ```json
+    {
+      "name": "uploads",
+      "arguments": {
+        "action": "create",
+        "id": "acme/platform/api"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `create` |
+    | `id` | Yes | Project ID or **raw** namespaced path such as `acme/platform/api`, not URL-encoded |
+    | `files` | No | Explicit list of `{ url, filename, mediaType }` entries. Normally omitted: the connector fills it from the chat attachments |
+
+    The response is `{ "uploads": [ { "ok": true, "filename": "...", "markdown": "...", "url": "...", "full_path": "..." } ] }`. Pass each `markdown` value verbatim into the `description` of `issues` `create` or the `body` of `issues` `createNote`; GitLab only keeps an upload alive once its relative reference is used in an issue or note.
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
@@ -386,31 +430,50 @@ This connector is used by three different roles. Jump to the section that matche
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **GitLab** and install it
-    3. Open the **Configuration app** (the link auto-populated on install) to choose the auth mode, provide credentials, connect a GitLab account, and allow the agents that may call the connector
+    GitLab uses the standard App + MCP install flow, documented end to end in [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace): [install the app](/apps-store/marketplace/connectors/install-in-workspace#install-the-app), [enter the credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app), [authorize the agents that may call it](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector), then [copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint). Search for **GitLab** in **Apps**, install it, and open the **Configuration app** link the install populates.
+
+    Everything below is what is specific to GitLab: the URLs the install generates, the workspace secrets it provisions, and the auth modes you choose between.
+
+    <Warning>
+      **Do not rely on the configuration app's Test connection result for this connector.** The connector's `testAuth` endpoint is a leftover from the Google Drive connector it was generated from: it resolves the GitLab credentials correctly, then makes its verification call against `https://www.gitlabapis.com/drive/v3/about`, a Google Drive path on a host that does not exist. It therefore reports a failure for perfectly valid GitLab credentials, and its failure text wrongly tells you to check that the scopes include Drive. Verify the credentials with `GitLab.getCurrentUser`, or with the `users` tool and `action: "getCurrent"`, as described in [Verify the setup](#verify-the-setup).
+    </Warning>
 
     ## Configuration
 
-    | Field | Description |
+    Installing the app is idempotent: it provisions the workspace secrets it needs and fills the app instance's own configuration. In the URLs below, `<api-url>` is your environment's API URL, `<studio>` its Studio URL, and `<app-instance>` the slug the app was installed under.
+
+    | URL | Where it comes from |
     |-------|-------------|
-    | **Configuration app** | Auto-populated on install; open this link to configure authentication (mode + credentials), connect a GitLab account (OAuth modes), and manage the authorized-agents allowlist. |
+    | Configuration app: `<studio>/apps/gitlab?workspaceId=<workspace-id>&workspaceSlug=<workspace-slug>&appInstance=<app-instance>` | Stored on the app instance as the read-only `configAppUrl` field on install. Open it to configure authentication (mode and credentials), connect a GitLab account in the OAuth modes, and manage the authorized-agents allowlist. |
+    | OAuth callback: `<api-url>/workspaces/slug:<workspace-slug>/webhooks/<app-instance>.oauthCallback` | Computed on install. Register it as the redirect URI on your own GitLab application in `oauth` mode. In `oauthCentral` mode you register nothing: the core workspace callback is used and proxies the authorization code back here. The two shapes are compared in [Callback URLs](/apps-store/marketplace/connectors/central-oauth#callback-urls). |
+    | MCP endpoint: `<api-url>/workspaces/slug:<workspace-slug>/webhooks/<app-instance>.mcp` | The app instance's own `mcp` webhook. This is the URL an Agent Creator capability points at. |
+
+    | Workspace secret | Description |
+    |-------|-------------|
+    | `gitlabAuth` | Object holding the auth mode and its credentials: `mode` (`oauthCentral`, `oauth` or `accessToken`), `oauthClientId`, `oauthClientSecret`, `scopes`, `accessToken`. Written by the configuration app. |
+    | `gitlabAuthorizedAgents` | Comma-separated agent IDs allowed to call the MCP endpoint, or `*` for all. Written by the configuration app. |
 
     The configuration app drives everything; the app instance itself has no per-field credential form. From it you pick one of:
 
-    | Auth mode | What you provide | Best for |
-    |-----------|------------------|----------|
-    | `oauthCentral` | Nothing; just click **Connect** | Workspaces on a platform where the maintainer set up the central GitLab client |
-    | `oauth` | Your own GitLab **Application ID + Secret** (redirect URI shown in the config app: `<api-url>/workspaces/slug:<your-workspace>/webhooks/<app-instance>.oauthCallback`) | You manage your own GitLab OAuth app |
-    | `accessToken` | A pre-minted GitLab **access token** / Personal Access Token with the `api` scope | Short-lived or caller-managed tokens, service-account / non-interactive automations |
+    | Auth mode | What you provide | Runtime identity at GitLab | Best for |
+    |-----------|------------------|----------------------------|----------|
+    | `oauthCentral` | Nothing beyond selecting **Connect** (optionally narrow **Scopes**) | The invoking user | Platforms where the maintainer set up the central GitLab client |
+    | `oauth` | Your own GitLab **Application ID** and **Secret**, plus the redirect URI above registered on the application | The invoking user | You keep the GitLab OAuth application under your own control |
+    | `accessToken` | A GitLab access token or personal access token with the `api` scope | The single account that owns the token, for everyone | Unattended automation with no interactive user |
+
+    When `gitlabAuth.mode` is empty, the connector behaves as `oauth`.
 
     <Note>
-      Credentials are stored in the workspace's Secrets (`gitlabAuth`) and resolved server-side. The agent allowlist (**Authorized agents**, secret `gitlabAuthorizedAgents`) gates which Agent Creator agents may call the MCP endpoint; see the *Agent builder* tab. Builder automations calling `GitLab.op:` instructions resolve the same workspace credentials.
+      Credentials are stored in the workspace secrets and resolved server-side; no token is ever returned to an agent or to a Builder automation. The agent allowlist (**Authorized agents**, secret `gitlabAuthorizedAgents`) gates which Agent Creator agents may call the MCP endpoint; see [Agent builder](#agent-builder-agent-creator) and [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector), including [the allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard). Builder automations calling `GitLab.<instruction>:` resolve the same workspace credentials. The central platform client lives in a separate secret, `gitlabCentralOAuth`, on the core `gitlab` workspace only, and is never readable from a tenant workspace.
+    </Note>
+
+    <Note>
+      **Running OAuth-backed automations without a user (cron and background runs).** In the OAuth modes, a per-user token normally comes from the caller's own session. For scheduled or event-driven automations that have no interactive user, the connector can replay a stored refresh token instead: pass a server-controlled user ID as `targetUserId`, and it reads the workspace secret `glabRefresh_<userId>` and exchanges it for a fresh access token. That secret is only written when the person who connects is a workspace **editor** or **owner**; for anyone else the write is denied and only the interactive path works. Never build that user ID from a tool argument or from user input: whoever it names is the account every scheduled call will run as.
     </Note>
 
     ## Available Instructions
 
-    Every instruction resolves credentials from the workspace configuration. The MCP server exposes the same operations behind the 16 entity tools (see the *Agent builder* tab).
+    Every instruction resolves credentials from the workspace configuration. The MCP server exposes the same operations behind the 17 entity tools (see [Agent builder](#agent-builder-agent-creator)). The entity tools themselves are reachable only through the MCP endpoint: calling one as an App instruction is rejected with HTTP `403` and a message stating that direct calls are not allowed.
 
     ### Projects
 
@@ -430,6 +493,8 @@ This connector is used by three different roles. Jump to the section that matche
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
     | `listIssues` | List issues of project `id` (`state`, `labels`, `milestone`, `search`, `assignee_username`, `per_page`, `page`) | `[ { iid, title, state, ... } ]` |
+    | `listAllIssues` | List issues across every project the caller can access (`scope` = `created_by_me` / `assigned_to_me` / `all`, `state`, `labels`, `milestone`, `search`, `assignee_username`, `author_username`, `per_page`, `page`). Use this for "my issues" instead of looping over projects | `[ { iid, title, state, project_id, ... } ]` |
+    | `listGroupIssues` | List issues across a group and its subgroups by `group_id` (same filters as `listAllIssues`) | `[ { iid, title, state, project_id, ... } ]` |
     | `createIssue` | Create an issue in `id` with `title` (+ `description`, `labels`, `assignee_ids`, `milestone_id`, `confidential`, `due_date`) | `{ iid, title, web_url, ... }` |
     | `getIssue` | Get issue `iid` of project `id` | `{ iid, title, description, ... }` |
     | `updateIssue` | Update issue `iid` of `id` (`title`, `description`, `labels`, `assignee_ids`, `milestone_id`, `state_event`) | `{ iid, ... }` |
@@ -447,6 +512,8 @@ This connector is used by three different roles. Jump to the section that matche
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
     | `listMergeRequests` | List MRs of `id` (`state`, `source_branch`, `target_branch`, `labels`, `search`, `per_page`) | `[ { iid, title, state, ... } ]` |
+    | `listAllMergeRequests` | List MRs across every project the caller can access (`scope` = `created_by_me` / `assigned_to_me` / `all`, `state`, `labels`, `milestone`, `search`, `source_branch`, `target_branch`, `author_username`, `reviewer_username`, `per_page`, `page`). Use `reviewer_username` for "MRs waiting on my review" | `[ { iid, title, state, project_id, ... } ]` |
+    | `listGroupMergeRequests` | List MRs across a group and its subgroups by `group_id` (same filters as `listAllMergeRequests`) | `[ { iid, title, state, project_id, ... } ]` |
     | `createMergeRequest` | Create an MR in `id` (`source_branch`, `target_branch`, `title` + `description`, `assignee_ids`, `reviewer_ids`, `labels`, `milestone_id`, `remove_source_branch`, `squash`) | `{ iid, title, web_url, ... }` |
     | `getMergeRequest` | Get MR `iid` of `id` | `{ iid, title, merge_status, ... }` |
     | `updateMergeRequest` | Update MR `iid` of `id` (`title`, `description`, `target_branch`, `assignee_ids`, `labels`, `milestone_id`, `state_event`) | `{ iid, ... }` |
@@ -555,7 +622,7 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `getCurrentUser` | Get the currently authenticated user | `{ id, username, name, email }` |
+    | `getCurrentUser` | Get the authenticated user behind the resolved credentials | `{ id, username, name, email }` |
     | `getUser` | Get a user by `user_id` | `{ id, username, name, ... }` |
     | `listUsers` | List users (`active`, `blocked`, `username`, `per_page`, `page`) | `[ { id, username, name } ]` |
     | `searchUsers` | Search users by `search` (name/username/email) (+ `per_page`) | `[ { id, username, name } ]` |
@@ -563,10 +630,22 @@ This connector is used by three different roles. Jump to the section that matche
     | `createGroup` | Create a group `name`/`path` (+ `description`, `visibility`, `parent_id`) | `{ id, name, web_url, ... }` |
     | `getGroup` | Get group by `id` (or URL-encoded path) | `{ id, name, projects, ... }` |
     | `updateGroup` | Update group `id` (`name`, `path`, `description`, `visibility`) | `{ id, name, ... }` |
+    | `listSubgroups` | List direct subgroups under `groupPath` (URL-encoded full path, plus `search`, `owned`, `all_available`, `min_access_level`, `per_page`, `page`) | `[ { id, name, full_path } ]` |
+    | `listDescendantGroups` | List all descendant groups under `groupPath` (same parameters as `listSubgroups`) | `[ { id, name, full_path } ]` |
+
+    ### Uploads
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `uploadFile` | Upload one or more files to project `id` (raw namespaced path or numeric ID). Each entry of `files` is `{ url, filename, mediaType }`; each URL is fetched and relayed to GitLab as `multipart/form-data`. Optional `accessToken` and `baseUrl` override the resolved credentials | `{ uploads: [ { ok, filename, markdown, url, full_path } ] }` |
 
     <Note>
       `Returns` shows the shape of the operation output (the underlying GitLab API resource).
     </Note>
+
+    <Warning>
+      `listSubgroups` and `listDescendantGroups` dispatch to a helper that the connector workspace does not define, so they do not return group data. Use `listGroups` with `search` and `min_access_level`, or `getGroup` on the parent, until the connector ships a fix.
+    </Warning>
 
     ## DSUL Examples
 
@@ -624,38 +703,112 @@ This connector is used by three different roles. Jump to the section that matche
             value: staging
         output: pipeline
     ```
+
+    ### Attach a file to an issue
+
+    Upload the file first, then embed the markdown reference GitLab returns. `projectPath` is the raw namespaced path, for example `acme/platform/api`, and `fileUrl` is a URL the platform can fetch.
+
+    ```yaml
+    - GitLab.uploadFile:
+        id: '{{projectPath}}'
+        files:
+          - url: '{{fileUrl}}'
+            filename: incident-report.pdf
+            mediaType: application/pdf
+        output: upload
+    - GitLab.createIssue:
+        id: '{{projectId}}'
+        title: Incident report 2026-04-12
+        description: |
+          Full report attached.
+
+          {{upload.uploads[0].markdown}}
+        output: issue
+    ```
   </Tab>
 </Tabs>
 
 ---
 
-## Error Handling
+## Verify the setup
 
-| HTTP Status | Error | Solution |
-|-------------|-------|----------|
-| 400 | Bad request | Check argument shapes (IDs, dates, enum values) |
-| 401 | Unauthorized | Sign in again (OAuth modes), or verify the access token has the `api` scope |
-| 403 | Forbidden | The token lacks permission on this project/group; check the access level |
-| 404 | Not Found | Verify the project `id` (numeric or URL-encoded path) and resource `iid` |
-| 409 | Conflict | Common on merge conflicts or concurrent updates |
-| 429 | Rate Limited | GitLab.com enforces ~2000 req/min per token; back off and retry |
-| 500 | Server Error | Transient GitLab issue; retry after a few seconds |
+Run these checks in order before letting an agent or an automation write to GitLab. Each one is safe and read-only. They are the GitLab instances of the generic checks in [Verify the installation](/apps-store/marketplace/connectors/install-in-workspace#verify-the-installation) and [Verify the capability](/apps-store/marketplace/connectors/declare-capability#verify-the-capability); if you also configured the central client, add [Verify the central client](/apps-store/marketplace/connectors/central-oauth#verify-the-central-client).
 
-### Common Issues
+<Steps>
+  <Step title="Confirm the runtime identity">
+    From the agent, call `users` with `action: "getCurrent"`. From a Builder automation, call `GitLab.getCurrentUser`. The returned `username` is the account GitLab will attribute every subsequent call to. In an OAuth mode it must be the person who connected; in `accessToken` mode it is the token owner.
+  </Step>
+  <Step title="Confirm the scope of visible data">
+    Call `projects` with `action: "list"` and `membership: true`. The result must contain only projects that account is a member of. An empty result with projects visible in the GitLab UI means the connected account is not the one you expected.
+  </Step>
+  <Step title="Confirm the agent gate">
+    Temporarily remove the agent from **Authorized agents** in the configuration app and Save, then call any tool. The call must fail with an authorization message naming the agent ID. Re-add the agent and Save.
+  </Step>
+  <Step title="Confirm least privilege">
+    If you set **Scopes** to `read_api`, attempt one write, such as `labels` with `action: "create"`. GitLab must reject it with `403 Forbidden`.
+  </Step>
+</Steps>
 
-**"This agent is not authorized to use this connector"**: The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (id is shown in the error) or enable **Allow all agents**, and Save. The **Install capability** button does this for you.
+## Disconnect, revoke and remove
 
-**"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability (this is separate from the GitLab OAuth scopes), then allow the agent in the config app.
+The generic rules, including the fact that uninstalling never deletes the workspace secrets, are in [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall). Below are the GitLab-specific endpoints, secret names and side effects.
 
-**"GitLab is not connected for this user"**: No per-user OAuth token is stored for the caller. Open the configuration app (OAuth mode) and click **Connect**, or use the agent's connect flow.
+| Goal | Who does it | How |
+|------|-------------|-----|
+| Disconnect one user | The user | Select **Disconnect** in the configuration app, or use the agent's disconnect action. The connector attempts a revocation at `https://gitlab.com/oauth/revoke`, then deletes the stored per-user token and that user's `glabRefresh_<userId>` workspace secret. The configuration app returns with `status=disconnected`. |
+| Offboard a user | Workspace editor and GitLab admin | Have the user disconnect, then remove the account from the GitLab group. If the account is already gone, delete the `glabRefresh_<userId>` workspace secret so no scheduled run can replay it. |
+| Stop one agent | Workspace editor | Untick the agent in **Authorized agents** and Save. The next call is rejected immediately. |
+| Rotate a workspace credential | Workspace editor | Reopen the configuration app, paste the new Application ID and Secret (or the new access token), and Save. In the OAuth modes, users whose refresh token was minted against the old client must reconnect. |
+| Remove the connector | Workspace editor | Uninstall the GitLab app from the workspace, then delete the `gitlabAuth`, `gitlabAuthorizedAgents` and any remaining `glabRefresh_<userId>` secrets. Finally delete or revoke the GitLab OAuth application or personal access token on the GitLab side, because uninstalling does not revoke it. |
 
-**"GitLab token refresh failed … must reconnect"**: The stored refresh token was rejected by GitLab (revoked / expired). The connection is dropped automatically; the user must reconnect from the config app.
+<Warning>
+  In `oauthCentral` mode the connector holds no client secret locally, so it cannot call GitLab's revocation endpoint: disconnecting deletes the stored tokens on the Prisme.ai side only. To invalidate an already issued token immediately, revoke the authorization from GitLab, under **User Settings > Applications**.
+</Warning>
 
-**"GitLab is not authenticated / OAuth is not configured"**: Neither a tenant OAuth client nor the central platform client is available. Set the OAuth client ID/secret in the config app (tenant mode), or ask the platform maintainer to provision the central OAuth client from the core workspace's config app.
+## Error handling
 
-**"Can't approve own MR"**: A user counts as the MR author and cannot approve its own merge requests. Connect with a different GitLab account (or use an `accessToken` from another user) for the approval step.
+The connector normalizes GitLab API failures into a single message per status code. Any status it does not special-case is returned as `Error <status> while <operation>` followed by the detail GitLab supplied.
 
-**"pipeline creation 404"**: The target ref has no `.gitlab-ci.yml` at its root. Commit a CI config first, or pick a ref that has one.
+| HTTP status | Message the connector returns | Resolution |
+|-------------|-------------------------------|------------|
+| 400 | Bad request while the operation | Check argument shapes: IDs, dates, enum values |
+| 401 | Authentication failed, check GitLab credentials or OAuth connection | Reconnect (OAuth modes), or verify the access token is valid and carries the `api` scope |
+| 403 | Forbidden, check the user's GitLab permissions or OAuth scopes | The connected account lacks the access level on this project or group, or the granted scope is `read_api` on a write call |
+| 404 | Resource not found | Verify the project `id` (numeric or URL-encoded path) and the resource `iid` |
+| 429 | Rate limit or org limit exceeded, wait and retry | Back off and retry; see the [GitLab rate limits reference](https://docs.gitlab.com/security/rate_limits/) for the limits that apply to your plan |
+| 500 | GitLab server error | Retry after a few seconds |
+
+Statuses such as `409 Conflict`, returned by GitLab on merge conflicts and concurrent updates, fall through to the generic message and carry GitLab's own explanation.
+
+### Common issues
+
+Failures that are not specific to GitLab are covered by the shared troubleshooting sections: [installation and allowlist](/apps-store/marketplace/connectors/install-in-workspace#troubleshooting), [capability wiring](/apps-store/marketplace/connectors/declare-capability#troubleshooting), and [the central OAuth client](/apps-store/marketplace/connectors/central-oauth#troubleshooting).
+
+**"This agent is not authorized to use this connector"**: The calling agent is not in the allowlist. Open the configuration app, go to **Authorized agents**, tick this agent (its ID is shown in the error) or enable **Allow all agents**, and Save. The **Install capability** button does this for you.
+
+**"The calling agent could not be identified, so it cannot be authorized"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability (this is separate from the GitLab OAuth scopes), then allow the agent in the configuration app.
+
+**"GitLab is not connected for this user"**: No per-user OAuth token is stored for the caller. Open the configuration app in an OAuth mode and select **Connect**, or use the agent's connect action.
+
+**"GitLab token refresh failed"**: GitLab rejected the stored refresh token, usually because the user revoked the authorization or the OAuth client secret was rotated. The connector drops the stored connection so status reporting turns to disconnected; the user reconnects from the configuration app.
+
+**"GitLab token endpoint temporarily unavailable"**: GitLab returned a server error on the token endpoint. This is transient, the stored connection is kept, and no reconnection is needed. Retry the call.
+
+**"No stored GitLab token for this user"**: A background or scheduled run tried to resolve a user who never deposited a refresh token. That user must connect once from the configuration app **as a workspace editor or owner**, which is the only case where the `glabRefresh_<userId>` secret can be written.
+
+**"GitLab is not authenticated"**: The workspace has no usable auth configuration. Choose a mode and enter its credentials in the configuration app.
+
+**"GitLab OAuth is not configured"**: Neither a workspace OAuth client nor the central platform client is available. Set the Application ID and Secret in the configuration app (`oauth` mode), or ask the platform maintainer to provision the [central OAuth client](/apps-store/marketplace/connectors/central-oauth) from the core `gitlab` workspace.
+
+**The configuration app returns `status=error&message=invalid_state`**: The authorization did not match a pending request, typically because the browser session changed or the flow was started twice. Start the connect flow again from the configuration app in a single tab.
+
+**The configuration app returns `status=error&message=oauth_client_not_configured`**: The callback ran before any OAuth client was resolvable. Save the client credentials (or have the maintainer provision the central client), then reconnect.
+
+**`Unknown tool` in an agent response**: The tool name does not exist on this server. Compare it against the tool catalog above; names are case-sensitive.
+
+**A merge request cannot be approved**: GitLab does not let the author of a merge request approve it. Approve from a different GitLab account.
+
+**Triggering a pipeline returns 404**: The target ref has no `.gitlab-ci.yml` at its root. Commit a CI configuration first, or pick a ref that has one.
 
 ## External Resources
 

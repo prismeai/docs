@@ -12,11 +12,21 @@ description: 'Let Agent Creator agents read and write HubSpot CRM and Marketing 
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The HubSpot connector exposes a HubSpot portal through the [HubSpot REST API](https://developers.hubspot.com/docs/api/overview) to **Agent Creator** agents (through MCP) and to Builder automations (through the `Hubspot.op:` App instructions), covering the CRM (contacts, companies, deals, tickets, engagements, associations, pipelines, properties, owners, lists) and the Marketing layer (forms, marketing emails, workflows, files). The ~120 HubSpot operations are grouped into **18 entity tools**, each driven by an `action` argument. The MCP server runs in the **tenant app-instance context**: it resolves the installing workspace's own credentials and authorizes the calling agent against that workspace's allowlist. Authentication supports several modes:
+The HubSpot connector exposes a HubSpot portal through the [HubSpot REST API](https://developers.hubspot.com/docs/api/overview) to **Agent Creator** agents (through MCP) and to Builder automations (through the `Hubspot.<instruction>` App instructions), covering the CRM (contacts, companies, deals, tickets, engagements, associations, pipelines, properties, owners, lists) and the Marketing layer (forms, marketing emails, workflows, files). The same 124 HubSpot operations are published twice: as **124 App instructions** for Builder automations, and as **18 entity tools** for MCP, each driven by an `action` argument. The MCP server (`hubspot-mcp`) runs in the **tenant app-instance context**: it resolves the installing workspace's own credentials and authorizes the calling agent against that workspace's allowlist. HubSpot is a single-host API: every call goes to `https://api.hubapi.com` with an `Authorization: Bearer <token>` header.
 
-- **Per-user OAuth2, central client** (`oauthCentral`, recommended): one HubSpot OAuth application is registered once by the platform maintainer; every end user signs in with their own HubSpot portal. Nothing to register per workspace: each one just installs the app and clicks *Connect*.
-- **Per-user OAuth2, tenant client** (`oauth`): paste your own HubSpot OAuth client ID/secret in the connector config app. Each user signs in with their own account against your client (authorization-code + PKCE flow).
-- **Private App token** (`accessToken`): a caller-managed HubSpot **Private App access token (PAT)**, used as-is with no exchange. Best for service-account / non-interactive automations where a single identity is preferable.
+Three authentication modes are supported. Pick one before configuring anything:
+
+| Mode | Runtime identity at HubSpot | Choose it when |
+|------|-----------------------------|----------------|
+| `oauthCentral` (recommended) | The end user who signed in, on the platform-wide HubSpot OAuth application | A platform maintainer has registered the central HubSpot application and you want each user to act as themselves with nothing to register per workspace |
+| `oauth` | The end user who signed in, on your own HubSpot OAuth application | You must own the HubSpot application (portal allowlist, scope set, secret rotation) for your workspace |
+| `accessToken` | The HubSpot Private App itself, one shared identity for every caller | Unattended automations with no interactive user, where a single service identity is acceptable |
+
+`oauthCentral` and `oauth` are the same per-user authorization-code flow with Proof Key for Code Exchange (PKCE); they differ only in which OAuth client is used. `oauthCentral` explicitly ignores any client ID and secret left in the workspace configuration and always resolves the central client.
+
+<Warning>
+  **`accessToken` is a shared credential.** Every agent and every automation that reaches the connector acts as the same HubSpot Private App, so HubSpot audit records show one identity for all callers and per-user permissions are not enforced. Use it only for unattended workloads, grant the Private App the narrowest scope set that covers the operations you call, and prefer a per-user OAuth mode for anything a person triggers.
+</Warning>
 
 <CardGroup cols={3}>
   <Card title="CRM Records" icon="address-book">
@@ -35,27 +45,47 @@ The HubSpot connector exposes a HubSpot portal through the [HubSpot REST API](ht
 This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to use HubSpot. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to use HubSpot.
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and set up the shared HubSpot OAuth client once for everyone. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and set up the shared HubSpot OAuth client once for everyone.
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call HubSpot operations directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations (DSUL) that call HubSpot operations directly.
   </Card>
 </CardGroup>
 
+The generic procedures behind each role are documented once and shared by every App + MCP connector: [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace), [Central OAuth client](/apps-store/marketplace/connectors/central-oauth) and [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability). This page carries the HubSpot-specific values those procedures ask for.
+
 ## Prerequisites
 
+- The Prisme.ai roles listed in [what a workspace install requires](/apps-store/marketplace/connectors/install-in-workspace#before-you-begin), or, for the central client, in [what the central OAuth setup requires](/apps-store/marketplace/connectors/central-oauth#before-you-begin).
 - A **HubSpot account** with access to the portal you want to expose.
-- For the **OAuth modes**: a HubSpot OAuth application. **HubSpot's Developer Platform 2025.2 retired the legacy *Public Apps* UI**: the OAuth app is now declared as code in a HubSpot project and deployed via the HubSpot CLI (from a free **HubSpot developer account** at [developers.hubspot.com](https://developers.hubspot.com/), separate from any CRM account). The platform maintainer registers one app for the central mode; a workspace can also register its own for the tenant mode. Copy the **Client ID** and **Client Secret** from the deployed app's *Auth* tab.
-- For the **Private App token mode**: a **Private App access token** created at *HubSpot Settings → Integrations → Private Apps* (`https://app.hubspot.com/private-apps/<portal-id>`), with the scopes covering the operations you intend to call.
-- **OAuth scopes**: the connector requests the free-tier essentials by default (`oauth`, `crm.objects.contacts.*`, `crm.objects.companies.*`, `crm.objects.deals.*`, `crm.objects.owners.read`, `tickets`). Paid-tier features (lists, content, automation, forms, files) require their own scopes and a matching HubSpot subscription; every requested scope must be declared in the deployed app's `requiredScopes` / `optionalScopes`.
-- Base URL: `https://api.hubapi.com` (single host).
+- For the **OAuth modes**: a HubSpot OAuth application. HubSpot Developer Platform `2025.2` declares the OAuth app as code in a HubSpot project deployed with the HubSpot CLI, from a free **HubSpot developer account** at [developers.hubspot.com](https://developers.hubspot.com/), which is separate from any CRM account. The platform maintainer registers one app for `oauthCentral`; a workspace can register its own for `oauth`. Copy the **Client ID** and **Client Secret** from the deployed app's **Auth** tab.
+- For **`accessToken`**: a **Private App access token** created in the HubSpot portal under **Settings > Integrations > Private Apps**, granted the scopes that cover the operations you intend to call.
+- **OAuth scopes**: the connector sends every requested scope in the `scope=` parameter of the authorization URL, so each one must already be declared in the HubSpot application as a required or an optional scope. The shipped application declares the sets below.
+- Base URL: `https://api.hubapi.com` (single host). Authorization endpoint: `https://app.hubspot.com/oauth/authorize`. Token endpoint: `https://api.hubapi.com/oauth/v1/token`.
+
+The shipped HubSpot application declares these scopes.
+
+| Tier | Scopes | Covers |
+|------|--------|--------|
+| Required | `oauth`, `crm.objects.contacts.read`, `crm.objects.contacts.write`, `crm.objects.companies.read`, `crm.objects.companies.write`, `crm.objects.deals.read`, `crm.objects.deals.write`, `crm.objects.owners.read`, `tickets` | The `contacts`, `companies`, `deals`, `tickets` and `owners` tools, plus refresh-token issuance (`oauth`) |
+| Optional | `crm.schemas.contacts.read`, `crm.schemas.companies.read`, `crm.schemas.deals.read`, `crm.lists.read`, `crm.lists.write`, `files`, `forms`, `automation`, `content`, `e-commerce` | `properties` schema reads, `lists`, `files`, `forms`, `workflows` (`automation`) and `marketingEmails` (`content`) |
+
+When no scope string is configured for a workspace, the connector requests the required tier only:
+
+```text
+oauth crm.objects.contacts.read crm.objects.contacts.write crm.objects.companies.read crm.objects.companies.write crm.objects.deals.read crm.objects.deals.write crm.objects.owners.read tickets
+```
+
+Optional-tier scopes depend on the portal's HubSpot subscription. Requesting one the portal does not carry makes HubSpot reject the authorization request, so add optional scopes to the workspace **Scopes** field only for portals that have the matching feature.
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
   **Goal:** two one-time tasks: (1) configure the shared **central OAuth client** so every workspace lets its users sign in with their own HubSpot portal, and (2) optionally expose HubSpot as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs. Throughout, `<api-url>` is your environment's API URL (`https://api.studio.prisme.ai/v2` on production).
+
+  The generic flow, including the role checks on the core workspace, the maintainer view and how the client secret is kept out of tenant workspaces, is documented once in [Central OAuth client](/apps-store/marketplace/connectors/central-oauth). The HubSpot-specific values it asks for are below.
 
   ## 1. Configure the connector
 
@@ -67,51 +97,55 @@ This connector is used by three different roles. Jump to the section that matche
       <api-url>/workspaces/slug:hubspot/webhooks/oauthCallback
       ```
 
-      (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:hubspot/webhooks/oauthCallback` on production). Deploy with `hs project upload && hs project deploy`, allowlist the portals (numeric Hub IDs) that may install the app, then copy the **Client ID** and **Client Secret** from the app's *Auth* tab (the secret is shown only once).
+      (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:hubspot/webhooks/oauthCallback` on production). This is the **only** redirect URI to register: tenant workspaces reuse it, and the core workspace proxies the authorization code back to the workspace that started the flow. Do not register a tenant-shaped URI here; see [Callback URLs](/apps-store/marketplace/connectors/central-oauth#callback-urls) for the two shapes and why they are not interchangeable. The shipped app declares `"distribution": "private"`, so list the HubSpot portals allowed to install it. Deploy with `hs project upload && hs project deploy`, then copy the **Client ID** and **Client Secret** from the app's **Auth** tab (the secret is shown only once).
     </Step>
     <Step title="Enter the credentials through the configuration app">
-      Open the central `hubspot` workspace and launch its **Configuration app**: `<studio>/apps/hubspot` (e.g. `https://studio.prisme.ai/apps/hubspot`). Loaded from the core workspace, the app shows the **maintainer view** (org owner / editor / admin only); paste the **Client ID** and **Client Secret** there and Save; the app stores them in the core workspace's secrets for you. Do not edit Studio's raw Secrets by hand. These credentials stay in the `hubspot` workspace and are never exposed to tenants or end users; token exchange is proxied through the core `centralTokenExchange` webhook so the client secret never leaves the core workspace.
+      Open the central `hubspot` workspace and launch its **Configuration app**: `<studio>/apps/hubspot` (e.g. `https://studio.prisme.ai/apps/hubspot`). Loaded from the core workspace, the app shows the **maintainer view** (org owner / editor / admin only); paste the **Client ID** and **Client Secret** there and Save. Follow [Configure the central client](/apps-store/marketplace/connectors/central-oauth#configure-the-central-client) for the form itself. The app writes them to the core workspace secret `hubspotCentralOAuth`; do not edit Studio's raw Secrets by hand. These credentials stay in the `hubspot` workspace and are never exposed to tenants or end users: tenants read the public client id and scopes from the core `getOAuthClientPublic` webhook, and token exchange is proxied through the core `centralTokenExchange` webhook, so the client secret never leaves the core workspace ([how this works](/apps-store/marketplace/connectors/central-oauth#how-the-client-secret-stays-in-the-core-workspace)).
     </Step>
     <Step title="Tell workspaces to use the central client">
-      Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**.
+      Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**. Hand them [Select the central client in a workspace](/apps-store/marketplace/connectors/central-oauth#select-the-central-client-in-a-workspace).
     </Step>
     <Step title="(Optional) Publish to the Capabilities catalog">
-      From that same maintainer view, the **Add to catalog** button publishes HubSpot to the org-wide **Capabilities catalog** in one click (org owner / admin only; it stays disabled until the central client is saved). Once published, every agent builder in the org can enable HubSpot from the catalog without pasting an endpoint; see *Option A* in the *Agent builder* tab.
+      From that same maintainer view, the **Add to catalog** button publishes HubSpot to the org-wide **Capabilities catalog** in one click (org owner / admin only; it stays disabled until the central client is saved). Once published, every agent builder in the org can enable HubSpot from the catalog without pasting an endpoint; see [Publish the connector to the Capabilities catalog](/apps-store/marketplace/connectors/declare-capability#publish-the-connector-to-the-capabilities-catalog) and [Option A, the shared catalog capability](#option-a-shared-catalog-capability).
     </Step>
   </Steps>
 
   ## 2. Declare the capability in AI Governance
 
-  As an alternative to (or in addition to) the catalog button, you can declare HubSpot as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
+  As an alternative to (or in addition to) the catalog button, you can declare HubSpot as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint. Follow [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance), with these HubSpot values:
+
+  | Field | Value for HubSpot |
+  |-------|-------------------|
+  | Capability name | `HubSpot` |
+  | Server URL (**SSE/WebSocket URL**) | The connector's **MCP Endpoint**: the core `<api-url>/workspaces/slug:hubspot/webhooks/mcp`, or a tenant workspace's `<api-url>/workspaces/slug:<workspace>/webhooks/<app-instance>.mcp` |
+  | **Scope** | `context_id,agent_id,user_id` — the `agent_id` is what lets the connector identify and authorize the calling agent |
+  | Authorization block | Nothing to author. Connect, status and disconnect are served by the connector's own `oauthConnect`, `oauthStatus` and `oauthDisconnect` webhooks, wired automatically |
 
   <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) the **HubSpot** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
-
-      ```text
-      context_id,agent_id,user_id
-      ```
-
-      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant.
-    </Step>
-    <Step title="Smoke-test">
-      From an agent that has the capability, in a workspace configured for `oauthCentral`, trigger any tool (e.g. `contacts` with `action: "list"`). The user is prompted to connect once (HubSpot sign-in, pick a portal); subsequent calls reuse the stored token transparently and refresh it automatically.
+    <Step title="Verify the central client end to end">
+      From an agent that has the capability, in a workspace configured for `oauthCentral`, run a read-only call: `owners` with `action: "list"`. The user is prompted to connect once (HubSpot sign-in, then portal selection). The call must return the owners of **that user's own portal**, which confirms that the runtime identity is the end user and not a shared account. Subsequent calls reuse the stored token and refresh it automatically. The remaining checks are in [Verify the central client](/apps-store/marketplace/connectors/central-oauth#verify-the-central-client).
     </Step>
   </Steps>
 
   <Warning>
-    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model**: which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is also **no OAuth auth-config JSON** to attach in Governance: connect / status / disconnect are handled by the connector's own webhooks, wired automatically.
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model**: which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see [Workspace builder](#workspace-builder-dsul)). Read [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization).
+  </Warning>
+
+  <Warning>
+    **The core `hubspot` workspace's own MCP endpoint bypasses the allowlist.** As soon as the central OAuth client is stored there, that endpoint accepts every calling agent, on the assumption that per-user OAuth is the real access gate. Publish the core endpoint as a capability only if you accept that any agent in the organization may call it; otherwise publish a capability that points at a dedicated tenant workspace, which does enforce its allowlist. See [Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint).
   </Warning>
 
   <Note>
-    **HubSpot scope handling has a strict OAuth-URL contract**: the connector lists required scopes in `scope=` and optional scopes in `optional_scope=`, and **every requested scope must already be declared in the HubSpot app's `requiredScopes` or `optionalScopes`**. Putting an optional-tier scope (Marketing Hub Pro+, CMS Hub, etc.) into `scope=` triggers a "domain mismatch" rejection. The shipped `app-hsmeta.json` keeps `requiredScopes` to the free-tier essentials; paid-tier scopes sit in `optionalScopes`. To add a scope, edit `app-hsmeta.json` for each environment and re-run `hs project upload && hs project deploy`.
+    **Every requested scope must be declared in the HubSpot application.** The connector puts all configured scopes into the `scope=` parameter of the authorization URL, so a scope missing from the application's `requiredScopes` or `optionalScopes` makes HubSpot reject the authorization request. To add a scope, edit `app-hsmeta.json` for each environment, then re-run `hs project upload && hs project deploy` from that project folder. Existing user sessions stay valid; the next user to connect sees the updated consent screen.
   </Note>
+
+  ## 3. Rotate or revoke the central client
+
+  The generic rotation, scope-change and withdrawal rules are in [Rotate and revoke the central client](/apps-store/marketplace/connectors/central-oauth#rotate-and-revoke-the-central-client). What is specific to HubSpot:
+
+  - **Rotate the client secret.** Generate a new secret on the HubSpot application, reopen the maintainer view of the configuration app, paste the new **Client ID** and **Client Secret**, and select **Save**. Access tokens already issued keep working until they expire; refreshes then run against the new secret through the core `centralTokenExchange` webhook.
+  - **Revoke the client.** Delete the HubSpot application from the developer account. Every stored per-user token stops refreshing, `oauthStatus` reports `connected: false`, and agents re-propose the connect flow. Workspaces that must keep working should first switch to auth mode `oauth` with their own HubSpot application, or to `accessToken`.
+  - **Withdraw the central client without deleting the HubSpot application.** Delete the `hubspotCentralOAuth` secret from the core `hubspot` workspace **Secrets**. The maintainer view has no withdraw action.
 </Accordion>
 
 ---
@@ -123,59 +157,52 @@ This connector is used by three different roles. Jump to the section that matche
     **Goal:** let an agent you build in Agent Creator use HubSpot through MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the HubSpot app in a workspace (see the *Workspace builder* tab), and, for the central OAuth mode, a *Platform admin* must have provisioned the shared OAuth client (see the *Platform admin setup* accordion above).
+      Before an agent can call the connector, a workspace builder must have installed and configured the HubSpot app in a workspace (see [Workspace builder](#workspace-builder-dsul)), and, for the central OAuth mode, a platform admin must have provisioned the shared OAuth client (see [Platform admin (Governance): one-time platform setup](#platform-admin-governance-one-time-platform-setup)).
     </Note>
 
-    This connector runs in the **tenant app-instance context**: your agent is authorized two ways at once: it is identified by the `agent_id` that Agent Creator injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The HubSpot access token itself is resolved server-side from the configured auth mode.
+    This connector runs in the **tenant app-instance context**, and your agent is authorized in two steps. First it is identified by the `agent_id` that Agent Creator injects through the capability **Scope**. Then that agent id must appear in the connector's **authorized-agents allowlist**, managed in the configuration app. The HubSpot access token itself is resolved server-side from the configured auth mode, so no credential ever reaches the agent. The full model is in [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization).
 
     There are two ways to wire it up. Pick based on how much isolation you need.
 
-    ## Option A: Enable the shared capability from the catalog
+    ## Option A (shared catalog capability)
 
-    The fastest path: a *Platform admin* has already published a **HubSpot** capability to the Capabilities catalog (see the *Platform admin setup* accordion above: the **Add to catalog** button, or §2), so you just pick it from the catalog.
+    The fastest path: a platform admin has already published a **HubSpot** capability to the Capabilities catalog (see [Publish to the Capabilities catalog](#platform-admin-governance-one-time-platform-setup)), so you just pick it from the catalog. Open your agent in Agent Creator, browse the capability catalog, select **HubSpot**, and enable it. The MCP endpoint URL and the **Scope** (`context_id,agent_id,user_id`) are already wired by the admin, so there is nothing to paste. When the capability points at the core `hubspot` workspace, that endpoint accepts every calling agent once the central OAuth client is stored there, so there is no allowlist step on your side.
 
-    <Steps>
-      <Step title="Open your agent in Agent Creator">
-        Open the agent you want to extend and go to its capabilities / tools.
-      </Step>
-      <Step title="Add the HubSpot capability">
-        Browse the capability catalog, select **HubSpot**, and enable it. The MCP endpoint URL and the *Scope* (`context_id,agent_id,user_id`) are already wired by the admin; nothing to paste, and the shared instance accepts every agent, so there is no allowlist step on your side.
-      </Step>
-      <Step title="Connect a HubSpot account">
-        On the first tool call, an unconnected user is prompted to sign in: Agent Creator surfaces a `connect_url` to HubSpot's authorization page, where the user picks the portal to authorize (from the allowlisted set) and reviews the requested scopes. After sign-in the per-user token is stored and reused on subsequent calls.
-      </Step>
-    </Steps>
+    On the first tool call, an unconnected user is prompted to sign in: Agent Creator surfaces a `connect_url` to HubSpot's authorization page, where the user picks the portal to authorize (from the allowlisted set) and reviews the requested scopes. After sign-in the per-user token is stored and reused on subsequent calls.
 
     <Note>
-      Convenient, but your agent runs against a **shared, platform-managed instance**: its HubSpot credentials are owned by someone else and the instance accepts every agent that is granted the capability. Prefer Option B for anything beyond quick experiments.
+      Convenient, but your agent runs against a **shared, platform-managed instance**: its HubSpot credentials are owned by someone else and the instance accepts every agent that is granted the capability. Prefer [Option B, your own workspace](#option-b-your-own-workspace) for anything beyond quick experiments.
     </Note>
 
-    ## Option B: Run it from your own workspace (recommended)
+    ## Option B (your own workspace)
 
-    For production agents, install the connector in **your own workspace** and point the agent at *that* workspace's MCP endpoint.
+    Recommended for production agents: install the connector in **your own workspace** and point the agent at *that* workspace's MCP endpoint.
 
     <Warning>
-      **Prefer this mode for security.** Because the MCP runs in *your* app-instance context, the HubSpot credentials, the per-user OAuth tokens and the authorized-agents allowlist are all **scoped to your workspace**, not shared platform-wide. You decide exactly which agents may call it and which HubSpot account / auth mode backs them, and a misconfiguration elsewhere can never expose your data. The shared catalog capability (Option A) is a broad surface many agents can reach; your own workspace is an isolated, least-privilege boundary.
+      **Prefer this mode for security.** Because the MCP runs in *your* app-instance context, the HubSpot credentials, the per-user OAuth tokens and the authorized-agents allowlist are all **scoped to your workspace**, not shared platform-wide. You decide exactly which agents may call it and which HubSpot account / auth mode backs them, and a misconfiguration elsewhere can never expose your data. The shared catalog capability ([Option A](#option-a-shared-catalog-capability)) is a broad surface many agents can reach; your own workspace is an isolated, least-privilege boundary.
     </Warning>
 
     <Steps>
       <Step title="Install and configure the connector in your workspace">
-        Follow the *Workspace builder* tab: install **HubSpot** in your workspace, open its **Configuration app**, choose the auth mode and connect a HubSpot account (or paste a Private App token).
+        Follow [Workspace builder](#workspace-builder-dsul): install **HubSpot** in your workspace, open its **Configuration app**, choose the auth mode and connect a HubSpot account (or paste a Private App token).
       </Step>
       <Step title="Allowlist your agent">
-        In that workspace's config app, open **Authorized agents** and tick your agent (the **Install capability** button does this for you), or enable **Allow all agents**.
+        In that workspace's config app, open **Authorized agents** and tick your agent, or enable **Allow all agents**. The **Install capability** button allowlists the agent and attaches the tool in one action; see [Install the capability on one agent](/apps-store/marketplace/connectors/declare-capability#install-the-capability-on-one-agent).
       </Step>
       <Step title="Add the MCP capability to your agent">
-        In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
+        In your agent, add a capability pointing at **your workspace's MCP Endpoint**, which has the form `<api-url>/workspaces/slug:<your-workspace>/webhooks/<app-instance>.mcp`, and set its **Scope** to:
 
         ```text
         context_id,agent_id,user_id
         ```
 
-        The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "agent could not be identified" message. This *Scope* is separate from the HubSpot OAuth scopes.
+        The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "calling agent could not be identified" message. This *Scope* is separate from the HubSpot OAuth scopes; see [What the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means).
       </Step>
       <Step title="Connect a HubSpot account">
         On the first tool call, the user is prompted to sign in (or uses **Connect** in the config app). The per-user token is stored and reused; refresh is automatic.
+      </Step>
+      <Step title="Verify with a read-only call">
+        Ask the agent to list HubSpot owners. The `owners` tool with `action: "list"` must return the owners of the connected portal. If it returns an authorization message instead, work through [Common Issues](#common-issues). The rest of the capability checks are in [Verify the capability](/apps-store/marketplace/connectors/declare-capability#verify-the-capability).
       </Step>
     </Steps>
 
@@ -190,22 +217,22 @@ This connector is used by three different roles. Jump to the section that matche
     Refine the trigger keywords (resource names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
 
     <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the config app and its identity propagated so the connector can read its `agent_id`.
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the config app and its identity propagated so the connector can read its `agent_id`. See [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance).
     </Note>
 
     <Note>
-      **Restricting to read-only (least privilege).** HubSpot tools cover both reads and writes (create/update contacts, companies, deals). The requested OAuth scopes **are** the grant. To allow only read access, set the **Scopes** field in the configuration app to the read-only set, dropping every `*.write` scope, e.g.:
+      **Restricting to read-only (least privilege).** HubSpot tools cover both reads and writes (create, update and archive contacts, companies, deals and tickets). The granted OAuth scopes **are** the enforcement point. To allow reads only, set the **Scopes** field in the configuration app to the read set, dropping every `*.write` scope:
 
       ```text
-      oauth crm.objects.contacts.read crm.objects.companies.read crm.objects.deals.read crm.objects.owners.read tickets
+      oauth crm.objects.contacts.read crm.objects.companies.read crm.objects.deals.read crm.objects.owners.read
       ```
 
-      With central OAuth (`oauthCentral`) you do **not** create your own HubSpot app; keep `oauthCentral` and enter the read scopes; your tenant scope overrides the platform default (the central app must list these read scopes). Write calls are then rejected by HubSpot with `403`. The scope is set at the workspace level (a workspace editor can widen it again).
+      HubSpot's `tickets` scope grants read **and** write in one scope, so leaving it in keeps ticket writes open; drop it to close them, at the cost of losing the `tickets` tool entirely. With `oauthCentral` you do not create your own HubSpot application: keep `oauthCentral` and enter the read scopes, and the workspace scope string overrides the platform default (the central application must declare those read scopes). Write calls are then rejected by HubSpot with `403`. The scope string is a workspace-level setting that a workspace editor can widen again, and existing connections keep the scopes they were granted until their owner disconnects and reconnects.
     </Note>
 
     ## Available Tools
 
-    The MCP server exposes 18 entity-level tools, each with an `action` argument to select the operation. Every tool accepts an `outputFormat` parameter (see *Output Formats*).
+    The MCP server exposes 18 entity-level tools, each with an `action` argument to select the operation. `action` is the only argument the tool schemas mark as required; every other parameter is optional in the schema and validated by HubSpot at call time. Every tool also accepts an `outputFormat` parameter (see [Output Formats](#output-formats)).
 
     ### `contacts` / `companies` / `deals`
 
@@ -219,11 +246,11 @@ This connector is used by three different roles. Jump to the section that matche
     | `update` | Update a record by id |
     | `archive` | Archive (soft-delete) a record |
     | `search` | Full-text and structured search with filter groups, sorts and a `query` shortcut |
-    | `merge` | Merge two records into one (`primaryObjectId` ← `objectIdToMerge`) |
-    | `batchRead` | Read up to 100 records at once |
-    | `batchCreate` | Create up to 100 records in one call |
-    | `batchUpdate` | Update up to 100 records in one call |
-    | `batchArchive` | Archive up to 100 records in one call |
+    | `merge` | Merge two records into one (`primaryObjectId` keeps, `objectIdToMerge` is absorbed) |
+    | `batchRead` | Read several records in one call, from `inputs` |
+    | `batchCreate` | Create several records in one call, from `inputs` |
+    | `batchUpdate` | Update several records in one call, from `inputs` |
+    | `batchArchive` | Archive several records in one call, from `inputs` |
 
     ### `tickets`
 
@@ -236,6 +263,8 @@ This connector is used by three different roles. Jump to the section that matche
     | `list` | List associations from a record to a target object type |
     | `create` | Create an association between two records |
     | `archive` | Remove an association between two records |
+
+    `fromObjectType` and `toObjectType` accept `contacts`, `companies`, `deals`, `tickets`, `notes`, `tasks`, `meetings`, `calls` and `emails`.
 
     ### `notes` / `tasks` / `calls` / `engagementEmails` / `meetings`
 
@@ -264,6 +293,8 @@ This connector is used by three different roles. Jump to the section that matche
     | `updateStage` | Update a stage |
     | `archiveStage` | Archive a stage |
 
+    Every `pipelines` action takes an `objectType` of `deals` or `tickets`.
+
     ### `properties`
 
     | Action | Description |
@@ -277,6 +308,8 @@ This connector is used by three different roles. Jump to the section that matche
     | `createGroup` | Create a property group |
     | `updateGroup` | Update a property group |
     | `archiveGroup` | Archive a property group |
+
+    Every `properties` action takes an `objectType` such as `contacts`, `companies`, `deals`, `tickets`, `notes`, `tasks`, `calls`, `emails` or `meetings`. Property definitions read through this tool need the matching `crm.schemas.*.read` scope.
 
     ### `owners`
 
@@ -294,9 +327,11 @@ This connector is used by three different roles. Jump to the section that matche
     | `update` | Rename a list |
     | `delete` | Delete a list |
     | `search` | Search lists by name and processing type |
-    | `addMembers` | Add records to a static list |
-    | `removeMembers` | Remove records from a static list |
+    | `addMembers` | Add records to a `MANUAL` list |
+    | `removeMembers` | Remove records from a `MANUAL` list |
     | `getMemberships` | List the members of a list |
+
+    `processingType` is one of `MANUAL`, `SNAPSHOT` or `DYNAMIC`, and `objectTypeId` identifies the record type (for example `0-1` for contacts). Membership of a `DYNAMIC` list is computed from its filter tree, so only `MANUAL` lists accept `addMembers` and `removeMembers`. The `lists` tool schema declares `listId` as the only parameter of those two actions; the record ids travel as extra top-level arguments passed through to the HubSpot endpoint.
 
     ### `forms`
 
@@ -352,6 +387,8 @@ This connector is used by three different roles. Jump to the section that matche
 
     ## Tool Details
 
+    In the tables below, **Required** means HubSpot rejects the call without the parameter. Only `action` is enforced by the tool schema itself.
+
     ### `contacts` (action: `search`)
 
     ```json
@@ -378,8 +415,8 @@ This connector is used by three different roles. Jump to the section that matche
     | `filterGroups` | No | Array of `{ filters: [{ propertyName, operator, value }] }`. Filters inside a group are AND'd; groups are OR'd |
     | `sorts` | No | Array of `{ propertyName, direction }` |
     | `query` | No | Free-text query alternative to `filterGroups` |
-    | `properties` | No | Properties to include in the response |
-    | `limit` | No | Page size (max 100) |
+    | `properties` | No | Property names to include in the response |
+    | `limit` | No | Page size |
     | `after` | No | Cursor from a previous response (`paging.next.after`) |
 
     ### `deals` (action: `create`)
@@ -429,7 +466,9 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `action` | Yes | Must be `addMembers` |
-    | `listId` | Yes | Target list ID (only valid for static / `MANUAL` lists) |
+    | `listId` | Yes | Target list id. Only a `MANUAL` list accepts membership changes |
+
+    The tool schema declares no parameter for the records to add. Supply them as extra top-level arguments alongside `listId`, in the shape the [HubSpot lists API](https://developers.hubspot.com/docs/api/crm/lists) expects for `PUT /crm/v3/lists/{listId}/memberships/add`; the connector passes unrecognized top-level arguments through to the request body.
 
     ### `marketingEmails` (action: `sendTransactional`)
 
@@ -438,7 +477,7 @@ This connector is used by three different roles. Jump to the section that matche
       "name": "marketingEmails",
       "arguments": {
         "action": "sendTransactional",
-        "emailId": "67890",
+        "emailId": 67890,
         "message": {
           "to": "alice@acme.com",
           "from": "noreply@acme.com"
@@ -452,7 +491,7 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `action` | Yes | Must be `sendTransactional` |
-    | `emailId` | Yes | The single-send email template ID |
+    | `emailId` | Yes | Numeric id of the transactional email template |
     | `message` | Yes | `{ to, from, cc, bcc, replyTo, sendId }` |
     | `contactProperties` | No | Properties to set on the contact for personalization |
     | `customProperties` | No | Custom merge tags resolved inside the email body |
@@ -484,31 +523,60 @@ This connector is used by three different roles. Jump to the section that matche
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **HubSpot** and install it
-    3. Open the **Configuration app** (the link auto-populated on install) to choose the auth mode, provide credentials, connect a HubSpot account, and allow the agents that may call the connector
+    HubSpot follows the standard App + MCP install flow: [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace). Search for **HubSpot** in **Apps** and install it ([Install the app](/apps-store/marketplace/connectors/install-in-workspace#install-the-app)), then open the **Configuration app** link that the install populates ([Configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app)) to choose the auth mode, provide credentials, connect a HubSpot account, and allow the agents that may call the connector ([Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector)). The MCP endpoint you hand to an agent builder is the one described in [Copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint).
 
     ## Configuration
 
     | Field | Description |
     |-------|-------------|
-    | **Configuration app** | Auto-populated on install: open this link to configure authentication (mode + credentials), connect a HubSpot account (OAuth modes), and manage the authorized-agents allowlist. |
+    | **Configuration app** (`configAppUrl`) | Read-only, auto-populated on install: open this link to configure authentication (mode plus credentials), connect a HubSpot account (OAuth modes), and manage the authorized-agents allowlist. |
 
     The configuration app drives everything; the app instance itself has no per-field credential form. From it you pick one of:
 
     | Auth mode | What you provide | Best for |
     |-----------|------------------|----------|
-    | `oauthCentral` | Nothing; just click **Connect** | Workspaces on a platform where the maintainer set up the central HubSpot client; human-facing agents where each user acts as themselves |
-    | `oauth` | Your own HubSpot **Client ID + Secret** (redirect URI shown in the config app) | You manage your own HubSpot OAuth app |
-    | `accessToken` | A HubSpot **Private App access token (PAT)** | Service-account / non-interactive automations where one identity is preferable |
+    | `oauthCentral` | Nothing beyond selecting **Connect**. An optional **Scopes** string narrows the platform default. See [Select the central client in a workspace](/apps-store/marketplace/connectors/central-oauth#select-the-central-client-in-a-workspace) | Platforms where the maintainer configured the central HubSpot client, and human-facing agents where each user acts as themselves |
+    | `oauth` | Your own HubSpot **Client ID** and **Client Secret**, plus an optional **Scopes** string. Register the redirect URI shown in the config app, of the form `<api-url>/workspaces/slug:<your-workspace>/webhooks/<app-instance>.oauthCallback` | You manage your own HubSpot OAuth application |
+    | `accessToken` | A HubSpot **Private App access token** | Unattended automations where one shared identity is acceptable |
+
+    <Warning>
+      The tenant redirect URI carries an app-instance prefix and the central one does not. Copy the value the configuration app renders rather than assembling it; see [Callback URLs](/apps-store/marketplace/connectors/central-oauth#callback-urls).
+    </Warning>
+
+    Installing the app provisions two workspace secrets and wires them to the app instance ([what installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions)):
+
+    | Secret | Holds |
+    |--------|-------|
+    | `hubspotAuth` | The auth object `{ mode, oauthClientId, oauthClientSecret, accessToken, scopes }`, resolved server-side as `config.auth`. |
+    | `hubspotAuthorizedAgents` | Comma-separated agent ids allowed to call this instance's MCP endpoint, or `*` for all. Resolved as `config.authorizedAgents`. |
+
+    A third secret, `hubspotCentralOAuth`, exists only in the core `hubspot` workspace and holds the central OAuth client. Tenant workspaces cannot read it: they obtain the public client id and scopes from the core `getOAuthClientPublic` webhook, and token exchanges are proxied through the core `centralTokenExchange` webhook. See [How the client secret stays in the core workspace](/apps-store/marketplace/connectors/central-oauth#how-the-client-secret-stays-in-the-core-workspace).
 
     <Note>
-      Credentials are stored in the workspace's Secrets (`hubspotAuth`) and resolved server-side. The agent allowlist (**Authorized agents**, secret `hubspotAuthorizedAgents`) gates which Agent Creator agents may call the MCP endpoint; see the *Agent builder* tab. Builder automations calling `Hubspot.op:` instructions resolve the same workspace credentials.
+      Secrets are resolved server-side and never returned to a caller, so no credential value is echoed by the connector. The agent allowlist (**Authorized agents**) gates which Agent Creator agents may call the MCP endpoint; see [Agent builder](#agent-builder-agent-creator) and, for the `*` wildcard and its blast radius, [The allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard). Builder automations calling `Hubspot.<instruction>` resolve the same workspace credentials without going through the allowlist.
     </Note>
+
+    ### Per-user tokens and unattended runs
+
+    In the OAuth modes, each connected user's access token and refresh token are stored in that user's own scope. The access token is reused until it is within 120 seconds of expiry, then refreshed automatically; when HubSpot returns no expiry the connector assumes 3300 seconds. A refresh rejected with a `4xx` status invalidates the stored connection so the user is prompted to reconnect instead of hitting repeated failures, while a `5xx` is reported as transient and left connected.
+
+    For unattended runs such as scheduled automations, there is no signed-in user. The connector then resolves a token from a workspace secret named `hubRefresh_<userId>`, which is written during the OAuth callback. That write only succeeds when the connecting user is a workspace editor or owner, so to enable unattended runs have an editor connect once from the configuration app. Ordinary end users still get a working interactive connection either way.
+
+    <Warning>
+      The `targetUserId` that selects whose stored refresh token to use must come from trusted server-side configuration. Never wire it to an inbound request parameter or to an argument supplied by an agent, since that would let a caller act as another user.
+    </Warning>
+
+    ## Verify the workspace setup
+
+    Run the full check list in [Verify the installation](/apps-store/marketplace/connectors/install-in-workspace#verify-the-installation). The HubSpot-specific checks are:
+
+    1. In the configuration app, confirm that the auth mode is set and, in the OAuth modes, that the connection status shows as connected for your user.
+    2. In a Builder automation, run `Hubspot.listOwners` with no arguments. It must return the owners of the connected HubSpot portal. This is the connector's "who am I" check: in an OAuth mode the owners must belong to the signed-in user's own portal, and in `accessToken` mode they belong to the Private App's portal.
+    3. If the step returns an `error` field instead, match its message against [Common Issues](#common-issues).
 
     ## Available Instructions
 
-    Every instruction resolves credentials from the workspace configuration. CRM list operations accept `limit` (default 100) and `after` for cursor pagination, plus `properties` to request specific fields.
+    Every instruction resolves credentials from the workspace configuration and returns the HubSpot response body, or `{ error }` when the call fails. CRM list operations accept `limit` and `after` for cursor pagination, plus `properties` to request specific fields. The default page size is HubSpot's, not the connector's.
 
     ### Contacts
 
@@ -521,7 +589,7 @@ This connector is used by three different roles. Jump to the section that matche
     | `archiveContact` | Archive a contact by `contactId` | Empty (HTTP 204) |
     | `searchContacts` | Search with `filterGroups`/`sorts`/`query`, select `properties` | `{ total, results, paging }` |
     | `mergeContacts` | Merge `objectIdToMerge` into `primaryObjectId` | `{ id, properties }` |
-    | `batchReadContacts` / `batchCreateContacts` / `batchUpdateContacts` / `batchArchiveContacts` | Batch ops on up to 100 `inputs` | `{ status, results }` |
+    | `batchReadContacts` / `batchCreateContacts` / `batchUpdateContacts` / `batchArchiveContacts` | Batch operations over an `inputs` array | `{ status, results }` |
 
     ### Companies
 
@@ -585,8 +653,12 @@ This connector is used by three different roles. Jump to the section that matche
     | `updateList` | Rename a list (`listId`, `listName`) | `{ list }` |
     | `deleteList` | Delete a list by `listId` | Empty (HTTP 204) |
     | `searchLists` | Search by `query`, paginate with `count`/`offset` | `{ lists, total, offset }` |
-    | `addListMembers` / `removeListMembers` | Add / remove members of a static list by `listId` | `{ recordsIdsAdded }` / `{ recordsIdsRemoved }` |
+    | `addListMembers` / `removeListMembers` | Add or remove members of a `MANUAL` list by `listId` | `{ recordsIdsAdded }` / `{ recordsIdsRemoved }` |
     | `getListMemberships` | List the members of a list by `listId` | `{ results, paging }` |
+
+    <Warning>
+      `addListMembers` and `removeListMembers` declare `listId` as their only argument and forward nothing else to HubSpot, so they cannot carry the record ids to add or remove. Perform list membership changes through the `lists` MCP tool, where extra top-level arguments are passed through, or call the HubSpot lists endpoint directly.
+    </Warning>
 
     ### Forms
 
@@ -673,13 +745,19 @@ This connector is used by three different roles. Jump to the section that matche
         output: created
     ```
 
-    ### Add a contact to a static list
+    ### Associate a note with a contact
 
     ```yaml
-    - Hubspot.addListMembers:
-        listId: '{{leadsListId}}'
-        recordIds:
-          - '{{contactId}}'
+    - Hubspot.createNote:
+        properties:
+          hs_note_body: 'Qualified during the discovery call.'
+          hs_timestamp: '{{run.date}}'
+        output: note
+    - Hubspot.createAssociation:
+        fromObjectType: notes
+        fromObjectId: '{{note.id}}'
+        toObjectType: contacts
+        toObjectId: '{{contactId}}'
     ```
 
     ### Send a transactional email
@@ -719,35 +797,65 @@ This connector is used by three different roles. Jump to the section that matche
 
 ## Error Handling
 
-| HTTP Status | Meaning | Typical Cause |
-|-------------|---------|----------------|
-| `400` | Bad Request | Invalid property value, malformed `filterGroups`, missing required field |
-| `401` | Unauthorized | Missing / invalid PAT or OAuth token, revoked refresh token |
-| `403` | Forbidden | The token lacks the required scope, or the portal does not have the feature enabled (Marketing Hub Pro+, etc.) |
-| `404` | Not Found | Record / list / workflow / form does not exist (or was archived) |
-| `409` | Conflict | Unique-property collision (e.g. a contact with the same email already exists) |
-| `429` | Rate Limited | Per-portal quota exceeded; back off using the `X-HubSpot-RateLimit-Secondly-Remaining` headers |
-| `500` / `502` / `503` | Server Error | Transient HubSpot API error; retry with exponential backoff |
+The connector normalizes every non-`2xx` HubSpot response into a single message that names the failing operation and appends HubSpot's own detail. It never echoes an unrecognized response body, so credentials and provider metadata cannot leak into a tool result.
+
+| HTTP status | Message the connector returns | Typical cause |
+|-------------|-------------------------------|----------------|
+| `400` | `Bad request while <operation>: <detail>` | Invalid property value, malformed `filterGroups`, missing required field |
+| `401` | `Authentication failed while <operation>. Check HubSpot credentials / OAuth connection.` | Missing or invalid Private App token or OAuth token, revoked refresh token |
+| `403` | `Forbidden while <operation>. Check the user's HubSpot permissions / OAuth scopes.` | The token lacks the scope, or the portal does not carry the feature the endpoint needs |
+| `404` | `Resource not found while <operation>.` | The record, list, workflow or form does not exist, or was archived |
+| `429` | `Rate limit / org limit exceeded while <operation>. Wait and retry.` | Portal quota exceeded |
+| `500` | `HubSpot server error while <operation>.` | Transient HubSpot failure; retry with backoff |
+| Any other | `Error <status> while <operation>: <detail>` | Includes `409` conflicts such as a unique-property collision on contact creation |
 
 ### Common Issues
 
-**"This agent is not authorized to use this connector"**: The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (id is shown in the error) or enable **Allow all agents**, and Save. The **Install capability** button does this for you.
+Failures that are not HubSpot-specific — an empty **Configuration app** field, a rejected redirect URI, an allowlist secret left as an unresolved binding — are covered in [Install a connector in your workspace: Troubleshooting](/apps-store/marketplace/connectors/install-in-workspace#troubleshooting), [Central OAuth client: Troubleshooting](/apps-store/marketplace/connectors/central-oauth#troubleshooting) and [Declare a connector capability: Troubleshooting](/apps-store/marketplace/connectors/declare-capability#troubleshooting).
 
-**"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability (this is separate from the HubSpot OAuth scopes), then allow the agent in the config app.
+**"This agent is not authorized to use this connector"**: The calling agent is not in the allowlist. Open the configuration app, select **Authorized agents**, tick this agent (its id is quoted in the error) or enable **Allow all agents**, then select **Save**. The **Install capability** button does this for you.
 
-**"HubSpot is not connected for this user"**: No per-user OAuth token is stored for the caller. Open the configuration app (OAuth mode) and click **Connect**, or use the agent's connect flow.
+**"The calling agent could not be identified, so it cannot be authorized"**: The MCP capability **Scope** does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability (this is separate from the HubSpot OAuth scopes), then allow the agent in the config app.
 
-**"HubSpot token refresh failed … must reconnect"**: The stored refresh token was rejected by HubSpot (revoked, or expired after ~6 months idle). The connection is dropped automatically; the user must reconnect from the config app.
+**"Unknown tool `<name>`"**: The MCP client asked for a tool this server does not publish. Re-read the tool list; the server exposes the 18 entity tools listed under [Available Tools](#available-tools).
 
-**"HubSpot OAuth is not configured"**: Neither a tenant OAuth client nor the central platform client is available. Set the OAuth client ID/secret in the config app (tenant mode), or ask the platform maintainer to provision the central OAuth client from the core workspace's config app.
+**"Direct calls are not allowed, use the MCP endpoint"**: A tool automation was invoked directly rather than through the MCP endpoint. Point the capability at the `.mcp` webhook, not at an individual tool webhook.
 
-**`invalid_scope` / "domain mismatch" during the OAuth dance**: The OAuth URL requests a scope the deployed HubSpot app does not declare. Every requested scope must appear in `requiredScopes` or `optionalScopes` of `app-hsmeta.json`; re-run `hs project upload && hs project deploy` after editing.
+**"Missing required argument `action`"**: The tool was called without an `action`. The message lists the actions that tool accepts; pick one.
 
-**`OBJECT_ALREADY_EXISTS` on contact create**: A contact with the same email already exists. Either `update` the existing contact (use `email` as `idProperty`) or query first with `search`.
+**"HubSpot is not connected for this user"**: No per-user OAuth token is stored for the caller. Open the configuration app in an OAuth mode and select **Connect**, or use the agent's connect flow.
 
-**`Lists API: cannot add members to a dynamic list`**: Only static / `MANUAL` lists accept `addMembers` and `removeMembers`. Dynamic lists are driven by their filter criteria.
+**"HubSpot is not authenticated"**: No auth mode resolved at all. Set the auth mode and its credentials in the configuration app.
 
-**No token revocation**: HubSpot exposes no RFC 7009 revocation endpoint, so disconnecting deletes the platform-stored tokens rather than revoking them at HubSpot; refresh tokens may stay valid until they naturally expire (typically 6 months idle).
+**"HubSpot token refresh failed"**: HubSpot rejected the stored refresh token, usually because the user revoked access or the grant expired. The connector deletes the stale connection automatically; the user reconnects from the config app.
+
+**"HubSpot token endpoint temporarily unavailable"**: HubSpot returned a `5xx` on the token endpoint. This is transient and marked as such, so the connection stays valid. Retry shortly; no reconnection is needed.
+
+**"No stored HubSpot token for this user"**: An unattended run tried to resolve a user who has no `hubRefresh_<userId>` workspace secret. Have that user connect once from the configuration app while holding the workspace editor or owner role.
+
+**"HubSpot OAuth is not configured"**: Neither a workspace OAuth client nor the central platform client is available. Set the OAuth client id and secret in the config app for mode `oauth`, or ask the platform maintainer to provision the central OAuth client from the core workspace.
+
+**OAuth callback reports `invalid_state`**: The authorization response did not match a pending connect request, typically after the connect page was left open too long or reused. Restart the flow from **Connect**.
+
+**OAuth callback reports `oauth_client_not_configured`**: The callback ran before any OAuth client was resolvable. Configure the client, then reconnect.
+
+**Authorization is rejected for a scope**: The authorization URL requested a scope the deployed HubSpot application does not declare, or one the portal's subscription does not carry. Every requested scope must appear in `requiredScopes` or `optionalScopes` of `app-hsmeta.json`; re-run `hs project upload && hs project deploy` after editing, and remove scopes the portal cannot grant.
+
+**No token revocation at HubSpot**: The connector's disconnect flow deletes the stored access token, the stored refresh token and the `hubRefresh_<userId>` workspace secret; it does not revoke anything at HubSpot. To cut access at the provider, uninstall the connected application from the HubSpot portal.
+
+## Disconnect, revoke and uninstall
+
+The generic lifecycle, including what survives an uninstall, is in [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall). Applied to HubSpot:
+
+| Goal | Who | How |
+|------|-----|-----|
+| Disconnect one user | The user | Select **Disconnect** in the configuration app, or use the agent's disconnect action. The stored tokens and that user's `hubRefresh_<userId>` secret are deleted, and the status view reports `disconnected`. |
+| Cut a user's access at HubSpot | HubSpot portal admin | Uninstall the connected application from the HubSpot portal. Refreshes then fail with a `4xx`, and the connector drops the stale connection on the next call. |
+| Rotate a workspace OAuth client secret | Workspace builder | Generate a new secret at HubSpot, paste the new **Client ID** and **Client Secret** in the configuration app, and select **Save**. |
+| Rotate a Private App token | Workspace builder | Rotate the token in the HubSpot portal, paste the new value in the configuration app, and select **Save**. |
+| Revoke one agent | Workspace builder | Untick it in **Authorized agents** in the configuration app, or clear **Allow all agents**. Its next call is denied with `This agent is not authorized to use this connector`. |
+| Rotate or revoke the central client | Platform maintainer | See [Rotate or revoke the central client](#3-rotate-or-revoke-the-central-client). |
+| Remove the connector from a workspace | Workspace builder | Uninstall the app, then delete the `hubspotAuth`, `hubspotAuthorizedAgents` and any `hubRefresh_<userId>` workspace secrets it provisioned. |
 
 ## External Resources
 

@@ -1,6 +1,6 @@
 ---
 title: 'Bing Search'
-description: 'Search the web from AI agents through Bing Grounding in Azure AI Foundry'
+description: 'Give agents fresh web results through the bing_search MCP tool, backed by a Bing Grounding connection in Azure AI Foundry and a shared Azure service principal'
 ---
 
 <img
@@ -12,121 +12,226 @@ description: 'Search the web from AI agents through Bing Grounding in Azure AI F
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Bing Search connector exposes web search as a remote MCP server for AI agents. It uses **Bing Grounding** through **Azure AI Foundry** and returns sourced search results in the standard MCP `content` response format.
+The Bing Search connector (workspace slug `tools-search-bing`, published as **Bing Web Search (Azure Foundry)**) exposes web search as a remote MCP server with a single tool, `bing_search`. Each call creates a short-lived Azure AI Foundry assistant equipped with the `bing_grounding` tool, runs the query against a **Bing Grounding** connection, returns the assistant's answer with source annotations in the standard MCP `content` shape, then deletes the assistant.
+
+Authentication to Azure is a **shared service credential**: one Microsoft Entra ID application (service principal) configured once on the connector workspace, using the OAuth 2.0 client credentials flow. There is no per-user sign-in and no App mode credential form.
 
 <CardGroup cols={3}>
-  <Card title="Current Web Search" icon="magnifying-glass">
-    Retrieve recent information from the web with source URLs
+  <Card title="Grounded web search" icon="magnifying-glass">
+    A single `bing_search` tool returns Bing-grounded text with source annotations, so agents can answer from the live web instead of guessing.
   </Card>
-  <Card title="Azure Foundry" icon="cloud">
-    Uses Azure AI Foundry Assistants with a configured Bing Grounding connection
+  <Card title="Azure AI Foundry backed" icon="cloud">
+    Runs on the Foundry Assistants API with a `bing_grounding` search configuration, so search stays inside your own Azure subscription and Foundry project.
   </Card>
-  <Card title="MCP Native" icon="robot">
-    Exposes a JSON-RPC MCP endpoint that Knowledges agents can call directly
+  <Card title="MCP native" icon="robot">
+    Serves a JSON-RPC 2.0 endpoint (`initialize`, `tools/list`, `tools/call`) that Agent Creator agents attach to as a capability.
   </Card>
 </CardGroup>
 
+## Who is this for?
+
+Three roles are involved. Each section below is self-contained; start with the one that matches your role.
+
+<CardGroup cols={3}>
+  <Card title="Azure administrator" icon="shield-halved" href="#register-the-azure-application">
+    You own the Azure subscription and the Foundry project. You register the Entra application, grant it a role on the project, and create the Bing Grounding connection.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece" href="#configure-the-connector-workspace">
+    You hold the `editor` role on the `tools-search-bing` workspace. You store the Azure secrets and fill in the Foundry configuration fields.
+  </Card>
+  <Card title="Agent builder" icon="robot" href="#connect-an-agent-to-the-mcp-endpoint">
+    You build agents in Agent Creator. You attach the MCP endpoint as a capability and brief the agent on when to search.
+  </Card>
+</CardGroup>
+
+## Operating model and runtime identity
+
+This connector supports exactly one authentication method, so there is no credential choice to make. Understand what it implies before you configure it.
+
+| Property | Value |
+|---|---|
+| Authentication method | OAuth 2.0 client credentials against Microsoft Entra ID (`config.auth.type` is `oauth_client_credentials`) |
+| Runtime identity seen by Azure | The Entra application (service principal) configured on the connector workspace, never the end user |
+| Permission enforcement point | Azure role assignments on the Foundry resource or project, plus the Bing Grounding connection referenced by `bing_connection_id` |
+| Credential scope | Shared across every agent and every user that can reach the MCP endpoint |
+| Caller authentication | The MCP endpoint requires an authenticated Prisme.ai principal: a user JWT, a workspace JWT, or an organization API key |
+| Audit attribution in Azure | All searches appear as the shared service principal, not as the invoking user |
+
+<Warning>
+  Because the Azure credential is a shared service principal, every caller that can reach the MCP endpoint searches with the same identity and consumes the same Azure quota. Azure-side logs cannot tell one Prisme.ai user from another. Keep the workspace `editor` role restricted to the people who are allowed to change the [Foundry configuration fields](#foundry-configuration-fields) and the [workspace secrets](#workspace-secrets), and give the service principal the least-privileged role that lets it create and delete assistants in the project.
+</Warning>
+
+The connector performs read-only web search. It creates and deletes its own temporary Foundry assistants and threads, and it writes nothing to your business systems.
+
 ## Prerequisites
 
-- An **Azure subscription** with access to Azure AI Foundry
-- An **Azure AI Foundry project** with a Bing Grounding connection
-- An Azure AD application using the **client credentials** flow
-- Workspace secrets for the Azure tenant, client ID, client secret, and token scope
+### Azure prerequisites
+
+- An **Azure subscription** with an **Azure AI Foundry** resource and a project inside it.
+- A **model deployment** in that project for the model named in `foundry_model` (the shipped value is `gpt-4o`). The assistant is created against that deployment name.
+- A **Grounding with Bing Search** resource connected to the project. Note the full Azure resource ID of the connection; it is the value of `bing_connection_id`.
+- Permission in **Microsoft Entra ID** to create an app registration and a client secret, or an existing service principal you can reuse.
+- Permission to create **role assignments** on the Foundry resource or project.
+
+### Prisme.ai prerequisites
+
+- Access to the `tools-search-bing` workspace with the `editor` role, which is what grants `update` on the workspace and `manage` on its automations.
+- The platform API URL for your environment, used to build the MCP endpoint.
+- For the agent builder: an agent in Agent Creator that you can edit and publish.
 
 <Note>
-  This connector is designed for agent web-search scenarios and exposes the
-  `bing_search` MCP tool.
+  This connector needs no Microsoft Graph permissions and no Graph admin consent, unlike the Outlook, SharePoint, Excel, and Word connectors. Access is governed entirely by Azure role assignments on the Foundry project and by the Bing Grounding connection.
 </Note>
 
-## Instance Configuration
+## Register the Azure application
 
-The **Bing Web Search (Azure Foundry)** connector is available in your Prisme.ai instance. Before using it from an agent:
+Perform these steps in the Azure portal as the Azure administrator, then hand the values listed in step 5 to the workspace builder, who uses them in [Configure the connector workspace](#configure-the-connector-workspace).
 
-1. Open the connector configuration
-2. Verify the Azure Foundry project settings in the connector configuration
-3. Set the required Azure credentials in workspace secrets
+<Steps>
+  <Step title="Create the app registration">
+    In **Microsoft Entra ID**, open **App registrations** and select **New registration**. Give it a name that identifies this connector, leave the redirect URI empty (the client credentials flow does not use one), and select **Register**.
+  </Step>
+  <Step title="Copy the identifiers">
+    On the application **Overview** page, copy the **Directory (tenant) ID** and the **Application (client) ID**.
+  </Step>
+  <Step title="Create a client secret">
+    Open **Certificates & secrets**, select **New client secret**, set an expiry that matches your rotation policy, and select **Add**. Copy the secret **Value** immediately; Azure shows it only once.
+  </Step>
+  <Step title="Grant the service principal a role on Foundry">
+    On the Azure AI Foundry resource or project, open **Access control (IAM)**, select **Add role assignment**, choose the **Azure AI User** role, and assign it to the application you registered. This is the built-in Azure AI Foundry role that grants data-plane access to project resources such as assistants and threads. See the [Azure AI Foundry role-based access control reference](https://learn.microsoft.com/en-us/azure/ai-foundry/concepts/rbac-azure-ai-foundry) for the full role list.
+  </Step>
+  <Step title="Hand off the configuration values">
+    Send the workspace builder, through your approved secret-sharing channel and never in a chat prompt or a ticket comment: the tenant ID, the client ID, the client secret, the token scope (`https://ai.azure.com/.default`, the `.default` scope of the Azure AI Foundry data plane), the Foundry base URL, the project name, and the Bing Grounding connection resource ID.
+  </Step>
+</Steps>
 
-## Azure App Registration
+## Configure the connector workspace
 
-The connector authenticates to Azure AI Foundry with Microsoft Entra ID client credentials. You can create a dedicated app registration or reuse an existing service principal.
+Perform these steps in Builder, on the `tools-search-bing` workspace, as the workspace builder, using the values handed over in [Register the Azure application](#register-the-azure-application).
 
-1. In Microsoft Entra ID, create an **App registration**
-2. Copy the **Directory (tenant) ID** and **Application (client) ID**
-3. Create a **client secret** in **Certificates & secrets**
-4. Assign the service principal the **Azure AI User** role on the Azure AI Foundry resource or project used by the connector
-5. Make sure the Azure AI Foundry project has access to the Bing Grounding connection configured below
+### Workspace secrets
 
-<Note>
-  Unlike Microsoft Graph connectors such as Outlook, SharePoint, or Excel, this
-  connector does not require Graph API permissions or Graph admin consent. Access
-  is controlled through Azure AI Foundry RBAC and the configured Bing Grounding
-  connection.
-</Note>
-
-## Connector Configuration
-
-Set these values in the connector configuration. They define which Azure Foundry project, model, and Bing Grounding connection the connector uses.
-
-| Field | Description |
-|-------|-------------|
-| **Provider** | `bing` |
-| **Foundry Base URL** | Azure AI Foundry service URL, for example `https://<resource>.services.ai.azure.com` |
-| **Foundry Project** | Azure AI Foundry project name |
-| **Foundry API Version** | Azure AI Foundry Assistants API version |
-| **Foundry Model** | Model used by the temporary search assistant |
-| **Bing Connection ID** | Full Azure resource ID of the Bing Grounding connection |
-
-Default search options can also be configured:
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| **Default Count** | `5` | Number of search results when `num_results` is omitted |
-| **Default Market** | `en-US` | Market code when `market` is omitted |
-| **Default Freshness** | `Week` | Recency filter when `freshness` is omitted |
-| **Token Cache TTL** | `3300` | Azure access token cache duration in seconds |
-
-## Workspace Secrets
-
-Set these values in the workspace secrets panel. They are referenced by the connector configuration and are used to request Azure AD access tokens with the client credentials flow.
+Store the Azure credential in workspace secrets first. The connector configuration references these secrets by name, so the values never appear in a visible configuration field.
 
 | Secret | Description |
 |--------|-------------|
-| `AZURE_TENANT_ID` | Azure AD directory tenant ID |
-| `AZURE_CLIENT_ID` | Azure AD application client ID |
-| `AZURE_CLIENT_SECRET` | Azure AD application client secret |
-| `AZURE_TOKEN_SCOPE` | OAuth scope used when requesting the Azure access token, usually `https://ai.azure.com/.default` |
+| `AZURE_TENANT_ID` | Microsoft Entra ID directory (tenant) ID |
+| `AZURE_CLIENT_ID` | Application (client) ID of the registered app |
+| `AZURE_CLIENT_SECRET` | Client secret value of the registered app |
+| `AZURE_TOKEN_SCOPE` | OAuth scope requested in the client credentials flow, for the Azure AI Foundry data plane: `https://ai.azure.com/.default` |
+
+The connector reads them through the `azure_tenant_id`, `azure_client_id`, `azure_client_secret`, and `azure_token_scope` configuration fields, which are pre-bound to `{{secret.AZURE_TENANT_ID}}`, `{{secret.AZURE_CLIENT_ID}}`, `{{secret.AZURE_CLIENT_SECRET}}`, and `{{secret.AZURE_TOKEN_SCOPE}}`.
+
+<Warning>
+  Never paste the client secret into a visible configuration field, an agent system prompt, an automation, or a commit. Only `AZURE_CLIENT_SECRET` in workspace secrets is a supported location for it.
+</Warning>
+
+### Foundry configuration fields
+
+These fields point the connector at your Azure AI Foundry project and Bing Grounding connection. The labels **Azure Tenant ID**, **Azure Client ID**, and **Azure Client Secret** are the ones declared by the connector's authentication form.
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `provider` | Search provider identifier | `bing` |
+| `foundry_base_url` | Azure AI Foundry service URL of the resource | `https://<resource-name>.services.ai.azure.com` |
+| `foundry_project` | Azure AI Foundry project name, used in the `/api/projects/<project>/...` request paths | `<project-name>` |
+| `foundry_api_version` | Foundry Assistants API version sent as the `api-version` query parameter | `2025-05-01` |
+| `foundry_model` | Model deployment used by the temporary search assistant | `gpt-4o` |
+| `bing_connection_id` | Full Azure resource ID of the Bing Grounding connection | `/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.CognitiveServices/accounts/<resource-name>/projects/<project-name>/connections/<connection-name>` |
+
+### Default search options
+
+These values apply when the agent omits the matching `bing_search` argument.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `default_count` | `5` | Number of results requested when `num_results` is omitted |
+| `default_market` | `en-US` | Market code sent to Bing Grounding when `market` is omitted |
+| `default_freshness` | `Week` | Recency filter applied when `freshness` is omitted |
+| `token_cache_ttl` | `3300` | Lifetime in seconds of the cached Azure access token. The connector falls back to `3300` when the field is empty |
+
+<Warning>
+  `default_freshness` is `Week`, so a call that omits `freshness` returns only results from the past week. Raise it to `Month` in the configuration, or have the agent pass `freshness` explicitly, when you need older sources.
+</Warning>
+
+Select **Save** to persist the configuration. The change takes effect on the next MCP call; no republish is required.
+
+## Connect an agent to the MCP endpoint
+
+Perform these steps in Agent Creator as the agent builder, after the workspace builder confirms that [the connector workspace configuration](#configure-the-connector-workspace) is saved.
+
+The MCP endpoint of the connector workspace is:
+
+```text
+<api-url>/workspaces/slug:tools-search-bing/webhooks/bing-search/mcp
+```
+
+Replace `<api-url>` with the platform API URL of your environment, for example `https://api.studio.prisme.ai/v2` on production.
+
+<Steps>
+  <Step title="Open the agent">
+    In Agent Creator, open the agent you want to extend and go to its capabilities.
+  </Step>
+  <Step title="Add the MCP capability">
+    Add a capability of type MCP and set its server URL to the endpoint above. The endpoint authenticates the caller's Prisme.ai principal, so no extra header or API key is needed. The Azure credential is resolved server-side and is never sent to the agent.
+  </Step>
+  <Step title="Save the agent">
+    Select **Save**. The agent now discovers the `bing_search` tool through `tools/list`.
+  </Step>
+  <Step title="Brief the agent">
+    Add the tool guidance below to the agent's system instructions, then select **Save** again. Publish the agent when you are ready to expose it to end users.
+  </Step>
+</Steps>
+
+### Brief the agent in its system prompt
+
+Attaching the capability is not enough; the agent also needs to know when to reach for the tool. Use this starter and adapt the trigger topics to your context.
+
+```text
+You have access to the Bing Search MCP server (tool: bing_search). Use it whenever the answer depends on fresh, public web information: news, regulatory updates, market data, product specifications, factual lookups. Pass the user's intent as `query`. Set `market` to match the user's language (for example fr-FR for French). Set `freshness` explicitly: the default is Week, so pass Month when the user asks about older material and Day for breaking news. Keep `num_results` between 1 and 10. Always cite the source URLs returned by the tool.
+```
 
 <Note>
-  Keep Azure credentials in workspace secrets. Do not paste client secrets into
-  the visible connector configuration fields.
+  For AI Knowledge agents that have no native MCP capability picker, add the connector under **Advanced > Tools** on the **MCP** tab and paste the same endpoint URL. Prefer the Agent Creator capability path for new agents.
 </Note>
 
-## MCP Setup
+## Tool reference
 
-1. Open your **Knowledges project**
-2. Go to **Advanced > Tools**
-3. Click **Add** and select the **MCP** tab
-4. Paste the MCP endpoint URL from the connector configuration
-5. Save the tool and let the agent discover the `bing_search` tool
-
-## Available Tool
+The connector exposes one tool. The MCP endpoint delegates every `bing_search` call to the workspace's `web-search` automation, which is where the Foundry calls happen.
 
 | Tool | Description |
 |------|-------------|
-| `bing_search` | Search the web through Bing Grounding and return sourced results |
+| `bing_search` | Web search powered by Bing via Azure AI Foundry. Use this to find current information on the web. |
 
-### Tool Arguments
+### bing_search arguments
+
+Every optional argument falls back to the matching value in [Default search options](#default-search-options).
 
 | Argument | Type | Required | Description |
 |----------|------|----------|-------------|
-| `query` | string | Yes | Search query |
-| `num_results` | number | No | Number of results to request, from 1 to 10 |
-| `market` | string | No | Market code, for example `en-US` or `fr-FR` |
-| `freshness` | string | No | Recency filter: `Day`, `Week`, or `Month` |
+| `query` | string | Yes | Search query. An empty or missing value returns an error result. |
+| `num_results` | number | No | Number of results, from 1 to 10. Falls back to `default_count`. |
+| `market` | string | No | Market code, for example `en-US` or `fr-FR`. Falls back to `default_market`. |
+| `freshness` | string | No | Recency filter: `Day`, `Week`, or `Month`. Falls back to `default_freshness`. |
 
-## MCP Examples
+Any tool name other than `bing_search` returns the JSON-RPC error `-32601` with the message `Tool not found: <name>`.
 
-### Search with Defaults
+## MCP protocol surface
+
+The endpoint speaks JSON-RPC 2.0 over HTTP POST and answers four methods.
+
+| Method | Result |
+|--------|--------|
+| `initialize` | `protocolVersion` `2025-06-18`, `capabilities.tools`, and `serverInfo` `{ "name": "bing-search", "version": "1.0.0" }` |
+| `notifications/initialized` | HTTP `200` with an empty body |
+| `tools/list` | The `bing_search` tool definition and its input schema |
+| `tools/call` | The tool result for `bing_search`, or error `-32601` for any other tool |
+
+Any other method returns the JSON-RPC error `-32601` with the message `Method not found: <method>`. A request that carries no authenticated Prisme.ai principal returns HTTP `401` and the JSON-RPC error `-32000` with the message `Authentication required`.
+
+### Call examples
+
+Search with the configured defaults:
 
 ```json
 {
@@ -136,13 +241,13 @@ Set these values in the workspace secrets panel. They are referenced by the conn
   "params": {
     "name": "bing_search",
     "arguments": {
-      "query": "latest Azure AI Foundry Bing Grounding documentation"
+      "query": "Azure AI Foundry Bing Grounding documentation"
     }
   }
 }
 ```
 
-### Search a French Market with Fresh Results
+Search a French market, restricted to the past day:
 
 ```json
 {
@@ -161,41 +266,79 @@ Set these values in the workspace secrets panel. They are referenced by the conn
 }
 ```
 
-## Response Format
+### Response format
 
-Successful calls return an MCP tool result:
+A successful call returns a single text block holding the assistant's answer, plus the Bing source annotations returned by Foundry:
 
 ```json
 {
   "content": [
     {
       "type": "text",
-      "text": "Search results with titles, URLs, snippets, and source annotations"
+      "text": "Search results with titles, URLs and snippets",
+      "annotations": []
     }
   ],
   "isError": false
 }
 ```
 
-If the query is missing or Azure authentication fails, the connector returns `isError: true` with a text error message.
+Failures inside the tool are returned as a tool result with `isError` set to `true` and a text block carrying the message, rather than as a JSON-RPC error. A run that does not reach the `completed` state also carries the raw Foundry `last_error` object alongside the content.
+
+## Verify the connector
+
+Run these checks in order. Stop at the first failure and use the matching entry in [Troubleshooting](#troubleshooting).
+
+1. In Builder, open the `tools-search-bing` workspace and run the `tests-run-all` automation. It chains the `tests-mcp` and `tests-web-search` suites and returns a consolidated report. Expected result: `report.status` is `✅ ALL TESTS PASSED` and `report.total_failed` is `0`.
+2. To check the protocol surface on its own, run `tests-mcp`. It exercises `initialize`, `notifications/initialized`, `tools/list`, a live `bing_search` call, an unknown method, an unknown tool, and a call with no `query`. Expected result: `passed` equals `total`.
+3. To check the search path without going through HTTP, run `tests-web-search`. Expected result: the valid-query, `market=fr-FR`, and `freshness=Day` cases all return `isError: false` with a non-empty text block.
+4. From the agent, ask a question that requires a fresh web source. Expected result: the agent calls `bing_search` and answers with the URLs returned by the tool.
 
 ## Troubleshooting
 
-**`Error: query parameter is required`** - The MCP call did not include `params.arguments.query`.
+**`Authentication required`** (HTTP `401`, JSON-RPC error `-32000`): the request reached the endpoint without an authenticated Prisme.ai principal. Call it with a user JWT, a workspace JWT, or an organization API key. Agent Creator capabilities and Builder cross-workspace calls supply one automatically.
 
-**`Authentication error`** - Check the Azure tenant ID, client ID, client secret, and token scope secrets in the connector workspace.
+**`Method not found: <method>`** (JSON-RPC error `-32601`): the client sent a method outside `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`. Check the client's MCP protocol version against the `2025-06-18` version returned by `initialize`.
 
-**`Failed to create assistant`** - Verify the Foundry base URL, project name, API version, model, and Bing Grounding connection ID.
+**`Tool not found: <name>`** (JSON-RPC error `-32601`): the call used a tool name that this server does not expose. The only tool is `bing_search`.
 
-**`Search did not complete`** - The Azure Foundry assistant run did not finish before the connector timeout. Retry with a narrower query or fewer requested results.
+**`Error: query parameter is required`**: the call carried no `params.arguments.query`, or the value was empty. Have the agent always pass a non-empty `query`.
+
+**`Authentication error: Azure AD token error: <description>`**: Microsoft Entra ID rejected the client credentials request. Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` in [Workspace secrets](#workspace-secrets), and confirm the client secret has not expired. The `<description>` is the `error_description` returned by Entra ID and names the exact cause.
+
+**`Authentication error: Azure AD token fetch failed: <message>`**: the token request to `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token` did not complete. Check that `AZURE_TENANT_ID` is a valid directory ID and that the platform can reach the Microsoft identity endpoint.
+
+**`Failed to create assistant: <message>`**: Foundry rejected the assistant creation call. Verify `foundry_base_url`, `foundry_project`, `foundry_api_version`, and that `foundry_model` matches a deployment that exists in the project, in [Foundry configuration fields](#foundry-configuration-fields), and confirm that the service principal holds a role granting data-plane access on the project. A `403` here usually means the role assignment from step 4 of [Register the Azure application](#register-the-azure-application) is missing or was made on the wrong scope.
+
+**`Failed to create thread: <message>`**: the assistant was created but the thread call failed. This points to the same role assignment from [Register the Azure application](#register-the-azure-application) or to a transient Foundry error. Retry, then check the project's health in the Azure portal.
+
+**`Search did not complete. Status: <status>. Error: <code> - <message>`**: the Foundry run ended in `failed`, `cancelled`, or `expired`, or it was still running after the connector's polling window of 15 polls at 2 seconds each, about 30 seconds. Retry with a narrower query or a lower `num_results`. A `failed` status with a Bing-related code usually means `bing_connection_id` does not point at a valid Grounding with Bing Search connection on this project.
+
+**Results are systematically too old or too narrow**: `default_freshness` is `Week` and `default_count` is `5`. Either raise them in [Default search options](#default-search-options) or instruct the agent to pass `freshness` and `num_results` on every call.
+
+**A rotated client secret is not picked up**: the connector caches the Azure access token for `token_cache_ttl` seconds (`3300` by default) in the run session. Wait for the cached token to expire, or start a new session, after changing `AZURE_CLIENT_SECRET`. See [Rotate secrets and remove access](#rotate-secrets-and-remove-access) for the full rotation order.
+
+## Rotate secrets and remove access
+
+- **Rotate the client secret**: create a second client secret on the app registration in Azure, update `AZURE_CLIENT_SECRET` in [Workspace secrets](#workspace-secrets), wait for the cached token to expire (`token_cache_ttl`, `3300` seconds by default), verify with the `tests-web-search` automation as described in [Verify the connector](#verify-the-connector), then delete the old secret in Azure.
+- **Revoke the connector's access to Azure**: remove the role assignment of the service principal on the Foundry resource or project, or delete the client secret. Both make every subsequent search fail with an authentication or assistant-creation error rather than returning stale data.
+- **Disconnect a single agent**: in Agent Creator, remove the MCP capability you added in [Connect an agent to the MCP endpoint](#connect-an-agent-to-the-mcp-endpoint) and save. The agent stops discovering `bing_search`; no Azure change is needed.
+- **Disable the connector for everyone**: clear the Azure secrets listed in [Workspace secrets](#workspace-secrets) on the `tools-search-bing` workspace. Every call then returns `Authentication error` until the secrets are restored.
+- **Uninstall completely**: remove the MCP capability from every agent that references the endpoint, delete the four Azure secrets from the workspace, then delete the Entra app registration and the Grounding with Bing Search connection in Azure if no other system uses them.
 
 ## Related
 
 <CardGroup cols={2}>
-  <Card title="Connectors Overview" icon="plug" href="/apps-store/marketplace/connectors">
-    Compare App and MCP connector usage modes
+  <Card title="Connectors overview" icon="plug" href="/apps-store/marketplace/connectors/overview">
+    Compare the App and MCP usage modes across the connector catalog.
   </Card>
-  <Card title="Knowledges Tools" icon="robot" href="/products/ai-knowledge/connectors">
-    Add MCP tools to an Knowledges agent
+  <Card title="Agent capabilities" icon="robot" href="/products/agent-factory/capabilities">
+    Attach MCP servers to agents in Agent Creator.
+  </Card>
+  <Card title="Grounding with Bing Search" icon="magnifying-glass" href="https://learn.microsoft.com/en-us/azure/ai-foundry/agents/how-to/tools/bing-grounding">
+    Microsoft reference for the Bing Grounding tool and its connection setup.
+  </Card>
+  <Card title="Azure AI Foundry access control" icon="shield-halved" href="https://learn.microsoft.com/en-us/azure/ai-foundry/concepts/rbac-azure-ai-foundry">
+    Built-in roles that govern data-plane access to a Foundry project.
   </Card>
 </CardGroup>
