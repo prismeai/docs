@@ -1,0 +1,214 @@
+---
+title: 'Declare a connector capability'
+description: 'Standard flow for exposing an App + MCP connector to agents: the Install capability button, publishing to the organization Capabilities catalog, and the manual AI Governance path'
+---
+
+A connector only becomes usable once an agent can discover its tools. That wiring is a **capability**: an MCP entry that names the connector's endpoint and tells Agent Creator which identifiers to inject into every call. Connectors expose it three ways, and this page documents all three so a connector page can link here instead of repeating them.
+
+<CardGroup cols={3}>
+  <Card title="Install capability" icon="wand-magic-sparkles">
+    One agent, one action, from the connector's configuration app. The recommended path for a workspace builder wiring their own agent.
+  </Card>
+  <Card title="Add to catalog" icon="book-open">
+    Organization-wide publishing, so every agent builder can attach the connector without pasting an endpoint. For an organization owner or admin.
+  </Card>
+  <Card title="Manual declaration" icon="sliders">
+    Author the capability by hand in AI Governance when neither button applies. Same values, entered yourself.
+  </Card>
+</CardGroup>
+
+## Availability is not authorization
+
+These are two separate gates and conflating them is the most common misconfiguration.
+
+- **Declaring a capability makes the connector reachable.** A catalog entry tells agent builders that the connector exists and where its endpoint is. It grants nothing at the connector.
+- **The connector decides whether a given agent may execute.** A workspace-installed instance checks the calling agent's id against its own **Authorized agents** allowlist. An agent that holds the capability but is not allowlisted is denied at call time.
+
+The one exception is a connector core endpoint backed by a central OAuth client, where the per-agent check short-circuits and every calling agent is accepted. Read [Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint) before publishing a core endpoint to the catalog.
+
+## Before you begin
+
+- The connector is installed and configured in a workspace, with a credential saved and, in the per-user OAuth modes, at least one account connected. See [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace).
+- For **Install capability**: the ability to open that workspace's configuration app, and an agent in Agent Creator that your account can edit.
+- For **Add to catalog**: the `org:owner` or `org:admin` role in the organization. The section is hidden for every other role, and hidden as well while the role is still being resolved.
+- For the manual path: access to **Governance > Org > Capabilities** in your organization.
+- The connector's MCP endpoint and its expected **Scope** value, both rendered by the configuration app.
+
+## Install the capability on one agent
+
+This is the shortest safe path, and it closes both gates at once: it authorizes the agent at the connector **and** attaches the tool to the agent.
+
+<Steps>
+  <Step title="Open Authorized agents in the configuration app">
+    In the connector's configuration app for your workspace, open **Authorized agents**. It lists the agents your account can reach, with a search field for long lists.
+  </Step>
+  <Step title="Select Install capability on the agent's row">
+    Select **Install capability**. The label changes to **Installing…** while it runs, and to **Reinstall** once it has succeeded.
+  </Step>
+  <Step title="Confirm the result">
+    The app confirms with `Capability installed on <agent name>.` A failure reports `Install failed (<status>).` with the detail returned by Agent Creator.
+  </Step>
+  <Step title="Save and test the agent">
+    Open the agent in Agent Creator, confirm the connector's tool is listed, and run a read-only prompt against it.
+  </Step>
+</Steps>
+
+The action performs three things, in order:
+
+1. **Allowlists the agent.** The agent id is added to the workspace's authorized-agents secret, unless **Allow all agents** is already enabled, in which case the allowlist is left untouched.
+2. **Removes stale copies of the capability.** It reads the agent's existing tools and deletes any whose name matches the connector's tool name or whose server URL matches this endpoint. That makes reinstalling idempotent and prevents an agent from carrying two entries after a workspace re-import changed the endpoint.
+3. **Attaches the MCP tool.** It creates a tool of type `mcp` on the agent, pointing at this workspace's MCP endpoint, with the **Scope** already set. For a connector in a per-user OAuth mode it also attaches an `auth` block of type `oauth` carrying the connector's own status, connect, and disconnect URLs, which is what renders the per-user connect action for end users.
+
+<Note>
+  The capability points at **your** workspace instance, so the credentials, the per-user tokens, and the allowlist backing it are yours. That isolation is the reason to prefer a workspace-installed instance over a shared platform endpoint for anything beyond an experiment.
+</Note>
+
+### What the Scope means
+
+The capability **Scope** field is a list of identifiers that Agent Creator injects into every MCP call, server-side. It is **not** an OAuth scope list and has no relation to the provider permissions the connector requests.
+
+| Value | Purpose |
+|---|---|
+| `context_id,agent_id,user_id` | The default. `agent_id` is what lets the connector identify the calling agent and check it against the allowlist; without it every call is denied. `user_id` is what lets the connector resolve the invoking user's own provider token in the per-user OAuth modes. |
+| `context_id,agent_id,user_id,attachment_urls` | Used by connectors that act on files the user uploaded in the chat, for example uploading an attachment to the provider or reading a document. `attachment_urls` injects the URLs of those files so the connector operates on the real file instead of a URL the model invented. |
+
+Use the value the connector's configuration app and connector page state. A connector that does not consume chat attachments does not need `attachment_urls`, and adding it changes nothing for that connector.
+
+## Publish the connector to the Capabilities catalog
+
+Publishing registers the connector in the organization's **Capabilities catalog**, so any agent builder in the organization can attach it from the catalog with the endpoint and Scope already wired.
+
+<Steps>
+  <Step title="Open the Capabilities catalog section">
+    In the configuration app, open **Capabilities catalog**. The section is shown only to `org:owner` and `org:admin`. In a connector maintainer view, the action stays disabled until the central client or central credential is saved, with a hint telling you so.
+  </Step>
+  <Step title="Read the current state">
+    The section reports what it found. **Already in the catalog** means an entry pointing at this exact endpoint exists. A message that the catalog could not be verified means the existence check failed; you can still publish.
+  </Step>
+  <Step title="Add or update the entry">
+    Select **Add to catalog** when no entry exists, or **Update catalog entry** when one does. Updating rewrites the endpoint, the Scope, and the authorization block, which is the fix after a re-import changed the endpoint URL.
+  </Step>
+  <Step title="Confirm the result">
+    The app reports `Added to the Capabilities catalog.` or `Catalog entry updated.` A failure reports the HTTP status; `Forbidden — you need catalog write rights in this org.` means your organization role does not allow catalog writes.
+  </Step>
+</Steps>
+
+The entry is created as a capability of type `mcp` whose server URL is the connector's MCP endpoint and whose **Scope** carries the value described above. Where the connector authenticates per user, the entry also carries an authorization block of type `oauth2` with the connector's status, connect, and disconnect URLs.
+
+<Note>
+  The block type differs by surface: a **catalog** entry uses `oauth2`, a tool attached directly to an **agent** uses `oauth`. The buttons set the right one for you; the distinction matters only if you author either by hand.
+</Note>
+
+<Warning>
+  A catalog entry is **organization-wide**. Once published, every agent builder in the organization can attach the connector. That is different from **Install capability**, which wires exactly one agent. Publishing an entry that points at a **workspace** endpoint is still gated by that workspace's allowlist; publishing one that points at a **core** endpoint backed by a central OAuth client is not gated per agent at all.
+</Warning>
+
+## Declare the capability manually in AI Governance
+
+Use the manual path when the configuration app offers no button for your case: your role does not expose the catalog section, you are wiring an agent surface with no capability picker, or you want to author the entry yourself.
+
+<Steps>
+  <Step title="Open the capability catalog">
+    Go to **Governance > Org > Capabilities** and create a capability of type `mcp`.
+  </Step>
+  <Step title="Point it at the MCP endpoint">
+    Set the server URL field, labelled **SSE/WebSocket URL**, to the connector's MCP endpoint, copied from the configuration app.
+  </Step>
+  <Step title="Set the Scope field">
+    Set **Scope** to the value the connector expects, normally:
+
+    ```text
+    context_id,agent_id,user_id
+    ```
+
+    Add `attachment_urls` only for a connector that acts on chat attachments. Without `agent_id`, Agent Creator injects no agent identity and every call is denied.
+  </Step>
+  <Step title="Add the authorization block, for per-user OAuth connectors">
+    To render the per-user connect action, add an authorization block of type `oauth2` carrying the connector's status, connect, and disconnect URLs. The configuration app renders the exact block for your instance; copy it rather than assembling it.
+  </Step>
+  <Step title="Save the capability">
+    Save. It then appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; there is no per-capability role grant.
+  </Step>
+  <Step title="Allowlist each agent at the connector">
+    Declaring the capability does not authorize any agent. For a workspace endpoint, tick each agent in **Authorized agents** in the connector's configuration app.
+  </Step>
+</Steps>
+
+This maps one to one onto what the buttons do:
+
+| Manual field in AI Governance | Value set by the buttons |
+|---|---|
+| Capability type | `mcp` |
+| Server URL (**SSE/WebSocket URL**) | The connector's MCP endpoint for the workspace instance, or the core endpoint in a maintainer view |
+| **Scope** | `context_id,agent_id,user_id`, plus `attachment_urls` for attachment-consuming connectors |
+| Authorization block | Type `oauth2` in the catalog, type `oauth` on a per-agent tool, carrying the connector's status, connect, and disconnect URLs |
+| Agent authorization | Not a catalog field. Held by the connector's **Authorized agents** allowlist |
+
+<Note>
+  Some agent surfaces have no capability picker and instead accept an MCP server under an advanced tools section. Paste the same endpoint there. The agent still has to be allowlisted at the connector, and its identity still has to reach the connector, so prefer the Agent Creator capability path where it is available.
+</Note>
+
+## Verify the capability
+
+<Steps>
+  <Step title="Confirm the tools are discovered">
+    Open the agent in Agent Creator and confirm the connector's tools are listed. If the list is empty, the endpoint URL is wrong or the connector is not reachable.
+  </Step>
+  <Step title="Run a read-only tool call">
+    Prompt the agent to perform a read that the connector supports. A successful call proves discovery, agent authorization, and credential resolution together.
+  </Step>
+  <Step title="Confirm the runtime identity">
+    Ask the agent for the connector's "who am I" result. In a per-user mode it must name the signed-in user; in a shared-credential mode it names the service account, and every write is attributed to it.
+  </Step>
+  <Step title="Confirm the connect action appears, for per-user OAuth connectors">
+    As a user who has never connected, trigger a tool call. The connector reports that the user is not connected and the connect action is offered. Complete it once and retry.
+  </Step>
+  <Step title="Confirm a non-declared agent is still denied">
+    From an agent that holds no capability for this connector, confirm it has no access. Then, from an agent that holds the capability but was never allowlisted, confirm the workspace endpoint denies it with `This agent is not authorized to use this connector.` That denial is the proof that availability and authorization are separate.
+  </Step>
+</Steps>
+
+## Remove or update a capability
+
+- **Revoke one agent without touching the capability.** Untick it in **Authorized agents** at the connector. The agent keeps the tool in its list but every call is denied. This is the fastest reversible control.
+- **Detach the capability from one agent.** Remove the connector's tool from that agent in Agent Creator and save. Other agents are unaffected.
+- **Update a stale catalog entry.** Select **Update catalog entry** in the configuration app. Use this after a workspace re-import or an app-instance rename changed the endpoint, otherwise builders attach an entry that points at a URL that no longer answers.
+- **Unpublish from the catalog.** Delete the entry in **Governance > Org > Capabilities**. The buttons publish and update; removal is done there. Do this whenever you uninstall the connector, rotate to a different endpoint, or withdraw a central OAuth client.
+- **After uninstalling the connector.** Uninstalling the app instance stops the endpoint answering but leaves any catalog entry in place, and leaves the workspace secrets behind. Remove the catalog entry and delete the connector's secrets. See [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall).
+
+## Troubleshooting
+
+**`This agent is not authorized to use this connector.`**: the agent holds the capability but is not in the workspace's allowlist. Open the connector's configuration app, open **Authorized agents**, tick the agent whose id the message quotes, and save. **Install capability** does this for you. Owner: workspace builder.
+
+**`The calling agent could not be identified, so it cannot be authorized.`**: the capability **Scope** does not declare `agent_id`, so no agent identity is injected. Set the Scope to `context_id,agent_id,user_id`, then allowlist the agent. This Scope is separate from the provider's OAuth scopes. Owner: agent builder.
+
+**`Install failed (<status>).`**: Agent Creator refused to attach the tool. A `403` means your account cannot edit that agent. Other statuses carry the detail returned by the API. Owner: agent builder.
+
+**`Forbidden — you need catalog write rights in this org.`**: your organization role does not allow catalog writes. The publish path needs `org:owner` or `org:admin`. Owner: organization administrator.
+
+**The Capabilities catalog section is not shown**: the section is hidden for roles other than `org:owner` and `org:admin`, and hidden while the role is still resolving or when it could not be resolved. Use the manual path in AI Governance, or ask an organization administrator to publish. Owner: organization administrator.
+
+**The publish action stays disabled**: in a maintainer view, publishing is blocked until the central client or central credential is saved, because the entry would point at an endpoint that cannot authenticate. Save the central configuration first. Owner: platform administrator.
+
+**`Could not verify the catalog — you can still try to add the entry.`**: the existence check could not read the catalog. Publishing still works; if an entry already exists for this endpoint it is matched on the server URL, so re-publishing does not create a duplicate for the same URL. Owner: organization administrator.
+
+**The agent lists two entries for the same connector**: an older entry survived an endpoint change. Run **Install capability** again, which removes stale copies before attaching a fresh tool, or remove the older tool from the agent by hand. Owner: workspace builder.
+
+**A tool call reaches the connector but returns no data**: the capability, the allowlist, and the credential are all fine; the resolved provider identity cannot see the resource. Verify the runtime identity and the provider permissions rather than the capability. Owner: provider administrator.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Install a connector in your workspace" icon="puzzle-piece" href="/apps-store/marketplace/connectors/install-in-workspace">
+    Install the app, save credentials, and manage the authorized-agents allowlist.
+  </Card>
+  <Card title="Central OAuth client" icon="key" href="/apps-store/marketplace/connectors/central-oauth">
+    What changes about agent authorization when a core endpoint is backed by a central client.
+  </Card>
+  <Card title="Agent Creator capabilities" icon="robot" href="/products/agent-factory/capabilities">
+    How agents discover and call MCP tools.
+  </Card>
+  <Card title="Governance capabilities" icon="shield-halved" href="/products/ai-governance/capabilities">
+    How the organization governs the capability catalog.
+  </Card>
+</CardGroup>

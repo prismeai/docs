@@ -1,0 +1,207 @@
+---
+title: 'Install a connector in your workspace'
+description: 'Standard workspace builder flow for App + MCP connectors: install the app, enter credentials in the configuration app, allowlist agents, copy the MCP endpoint, verify, then rotate or uninstall'
+---
+
+Most Prisme.ai connectors are **App + MCP connectors** built on the tenant-context model: one connector workspace is published as an app, and every workspace that uses it installs its own **app instance**. That instance holds your credentials, your authorized-agents allowlist, and your own MCP endpoint. This page documents the standard installation flow that these connectors share, so a connector page only has to describe what is specific to its provider.
+
+The reader here is the **workspace builder**. Two other roles depend on the outcome:
+
+<CardGroup cols={3}>
+  <Card title="Workspace builder" icon="puzzle-piece">
+    You install the connector, enter the credentials, and decide which agents may call it. This page is yours.
+  </Card>
+  <Card title="Agent builder" icon="robot">
+    Attaches the connector to an agent once you hand over the MCP endpoint. See [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability).
+  </Card>
+  <Card title="Platform administrator" icon="shield-halved">
+    Optionally provisions one platform-wide OAuth client so you do not register your own. See [Central OAuth client](/apps-store/marketplace/connectors/central-oauth).
+  </Card>
+</CardGroup>
+
+<Note>
+  Connector names, secret names, auth modes, and tool names differ from one connector to the next. Wherever this page writes `<connector>`, read the value from the connector's own page or from its configuration app. Nothing here replaces the provider prerequisites documented on the connector page.
+</Note>
+
+## Before you begin
+
+- The `owner`, `editor`, or `admin` role on the Builder workspace where you install the connector. Installing writes workspace secrets and workspace configuration, so a viewer cannot complete this flow.
+- The provider prerequisites listed on the connector's own page: an account or tenant on the external service, and, depending on the mode you choose, an API token, a service account, or a registered OAuth application.
+- A decision on the authentication mode, made before you install. Connector pages present the supported modes in a table with the provider identity each one uses. Choose on the outcome you need:
+
+| You need | Choose | Provider identity at runtime |
+|---|---|---|
+| A human triggers the action and the provider must attribute it to that person | Per-user OAuth against a central platform client, where the connector supports it | The invoking end user |
+| The same, but the OAuth application must stay under your own control | Per-user OAuth against a tenant-owned client you register yourself | The invoking end user |
+| Unattended automation with no interactive sign-in | A shared credential: API token, personal access token, service account, or client credentials | One shared service account |
+
+<Warning>
+  A shared credential is a **shared service identity**. Every agent and every user of the workspace acts as that one provider account, the provider's audit log attributes all writes to it, and its permissions become the blast radius of the whole connector. Prefer a per-user mode whenever a human triggers the action, and back a shared credential with an account restricted to the projects, sites, or objects the connector actually needs.
+</Warning>
+
+## What installing provisions
+
+Installing the app runs the connector's `onInstall` automation, which reacts to both `workspaces.apps.installed` and `workspaces.apps.configured`. It is idempotent and re-runs on every reconfiguration. It performs four things:
+
+1. **Provisions the workspace secrets.** Typically two: one object secret holding the authentication profile (`<connector>Auth`), and one string secret holding the authorized-agents allowlist (`<connector>AuthorizedAgents`). Existing secrets are never overwritten, so a reinstall keeps your credentials.
+2. **Binds the configuration to those secrets.** The workspace `config.value` maps each configuration key onto its `{{secret.*}}` reference, and the app instance configuration points at that workspace configuration. A secret reference only resolves inside `config.value`, which is why the binding is written in two hops rather than stored on the instance directly.
+3. **Generates the `configAppUrl`.** This read-only **Configuration app** field is the entry point for everything else on this page. It carries the workspace id, the workspace slug, and the app-instance slug as query parameters.
+4. **Generates the per-instance OAuth callback URL**, for connectors that support per-user OAuth, and stores it as `oauthCallbackUrl` on the instance.
+
+The MCP endpoint is not stored as a configuration field. It is derived from the workspace slug and the app-instance slug, and the configuration app renders the exact value for your instance.
+
+## Install the app
+
+<Steps>
+  <Step title="Open the Apps catalog in your workspace">
+    In Builder, open the workspace that will own the credentials, then open **Apps**.
+  </Step>
+  <Step title="Install the connector">
+    Search for the connector by the name given on its documentation page, then install it. The app-instance slug you choose becomes part of every URL the instance exposes, so keep it stable.
+  </Step>
+  <Step title="Confirm the install completed">
+    Open the app instance configuration. The **Configuration app** field is populated with a link. If it is empty, the `onInstall` automation did not complete: reconfigure the instance to re-trigger it.
+  </Step>
+</Steps>
+
+## Configure credentials in the configuration app
+
+Every App + MCP connector ships a configuration app. Open it from the **Configuration app** link on the instance, or, where the connector renders its bundle inline, from the instance configuration panel itself. The app resolves your workspace and app instance from the link, so open it from that link rather than from a bookmark taken in another workspace.
+
+<Warning>
+  Enter credentials **only** through the configuration app. Do not hand-edit the app-instance configuration and do not write the connector's secrets directly in Studio **Secrets**. The configuration app writes the profile in the exact object shape the connector reads, and the two-hop binding is what makes `{{secret.*}}` resolve at runtime. A hand-written value in the wrong shape or the wrong place leaves the connector reading an unresolved binding, which fails closed.
+</Warning>
+
+<Steps>
+  <Step title="Select the authentication mode">
+    Pick the mode you decided on in *Before you begin*. The form redraws to show only the fields that mode needs.
+  </Step>
+  <Step title="Fill in the credential fields and save">
+    Enter the values the connector page lists for that mode, then select the save action. Secret fields are write-only: reopening the app shows that a value is stored without returning it.
+  </Step>
+  <Step title="Register the callback URL, for a tenant-owned OAuth client">
+    If you selected per-user OAuth against your own client, copy the callback URL the configuration app renders and register it at the provider as the redirect URI, byte for byte. It has this shape:
+
+    ```text
+    <api-url>/workspaces/slug:<your-workspace-slug>/webhooks/<app-instance-slug>.oauthCallback
+    ```
+
+    Do not assemble it by hand. With a central platform client the redirect URI is the core workspace one instead, and you register nothing. See [Central OAuth client](/apps-store/marketplace/connectors/central-oauth#callback-urls).
+  </Step>
+  <Step title="Test the credential">
+    Where the connector offers a **Test connection** action, run it. It resolves the stored profile and makes one lightweight provider call, so a success proves the credential and not just the form.
+  </Step>
+  <Step title="Connect an account, in the per-user OAuth modes">
+    Start the connection from the configuration app. Each user of the workspace connects once with their own provider account. The token is stored server-side and refreshed automatically; no automation and no agent ever receives it.
+  </Step>
+</Steps>
+
+## Authorize the agents that may call the connector
+
+The credentials answer *which provider account the connector uses*. The **Authorized agents** allowlist answers *which agents may make it act*. Both gates apply.
+
+The connector reads the calling agent's id from the MCP request. Agent Creator injects that id server-side when the capability declares `agent_id` in its **Scope**. The connector then checks the id against the allowlist stored in the `<connector>AuthorizedAgents` secret, a comma-separated list of agent ids.
+
+<Steps>
+  <Step title="Open Authorized agents">
+    In the configuration app, open **Authorized agents**. It lists the agents your account can reach.
+  </Step>
+  <Step title="Select the agents that may call this instance">
+    Tick each agent, then save. Ticking is persisted immediately in most connectors, and the list is reflected in the workspace secret.
+  </Step>
+  <Step title="Or install the capability in one action">
+    Selecting **Install capability** on an agent's row allowlists that agent and wires the MCP tool onto it in a single step. See [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability#install-the-capability-on-one-agent).
+  </Step>
+</Steps>
+
+### The allow-all wildcard
+
+Enabling **Allow all agents** stores the single sentinel value `*` in the allowlist. The connector then accepts any caller and stops requiring an agent id at all, so a call that carries no identity is authorized too.
+
+<Warning>
+  `*` disables the per-agent gate entirely for this instance. After that, the only remaining gates are the provider's own permissions and, in the per-user OAuth modes, whether the invoking user has connected an account. Use `*` for a private test workspace, not for a workspace holding a shared service credential.
+</Warning>
+
+## Copy the MCP endpoint
+
+The configuration app renders the endpoint under **MCP endpoint** with a copy action. It has this shape:
+
+```text
+<api-url>/workspaces/slug:<your-workspace-slug>/webhooks/<app-instance-slug>.mcp
+```
+
+The slug form is deliberate: it survives a workspace re-import, whereas a raw workspace id does not.
+
+<Warning>
+  Treat the MCP endpoint URL as sensitive and share it only with the people who wire agents against this instance. The allowlist matches the agent id presented in the call, so it routes and filters traffic rather than cryptographically authenticating the caller. Do not paste the endpoint into a chat prompt, an agent system prompt, a log, or a repository.
+</Warning>
+
+Hand the endpoint to the agent builder together with the capability **Scope** value the connector expects, normally `context_id,agent_id,user_id`. That is the handoff into [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability).
+
+## Verify the installation
+
+Run these checks before letting an agent write anything. Each one is independent of the setup screens.
+
+<Steps>
+  <Step title="Confirm the runtime identity">
+    Call the connector's "who am I" operation, listed on its page (for example a `users` tool with an action that returns the connected account). The response names the provider account the connector actually uses. In a per-user mode it must be the signed-in user. In a shared-credential mode it is the service account, and every write in this workspace is attributed to it.
+  </Step>
+  <Step title="Run a read-only query">
+    Call a narrow read or search operation. Results come back only for the resources the resolved identity can see.
+  </Step>
+  <Step title="Check that unauthorized access is blocked">
+    Call a read operation on a resource the account must not see. It must fail with a not-found or forbidden error rather than return data.
+  </Step>
+  <Step title="Check that a non-allowlisted agent is rejected">
+    From an agent you did not tick, call any tool. The call must be denied with `This agent is not authorized to use this connector.` If it succeeds, the allowlist holds `*`, or the instance resolves a central client (see [Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint)).
+  </Step>
+  <Step title="Check the write path last">
+    Only once the reads behave as expected, perform one reversible write in a test resource, confirm it appears at the provider under the expected author, then undo it.
+  </Step>
+</Steps>
+
+## Rotate credentials and uninstall
+
+- **Revoke one agent.** Untick it in **Authorized agents**, or clear **Allow all agents**. Its next call is denied with `This agent is not authorized to use this connector.` Other agents are unaffected.
+- **Disconnect one user.** In the per-user OAuth modes, disconnect from the configuration app. The connector deletes that user's stored tokens. To also revoke the grant at the provider, the user must remove the application's access from their own provider account settings; that is the only provider-side guarantee.
+- **Offboard a user.** Disconnect them before their Prisme.ai account is removed, so the per-user token secret the connector stores for them is deleted rather than orphaned.
+- **Rotate a shared credential.** Generate a new token or key at the provider, replace the value in the configuration app, then re-run **Test connection**. No user re-consent is needed, because a shared credential has no per-user connection.
+- **Rotate a tenant-owned OAuth client secret.** Generate a new secret at the provider, then re-enter the client id and secret in the configuration app. Token refreshes fail until the stored value matches the one the provider expects, and users reconnect once if the provider invalidated their grants.
+- **Uninstall.** Remove the app instance from the workspace. The endpoint stops answering immediately.
+
+<Warning>
+  Uninstalling removes the app instance but does **not** delete the workspace secrets the install flow provisioned, nor the per-user token secrets. These connectors ship no uninstall handler by design, so a reinstall keeps working. To purge stored credentials, delete the connector's secrets from the workspace **Secrets** after uninstalling. The connector page names them. If you published the connector to the Capabilities catalog, remove that entry too, or agent builders keep seeing an endpoint that no longer answers.
+</Warning>
+
+## Troubleshooting
+
+**`This agent is not authorized to use this connector.`**: the calling agent is not in this instance's allowlist. Open the configuration app, open **Authorized agents**, tick the agent whose id the message quotes, and save. **Install capability** does this for you. Owner: workspace builder.
+
+**`The calling agent could not be identified, so it cannot be authorized.`**: the MCP capability **Scope** does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to the value the connector expects, normally `context_id,agent_id,user_id`, then allowlist the agent. This Scope is separate from the provider's OAuth scopes. Owner: agent builder.
+
+**Every call is denied even though the agent is ticked**: the allowlist secret still holds an unresolved binding rather than a list of ids. The connector treats a value containing `{{` as empty and fails closed. Re-open the configuration app and save the allowlist again so the two-hop binding is rewritten; if the value was hand-edited in Studio **Secrets**, remove it and let the configuration app rewrite it.
+
+**The Configuration app field is empty after install**: `onInstall` did not complete. Reconfigure the app instance to re-emit `workspaces.apps.configured` and re-run the flow. It is idempotent, so nothing already provisioned is lost.
+
+**The provider rejects the redirect URI**: the URI registered at the provider does not match the one the connector sends, byte for byte. Copy it from the configuration app rather than typing it, and check whether the connector resolves a central client, in which case the core workspace URI applies instead of the per-instance one. Owner: provider administrator plus workspace builder.
+
+**The connector reports that authentication is not configured**: neither a tenant credential nor, for per-user OAuth, a central platform client is available. Enter the credential in the configuration app, or ask the platform administrator to provision the central client. Owner: workspace builder or platform administrator.
+
+**Tool calls fail only for some users, with a "not connected" message**: those users have not completed the per-user OAuth connection. Each user connects once from the configuration app. This is expected in the per-user modes and never happens in the shared-credential modes.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Declare a connector capability" icon="plug" href="/apps-store/marketplace/connectors/declare-capability">
+    Attach the connector to an agent, or publish it to your organization's Capabilities catalog.
+  </Card>
+  <Card title="Central OAuth client" icon="key" href="/apps-store/marketplace/connectors/central-oauth">
+    Register one platform-wide OAuth client so no workspace has to register its own.
+  </Card>
+  <Card title="Connector architecture and security" icon="sitemap" href="/apps-store/marketplace/connectors/architecture">
+    Trust domains, execution topologies, and the controls applied to every MCP tool call.
+  </Card>
+  <Card title="Builder integrations" icon="code" href="/products/ai-builder/integrations">
+    Call connector instructions deterministically from DSUL automations.
+  </Card>
+</CardGroup>
