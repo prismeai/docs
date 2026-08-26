@@ -1,6 +1,6 @@
 ---
 title: 'ServiceNow'
-description: 'Manage ServiceNow ITSM tickets, change requests, problems and the service catalog from Agent Creator agents and Builder workflows'
+description: 'Manage ServiceNow ITSM incidents, change requests, problems and the service catalog from Agent Creator agents and Builder workflows'
 ---
 
 <img
@@ -12,19 +12,19 @@ description: 'Manage ServiceNow ITSM tickets, change requests, problems and the 
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The ServiceNow app exposes the [ServiceNow](https://www.servicenow.com) ITSM platform through its Table API. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. It covers incidents, change requests, problems, the service catalog, requests, attachments, users and groups, plus a generic table accessor for any other ServiceNow table.
+The ServiceNow app exposes the [ServiceNow](https://www.servicenow.com) ITSM platform through its REST APIs. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. It covers incidents, change requests, problems, the service catalog, requests and request items, attachments, users and groups, plus a generic table accessor and an aggregate-statistics tool for any other ServiceNow table.
 
-Authentication is a **per-workspace credential** resolved server-side: either **Basic Auth** (a ServiceNow user with the right roles) or an **OAuth2 client** (`client_credentials` grant). Agents are identified by the capability **Scope** `context_id,agent_id,user_id`; the credential is never passed through the agent.
+Authentication is a **per-workspace service credential** resolved server-side: either **Basic Auth** (a ServiceNow integration user) or an **OAuth2 client** (`client_credentials` grant). Every call reaches ServiceNow as that one account, so ServiceNow ACLs and the account's effective roles — not the end user's — are the authorization boundary. The credential is never passed through the agent.
 
 <CardGroup cols={3}>
-  <Card title="ITSM Tickets" icon="headset">
-    Create, read, update and transition incidents, change requests and problems with work notes and close codes.
+  <Card title="ITSM tickets" icon="headset">
+    Create, read, update and transition incidents, change requests and problems, with work notes, customer comments and close codes.
   </Card>
-  <Card title="Service Catalog" icon="cart-shopping">
-    List and inspect catalog items, then order them with their variables, creating a request and request item.
+  <Card title="Service catalog" icon="cart-shopping">
+    List and inspect catalog items with their variables, then order them — which creates a request and a request item (RITM).
   </Card>
-  <Card title="Generic Table Access" icon="table">
-    Query any ServiceNow table with encoded queries, fetch records by sys_id, and compute aggregate statistics.
+  <Card title="Generic table access" icon="table">
+    Query any ServiceNow table with encoded queries, fetch records by `sys_id`, and compute aggregate statistics.
   </Card>
 </CardGroup>
 
@@ -33,54 +33,73 @@ Authentication is a **per-workspace credential** resolved server-side: either **
 This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to manage ServiceNow tickets. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to manage ServiceNow tickets. Go to Agent builder (Agent Creator).
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and want to publish ServiceNow as a reusable capability. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and want to publish ServiceNow as a reusable capability. Go to Platform admin (Governance).
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call ServiceNow operations directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations (DSUL) that call ServiceNow operations directly. Go to Workspace builder (DSUL).
   </Card>
 </CardGroup>
+
+## How the connector resolves your instance
+
+Unlike a connector that publishes one MCP server per workspace, ServiceNow exposes a **single shared MCP endpoint** hosted by the central `service-now` workspace:
+
+```text
+<api-url>/workspaces/slug:service-now/webhooks/mcp
+```
+
+Tenant separation is carried by the **MCP API Key**, not by the URL. When you install the app, the install flow asks the central workspace to mint an HMAC-signed key that encodes your workspace id and a private credentials-lookup URL, and writes it into your app instance configuration. On every `tools/call`, the central endpoint verifies that signature, calls back into *your* workspace to build the authorization header from *your* credentials, and caches the result for 10 minutes per workspace before routing the call to the tool.
+
+<Warning>
+  Treat the **MCP API Key** as a secret: anyone holding it can execute ServiceNow tools against your instance with your service credential. Copy it only into the capability header field of an agent you control, never into a chat prompt, an agent system prompt, a log or a repository.
+</Warning>
+
+### How this differs from the standard connector flow
+
+Most App + MCP connectors follow the flow described in [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace). ServiceNow deviates from it on three points, so read the procedures on this page rather than the shared ones:
+
+| Standard flow | ServiceNow |
+|---|---|
+| Credentials are entered in a **configuration app** opened from a `configAppUrl` field | There is no configuration app. Credentials go into four **workspace secrets**, and the instance URL and auth type into the app instance configuration ([Workspace builder](#workspace-builder-dsul)). |
+| Each instance publishes its **own** MCP endpoint at `.../webhooks/<app-instance-slug>.mcp` | One shared endpoint hosted by the central `service-now` workspace, with tenancy carried by the signed **MCP API Key** header. |
+| An **Authorized agents** allowlist gates which agents may call the connector, using the `agent_id` injected by the capability **Scope** | There is **no per-agent allowlist** and the calling agent's identity is never read. Any holder of a workspace's MCP API Key reaches that workspace's ServiceNow instance. |
+
+What still transfers unchanged is the shared-credential guidance in [Before you begin](/apps-store/marketplace/connectors/install-in-workspace#before-you-begin): ServiceNow only supports shared-service-account modes, so pick an account whose ServiceNow roles are the least-privilege set for the tables you need. The [Central OAuth client](/apps-store/marketplace/connectors/central-oauth) flow does **not** apply at all — this connector has no per-user OAuth and no central OAuth client.
 
 ## Prerequisites (ServiceNow side)
 
 - A **ServiceNow** instance; its URL has the form `https://<instance>.service-now.com`.
 - A **credential**, one of:
-  - **Basic Auth**: a ServiceNow user (username + password) holding the roles needed for the tables you target.
-  - **OAuth2 client** (`client_credentials` grant): create an **Application Registry** in ServiceNow under **System OAuth > Application Registry** and note its **Client ID** / **Client Secret**.
-- The **roles** for the tables you intend to use: `itil` for incidents, `change_manager` for change requests, `problem_manager` for problems, `sn_request_write` for catalog requests, and a table-specific role for anything else. The generic table tools are ACL-filtered by the account's effective roles.
+  - **Basic Auth**: a ServiceNow integration user (username + password).
+  - **OAuth2 client** (`client_credentials` grant): create an **Application Registry** entry in ServiceNow under **System OAuth > Application Registry** and note its **Client ID** and **Client Secret**.
+- The account must hold the ServiceNow roles for the tables you intend to use — for example `itil` for incidents, `change_manager` for change requests and `problem_manager` for problems. These role names come from [ServiceNow's own product documentation](https://docs.servicenow.com), not from the connector; the connector performs no permission check of its own and every request is ACL-filtered by the account's effective roles.
+- The change-state operations (`getChangeTransitions`, `transitionChange`) call the ServiceNow Change Management REST API under `/api/sn_chg_rest/`, which requires that API to be activated on the instance. The catalog operations call the Service Catalog API under `/api/sn_sc/`.
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
-  **Goal:** ServiceNow is a **per-workspace** connector: each workspace pastes its own ServiceNow credential (see the *Workspace builder* tab), so there is **no platform-wide credential to provision**. The only optional platform task is to publish ServiceNow as a reusable **capability** in AI Governance so agent builders can enable it from the catalog instead of pasting a raw MCP endpoint.
+  **Goal:** ServiceNow is a **per-workspace** connector: each workspace supplies its own ServiceNow instance URL and credential (see [Workspace builder (DSUL)](#workspace-builder-dsul)), so there is **no platform-wide ServiceNow credential to provision**. The only optional platform task is to publish ServiceNow as a reusable **capability** in AI Governance so agent builders can enable it from the catalog instead of pasting a raw MCP endpoint.
 
   <Note>
-    There is no shared ServiceNow credential and no central OAuth client for this connector. The ServiceNow instance URL and credentials (Basic or OAuth2) always live in the consuming workspace. A Governance capability you publish here points at a specific workspace's MCP endpoint; that workspace still owns the credential.
+    There is no shared ServiceNow credential and no central OAuth client for this connector. The ServiceNow instance URL and credentials (Basic or OAuth2) always live in the consuming workspace. The one platform-level secret is the HMAC signing key held by the central `service-now` workspace, which is generated automatically the first time an app instance requests a key; it signs MCP API keys and never touches ServiceNow.
   </Note>
 
   ## Declare the capability in AI Governance (optional)
 
-  <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) the **ServiceNow** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint** (the workspace running the connector), and set its **Scope** to:
+  Follow [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance), with the ServiceNow values below. The **Install capability** and **Add to catalog** buttons described on that page belong to a connector configuration app, which ServiceNow does not ship, so the manual path is the only one available here.
 
-      ```text
-      context_id,agent_id,user_id
-      ```
-
-      The `agent_id` in the scope is what lets the connector identify the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant.
-    </Step>
-  </Steps>
+  | Capability field | ServiceNow value |
+  |---|---|
+  | Capability type | `mcp` |
+  | Server URL (**SSE/WebSocket URL**) | `<api-url>/workspaces/slug:service-now/webhooks/mcp` — the shared endpoint of the central `service-now` workspace, identical for every tenant |
+  | **Scope** | Not used. The connector never reads the calling agent's identity, so `agent_id` changes nothing here. |
+  | Authorization block | None. Authentication is a server-side Basic or `client_credentials` service credential, not a per-user OAuth flow, so there is no OAuth auth-config JSON to attach. |
+  | Per-agent authorization | None. Each agent builder supplies their own workspace's **MCP API Key** as a capability header instead — see [Agent builder (Agent Creator)](#agent-builder-agent-creator). |
 
   <Warning>
-    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent against a ServiceNow instance. The ServiceNow credential is resolved server-side from the workspace running the connector, and ServiceNow ACLs (the account's effective roles) are the final authorization boundary. There is **no OAuth auth-config JSON** to attach in Governance: authentication is a server-side Basic or `client_credentials` credential, not a per-user OAuth flow.
+    [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization): declaring the capability makes the connector **available**; it does not by itself authorize anything. Each agent builder must still supply their own workspace's **MCP API Key** on the capability — without it the endpoint answers with a JSON-RPC error and no tool runs. This connector has **no per-agent allowlist** and does **not** read the calling agent's identity: any holder of a workspace's MCP API Key reaches that workspace's ServiceNow instance. There is also **no OAuth auth-config JSON** to attach in Governance, because authentication is a server-side Basic or `client_credentials` service credential, not a per-user OAuth flow.
   </Warning>
 </Accordion>
 
@@ -93,123 +112,146 @@ This connector is used by three different roles. Jump to the section that matche
     **Goal:** let an agent you build in Agent Creator manage ServiceNow tickets through MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the ServiceNow app in a workspace (see the *Workspace builder* tab). Optionally, a *Platform admin* may have published a ServiceNow capability in AI Governance (see the *Platform admin setup* accordion above).
+      Before an agent can call the connector, a workspace builder must have installed and configured the ServiceNow app in a workspace — see [Workspace builder (DSUL)](#workspace-builder-dsul). Optionally, a platform administrator may have published a ServiceNow capability in AI Governance — see [Platform admin (Governance)](#platform-admin-governance-one-time-platform-setup).
     </Note>
 
-    The ServiceNow credential (Basic or OAuth2) is resolved server-side from the workspace's app configuration; it is never exposed to the agent. Your agent is identified by the `agent_id` that Agent Creator injects through the capability *Scope*.
+    The ServiceNow credential is resolved server-side from the installing workspace's configuration and is never exposed to the agent. The agent's own identity is not used for authorization: the connector routes on the signed **MCP API Key** alone.
 
     <Steps>
       <Step title="Install and configure the connector in a workspace">
-        Follow the *Workspace builder* tab: install **ServiceNow** in a workspace, then fill in the instance URL and credentials (Basic or OAuth2).
+        Follow [Workspace builder (DSUL)](#workspace-builder-dsul): install **ServiceNow** in a workspace, set the **Instance URL** and **Authentication Type**, and fill the credential secrets.
+      </Step>
+      <Step title="Copy the MCP endpoint and API key">
+        Open the ServiceNow app instance configuration and copy the read-only **MCP Endpoint** and **MCP API Key** values. Both are written automatically when the app is installed or reconfigured.
       </Step>
       <Step title="Add the MCP capability to your agent">
-        In your agent, add a capability pointing at the workspace's **MCP Endpoint** URL, and set its **Scope** to:
+        In Agent Creator, open your agent and add a capability. Select a dedicated ServiceNow capability if your platform admin published one; otherwise use the generic `custom_mcp` capability. Paste the **MCP Endpoint** as the server URL, then add the API key as a header:
 
-        ```text
-        context_id,agent_id,user_id
+        ```json
+        {
+          "mcp-api-key": "your-mcp-api-key"
+        }
         ```
-
-        The `agent_id` is what lets the connector identify your agent. The server URL is the connector's MCP Endpoint, auto-populated when the app is installed.
       </Step>
-      <Step title="Save">
-        The agent now has access to every ServiceNow tool exposed by the MCP server.
+      <Step title="Brief the agent, then save">
+        Add tool-use guidance to the system prompt — see [Brief the agent in its system prompt](#brief-the-agent-in-its-system-prompt) — and save the agent. It can now list and call every ServiceNow tool.
       </Step>
     </Steps>
 
     ## Brief the agent in its system prompt
 
-    Wiring the capability is not enough: the agent also needs to know the tools exist and when to use them. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+    Wiring the capability is not enough: the agent also needs to know the tools exist and when to use them. Copy-pasteable starter:
 
     ```text
-    You have access to the ServiceNow MCP server. Use it whenever the user asks about ITSM data: incidents, change requests, problems, requested items, the service catalog, attachments, users or groups. Examples: "List my open incidents", "Create a change request for the database upgrade tonight", "What's the status of INC0012345?", "Order a new laptop from the catalog". Prefer calling MCP tools directly over guessing, and confirm with the user before any destructive action (resolve an incident, close a problem, transition a change).
+    You have access to the ServiceNow MCP server. Use it whenever the user asks about ITSM data: incidents, change requests, problems, requests and requested items, the service catalog, attachments, users or groups. Examples: "List my open incidents", "Create a change request for the database upgrade tonight", "What's the status of INC0012345?", "Order a new laptop from the catalog". Prefer calling MCP tools directly over guessing. Records are addressed by sys_id, so look a record up before updating it. Always confirm with the user before a write: creating a ticket, resolving or closing an incident, transitioning a change, uploading an attachment, or ordering a catalog item.
     ```
 
     Refine the trigger keywords (assignment groups, ticket prefixes, catalog item names) so the agent reliably picks up the right intent in your context.
 
     <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent's identity is still propagated so the connector can read its `agent_id`.
+      **Legacy AI Knowledge agents** (no native MCP picker): go to **Advanced > Tools**, click **Add**, select the **MCP** tab, paste the **MCP Endpoint** URL, and add the same API-key header in the headers field:
+
+      ```json
+      {
+        "mcp-api-key": "your-mcp-api-key"
+      }
+      ```
     </Note>
 
-    ## Available Tools
+    ## Available tools
 
-    ### Generic Table Access
+    The MCP server exposes 28 tools. Records are addressed by `sys_id` throughout; `getIncident` and `getUser` additionally accept a human-readable identifier.
+
+    ### Generic table access
 
     | Tool | Description |
     |------|-------------|
-    | `queryRecords` | Query any ServiceNow table using encoded query syntax |
-    | `getRecord` | Get a single record from any table by `sys_id` |
-    | `getStats` | Aggregate statistics for a table (count, sum, avg, min, max, group by) |
+    | `queryRecords` | Query any table using encoded query syntax. Requires `tableName`. |
+    | `getRecord` | Get a single record from any table. Requires `tableName` and `sysId`. |
+    | `getStats` | Aggregate statistics for a table (count, sum, average, group by). Requires `tableName`. |
 
     ### Incidents
 
     | Tool | Description |
     |------|-------------|
-    | `listIncidents` | List incidents (state / priority / assignedTo / assignmentGroup filters) |
-    | `getIncident` | Get an incident by `sysId` or `number` |
-    | `createIncident` | Create an incident |
-    | `updateIncident` | Update an incident (supports `workNotes`, `comments`, `closeCode`, `closeNotes`) |
+    | `listIncidents` | List incidents, with `state` / `priority` / `assignedTo` / `assignmentGroup` convenience filters and a raw `query`. |
+    | `getIncident` | Get an incident by `sysId` **or** `number`. |
+    | `createIncident` | Create an incident. Requires `shortDescription`. |
+    | `updateIncident` | Partial update of an incident. Requires `sysId`. Supports `workNotes`, `comments`, `closeCode`, `closeNotes`. |
 
-    ### Change Requests
+    ### Change requests
 
     | Tool | Description |
     |------|-------------|
-    | `listChanges` | List change requests |
-    | `getChange` | Get a change request |
-    | `createChange` | Create a `normal` / `standard` / `emergency` change |
-    | `updateChange` | Update a change request |
-    | `getChangeTransitions` | Get available state transitions |
-    | `transitionChange` | Transition to a new state |
+    | `listChanges` | List change requests, with `state` / `priority` / `type` / assignment filters and a raw `query`. |
+    | `getChange` | Get a change request. Requires `sysId`. |
+    | `createChange` | Create a `normal`, `standard` or `emergency` change. Requires `changeType` and `shortDescription`. |
+    | `updateChange` | Update a change request. Requires `sysId`. |
+    | `getChangeTransitions` | List the state transitions available for a change. Requires `sysId`. |
+    | `transitionChange` | Move a change to a target state. Requires `sysId` and `state`. |
 
     ### Problems
 
     | Tool | Description |
     |------|-------------|
-    | `listProblems` | List problems |
-    | `getProblem` | Get a problem |
-    | `createProblem` | Create a problem |
-    | `updateProblem` | Update a problem (supports `workaround`, `causeNotes`, `fixNotes`) |
+    | `listProblems` | List problems, with `state` / `priority` / assignment filters and a raw `query`. |
+    | `getProblem` | Get a problem. Requires `sysId`. |
+    | `createProblem` | Create a problem. Requires `shortDescription`. |
+    | `updateProblem` | Update a problem. Requires `sysId`. Supports `workaround`, `causeNotes`, `fixNotes`, `workNotes`. |
 
-    ### Service Catalog
-
-    | Tool | Description |
-    |------|-------------|
-    | `listCatalogItems` | List available catalog items |
-    | `getCatalogItem` | Get a catalog item with its variables (form fields) |
-    | `orderCatalogItem` | Order a catalog item (creates a request + request item) |
-
-    ### Requests & Request Items
+    ### Service catalog
 
     | Tool | Description |
     |------|-------------|
-    | `listRequests` | List service catalog requests |
-    | `getRequest` | Get a service catalog request |
-    | `listRequestItems` | List request items (RITMs), optionally filtered by parent request |
+    | `listCatalogItems` | List catalog items, optionally filtered by `catalog`, `category` or `query`. |
+    | `getCatalogItem` | Get a catalog item with its variables (form fields). Requires `sysId`. |
+    | `orderCatalogItem` | Order a catalog item, creating a request and a request item. Requires `sysId`. |
 
-    ### Attachments, Users & Groups
+    ### Requests and request items
 
     | Tool | Description |
     |------|-------------|
-    | `listAttachments` | List attachments on a record |
-    | `uploadAttachment` | Upload a file (base64) to a record |
-    | `listUsers` | List ServiceNow users |
-    | `getUser` | Get a user by `sysId` or `username` |
-    | `listGroups` | List ServiceNow user groups |
+    | `listRequests` | List service catalog requests (`sc_request`). |
+    | `getRequest` | Get a service catalog request. Requires `sysId`. |
+    | `listRequestItems` | List request items / RITMs (`sc_req_item`), optionally filtered by parent `requestId`. |
 
-    ## Output Formats
+    ### Attachments, users and groups
 
-    Tools return the underlying ServiceNow Table API JSON. Most list and get operations accept a `displayValue` argument that controls how reference and choice fields are rendered:
+    | Tool | Description |
+    |------|-------------|
+    | `listAttachments` | List attachments on a record. Requires `tableName` and `tableSysId`. |
+    | `uploadAttachment` | Upload a base64 file to a record. Requires `tableName`, `tableSysId`, `fileName`, `contentBase64`. |
+    | `listUsers` | List users (`sys_user`), optionally filtered by `active` or `query`. |
+    | `getUser` | Get a user by `sysId` **or** `username`. |
+    | `listGroups` | List user groups (`sys_user_group`), optionally filtered by `active` or `query`. |
 
-    - **`false`**: raw `sys_id` values (the default for most fields).
-    - **`true`**: human-readable labels.
-    - **`all`**: both, under `value` and `display_value`.
+    ## Shared arguments
 
-    List operations also accept `limit`, `offset` and `fields` (comma-separated) to control the response size and shape.
+    | Argument | Applies to | Behavior |
+    |----------|-----------|----------|
+    | `limit` | Every list tool except `listAttachments` | Maximum records to return. **Defaults to `20`** when omitted. |
+    | `offset` | Every list tool except `listAttachments` | Pagination offset. |
+    | `fields` | All read tools except `listCatalogItems`, `getCatalogItem` and `listAttachments` | Comma-separated field names to return. |
+    | `displayValue` | Generic, incident, change, problem, request and request-item tools | `false` returns raw values (the ServiceNow default), `true` returns human-readable labels, `all` returns both under `value` and `display_value`. |
+    | `query` | Every list tool except `listAttachments` | An [encoded query](https://docs.servicenow.com/bundle/utah-platform-administration/page/use/using-lists/concept/c_EncodedQueryStrings.html). On tools that also expose convenience filters, the filters and the raw query are combined with `^` (logical AND). |
 
-    ## Tool Details
+    ## Output formats
+
+    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
+
+    - **`verbose`** (default): a short human-readable summary optimized for LLM consumption — the record type, its identifier, key fields, and a hint pointing at the follow-up tool.
+    - **`structured`**: machine-readable JSON in `structuredContent`, also rendered as text.
+    - **`both`**: the verbose text and the structured JSON, side by side.
+
+    <Note>
+      `outputFormat` is honored at runtime by every tool but is not advertised in the `tools/list` manifest, so an agent will not discover it on its own. Name it explicitly in your system prompt if you want structured output.
+    </Note>
+
+    The `structuredContent` payload is the connector's own envelope, not the raw ServiceNow response body. List tools return `{ <plural>: [...], count, totalCount }` — for example `incidents`, `changes`, `problems`, `requests`, `requestItems`, `users`, `groups`, and `records` plus `table` for `queryRecords`. Read, create, update and transition tools return the ServiceNow record object directly. `count` is the number of rows returned; `totalCount` is the value of the `X-Total-Count` response header.
+
+    ## Tool details
 
     ### queryRecords
-
-    Query any ServiceNow table using the [encoded query](https://docs.servicenow.com/bundle/utah-platform-administration/page/use/using-lists/concept/c_EncodedQueryStrings.html) syntax.
 
     ```json
     {
@@ -227,11 +269,34 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `tableName` | Yes | `incident`, `change_request`, `problem`, `sc_req_item`, `sys_user`, … |
-    | `query` | No | Encoded query (operators: `=`, `!=`, `STARTSWITH`, `CONTAINS`, `IN`, `^`, `^OR`, …) |
-    | `fields` | No | Comma-separated field names to return |
-    | `limit` | No | Max records (default 20) |
-    | `offset` | No | Pagination offset |
-    | `displayValue` | No | `true` / `false` / `all` |
+    | `query` | No | Encoded query (operators include `=`, `!=`, `STARTSWITH`, `CONTAINS`, `IN`, `^`, `^OR`). |
+    | `fields` | No | Comma-separated field names to return. |
+    | `limit` | No | Maximum records; defaults to `20`. |
+    | `offset` | No | Pagination offset. |
+    | `displayValue` | No | `true`, `false` or `all`. |
+
+    ### getStats
+
+    ```json
+    {
+      "name": "getStats",
+      "arguments": {
+        "tableName": "incident",
+        "query": "active=true",
+        "count": true,
+        "groupBy": "priority,assignment_group"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `tableName` | Yes | Table to aggregate. |
+    | `query` | No | Encoded query restricting the rows counted. |
+    | `count` | No | Return a row count. **The connector sends `true` when you omit it**, so a call with only `tableName` returns a count. |
+    | `sumFields` | No | Comma-separated numeric fields to sum. |
+    | `avgFields` | No | Comma-separated numeric fields to average. |
+    | `groupBy` | No | Comma-separated fields to group by. |
 
     ### createIncident
 
@@ -240,11 +305,11 @@ This connector is used by three different roles. Jump to the section that matche
       "name": "createIncident",
       "arguments": {
         "shortDescription": "VPN disconnects every 10 minutes",
-        "callerId": "caller-sys-id",
+        "callerId": "<caller-sys-id>",
         "category": "network",
         "impact": "2",
         "urgency": "2",
-        "assignmentGroup": "Network Support",
+        "assignmentGroup": "<assignment-group-sys-id>",
         "contactType": "email"
       }
     }
@@ -252,13 +317,15 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `shortDescription` | Yes | Brief description of the incident |
-    | `callerId` | No | Caller `sys_id` |
-    | `category` / `subcategory` | No | Classification |
-    | `impact` / `urgency` | No | `1` / `2` / `3`; ServiceNow derives `priority` from these |
-    | `assignmentGroup` / `assignedTo` | No | Routing |
-    | `cmdbCi` | No | Affected configuration item `sys_id` |
-    | `contactType` | No | How reported: `email`, `phone`, `walk-in`, … |
+    | `shortDescription` | Yes | Brief description of the incident. |
+    | `description` | No | Full description. |
+    | `callerId` | No | Caller `sys_id`. |
+    | `category` / `subcategory` | No | Classification. |
+    | `impact` / `urgency` | No | `1`, `2` or `3`; ServiceNow normally derives `priority` from these. |
+    | `priority` | No | Set directly if your instance allows it. |
+    | `assignmentGroup` / `assignedTo` | No | Routing. |
+    | `cmdbCi` | No | Affected configuration item `sys_id`. |
+    | `contactType` | No | How the incident was reported: `email`, `phone`, `walk-in`, … |
 
     ### updateIncident
 
@@ -266,7 +333,7 @@ This connector is used by three different roles. Jump to the section that matche
     {
       "name": "updateIncident",
       "arguments": {
-        "sysId": "incident-sys-id",
+        "sysId": "<incident-sys-id>",
         "state": "6",
         "closeCode": "Solved (Permanently)",
         "closeNotes": "Rolled back the firmware to 7.2.1."
@@ -276,11 +343,16 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `sysId` | Yes | Incident `sys_id` |
-    | `state` | No | `1` New, `2` In Progress, `3` On Hold, `6` Resolved, `7` Closed, `8` Canceled |
-    | `workNotes` | No | Internal work notes (appended) |
-    | `comments` | No | Customer-visible comments (appended) |
-    | `closeCode` / `closeNotes` | No | Required by most workflows when resolving |
+    | `sysId` | Yes | Incident `sys_id`. `number` is not accepted here — resolve it with `getIncident` first. |
+    | `state` | No | `1` New, `2` In Progress, `3` On Hold, `6` Resolved, `7` Closed. Other values may exist in your instance's `state` choice list. |
+    | `shortDescription` / `description` | No | Rewrite the summary or the body. |
+    | `impact` / `urgency` / `priority` | No | Re-rate the incident. |
+    | `assignmentGroup` / `assignedTo` | No | Reassign. |
+    | `workNotes` | No | Internal work notes (appended to the journal). |
+    | `comments` | No | Customer-visible comments (appended to the journal). |
+    | `closeCode` / `closeNotes` | No | Required by most resolve/close workflows. |
+
+    Only the arguments you pass are sent, so the update is a genuine partial update.
 
     ### transitionChange
 
@@ -290,7 +362,7 @@ This connector is used by three different roles. Jump to the section that matche
     {
       "name": "transitionChange",
       "arguments": {
-        "sysId": "change-sys-id",
+        "sysId": "<change-sys-id>",
         "state": "-2"
       }
     }
@@ -298,8 +370,12 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `sysId` | Yes | Change request `sys_id` |
-    | `state` | Yes | Target state value. Common (model-dependent): `-5` New, `-4` Assess, `-3` Authorize, `-2` Scheduled, `-1` Implement, `0` Review, `3` Closed, `4` Canceled |
+    | `sysId` | Yes | Change request `sys_id`. |
+    | `state` | Yes | Target state value. Omitting it returns `Error: state is required. Use getChangeTransitions to see available states.` |
+
+    <Note>
+      The connector does not define the state values; it forwards whatever you pass to the ServiceNow Change Management REST API. In the standard change model shipped by ServiceNow, `-5` is New, `-4` Assess, `-3` Authorize, `-2` Scheduled, `-1` Implement, `0` Review, `3` Closed and `4` Canceled, but instances with a custom change model use different values. Always resolve them with `getChangeTransitions`.
+    </Note>
 
     ### orderCatalogItem
 
@@ -307,7 +383,7 @@ This connector is used by three different roles. Jump to the section that matche
     {
       "name": "orderCatalogItem",
       "arguments": {
-        "sysId": "catalog-item-sys-id",
+        "sysId": "<catalog-item-sys-id>",
         "quantity": 1,
         "variables": {
           "laptop_model": "macbook_pro_16",
@@ -319,9 +395,11 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `sysId` | Yes | Catalog item `sys_id` |
-    | `quantity` | No | Quantity (default 1) |
-    | `variables` | No | Object of form field values. Keys must match the item's variable names; call `getCatalogItem` first to discover them |
+    | `sysId` | Yes | Catalog item `sys_id`. |
+    | `quantity` | No | Quantity; defaults to `1`. |
+    | `variables` | No | Object of form field values. Keys must match the item's variable names — call `getCatalogItem` first to discover them. |
+
+    The verbose response reports the request **number**, the **request id** and the target **table**.
 
     ### uploadAttachment
 
@@ -330,7 +408,7 @@ This connector is used by three different roles. Jump to the section that matche
       "name": "uploadAttachment",
       "arguments": {
         "tableName": "incident",
-        "tableSysId": "incident-sys-id",
+        "tableSysId": "<incident-sys-id>",
         "fileName": "vpn-logs.txt",
         "contentBase64": "VlBOIGxvZ3MgY29udGVudC4uLg==",
         "contentType": "text/plain"
@@ -340,13 +418,15 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `tableName` | Yes | Table the record belongs to |
-    | `tableSysId` | Yes | Record `sys_id` |
-    | `fileName` | Yes | Attachment file name |
-    | `contentBase64` | Yes | File content as a base64 string |
-    | `contentType` | No | MIME type (e.g. `text/plain`, `application/pdf`) |
+    | `tableName` | Yes | Table the record belongs to. |
+    | `tableSysId` | Yes | Record `sys_id`. |
+    | `fileName` | Yes | Attachment file name. |
+    | `contentBase64` | Yes | File content as a base64 string. |
+    | `contentType` | No | MIME type; defaults to `application/octet-stream`. |
 
-    Max attachment size is set by the instance (default 1 GB via `com.glide.attachment.max_size`, but most instances restrict it further).
+    <Warning>
+      `contentBase64` is mandatory: the tool takes file *content*, not a URL, so a file the user uploaded in chat cannot be attached by reference. The maximum attachment size is whatever your ServiceNow instance enforces.
+    </Warning>
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
@@ -356,103 +436,126 @@ This connector is used by three different roles. Jump to the section that matche
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **ServiceNow** and install it
-    3. Open the app instance configuration and fill in the instance URL and credentials (Basic or OAuth2)
+    You need the `owner`, `editor` or `admin` role on the Builder workspace, as for any connector — the general prerequisites are in [Before you begin](/apps-store/marketplace/connectors/install-in-workspace#before-you-begin). The rest of that shared flow does not apply: ServiceNow has no configuration app and no authorized-agents allowlist, so follow the steps below instead.
+
+    <Steps>
+      <Step title="Install the app">
+        Go to **Apps** in your workspace, search for **ServiceNow**, and install it.
+      </Step>
+      <Step title="Fill the credential secrets">
+        The install flow provisions four empty workspace secrets and pre-wires them to the app configuration. Open **Secrets** in your workspace and fill the ones your auth mode needs:
+
+        | Secret | Used for |
+        |--------|----------|
+        | `servicenowUsername` | ServiceNow user name for Basic Auth (the integration user). |
+        | `servicenowPassword` | ServiceNow password for Basic Auth, for the integration user. |
+        | `servicenowClientId` | ServiceNow OAuth app Client ID (**System OAuth > Application Registry**). |
+        | `servicenowClientSecret` | ServiceNow OAuth app Client Secret. |
+
+        Leave the ones you do not use empty; the connector treats an unfilled secret as absent.
+      </Step>
+      <Step title="Set the instance URL and auth type">
+        Open the app instance configuration, set **Instance URL** to `https://<instance>.service-now.com` (full URL with scheme) and **Authentication Type** to `basic` or `oauth2`, then save.
+      </Step>
+      <Step title="Confirm the MCP fields were populated">
+        After saving, **MCP Endpoint** and **MCP API Key** are filled in automatically. They are read-only; hand them to an agent builder as described in [Agent builder (Agent Creator)](#agent-builder-agent-creator).
+      </Step>
+    </Steps>
 
     ## Configuration
 
     | Field | Description |
     |-------|-------------|
-    | **Instance URL** | `https://<instance>.service-now.com` (full URL with scheme) |
-    | **Authentication Type** | `basic` or `oauth2` |
-    | **Username** / **Password** | Required when `authType = basic` (stored as workspace secrets) |
-    | **OAuth2 Client ID** / **Client Secret** | Required when `authType = oauth2`; uses the `client_credentials` grant (Client Secret stored as a workspace secret) |
-    | **MCP Endpoint** | Auto-populated on install; the URL of the MCP endpoint for this instance, used to wire the connector into an agent capability |
-
-    The credential you provide selects the auth mode:
+    | **Instance URL** | `https://<instance>.service-now.com` (full URL with scheme). Not a secret; set it directly in the app configuration. |
+    | **Authentication Type** | `basic` or `oauth2`. Defaults to `basic`; any value other than `oauth2` falls back to Basic Auth. |
+    | **Username** / **Password** | Bound to the `servicenowUsername` / `servicenowPassword` workspace secrets. Required when the auth type is `basic`. |
+    | **OAuth2 Client ID** / **OAuth2 Client Secret** | Bound to the `servicenowClientId` / `servicenowClientSecret` workspace secrets. Required when the auth type is `oauth2`. |
+    | **MCP Endpoint** | Read-only; written on install. The shared endpoint of the central `service-now` workspace. |
+    | **MCP API Key** | Read-only; written on install. The HMAC-signed key that identifies your workspace to the shared endpoint. Do not modify. |
 
     | Auth mode | What you provide | Best for |
     |-----------|------------------|----------|
-    | **Basic Auth** (`authType: basic`) | A ServiceNow username + password | Quick setup; reuses an existing technical user and its roles |
-    | **OAuth2 client credentials** (`authType: oauth2`) | Client ID + Client Secret from an Application Registry | Token-based, server-to-server; the connector exchanges them at `/oauth_token.do` and caches the bearer |
+    | **Basic Auth** (`authType: basic`) | A ServiceNow username and password | Quick setup; reuses an existing integration user and its roles. |
+    | **OAuth2 client credentials** (`authType: oauth2`) | Client ID and Client Secret from an Application Registry entry | Token-based server-to-server access. The connector posts a `client_credentials` grant to `/oauth_token.do` and uses the returned bearer token. |
 
     <Note>
-      Credentials are stored as workspace secrets and resolved server-side on every call. Switch modes by editing the app instance configuration; no instruction lets you change credentials at runtime.
+      Both modes authenticate as a **single shared service account**, so every action is attributed to that account in the ServiceNow audit trail regardless of which agent or end user triggered it. Choose an account whose roles are the least-privilege set for the tables you actually need, and keep write-capable roles off it if the workspace should only read. Credentials are stored as workspace secrets and resolved server-side on every call; no instruction can change them at runtime.
     </Note>
 
-    ## Available Instructions
+    ## Available instructions
 
-    Every instruction resolves the credential from the workspace configuration. Most list operations accept `limit`, `offset`, `fields` (comma-separated) and `displayValue` (`true` / `false` / `all`) to control the response shape.
+    Every instruction resolves the credential from the workspace configuration and returns the connector's envelope, not the raw ServiceNow body: `{ operation, structuredData, itemType, … }` on success, or `{ error }` with an explanatory message when authentication or the API call fails. The `Returns` column below describes `structuredData`, which is where the ServiceNow data lands.
 
-    ### Generic Table Access
+    List instructions accept `limit` (default `20`), `offset` and, where noted in [Agent builder (Agent Creator)](#agent-builder-agent-creator), `fields` and `displayValue`.
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `queryRecords` | Query any table by `tableName` (required) using an encoded `query`. `fields`, `limit`, `offset`, `displayValue` shape the response. | `{ result: [ { …record fields } ] }` |
-    | `getRecord` | Get one record by `tableName` (required) + `sysId` (required). | `{ result: { …record fields } }` |
-    | `getStats` | Aggregate statistics for `tableName` (required): `count`, `sumFields`, `avgFields`, grouped by `groupBy`, filtered by `query`. | `{ result: { stats: { count, … }, groupby_fields } }` |
+    ### Generic table access
+
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `queryRecords` | Query any table by `tableName` (required) using an encoded `query`. | `{ records: [ … ], count, totalCount, table }` |
+    | `getRecord` | Get one record by `tableName` (required) and `sysId` (required). | The record object |
+    | `getStats` | Aggregate statistics for `tableName` (required): `count` (sent as `true` when omitted), `sumFields`, `avgFields`, `groupBy`, filtered by `query`. | The ServiceNow aggregate `result` payload |
 
     ### Incidents
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listIncidents` | List incidents filtered by `state`, `priority`, `assignedTo`, `assignmentGroup` and/or a raw `query`. | `{ result: [ { sys_id, number, short_description, … } ] }` |
-    | `getIncident` | Get one incident by `sysId` **or** `number` (e.g. `INC0010001`). | `{ result: { sys_id, number, state, … } }` |
-    | `createIncident` | Create an incident. `shortDescription` (required); plus `callerId`, `category`, `impact`, `urgency`, `assignmentGroup`, `contactType`, … | `{ result: { sys_id, number, … } }` |
-    | `updateIncident` | Update an incident by `sysId` (required). Supports `state`, `workNotes`, `comments`, `closeCode`, `closeNotes`, reassignment. | `{ result: { sys_id, number, state, … } }` |
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `listIncidents` | List incidents filtered by `state`, `priority`, `assignedTo`, `assignmentGroup` and/or a raw `query`. | `{ incidents: [ … ], count, totalCount }` |
+    | `getIncident` | Get one incident by `sysId` **or** `number` (for example `INC0010001`). | The incident record |
+    | `createIncident` | Create an incident. `shortDescription` required. | The created incident record |
+    | `updateIncident` | Partial update by `sysId` (required): `state`, `workNotes`, `comments`, `closeCode`, `closeNotes`, reassignment. | The updated incident record |
 
-    ### Change Requests
+    ### Change requests
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listChanges` | List change requests filtered by `state`, `priority`, `type` (`normal`/`standard`/`emergency`), assignment and/or `query`. | `{ result: [ { sys_id, number, … } ] }` |
-    | `getChange` | Get one change request by `sysId` (required). | `{ result: { sys_id, number, state, … } }` |
-    | `createChange` | Create a change. `changeType` + `shortDescription` (required); plus `risk`, `impact`, `startDate`, `endDate`, `implementationPlan`, `backoutPlan`, `testPlan`, … Dates use `YYYY-MM-DD HH:mm:ss`. | `{ result: { sys_id, number, … } }` |
-    | `updateChange` | Update a change by `sysId` (required): schedule, plans, assignment, `workNotes`, … | `{ result: { sys_id, number, … } }` |
-    | `getChangeTransitions` | List the legal target states for a change by `sysId` (required). | `{ transitions: [ { state, label } ] }` |
-    | `transitionChange` | Move a change to a target `state` (required) by `sysId` (required). | `{ result: { sys_id, state, … } }` |
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `listChanges` | List change requests filtered by `state`, `priority`, `type` (`normal` / `standard` / `emergency`), assignment and/or `query`. | `{ changes: [ … ], count, totalCount }` |
+    | `getChange` | Get one change request by `sysId` (required). | The change record |
+    | `createChange` | Create a change. `changeType` and `shortDescription` required; plus `risk`, `impact`, `startDate`, `endDate`, `implementationPlan`, `backoutPlan`, `testPlan`, `cmdbCi`. Dates use `YYYY-MM-DD HH:mm:ss`. | The created change record |
+    | `updateChange` | Update a change by `sysId` (required): schedule, plans, assignment, `workNotes`. | The updated change record |
+    | `getChangeTransitions` | List the state transitions available for a change by `sysId` (required). | The `result` payload of the Change Management REST state endpoint |
+    | `transitionChange` | Move a change to a target `state` (required) by `sysId` (required). | The transition `result` payload |
 
     ### Problems
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listProblems` | List problems filtered by `state`, `priority`, assignment and/or `query`. | `{ result: [ { sys_id, number, … } ] }` |
-    | `getProblem` | Get one problem by `sysId` (required). | `{ result: { sys_id, number, … } }` |
-    | `createProblem` | Create a problem. `shortDescription` (required); plus `category`, `impact`, `urgency`, assignment, `cmdbCi`. | `{ result: { sys_id, number, … } }` |
-    | `updateProblem` | Update a problem by `sysId` (required). Supports `state`, `workaround`, `causeNotes`, `fixNotes`, `workNotes`. | `{ result: { sys_id, number, … } }` |
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `listProblems` | List problems filtered by `state`, `priority`, assignment and/or `query`. | `{ problems: [ … ], count, totalCount }` |
+    | `getProblem` | Get one problem by `sysId` (required). | The problem record |
+    | `createProblem` | Create a problem. `shortDescription` required; plus `category`, `impact`, `urgency`, `priority`, assignment, `cmdbCi`. | The created problem record |
+    | `updateProblem` | Update a problem by `sysId` (required): `state`, `workaround`, `causeNotes`, `fixNotes`, `workNotes`. | The updated problem record |
 
-    ### Service Catalog
+    ### Service catalog
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listCatalogItems` | List catalog items, optionally filtered by `catalog`, `category` or `query`. | `{ result: [ { sys_id, name, short_description } ] }` |
-    | `getCatalogItem` | Get one catalog item with its variables (form fields) by `sysId` (required). | `{ result: { sys_id, name, variables: [ … ] } }` |
-    | `orderCatalogItem` | Order an item by `sysId` (required), with `quantity` and a `variables` object of form values. | `{ result: { request_id, request_number, sys_id } }` |
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `listCatalogItems` | List catalog items, optionally filtered by `catalog`, `category` or `query`. | The array of catalog items |
+    | `getCatalogItem` | Get one catalog item with its variables (form fields) by `sysId` (required). | The catalog item, including `variables` |
+    | `orderCatalogItem` | Order an item by `sysId` (required), with `quantity` (default `1`) and a `variables` object. | The order result, including `number`, `request_id` and `table` |
 
-    ### Requests & Request Items
+    ### Requests and request items
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listRequests` | List service catalog requests, optionally filtered by `query`. | `{ result: [ { sys_id, number, … } ] }` |
-    | `getRequest` | Get one request by `sysId` (required). | `{ result: { sys_id, number, … } }` |
-    | `listRequestItems` | List request items (RITMs), optionally filtered by parent `requestId` or `query`. | `{ result: [ { sys_id, number, … } ] }` |
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `listRequests` | List service catalog requests (`sc_request`), optionally filtered by `query`. | `{ requests: [ … ], count, totalCount }` |
+    | `getRequest` | Get one request by `sysId` (required). | The request record |
+    | `listRequestItems` | List request items (`sc_req_item`), optionally filtered by parent `requestId` and/or `query`. Both are combined with `^`. | `{ requestItems: [ … ], count, totalCount }` |
 
-    ### Attachments, Users & Groups
+    ### Attachments, users and groups
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listAttachments` | List attachments on a record by `tableName` (required) + `tableSysId` (required). | `{ result: [ { sys_id, file_name, content_type, size_bytes } ] }` |
-    | `uploadAttachment` | Upload a base64 file to a record: `tableName`, `tableSysId`, `fileName`, `contentBase64` (all required) + `contentType`. | `{ result: { sys_id, file_name, download_link } }` |
-    | `listUsers` | List users, optionally filtered by `active` or `query`. | `{ result: [ { sys_id, user_name, name, email } ] }` |
-    | `getUser` | Get one user by `sysId` **or** `username`. | `{ result: { sys_id, user_name, name, email } }` |
-    | `listGroups` | List user groups, optionally filtered by `active` or `query`. | `{ result: [ { sys_id, name } ] }` |
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `listAttachments` | List attachments on a record by `tableName` (required) and `tableSysId` (required). No paging arguments. | The array of attachment metadata records |
+    | `uploadAttachment` | Upload a base64 file to a record: `tableName`, `tableSysId`, `fileName`, `contentBase64` (all required) plus `contentType` (default `application/octet-stream`). | The created attachment record |
+    | `listUsers` | List users (`sys_user`), optionally filtered by `active` or `query`. | `{ users: [ … ], count, totalCount }` |
+    | `getUser` | Get one user by `sysId` **or** `username`. | The user record |
+    | `listGroups` | List user groups (`sys_user_group`), optionally filtered by `active` or `query`. | `{ groups: [ … ], count, totalCount }` |
 
     <Note>
-      `Returns` shows the shape of the operation output. `displayValue: all` adds a `display_value` alongside each `value` for reference and choice fields.
+      `totalCount` reflects the `X-Total-Count` response header returned by ServiceNow, so it is the size of the full result set rather than the page you received. `displayValue: all` adds a `display_value` alongside each `value` for reference and choice fields.
     </Note>
 
-    ## DSUL Examples
+    ## DSUL examples
 
     ### Open an incident from a form
 
@@ -464,21 +567,23 @@ This connector is used by three different roles. Jump to the section that matche
         category: network
         impact: '2'
         urgency: '2'
-        assignmentGroup: Network Support
+        assignmentGroup: '{{network_group_sys_id}}'
         contactType: email
       output: incident
     ```
+
+    Read the new record's identifiers from `{{incident.structuredData.sys_id}}` and `{{incident.structuredData.number}}`.
 
     ### Assign and resolve
 
     ```yaml
     - ServiceNow.updateIncident:
-        sysId: '{{incident.sys_id}}'
+        sysId: '{{incident.structuredData.sys_id}}'
         assignedTo: '{{engineer_sys_id}}'
         state: '2'
         workNotes: Investigating the VPN concentrator logs.
     - ServiceNow.updateIncident:
-        sysId: '{{incident.sys_id}}'
+        sysId: '{{incident.structuredData.sys_id}}'
         state: '6'
         closeCode: Solved (Permanently)
         closeNotes: Rolled back the firmware to 7.2.1.
@@ -495,6 +600,8 @@ This connector is used by three different roles. Jump to the section that matche
         displayValue: all
       output: critical
     ```
+
+    The rows are in `{{critical.structuredData.records}}` and the full result-set size in `{{critical.structuredData.totalCount}}`.
 
     ### Order a catalog item
 
@@ -526,40 +633,87 @@ This connector is used by three different roles. Jump to the section that matche
 
 ---
 
-## Error Handling
+## Verify the setup
 
-| HTTP Status | Error | Solution |
-|-------------|-------|----------|
-| 401 | Unauthorized | Verify credentials; for OAuth2, check the `client_credentials` grant is enabled on the Application Registry |
-| 403 | Forbidden | The user/client lacks an ACL on the target table; grant `itil`, `change_manager`, `problem_manager`, or a table-specific role |
-| 404 | Not Found | Verify the `sys_id` / `number` and that the record is not in a restricted domain |
-| 409 | Conflict | The state transition is not allowed; call `getChangeTransitions` to get the valid targets |
-| 429 | Rate Limited | The instance returned a `X-RateLimit-*` error; back off, as ServiceNow also enforces per-user transaction quotas |
-| 500 | Server Error | A ServiceNow business rule or script failed; check the instance's system logs |
+Run these checks in order; each one isolates a different failure boundary.
 
-### Common Issues
+<Steps>
+  <Step title="Confirm the credential resolves">
+    From a Builder automation in the configured workspace, call `ServiceNow.listGroups` with `limit: 1`. A result with a `groups` array proves the instance URL, the auth mode and the credential are all correct. An `{ error }` payload naming a missing field means the configuration is incomplete — see [Common issues](#common-issues).
+  </Step>
+  <Step title="Confirm the MCP endpoint answers">
+    In Agent Creator, ask the agent to list its available tools. All 28 ServiceNow tools should appear. If none do, the capability URL is wrong; the tool listing works even without a valid API key, so a successful listing does not prove the key.
+  </Step>
+  <Step title="Confirm the MCP API Key is accepted">
+    Ask the agent a read-only question such as "List the three most recent active incidents". A JSON-RPC error mentioning a missing or invalid API key means the header was not set or was copied from a different workspace.
+  </Step>
+  <Step title="Check the negative case">
+    Ask for a record the service account must not see, or query a table it has no ACL on. The tool must answer `Access denied while <operation>. Check ACL permissions.` rather than returning data. Empty results on a table the account cannot read are also expected — ServiceNow filters silently rather than failing.
+  </Step>
+  <Step title="Check the write path last">
+    Only once the reads behave, create a throwaway incident, confirm it appears in ServiceNow attributed to the integration user, then resolve it with `updateIncident`. If the account is intentionally read-only, ServiceNow rejects the write and the tool returns the access-denied message.
+  </Step>
+</Steps>
 
-**"ServiceNow not configured"**: `instanceUrl` is missing from the app config. Paste the full URL with scheme (`https://acme.service-now.com`).
+## Revoke, rotate and remove
 
-**"Basic Auth requires username and password"**: `authType` is `basic` but one credential is empty. Either fill both or switch to `oauth2`.
+- **Rotate the Basic Auth password.** Change it in ServiceNow, then update the `servicenowPassword` workspace secret. Calls fail with the authentication-failed message until both match. Cached credentials expire after 10 minutes, so allow that long for in-flight sessions to pick up the change.
+- **Rotate the OAuth2 client secret.** Generate a new secret on the Application Registry entry, then update the `servicenowClientSecret` workspace secret. The connector requests a fresh token on the next uncached call.
+- **Revoke all access at the provider.** Deactivate the ServiceNow integration user, or delete the Application Registry entry. Every tool call then fails with the authentication-failed message; nothing in Prisme.ai needs changing.
+- **Revoke one agent's access.** Remove the ServiceNow capability from that agent, or rotate the workspace's **MCP API Key** by reinstalling the app instance. There is no per-agent allowlist, so any agent still holding the old key keeps working until the key changes.
+- **Uninstall.** Remove the app instance from the workspace. As with every App + MCP connector ([Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall)), uninstalling does not delete the workspace secrets the install flow provisioned (`servicenowUsername`, `servicenowPassword`, `servicenowClientId`, `servicenowClientSecret`); delete them from **Secrets** to purge the stored credentials. If a platform administrator declared a ServiceNow capability, remove that entry in **Governance > Org > Capabilities** too, or agent builders keep seeing a capability whose key no longer resolves.
 
-**"OAuth2 requires clientId and clientSecret"**: `authType` is `oauth2` but the client credentials are missing. Create an **Application Registry** in ServiceNow (**System OAuth > Application Registry**) with the `client_credentials` grant and paste its Client ID / Client Secret.
+## Error handling
 
-**Empty results with a seemingly valid query**: encoded queries are case-sensitive and ACL-filtered. Try `displayValue: all` and verify the effective roles of the account; a record outside the account's domain is silently excluded.
+ServiceNow responses are normalized into one message per status, with the failing operation named inline (for example `listing incidents`, `creating incident`, `fetching change transitions`).
 
-## External Resources
+| HTTP status | Returned message |
+|-------------|------------------|
+| `401` | `Authentication failed while <operation>. Check your credentials.` |
+| `403` | `Access denied while <operation>. Check ACL permissions.` |
+| `404` | `Resource not found while <operation>.` |
+| `429` | `Rate limited while <operation>. Please wait before retrying.` |
+| Other `4xx` / `5xx` | `Error <status> while <operation>: <message> <detail>`, extracted from the ServiceNow error body. |
+| No response | `ServiceNow instance unreachable while <operation>. Verify the instance URL is correct and the instance is up.` |
+| Non-2xx, non-error | `Unexpected response while <operation> (status: <status>). Verify the instance URL and authentication.` — most often a redirect caused by a wrong instance URL. |
+
+<Note>
+  A `200` response carrying an HTML body is rejected too, with `ServiceNow returned an HTML page instead of JSON while <operation>. The instance is likely hibernating — sign in at the developer portal to wake it up.` Personal Developer Instances return that page when asleep.
+</Note>
+
+### Common issues
+
+**`ServiceNow not configured. Set instanceUrl and credentials in workspace config.`**: **Instance URL** is empty in the app instance configuration. Paste the full URL with its scheme, for example `https://<instance>.service-now.com`, and save.
+
+**`Basic Auth requires username and password in workspace config.`**: the auth type resolves to `basic` but `servicenowUsername` or `servicenowPassword` is empty. Fill both workspace secrets, or set **Authentication Type** to `oauth2` and fill the client credentials instead. A secret that was provisioned but never filled counts as empty.
+
+**`OAuth2 requires clientId and clientSecret in workspace config.`**: **Authentication Type** is `oauth2` but `servicenowClientId` or `servicenowClientSecret` is empty. Create an **Application Registry** entry in ServiceNow (**System OAuth > Application Registry**) with the `client_credentials` grant and fill both secrets.
+
+**`OAuth2 token acquisition failed: <reason>`**: ServiceNow rejected the token request at `/oauth_token.do`. Check that the Application Registry entry allows the `client_credentials` grant and that the client id and secret match it exactly.
+
+**A JSON-RPC error about a missing or invalid API key**: the agent capability is missing the API key header, or the key was copied from a different workspace. Re-copy **MCP API Key** from the app instance configuration of the workspace whose ServiceNow instance you want to reach.
+
+**`Credentials lookup failed (<status>): <error>`**: the shared endpoint could reach your workspace but could not build a credential from it. Fix the underlying configuration error reported in the message, then retry.
+
+**`Tool not found: <name>`**: the agent called a tool that does not exist. Check the spelling against the tool tables above; names are case-sensitive.
+
+**`Error: either sysId or number is required`** / **`Error: either sysId or username is required`**: `getIncident` and `getUser` accept two alternative identifiers but need at least one. When looked up by `number` or `username`, a missing record answers `Incident <number> not found.` or `User <username> not found.`
+
+**Empty results from a query that looks correct**: encoded queries are case-sensitive and every request is ACL-filtered by the service account's effective roles. Records outside the account's roles or domain are excluded silently rather than raising an error. Verify the account's roles, and use `displayValue: all` to check that you are matching the stored value rather than its label.
+
+## External resources
 
 <CardGroup cols={2}>
   <Card title="ServiceNow Table API" icon="book" href="https://developer.servicenow.com/dev.do#!/reference/api/utah/rest/c_TableAPI">
-    Official Table API reference
+    Official Table API reference, behind most of the connector's operations.
   </Card>
-  <Card title="Encoded Query Strings" icon="magnifying-glass" href="https://docs.servicenow.com/bundle/utah-platform-administration/page/use/using-lists/concept/c_EncodedQueryStrings.html">
-    Operators and syntax for the `query` argument
+  <Card title="Encoded query strings" icon="magnifying-glass" href="https://docs.servicenow.com/bundle/utah-platform-administration/page/use/using-lists/concept/c_EncodedQueryStrings.html">
+    Operators and syntax for the `query` argument.
   </Card>
-  <Card title="OAuth Inbound Setup" icon="key" href="https://docs.servicenow.com/bundle/utah-platform-security/page/administer/security/task/t_CreateEndpointforExternalClients.html">
-    Create an OAuth Application Registry
+  <Card title="OAuth inbound setup" icon="key" href="https://docs.servicenow.com/bundle/utah-platform-security/page/administer/security/task/t_CreateEndpointforExternalClients.html">
+    Create an OAuth Application Registry entry for the `client_credentials` mode.
   </Card>
-  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
+  <Card title="Tool agents" icon="robot" href="/products/agent-factory/capabilities">
     Learn how Agent Creator agents consume MCP tools in Prisme.ai.
   </Card>
 </CardGroup>

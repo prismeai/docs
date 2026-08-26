@@ -1,6 +1,6 @@
 ---
 title: 'SonarQube'
-description: 'Read and act on SonarQube / SonarQube Cloud code-quality data from Agent Creator agents and Builder workflows'
+description: 'Read and act on SonarQube / SonarQube Cloud code-quality data from Agent Creator agents and Builder workflows: projects, issues, hotspots, measures, quality gates, rules and badges'
 ---
 
 <img
@@ -12,16 +12,18 @@ description: 'Read and act on SonarQube / SonarQube Cloud code-quality data from
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The SonarQube app exposes the [SonarQube](https://www.sonarsource.com/products/sonarqube/) and [SonarQube Cloud](https://sonarcloud.io) Web API. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. It covers projects, components, issues, security hotspots, measures, metrics, quality gates, quality profiles, rules, organizations, user tokens, analyses, branches, webhooks and SVG badges. Authentication is a **SonarQube User Token** stored in the workspace and resolved server-side and never passed through the agent.
+The SonarQube app exposes the [SonarQube](https://www.sonarsource.com/products/sonarqube/) and [SonarQube Cloud](https://sonarcloud.io) Web API. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. It covers projects, components, issues, security hotspots, measures, metrics, quality gates, quality profiles, rules, organizations, user tokens, analyses, branches, webhooks and SVG badges, through 46 operations that are identical in both surfaces.
+
+Authentication is a single **SonarQube user token**, stored as a secret in the installing workspace and sent server-side as an HTTP `Authorization: Bearer` header. The token is never exposed to the agent, and there is no per-user sign-in flow.
 
 <CardGroup cols={3}>
-  <Card title="Code Quality" icon="shield-check">
+  <Card title="Code quality" icon="shield-check">
     Issues, security hotspots, rules and quality profiles to triage code findings.
   </Card>
-  <Card title="Project Insights" icon="chart-line">
+  <Card title="Project insights" icon="chart-line">
     Measures, metric definitions, history, quality-gate status and analyses.
   </Card>
-  <Card title="Admin & Operations" icon="gear">
+  <Card title="Admin and operations" icon="gear">
     Projects, organizations, branches, webhooks, user tokens and SVG badges.
   </Card>
 </CardGroup>
@@ -31,55 +33,98 @@ The SonarQube app exposes the [SonarQube](https://www.sonarsource.com/products/s
 This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to use SonarQube. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to use SonarQube.
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and set up SonarQube once for everyone. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and want to know what to publish once for everyone.
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call SonarQube operations directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations (DSUL) that call SonarQube operations directly.
   </Card>
 </CardGroup>
 
+## Operating model
+
+SonarQube ships a single authentication mode, so there is no credential decision to make: the connector authenticates with one **static SonarQube user token** per installing workspace, stored as a workspace secret and sent server-side. Read this section before configuring anything, because it determines whose SonarQube permissions every agent and automation inherits.
+
+| Property | Value |
+|----------|-------|
+| Credential model | Static user token, one per installing workspace |
+| Runtime identity at SonarQube | The **owner of the user token**, never the invoking end user or agent builder |
+| Where the credential lives | The `sonarqubeToken` workspace secret, provisioned empty on install and bound to the app instance's **API Token** field |
+| How SonarQube receives it | `Authorization: Bearer <token>` on every request |
+| Delegated per-user OAuth | Not supported by this connector |
+| Deployment variants | SonarQube Cloud (`https://sonarcloud.io/api`, the default) and self-hosted SonarQube (`https://<your-sonarqube-host>/api`) |
+| Transport | Prisme.ai calls the SonarQube Web API with all arguments in the query string, including for `POST` operations |
+
+<Warning>
+  **Shared-credential blast radius.** Every call uses the same user token, so SonarQube attributes all reads and writes to its owner, and every agent and automation that can reach the connector inherits that account's permissions. The connector exposes destructive operations (`deleteProject`, `deleteProjectBranch`, `deleteWebhook`, `revokeUserToken`, `transitionIssue`), so a read-only deployment requires a SonarQube account that lacks the corresponding administer permissions. Grant the token owner the narrowest SonarQube role that covers your use case.
+</Warning>
+
+### How the MCP endpoint identifies your workspace
+
+The MCP server is hosted once, by the central SonarQube connector workspace, and shared by every workspace that installs the app. Installations are told apart by an auto-generated key rather than by separate URLs.
+
+<Steps>
+  <Step title="Install provisions a signed key">
+    On install (and on every reconfiguration), the app requests a key from the central workspace. The key is an HMAC-SHA256 signed token that encodes your workspace ID and the URL of your instance's `getConfig` webhook. It is written back into the app instance as the read-only **MCP API Key** field.
+  </Step>
+  <Step title="Tool calls present the key">
+    Each MCP `tools/call` request must carry that key in a dedicated request header:
+
+    ```text
+    mcp-api-key: <the MCP API Key value from the app instance>
+    ```
+
+    Missing or tampered keys are rejected with JSON-RPC error code `-32001` before any SonarQube call is made.
+  </Step>
+  <Step title="The endpoint fetches your credential">
+    Once the signature is verified, the central endpoint calls your workspace's `getConfig` webhook to read your SonarQube token and base URL, then caches them for that workspace for **10 minutes**.
+  </Step>
+</Steps>
+
+<Note>
+  The MCP handshake methods (`initialize`, `notifications/initialized`, `tools/list`) are answered without a key: they disclose the tool manifest, never SonarQube content. The server announces itself as `sonarqube-mcp` version `1.0.0` and speaks MCP protocol version `2025-06-18`.
+</Note>
+
+<Warning>
+  Because credentials are cached for 10 minutes per workspace, changing the SonarQube token or base URL can take up to 10 minutes to take effect on MCP tool calls. Builder instructions read the configuration directly and are not affected.
+</Warning>
+
 ## Prerequisites
 
+- The `owner`, `editor`, or `admin` role on the Prisme.ai workspace that will install the connector, because installing writes a workspace secret. See [Before you begin](/apps-store/marketplace/connectors/install-in-workspace#before-you-begin).
 - A **SonarQube** server (self-hosted) or a **SonarQube Cloud** account.
-- A **User Token** generated in **My Account > Security > Generate Tokens** (passed server-side as `Authorization: Bearer <token>`).
-- The **API base URL** of your instance:
-  - SonarCloud: `https://sonarcloud.io/api`
-  - Self-hosted: `https://<your-sonarqube-host>/api`
-- For SonarCloud only: the **organization key** that owns your projects (most search and create operations require it; use `searchOrganizations` to discover the keys visible to your token).
+- A **user token** generated in SonarQube under **My Account > Security > Generate Tokens**.
+- The token owner must hold the SonarQube permissions required by the operations you intend to use. Administer-scoped operations (`searchProjects`, `searchUserTokens` for another login, project and webhook management) fail with `403` when the account lacks them.
+- The **API base URL** of your instance. The connector defaults to `https://sonarcloud.io/api`; for a self-hosted instance use `https://<your-sonarqube-host>/api`.
+- For SonarQube Cloud only: the **organization key** that owns your projects. Several search and create operations require it; discover the keys your token can see with `searchOrganizations`.
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
-  **Goal:** SonarQube is a **per-workspace** connector: each workspace pastes its own SonarQube User Token (see the *Workspace builder* tab), so there is **no platform-wide credential to provision**. The only optional platform task is to publish SonarQube as a reusable **capability** in AI Governance so agent builders can enable it from the catalog instead of pasting a raw MCP endpoint.
+  **Goal:** SonarQube is a **per-workspace** connector: each workspace supplies its own SonarQube user token (see [Workspace builder (DSUL)](#workspace-builder-dsul)), so there is **no platform-wide credential to provision**. The only optional platform task is to publish SonarQube as a reusable **capability** in AI Governance so agent builders can enable it from the catalog instead of wiring the MCP endpoint by hand.
 
   <Note>
-    There is no shared SonarQube credential and no central OAuth client for this connector. The SonarQube User Token always lives in the consuming workspace and is resolved server-side. A Governance capability you publish here points at a specific workspace's MCP endpoint; that workspace still owns the credential.
+    There is no shared SonarQube credential and no central OAuth client for this connector, so [Central OAuth client](/apps-store/marketplace/connectors/central-oauth) does not apply: nothing here registers a provider application or holds a client secret. The SonarQube user token always lives in the consuming workspace and is resolved server-side. A Governance capability you publish here points at the shared MCP endpoint; the installing workspace still owns the credential, and the key that identifies it.
   </Note>
 
   ## Declare the capability in AI Governance (optional)
 
-  <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) the **SonarQube** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint** (the workspace running the connector), and set its **Scope** to:
+  SonarQube ships no configuration app, so the two one-click paths on [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability) are unavailable: there is no **Install capability** button ([Install the capability on one agent](/apps-store/marketplace/connectors/declare-capability#install-the-capability-on-one-agent)) and no **Add to catalog** button ([Publish the connector to the Capabilities catalog](/apps-store/marketplace/connectors/declare-capability#publish-the-connector-to-the-capabilities-catalog)). Only the manual path applies: follow [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance) and enter the SonarQube values below.
 
-      ```text
-      context_id,agent_id,user_id
-      ```
+  | Field in AI Governance | Value for SonarQube |
+  |---|---|
+  | Capability type | `mcp` |
+  | Server URL (**SSE/WebSocket URL**) | The **MCP Endpoint** value shown on an installed SonarQube app instance |
+  | Request header | That same instance's **MCP API Key**, sent under the header name given in [How the MCP endpoint identifies your workspace](#how-the-mcp-endpoint-identifies-your-workspace) |
+  | **Scope** | Not used. This connector never reads the calling agent's identity, so adding `agent_id` changes nothing |
+  | Authorization block | None. Authentication is a server-side user token, not a per-user OAuth flow |
+  | Agent authorization | Not available. This connector has no **Authorized agents** allowlist; the key alone decides which workspace's token is used |
 
-      The `agent_id` in the scope is what lets the connector identify the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
-    </Step>
-  </Steps>
+  Once saved, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
 
   <Warning>
-    Declaring the capability makes the connector **available**; the SonarQube credential is still owned by the workspace that installed the app. There is **no OAuth auth-config JSON** to attach in Governance: authentication is a server-side User Token, not a per-user OAuth flow.
+    Declaring the capability makes the connector **available**; the SonarQube credential is still owned by the workspace that installed the app, and the key pinned in the capability decides which workspace's token is used. There is **no OAuth auth-config JSON** to attach in Governance: authentication is a server-side user token, not a per-user OAuth flow. The connector performs no agent-level authorization of its own, so anyone who can attach the capability can act as the token owner. The usual second gate described in [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization) does not exist here: for SonarQube, availability **is** authorization.
   </Warning>
 </Accordion>
 
@@ -92,29 +137,25 @@ This connector is used by three different roles. Jump to the section that matche
     **Goal:** let an agent you build in Agent Creator read and act on SonarQube code-quality data through MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the SonarQube app in a workspace (see the *Workspace builder* tab). Optionally, a *Platform admin* may have published a SonarQube capability in AI Governance (see the *Platform admin setup* accordion above).
+      Before an agent can call the connector, a workspace builder must have installed the SonarQube app in a workspace and filled its SonarQube token, as described in [Workspace builder (DSUL)](#workspace-builder-dsul). Optionally, a platform admin may have published a SonarQube capability in AI Governance, as described in [Platform admin (Governance): one-time platform setup](#platform-admin-governance-one-time-platform-setup).
     </Note>
 
-    The SonarQube credential is resolved server-side from the installed app's configuration and never exposed to the agent. Your agent is identified through the capability *Scope* that Agent Creator injects.
+    The SonarQube credential is resolved server-side from the installed app's configuration and never reaches the agent. The agent's own identity is not propagated: every agent pointed at the same app instance acts as the same SonarQube account.
 
     <Steps>
       <Step title="Install and configure the connector in a workspace">
-        Follow the *Workspace builder* tab: install **SonarQube** in your workspace and provide the **API base URL** and **User Token**.
+        Follow [Workspace builder (DSUL)](#workspace-builder-dsul): install **SonarQube** in your workspace, set the **SonarQube API Base URL**, and fill the `sonarqubeToken` secret with your SonarQube user token.
       </Step>
       <Step title="Add the MCP capability to your agent">
-        In your agent, add a capability pointing at the workspace's **MCP Endpoint** URL, and set its **Scope** to:
+        In your agent, add a capability pointing at the app instance's **MCP Endpoint** URL, configure it to send that instance's **MCP API Key** header, and save the agent. Without the key, tool discovery still works but every tool call is rejected.
 
-        ```text
-        context_id,agent_id,user_id
-        ```
-
-        The server URL and identity propagation are then wired; the SonarQube token is fetched server-side from the app configuration.
+        There is no **Install capability** button for SonarQube, because the connector ships no configuration app, and no allowlist to tick afterwards. Wiring the capability by hand is the only path; the field values are listed in [Platform admin (Governance): one-time platform setup](#platform-admin-governance-one-time-platform-setup).
       </Step>
       <Step title="Brief the agent in its system prompt">
-        Wiring the capability is not enough: the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+        Wiring the capability is not enough: the agent also needs to know the MCP server exists and when to reach for it. Add a short paragraph to the agent's system prompt, then publish the agent. Copy-pasteable starter:
 
         ```text
-        You have access to the SonarQube MCP server. Use it whenever the user asks about code-quality data: projects, issues, security hotspots, measures, quality gates, rules or badges. Examples: "List the blocker issues in project X", "What's the coverage of auth-service?", "Show the security hotspots opened this week", "Why is the quality gate failing on main?". On SonarCloud, most search and create operations need an organization key; call searchOrganizations first if you don't know it. Prefer calling MCP tools directly over guessing, and confirm with the user before any destructive action (mark issues as false positive, change severity, delete a project or branch).
+        You have access to the SonarQube MCP server. Use it whenever the user asks about code-quality data: projects, issues, security hotspots, measures, quality gates, rules or badges. Examples: "List the blocker issues in project X", "What's the coverage of auth-service?", "Show the security hotspots still to review", "Why is the quality gate failing on main?". On SonarQube Cloud, several search and create operations need an organization key; call searchOrganizations first if you don't know it. Prefer calling MCP tools directly over guessing, and confirm with the user before any destructive action (mark issues as false positive, change severity, delete a project or branch, revoke a token).
         ```
 
         Refine the trigger keywords (project keys, branch names, rule families) so the agent reliably picks up the right intent in your context.
@@ -125,31 +166,33 @@ This connector is used by three different roles. Jump to the section that matche
       **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. Newer Agent Creator agents use the native capability picker described above.
     </Note>
 
-    ## Available Tools
+    ## Available tools
 
-    ### System & Authentication
+    The manifest contains 46 tools. Every tool also accepts `outputFormat` (see [Output formats](#output-formats)).
+
+    ### System and authentication
 
     | Tool | Description |
     |------|-------------|
     | `validateAuthentication` | Validate the current token |
-    | `getServerVersion` | Get SonarQube version |
-    | `listLanguages` | List supported languages |
+    | `getServerVersion` | Get the SonarQube version |
+    | `listLanguages` | List supported languages; optional `q` filter on the language name |
 
     ### Organizations
 
     | Tool | Description |
     |------|-------------|
-    | `searchOrganizations` | List SonarCloud organizations visible to the token. **Pass `member: true` for your own orgs, or `organizations` to check specific keys**; use the returned `key` as the `organization` argument elsewhere |
+    | `searchOrganizations` | List SonarQube Cloud organizations visible to the token. Either `organizations` or `member` is required, otherwise SonarQube Cloud rejects the call. Use the returned `key` as the `organization` argument elsewhere |
 
     ### Projects
 
     | Tool | Description |
     |------|-------------|
-    | `searchProjects` | Search projects you administer (filter by `q`, `qualifiers`, `visibility`, `analyzedBefore`). **Admin-scoped; for public orgs use `searchPublicProjects`** |
-    | `searchPublicProjects` | Browse projects in any org, including public orgs you are not a member of (Project Explorer endpoint) |
+    | `searchProjects` | Search projects, filtered by `organization`, `projects`, `q`, `qualifiers`, `visibility`, `analyzedBefore`, `onProvisionedOnly`. Admin-scoped: it returns projects only in organizations the token administers |
+    | `searchPublicProjects` | Browse projects in any organization, including public organizations the token owner is not a member of. Requires `organization` |
     | `createProject` | Create a project |
     | `deleteProject` | Delete a project |
-    | `updateProjectKey` | Update the project key |
+    | `updateProjectKey` | Update the project key (`from`, `to`) |
     | `updateProjectVisibility` | Change project visibility |
 
     ### Components
@@ -158,68 +201,68 @@ This connector is used by three different roles. Jump to the section that matche
     |------|-------------|
     | `showComponent` | Describe a component (project, file, directory) |
     | `searchComponents` | Search components (projects, files) |
-    | `getComponentTree` | Navigate the component tree |
+    | `getComponentTree` | Navigate the component tree with `strategy` `children`, `all` or `leaves` |
 
     ### Issues
 
     | Tool | Description |
     |------|-------------|
-    | `searchIssues` | Search for issues. **For "my issues / mes issues" pass `assignees: __me__`** (or `author: __me__` for issues you reported). To filter unresolved, pass `statuses: OPEN,CONFIRMED,REOPENED` |
-    | `assignIssue` | Assign or unassign an issue (omit `assignee` to unassign) |
+    | `searchIssues` | Search for issues, with filters on components, assignees, severities, types, statuses, tags, languages, rules, dates, branch and pull request |
+    | `assignIssue` | Assign an issue; omit `assignee` to unassign |
     | `transitionIssue` | Perform a workflow transition on an issue |
     | `addIssueComment` | Add a comment to an issue |
-    | `setIssueTags` | Set tags on an issue (comma-separated; empty to clear) |
+    | `setIssueTags` | Set tags on an issue; comma-separated, empty to clear |
     | `setIssueSeverity` | Change the severity of an issue |
     | `setIssueType` | Change the type of an issue |
 
-    ### Measures & Metrics
+    ### Measures and metrics
 
     | Tool | Description |
     |------|-------------|
-    | `getComponentMeasures` | Get measures of a component (e.g. `ncloc,bugs,coverage`) |
+    | `getComponentMeasures` | Get measures of a component, for example `ncloc,bugs,coverage` |
     | `getComponentTreeMeasures` | Get measures for a component tree |
-    | `getMeasuresHistory` | Get history of measures over a period |
+    | `getMeasuresHistory` | Get the history of measures between `from` and `to` |
     | `searchMetrics` | Search metric definitions |
 
-    ### Quality Gates
+    ### Quality gates
 
     | Tool | Description |
     |------|-------------|
     | `listQualityGates` | List quality gates |
-    | `showQualityGate` | Show a quality gate (by `id` or `name`) |
-    | `getProjectQualityGateStatus` | Get the quality-gate status of a project / branch / PR |
-    | `selectQualityGate` | Associate a project with a quality gate |
+    | `showQualityGate` | Show a quality gate by `id` or `name` |
+    | `getProjectQualityGateStatus` | Get the quality-gate status of a project, branch or pull request |
+    | `selectQualityGate` | Associate a project with a quality gate (`gateId` or `gateName`) |
 
-    ### Quality Profiles & Rules
+    ### Quality profiles and rules
 
     | Tool | Description |
     |------|-------------|
     | `searchQualityProfiles` | Search quality profiles |
     | `searchRules` | Search rules |
-    | `showRule` | Show a rule |
+    | `showRule` | Show a rule by `key` |
 
     ### Hotspots
 
     | Tool | Description |
     |------|-------------|
-    | `searchHotspots` | Search security hotspots. **For "my hotspots" pass `onlyMine: true`. For unresolved pass `status: TO_REVIEW`** |
+    | `searchHotspots` | Search security hotspots. Pass `onlyMine: true` for the token owner's hotspots, `status: TO_REVIEW` for those still to review |
     | `showHotspot` | Show a security hotspot |
     | `changeHotspotStatus` | Change the status of a hotspot |
 
-    ### User Tokens
+    ### User tokens
 
     | Tool | Description |
     |------|-------------|
-    | `searchUserTokens` | List user tokens (admin-only when `login` targets another user) |
+    | `searchUserTokens` | List user tokens; `login` targets another user and is admin-only |
     | `generateUserToken` | Generate a user token (`USER_TOKEN`, `PROJECT_ANALYSIS_TOKEN`, `GLOBAL_ANALYSIS_TOKEN`) |
-    | `revokeUserToken` | Revoke a user token by name |
+    | `revokeUserToken` | Revoke a user token by `name` |
 
-    ### Analyses & Branches
+    ### Analyses and branches
 
     | Tool | Description |
     |------|-------------|
     | `searchProjectAnalyses` | Search project analyses |
-    | `createAnalysisEvent` | Create an event on a project analysis |
+    | `createAnalysisEvent` | Create an event on a project analysis (`category` `VERSION` or `OTHER`) |
     | `listProjectBranches` | List branches of a project |
     | `deleteProjectBranch` | Delete a branch from a project |
 
@@ -227,7 +270,7 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Tool | Description |
     |------|-------------|
-    | `listWebhooks` | List webhooks (global or per-project) |
+    | `listWebhooks` | List webhooks, optionally scoped by `organization` or `project` |
     | `createWebhook` | Create a webhook |
     | `deleteWebhook` | Delete a webhook |
 
@@ -238,19 +281,21 @@ This connector is used by three different roles. Jump to the section that matche
     | `getProjectMeasureBadge` | Get an SVG badge for a project metric |
     | `getProjectQualityGateBadge` | Get an SVG badge for the project quality-gate status |
 
-    ## Output Formats
+    ## Output formats
 
     Every tool accepts an `outputFormat` argument that controls the MCP response shape:
 
-    - **`verbose`** (default): human-readable text for LLM consumption
-    - **`structured`**: machine-readable JSON in `structuredContent`
-    - **`both`**: both text and structured content
+    - **`verbose`** (default): a human-readable text summary built for LLM consumption, with the SonarQube payload embedded as a JSON block.
+    - **`structured`**: the raw SonarQube payload as JSON, both in the text `content` and in `structuredContent`.
+    - **`both`**: identical to `structured` in this connector.
 
-    ## Tool Details
+    ## Tool details
+
+    Argument names and required flags below come from the connector's tool manifest. For the semantics of individual SonarQube filter values, see the [SonarQube Web API reference](https://next.sonarqube.com/sonarqube/web_api).
 
     ### searchIssues
 
-    Search and filter issues on a project. Default response includes all issues the token can see; combine filters to scope down.
+    Search and filter issues. With no arguments it returns every issue the token can see, so combine filters to scope it down.
 
     ```json
     {
@@ -268,19 +313,21 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `componentKeys` | No | Comma-separated component / project keys |
-    | `assignees` | No | Use `__me__` for the current user |
-    | `severities` | No | `INFO`,`MINOR`,`MAJOR`,`CRITICAL`,`BLOCKER` |
-    | `types` | No | `BUG`,`VULNERABILITY`,`CODE_SMELL` |
-    | `statuses` | No | `OPEN`,`CONFIRMED`,`REOPENED`,`RESOLVED`,`CLOSED` |
-    | `tags` | No | Comma-separated tag names |
-    | `createdAfter` / `createdBefore` | No | ISO date or `YYYY-MM-DD` |
-    | `branch` / `pullRequest` | No | Restrict to a branch or PR |
-    | `p` / `ps` | No | Pagination; `ps` max 500 |
+    | `componentKeys` | No | Comma-separated component or project keys |
+    | `projects` | No | Project keys |
+    | `assignees` / `author` | No | Assignee logins, or the login that reported the issue |
+    | `severities` | No | `INFO`, `MINOR`, `MAJOR`, `CRITICAL`, `BLOCKER` |
+    | `types` | No | `BUG`, `VULNERABILITY`, `CODE_SMELL` |
+    | `statuses` / `resolutions` / `resolved` | No | Issue lifecycle filters passed through to SonarQube |
+    | `tags` / `languages` / `rules` | No | Comma-separated filter values |
+    | `createdAfter` / `createdBefore` | No | Creation-date window |
+    | `branch` / `pullRequest` | No | Restrict to a branch or pull request |
+    | `s` / `asc` | No | Sort field and direction |
+    | `p` / `ps` | No | Page index and page size |
 
     ### searchOrganizations
 
-    Discover the SonarCloud organization keys your token can see; call this first when you do not know the `organization` value other tools require.
+    Discover the SonarQube Cloud organization keys your token can see; call this first when you do not know the `organization` value other tools require.
 
     ```json
     {
@@ -293,9 +340,13 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `member` | No* | When `true`, return only orgs the authenticated user belongs to |
-    | `organizations` | No* | Comma-separated org keys to check (one of `member` or `organizations` is required on SonarCloud) |
-    | `p` / `ps` | No | Pagination |
+    | `member` | No* | When `true`, return only organizations the token owner belongs to |
+    | `organizations` | No* | Comma-separated organization keys to check |
+    | `p` / `ps` | No | Page index (default `1`) and page size (default `100`) |
+
+    <Note>
+      Pass at least one of `member` or `organizations`. SonarQube Cloud rejects the call when both are omitted.
+    </Note>
 
     ### transitionIssue
 
@@ -305,7 +356,7 @@ This connector is used by three different roles. Jump to the section that matche
     {
       "name": "transitionIssue",
       "arguments": {
-        "issue": "AY9z...",
+        "issue": "<issue-key>",
         "transition": "falsepositive"
       }
     }
@@ -318,7 +369,7 @@ This connector is used by three different roles. Jump to the section that matche
 
     ### getComponentMeasures
 
-    Read one or several metric values for a component (project, file, directory).
+    Read one or several metric values for a component (project, file or directory).
 
     ```json
     {
@@ -334,10 +385,10 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `component` | Yes | Component key (project, file or directory) |
-    | `metricKeys` | Yes | Comma-separated metric keys; see `searchMetrics` |
+    | `metricKeys` | Yes | Comma-separated metric keys; list the available ones with `searchMetrics` |
     | `branch` | No | Branch name |
-    | `pullRequest` | No | Pull request ID |
-    | `additionalFields` | No | Extra fields (e.g. `metrics,periods`) |
+    | `pullRequest` | No | Pull request identifier |
+    | `additionalFields` | No | Extra response fields |
 
     ### getProjectQualityGateStatus
 
@@ -355,14 +406,18 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `projectKey` | No* | Project key (one of `projectKey` or `projectId` must be set) |
-    | `projectId` | No* | Project ID, an alternative to `projectKey` |
+    | `projectKey` | No* | Project key |
+    | `projectId` | No* | Project identifier, an alternative to `projectKey` |
     | `branch` | No | Restrict to a branch |
     | `pullRequest` | No | Restrict to a pull request |
 
+    <Note>
+      Pass either `projectKey` or `projectId`. With neither, SonarQube answers with a `400` and the connector returns `Bad request while get the quality gate status of a project`.
+    </Note>
+
     ### createProject
 
-    Provision a new project. On SonarCloud, `organization` is required.
+    Provision a new project. On SonarQube Cloud, `organization` is required.
 
     ```json
     {
@@ -379,158 +434,199 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `name` | Yes | Display name |
-    | `project` | Yes | Project key (unique, alphanumeric + `-_.:`) |
-    | `organization` | No* | Required on SonarCloud |
+    | `project` | Yes | Project key |
+    | `organization` | No* | Required on SonarQube Cloud |
     | `visibility` | No | `public` or `private` |
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
     ## Workspace builder
 
-    **Goal:** install the connector in a workspace, configure the SonarQube credential, and call SonarQube operations from your automations.
+    **Goal:** install the connector in a workspace, store the SonarQube credential, and call SonarQube operations from your automations.
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **SonarQube** and install it
-    3. Open the app instance configuration and fill in the required fields
+    <Note>
+      SonarQube does not follow [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace). Four differences matter, so use the steps below rather than the shared flow:
+
+      - **No configuration app.** The app instance has no **Configuration app** link, so [Configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app) does not apply. You enter the SonarQube token in the workspace **Secrets** section instead.
+      - **No authorized-agents allowlist.** There is nothing to tick, so [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector) does not apply. Access is controlled by the **MCP API Key** alone.
+      - **One shared MCP endpoint, not a per-instance URL.** [Copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint) does not apply; the endpoint is identical for every installation and the key tells them apart.
+      - **Install provisions one string secret**, not the usual auth-object plus allowlist pair described in [What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions).
+    </Note>
+
+    <Steps>
+      <Step title="Install the app">
+        Open **Apps** in your workspace, search for **SonarQube** and install it. The install handler provisions two things for you: an empty `sonarqubeToken` secret in the workspace, and the app instance's read-only **MCP Endpoint** and **MCP API Key** values.
+      </Step>
+      <Step title="Fill the SonarQube token">
+        Open the workspace's **Secrets** section, set `sonarqubeToken` to the user token you generated in SonarQube under **My Account > Security > Generate Tokens**, and save. The app instance's **API Token** field is already bound to this secret, so you never paste the token into the app configuration itself.
+      </Step>
+      <Step title="Set the base URL if you are self-hosted">
+        In the app instance configuration, replace the default **SonarQube API Base URL** with `https://<your-sonarqube-host>/api`, and save.
+      </Step>
+    </Steps>
 
     ## Configuration
 
     | Field | Description |
     |-------|-------------|
-    | **SonarQube API Base URL** | Base URL of the SonarQube API. Defaults to `https://sonarcloud.io/api`; replace with your self-hosted instance URL when applicable |
-    | **API Token** | SonarQube User Token, stored as a workspace secret. Passed server-side as `Authorization: Bearer <token>` |
-    | **MCP Endpoint** | Auto-populated on install; the URL of the MCP endpoint for this instance (used to wire the *Agent builder* capability) |
+    | **SonarQube API Base URL** | Base URL of the SonarQube API. The connector falls back to `https://sonarcloud.io/api` when it is empty |
+    | **API Token** | SonarQube API token. Bound on install to the `sonarqubeToken` workspace secret and sent as `Authorization: Bearer <token>` |
+    | **MCP Endpoint** | Read-only. The URL of the shared MCP endpoint, filled automatically on install |
+    | **MCP API Key** | Read-only. The signed key that identifies this workspace on the shared MCP endpoint. Generated on install; do not modify it |
 
-    | Auth mode | What you provide | Best for |
-    |-----------|------------------|----------|
-    | User Token (Bearer) | A SonarQube **User Token** + the **API base URL** | Standard setup; the token is stored as a workspace secret and resolved server-side on every call |
+    | Secret | Description |
+    |--------|-------------|
+    | `sonarqubeToken` | The SonarQube user token used for every call from this workspace. Provisioned empty on install, for you to fill |
+    | `appSecret` | The HMAC secret used to sign MCP API keys. Present only on the central SonarQube connector workspace, never on an installing workspace |
+
+    <Warning>
+      Until `sonarqubeToken` holds a value, every MCP tool call fails with `SonarQube token not configured on this app instance.` and every Builder instruction returns `SonarQube not configured. Set token in the workspace config.`
+    </Warning>
 
     <Note>
-      SonarQube identifiers are project keys, component keys, issue keys, rule keys and login names, never numeric IDs except for quality-gate `gateId`. Most list / search operations accept `p` (page index, 1-based) and `ps` (page size, max 500) for pagination. On SonarCloud, most search and create operations also require an `organization` key.
+      SonarQube identifiers are project keys, component keys, issue keys, rule keys and login names. Most list and search operations accept `p` (page index) and `ps` (page size); `searchOrganizations`, `searchProjects` and `searchPublicProjects` default to `p: 1` and `ps: 100`. On SonarQube Cloud, several search and create operations also require an `organization` key.
     </Note>
 
-    ## Available Instructions
+    ## Available instructions
 
-    Every instruction resolves credentials from the workspace configuration.
+    Each instruction resolves the credential from the workspace configuration, so you never pass a token in DSUL. Instruction names and arguments match the MCP tools listed in [Agent builder (Agent Creator)](#agent-builder-agent-creator) one for one, minus `outputFormat`.
 
-    ### System & Authentication
+    ### System and authentication
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `validateAuthentication` | Validate the current token against the instance. | `{ valid }` |
-    | `getServerVersion` | Get the SonarQube server version. | A version string |
-    | `listLanguages` | List supported languages; optional `q` filter on name. | `{ languages: [{ key, name }] }` |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `validateAuthentication` | None |
+    | `getServerVersion` | None |
+    | `listLanguages` | `q` |
 
     ### Organizations
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `searchOrganizations` | List SonarCloud organizations visible to the token; pass `member: true` or `organizations`. | `{ organizations: [{ key, name, description, url }], paging }` |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `searchOrganizations` | `organizations`, `member`, `p`, `ps` |
 
     ### Projects
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `searchProjects` | Search projects you administer; filter by `organization`, `projects`, `q`, `qualifiers`, `visibility`, `analyzedBefore`, `onProvisionedOnly`. | `{ components: [{ key, name, visibility }], paging }` |
-    | `searchPublicProjects` | Browse projects in any org (incl. public orgs you are not a member of) by `organization`, optional `filter`/`s`/`asc`. | `{ projects: [{ key, name }], paging }` |
-    | `createProject` | Create a project from `name` + `project` (key); `organization` required on SonarCloud; optional `visibility`. | `{ project: { key, name, visibility } }` |
-    | `deleteProject` | Delete a project by `project` key. | Empty (HTTP 204) |
-    | `updateProjectKey` | Rename a project key `from` → `to`. | Empty (HTTP 204) |
-    | `updateProjectVisibility` | Set `visibility` (`public`/`private`) on a `project`. | Empty (HTTP 204) |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `searchProjects` | `organization`, `projects`, `q`, `qualifiers`, `visibility`, `analyzedBefore`, `onProvisionedOnly`, `p`, `ps` |
+    | `searchPublicProjects` | `organization` (required), `filter`, `s`, `asc`, `p`, `ps` |
+    | `createProject` | `name` (required), `project` (required), `organization`, `visibility` |
+    | `deleteProject` | `project` (required) |
+    | `updateProjectKey` | `from` (required), `to` (required) |
+    | `updateProjectVisibility` | `project` (required), `visibility` (required) |
 
     ### Components
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `showComponent` | Describe a `component` (project, file, directory); optional `branch`/`pullRequest`. | `{ component: { key, name, qualifier } }` |
-    | `searchComponents` | Search components by `q`, `qualifiers` (`TRK`,`FIL`,`DIR`…), `organization`. | `{ components: [{ key, name, qualifier }], paging }` |
-    | `getComponentTree` | Navigate the tree under `component`; `strategy` (`children`/`all`/`leaves`), `qualifiers`, `q`, `branch`, `s`. | `{ baseComponent, components: [{ key, name }], paging }` |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `showComponent` | `component` (required), `branch`, `pullRequest` |
+    | `searchComponents` | `q`, `qualifiers`, `organization`, `p`, `ps` |
+    | `getComponentTree` | `component` (required), `strategy`, `qualifiers`, `q`, `branch`, `s`, `p`, `ps` |
 
     ### Issues
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `searchIssues` | Search issues by `componentKeys`, `projects`, `assignees`, `author`, `severities`, `types`, `statuses`, `resolutions`, `resolved`, `tags`, `createdAfter`/`createdBefore`, `languages`, `rules`, `branch`/`pullRequest`. | `{ issues: [{ key, rule, severity, type, status, component }], paging }` |
-    | `assignIssue` | Assign `issue` to `assignee` (omit `assignee` to unassign). | `{ issue }` |
-    | `transitionIssue` | Apply `transition` (`confirm`/`reopen`/`resolve`/`falsepositive`/`wontfix`/`close`…) to `issue`. | `{ issue }` |
-    | `addIssueComment` | Add `text` comment to `issue`. | `{ issue, comment }` |
-    | `setIssueTags` | Set comma-separated `tags` on `issue` (empty clears). | `{ issue }` |
-    | `setIssueSeverity` | Set `severity` (`INFO`…`BLOCKER`) on `issue`. | `{ issue }` |
-    | `setIssueType` | Set `type` (`BUG`/`VULNERABILITY`/`CODE_SMELL`) on `issue`. | `{ issue }` |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `searchIssues` | `componentKeys`, `projects`, `assignees`, `author`, `severities`, `types`, `statuses`, `resolutions`, `resolved`, `tags`, `createdAfter`, `createdBefore`, `languages`, `rules`, `branch`, `pullRequest`, `s`, `asc`, `p`, `ps` |
+    | `assignIssue` | `issue` (required), `assignee` |
+    | `transitionIssue` | `issue` (required), `transition` (required) |
+    | `addIssueComment` | `issue` (required), `text` (required) |
+    | `setIssueTags` | `issue` (required), `tags` |
+    | `setIssueSeverity` | `issue` (required), `severity` (required) |
+    | `setIssueType` | `issue` (required), `type` (required) |
 
-    ### Measures & Metrics
+    ### Measures and metrics
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `getComponentMeasures` | Read `metricKeys` for a `component`; optional `branch`/`pullRequest`/`additionalFields`. | `{ component: { measures: [{ metric, value }] } }` |
-    | `getComponentTreeMeasures` | Read `metricKeys` across the tree under `component`; `strategy`, `qualifiers`, `s`. | `{ baseComponent, components: [{ measures }], paging }` |
-    | `getMeasuresHistory` | History of `metrics` for `component` over `from`/`to`. | `{ measures: [{ metric, history: [{ date, value }] }], paging }` |
-    | `searchMetrics` | Search metric definitions; optional fields `f`. | `{ metrics: [{ key, name, type }], total }` |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `getComponentMeasures` | `component` (required), `metricKeys` (required), `branch`, `pullRequest`, `additionalFields` |
+    | `getComponentTreeMeasures` | `component` (required), `metricKeys` (required), `strategy`, `qualifiers`, `s`, `p`, `ps` |
+    | `getMeasuresHistory` | `component` (required), `metrics` (required), `from`, `to`, `p`, `ps` |
+    | `searchMetrics` | `f`, `p`, `ps` |
 
-    ### Quality Gates
+    ### Quality gates
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listQualityGates` | List quality gates; optional `organization`. | `{ qualitygates: [{ id, name }], default }` |
-    | `showQualityGate` | Show a gate by `id` or `name`. | `{ id, name, conditions: [{ metric, op, error }] }` |
-    | `getProjectQualityGateStatus` | Pass/fail status for `projectKey`/`projectId`; optional `branch`/`pullRequest`. | `{ projectStatus: { status, conditions: [...] } }` |
-    | `selectQualityGate` | Associate `projectKey` with a gate (`gateId`/`gateName`). | Empty (HTTP 204) |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listQualityGates` | `organization` |
+    | `showQualityGate` | `id`, `name`, `organization` |
+    | `getProjectQualityGateStatus` | `projectKey`, `projectId`, `branch`, `pullRequest` |
+    | `selectQualityGate` | `projectKey` (required), `gateId`, `gateName`, `organization` |
 
-    ### Quality Profiles & Rules
+    ### Quality profiles and rules
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `searchQualityProfiles` | Search profiles by `organization`, `language`, `project`, `qualityProfile`, `defaults`. | `{ profiles: [{ key, name, language }] }` |
-    | `searchRules` | Search rules by `q`, `languages`, `repositories`, `severities`, `types`, `tags`, `statuses`, `qprofile`, `activation`. | `{ rules: [{ key, name, severity }], total }` |
-    | `showRule` | Show a rule by `key`; optional `organization`. | `{ rule: { key, name, htmlDesc } }` |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `searchQualityProfiles` | `organization`, `language`, `project`, `qualityProfile`, `defaults` |
+    | `searchRules` | `q`, `languages`, `repositories`, `severities`, `types`, `tags`, `statuses`, `qprofile`, `activation`, `p`, `ps` |
+    | `showRule` | `key` (required), `organization` |
 
     ### Hotspots
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `searchHotspots` | Search hotspots by `projectKey`, `branch`/`pullRequest`, `status` (`TO_REVIEW`/`REVIEWED`), `resolution`, `onlyMine`, `sinceLeakPeriod`. | `{ hotspots: [{ key, status, vulnerabilityProbability }], paging }` |
-    | `showHotspot` | Show a hotspot by `hotspot` key. | `{ key, status, rule, component }` |
-    | `changeHotspotStatus` | Set `status` on `hotspot`; optional `resolution`, `comment`. | Empty (HTTP 204) |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `searchHotspots` | `projectKey`, `branch`, `pullRequest`, `status`, `resolution`, `onlyMine`, `sinceLeakPeriod`, `p`, `ps` |
+    | `showHotspot` | `hotspot` (required) |
+    | `changeHotspotStatus` | `hotspot` (required), `status` (required), `resolution`, `comment` |
 
-    ### User Tokens
+    ### User tokens
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `searchUserTokens` | List user tokens; optional `login` (admin-only for other users). | `{ userTokens: [{ name, createdAt }] }` |
-    | `generateUserToken` | Generate a token `name`; optional `login`, `type`, `projectKey`, `expirationDate`. | `{ name, token, type }` |
-    | `revokeUserToken` | Revoke a token by `name`; optional `login`. | Empty (HTTP 204) |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `searchUserTokens` | `login` |
+    | `generateUserToken` | `name` (required), `login`, `type`, `projectKey`, `expirationDate` |
+    | `revokeUserToken` | `name` (required), `login` |
 
-    ### Analyses & Branches
+    ### Analyses and branches
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `searchProjectAnalyses` | Search analyses for `project`; optional `branch`, `category`, `from`/`to`. | `{ analyses: [{ key, date, events }], paging }` |
-    | `createAnalysisEvent` | Add `name` event (`category` `VERSION`/`OTHER`) to `analysis`. | `{ event: { key, name, category } }` |
-    | `listProjectBranches` | List branches of `project`. | `{ branches: [{ name, type, status }] }` |
-    | `deleteProjectBranch` | Delete `branch` from `project`. | Empty (HTTP 204) |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `searchProjectAnalyses` | `project` (required), `branch`, `category`, `from`, `to`, `p`, `ps` |
+    | `createAnalysisEvent` | `analysis` (required), `name` (required), `category` |
+    | `listProjectBranches` | `project` (required) |
+    | `deleteProjectBranch` | `project` (required), `branch` (required) |
 
     ### Webhooks
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listWebhooks` | List webhooks; optional `organization`/`project`. | `{ webhooks: [{ key, name, url }] }` |
-    | `createWebhook` | Create webhook `name` + `url`; optional `organization`, `project`, `secret`. | `{ webhook: { key, name, url } }` |
-    | `deleteWebhook` | Delete a webhook by `webhook` key. | Empty (HTTP 204) |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listWebhooks` | `organization`, `project` |
+    | `createWebhook` | `name` (required), `url` (required), `organization`, `project`, `secret` |
+    | `deleteWebhook` | `webhook` (required) |
 
     ### Badges
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `getProjectMeasureBadge` | SVG badge for `project` + `metric`; optional `branch`, `token`. | Raw SVG document |
-    | `getProjectQualityGateBadge` | SVG badge for the quality-gate status of `project`; optional `branch`, `token`. | Raw SVG document |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `getProjectMeasureBadge` | `project` (required), `metric` (required), `branch`, `token` |
+    | `getProjectQualityGateBadge` | `project` (required), `branch`, `token` |
 
-    <Note>
-      `Returns` shows the shape of the operation output. Arguments noted with `*` in the *Agent builder* tool details are required; on SonarCloud, pass `organization` explicitly or default it in your automation.
-    </Note>
+    ## Return shape
 
-    ## DSUL Examples
+    Every instruction returns the same envelope rather than the bare SonarQube response. On success:
+
+    ```yaml
+    operation: list          # list, read, create, update, delete or action
+    itemType: Issues         # the entity family the instruction touched
+    structuredData: {...}    # the raw SonarQube Web API response
+    items: [...]             # list operations only
+    jsonData: {...}          # read operations only
+    location: SonarQube      # list operations only
+    hint: '...'              # list operations only
+    ```
+
+    On failure the envelope holds a single `error` key containing the message shown in [Error handling](#error-handling).
+
+    <Warning>
+      Always read the SonarQube payload from `structuredData`, never from the top level of the output. `{{result.projectStatus.status}}` resolves to nothing; `{{result.structuredData.projectStatus.status}}` is the value you want.
+    </Warning>
+
+    For the field-level shape of `structuredData`, see the [SonarQube Web API reference](https://next.sonarqube.com/sonarqube/web_api), which documents each endpoint's response.
+
+    ## DSUL examples
 
     ### List all unresolved bugs on a project
 
@@ -540,7 +636,10 @@ This connector is used by three different roles. Jump to the section that matche
         types: BUG
         statuses: OPEN,CONFIRMED,REOPENED
         ps: 100
-        output: issues
+        output: result
+    - set:
+        name: issues
+        value: '{{result.structuredData.issues}}'
     ```
 
     ### Get the quality-gate status of a branch
@@ -549,39 +648,45 @@ This connector is used by three different roles. Jump to the section that matche
     - SonarQube.getProjectQualityGateStatus:
         projectKey: '{{projectKey}}'
         branch: main
-        output: gateStatus
+        output: result
     - conditions:
-        '{{gateStatus.projectStatus.status}} == "ERROR"':
+        '{{result.structuredData.projectStatus.status}} == "ERROR"':
           - emit:
               event: qualityGateFailed
               payload:
                 project: '{{projectKey}}'
-                conditions: '{{gateStatus.projectStatus.conditions}}'
+                conditions: '{{result.structuredData.projectStatus.conditions}}'
     ```
 
-    ### Triage a flaky issue as false positive
+    ### Triage a flaky issue as a false positive
 
     ```yaml
     - SonarQube.transitionIssue:
         issue: '{{issueKey}}'
         transition: falsepositive
+        output: transitionResult
+    - conditions:
+        '{{transitionResult.error}}':
+          - break: {}
     - SonarQube.addIssueComment:
         issue: '{{issueKey}}'
         text: 'False positive; already addressed in {{commitSha}}'
     ```
 
-    ### Pull last week's coverage and bugs trend
+    ### Pull a coverage and bugs trend
 
     ```yaml
     - SonarQube.getMeasuresHistory:
         component: '{{projectKey}}'
         metrics: coverage,bugs,vulnerabilities,code_smells
-        from: '{{lastWeekIso}}'
-        ps: 1000
-        output: history
+        from: '{{startDateIso}}'
+        output: result
+    - set:
+        name: history
+        value: '{{result.structuredData.measures}}'
     ```
 
-    ### Provision a new SonarCloud project
+    ### Provision a new SonarQube Cloud project
 
     ```yaml
     - SonarQube.createProject:
@@ -589,9 +694,9 @@ This connector is used by three different roles. Jump to the section that matche
         project: '{{org}}_{{repoName}}'
         organization: '{{org}}'
         visibility: private
-        output: project
+        output: created
     - SonarQube.selectQualityGate:
-        projectKey: '{{project.project.key}}'
+        projectKey: '{{created.structuredData.project.key}}'
         gateName: 'Sonar way'
         organization: '{{org}}'
     ```
@@ -600,43 +705,182 @@ This connector is used by three different roles. Jump to the section that matche
 
 ---
 
-## Error Handling
+## Verify the connection
 
-| HTTP Status | Error | Solution |
-|-------------|-------|----------|
-| 400 | Bad Request | Verify required arguments; on SonarCloud, most operations need `organization` (discover it with `searchOrganizations`) |
-| 401 | Unauthorized | Verify the User Token and `baseUrl` |
-| 403 | Forbidden | Check the SonarQube permissions of the token owner (admin-only operations such as `searchUserTokens` for other users) |
-| 404 | Not Found | Verify project keys, component keys, issue keys and login names |
-| 409 | Conflict | Resource already exists (project key, token name, …); pick a different identifier |
-| 429 | Rate Limited | Back off and retry with exponential delay |
-| 500 | Server Error | Server-side issue; check SonarQube logs (self-hosted) or SonarCloud status |
+Run these read-only checks in order. Each one isolates a different layer, so the first failure tells you where to look.
 
-### Common Issues
+<Steps>
+  <Step title="Check the credential from Builder">
+    Call `SonarQube.validateAuthentication` from an automation. A working setup returns an envelope whose `structuredData` reports the token as valid. An `error` key means the token or base URL is wrong; see [Error handling](#error-handling).
+  </Step>
+  <Step title="Check the tool manifest from the MCP endpoint">
+    Send a `tools/list` JSON-RPC request to the **MCP Endpoint**. It must return the 46 tools listed in [Agent builder (Agent Creator)](#agent-builder-agent-creator). This method needs no key, so a failure here points at the endpoint URL, not at your configuration.
+  </Step>
+  <Step title="Check an end-to-end tool call from the agent">
+    Ask the agent a read-only question such as "What SonarQube version are we on?" or "List my SonarQube organizations". A correct answer proves the key, the credential lookup and the SonarQube call all work.
+  </Step>
+</Steps>
 
-**"Not configured"**: The app instance has no User Token. Generate one in *SonarQube > My Account > Security > Generate Tokens* and paste it in the app configuration (see the *Workspace builder* tab).
+The connector-agnostic checks that surround these three are in [Verify the installation](/apps-store/marketplace/connectors/install-in-workspace#verify-the-installation): confirm the runtime identity, run a narrow read, confirm that a resource the account must not see is refused, and leave the write path for last. Skip its non-allowlisted-agent check, which has no equivalent here: SonarQube has no allowlist, so any caller holding a valid key is accepted.
 
-**"Invalid credentials"**: SonarQube rejected the token (revoked, expired or wrong instance). Re-generate the User Token and re-paste it, and confirm the **API base URL** matches your instance (SonarCloud vs self-hosted).
+## Rotate, revoke and remove
 
-**"organization parameter is missing"**: On SonarCloud, most search and create operations require the `organization` key. Pass it explicitly in the tool arguments or as a default in your DSUL automation; call `searchOrganizations` to discover the keys your token can see.
+| Task | Procedure |
+|------|-----------|
+| Rotate the SonarQube token | Generate a new user token in SonarQube, update the `sonarqubeToken` secret in the workspace, and save. Revoke the old token in SonarQube, or with `revokeUserToken`. MCP tool calls pick up the new value within 10 minutes; Builder instructions pick it up immediately |
+| Cut off agent access without uninstalling | Clear the `sonarqubeToken` secret. Tool calls then fail with `SonarQube token not configured on this app instance.` while the app stays installed |
+| Offboard the token owner | The token dies with the SonarQube account. Create a replacement token owned by a service account before disabling the person's account, and update the secret |
+| Remove one agent's access | Remove the SonarQube capability from that agent and republish it. The connector performs no agent-level authorization, so the capability is the only gate |
+| Uninstall the connector | Uninstall the SonarQube app from the workspace, then delete the `sonarqubeToken` secret and revoke that token in SonarQube. Removing the app instance invalidates its MCP API Key for credential lookups |
 
-**`searchProjects` returns nothing on a public org**: `searchProjects` is admin-scoped (it only lists projects in organizations you administer). To browse projects in any organization, including public ones you are not a member of, use `searchPublicProjects`.
+Uninstalling leaves the provisioned secret in place, as described in [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall); this connector ships no uninstall handler, so deleting `sonarqubeToken` is a manual step. If you published a SonarQube capability in AI Governance, remove that entry too, or agent builders keep seeing a connector whose credential is gone. See [Remove or update a capability](/apps-store/marketplace/connectors/declare-capability#remove-or-update-a-capability).
 
-**Badge tools return non-SVG content**: `getProjectMeasureBadge` and `getProjectQualityGateBadge` return raw SVG. The MCP transport currently surfaces them as JSON-encoded strings; consume them in App mode (DSUL) to write the SVG straight to a file or HTTP response.
+## Error handling
 
-## External Resources
+Failed calls return a single message built from the HTTP status, the operation description, and SonarQube's own error body.
+
+| Status | Message returned |
+|--------|------------------|
+| 400 | `Bad request while <operation>: <detail>` |
+| 401 | `Authentication failed while <operation>. Check credentials. Detail: <detail>` |
+| 403 | `Forbidden while <operation>. Check permissions. Detail: <detail>` |
+| 404 | `Resource not found while <operation>. Detail: <detail>` |
+| 429 | `Rate limit exceeded while <operation>. Wait and retry. Detail: <detail>` |
+| 500 | `SonarQube server error while <operation>. Detail: <detail>` |
+| Any other non-2xx, including 409 | `Error <status> while <operation>: <detail>` |
+
+`<operation>` is the operation description of the instruction that failed, for example `search for issues` or `create a project`. `<detail>` is SonarQube's error body; SonarQube usually returns `{"errors":[{"msg":"..."}]}`, which the connector includes as raw JSON.
+
+### Common issues
+
+#### SonarQube token not configured on this app instance.
+
+**Symptom:** every MCP tool call fails with this message, while `tools/list` still works.
+
+**Cause:** the `sonarqubeToken` secret is empty in the workspace that installed the app.
+
+**Owner:** workspace builder.
+
+**Fix:** generate a user token in SonarQube under **My Account > Security > Generate Tokens**, set it as the `sonarqubeToken` secret, and save.
+
+**Verify:** run the first step of [Verify the connection](#verify-the-connection), *Check the credential from Builder*.
+
+#### SonarQube not configured. Set token in the workspace config.
+
+**Symptom:** a Builder instruction returns this message instead of data.
+
+**Cause:** same as above, seen from the Builder surface: neither the instruction arguments nor the app configuration supplied a token.
+
+**Owner:** workspace builder.
+
+**Fix:** fill the `sonarqubeToken` secret, or pass `token` and `baseUrl` explicitly to the instruction.
+
+**Verify:** re-run the instruction and confirm the output has a `structuredData` key rather than an `error` key.
+
+#### Missing required header
+
+**Symptom:** `tools/call` fails with JSON-RPC error code `-32001` and this message:
+
+```text
+Missing required header: mcp-api-key
+```
+
+**Cause:** the capability wired into the agent does not send the workspace's **MCP API Key** header.
+
+**Owner:** agent builder, with the workspace builder who holds the app instance.
+
+**Fix:** copy the **MCP API Key** value from the SonarQube app instance, add it to the capability's header configuration, and save the agent.
+
+**Verify:** re-run a read-only tool call from the agent.
+
+#### Invalid API key
+
+**Symptom:** `tools/call` fails with error code `-32001` and a message beginning `Invalid API key:`, followed by `Invalid key format`, `Invalid signature` or `Invalid payload`.
+
+**Cause:** the key sent by the capability was truncated, edited, or belongs to a workspace whose signature no longer verifies.
+
+**Owner:** workspace builder.
+
+**Fix:** re-copy the **MCP API Key** from the app instance without altering it. If it still fails, reconfigure the app instance to have a fresh key issued, then update the capability.
+
+**Verify:** re-run a read-only tool call from the agent.
+
+#### Credentials lookup failed
+
+**Symptom:** `tools/call` fails with error code `-32001` and a message of the form `Credentials lookup failed (<status>): <error>`.
+
+**Cause:** the MCP endpoint reached your workspace's `getConfig` webhook but it did not return credentials. A `400` here means the token is not configured.
+
+**Owner:** workspace builder.
+
+**Fix:** confirm the SonarQube app is still installed in the workspace and that `sonarqubeToken` holds a value.
+
+**Verify:** re-run a read-only tool call from the agent.
+
+#### Authentication failed while ... Check credentials.
+
+**Symptom:** SonarQube answers `401` on every operation.
+
+**Cause:** the token is revoked or expired, or it belongs to a different SonarQube instance than the configured base URL.
+
+**Owner:** workspace builder.
+
+**Fix:** generate a fresh user token on the instance the base URL points at, update the `sonarqubeToken` secret, and confirm the base URL matches (`https://sonarcloud.io/api` for SonarQube Cloud, `https://<your-sonarqube-host>/api` for self-hosted).
+
+**Verify:** call `SonarQube.validateAuthentication`.
+
+#### Forbidden while ... Check permissions.
+
+**Symptom:** SonarQube answers `403` on some operations while reads succeed.
+
+**Cause:** the token owner lacks the SonarQube permission the operation needs. Administer-scoped operations, and `searchUserTokens` for another login, require elevated rights.
+
+**Owner:** a SonarQube administrator, together with the workspace builder.
+
+**Fix:** grant the token owner the missing SonarQube permission, or use a token owned by an account that already has it.
+
+**Verify:** re-run the failing operation.
+
+#### searchProjects returns nothing on a public organization
+
+**Symptom:** `searchProjects` returns an empty list even though the organization has projects.
+
+**Cause:** `searchProjects` is admin-scoped and lists only projects in organizations the token administers.
+
+**Owner:** agent builder or workspace builder.
+
+**Fix:** use `searchPublicProjects` with the `organization` key instead. It browses any organization, including public ones the token owner is not a member of.
+
+**Verify:** re-run with `searchPublicProjects` and confirm the expected projects appear.
+
+#### Badge tools return a JSON-encoded string
+
+**Symptom:** `getProjectMeasureBadge` and `getProjectQualityGateBadge` return SVG markup wrapped in a JSON string rather than a renderable image.
+
+**Cause:** SonarQube returns raw SVG, and the MCP layer serializes every payload as JSON.
+
+**Owner:** workspace builder.
+
+**Fix:** call the badge instructions from Builder instead, and write `structuredData` straight to a file or an HTTP response.
+
+**Verify:** confirm the written file opens as an SVG image.
+
+## External resources
 
 <CardGroup cols={2}>
   <Card title="SonarQube Web API" icon="book" href="https://next.sonarqube.com/sonarqube/web_api">
-    Official SonarQube Web API reference
+    Official SonarQube Web API reference, including response shapes and filter semantics
   </Card>
-  <Card title="SonarCloud Web API" icon="cloud" href="https://sonarcloud.io/web_api">
-    SonarCloud-flavored Web API reference
+  <Card title="SonarQube Cloud Web API" icon="cloud" href="https://sonarcloud.io/web_api">
+    SonarQube Cloud flavored Web API reference
   </Card>
-  <Card title="SonarSource Documentation" icon="circle-info" href="https://docs.sonarsource.com">
-    Product documentation, metrics catalog, rule descriptions
+  <Card title="SonarSource documentation" icon="circle-info" href="https://docs.sonarsource.com">
+    Product documentation, metrics catalog and rule descriptions
   </Card>
-  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
-    Learn how Agent Creator agents consume MCP tools in Prisme.ai.
+  <Card title="Agent capabilities" icon="robot" href="/products/agent-factory/capabilities">
+    How Agent Creator agents consume MCP tools in Prisme.ai
+  </Card>
+  <Card title="Declare a connector capability" icon="sliders" href="/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance">
+    The manual AI Governance path, the only capability flow that applies to SonarQube
   </Card>
 </CardGroup>

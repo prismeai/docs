@@ -1,10 +1,10 @@
 ---
 title: 'Jira (legacy)'
-description: 'Search, create, and manage Jira issues from Agent Creator agents and Builder workflows, for Cloud and Data Center'
+description: 'Legacy Jira connector: search, create and manage Jira Cloud and Data Center issues from Agent Creator agents and Builder workflows with a static API token or personal access token'
 ---
 
 <Note>
-  This is the **legacy** Jira connector (static Basic-Auth / PAT credential held by the installing workspace, flat tool names). It is superseded by the new **[Jira](/apps-store/marketplace/connectors/jira)** connector (App+MCP, tenant-context, central Atlassian 3LO OAuth, with issues / search / projects / users / metadata / agile / attachments entity tools). Use the new Jira connector for any new work; this page is kept for existing installations only.
+  This is the **legacy** Jira connector: a static credential (Atlassian email plus API token for Cloud, or a personal access token for Data Center) held by the workspace that installs it, and flat tool names such as `searchJira`. It is superseded by the **[Jira](/apps-store/marketplace/connectors/jira)** connector, which uses the tenant-context model, per-user Atlassian OAuth, and entity tools driven by an `action` argument. Use the Jira connector for any new work. This page documents the legacy connector for existing installations and for planning a migration.
 </Note>
 
 <img
@@ -16,74 +16,92 @@ description: 'Search, create, and manage Jira issues from Agent Creator agents a
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Jira connector exposes [Atlassian Jira](https://www.atlassian.com/software/jira) issue tracking as tools, supporting both **Jira Cloud** and **Jira Data Center** deployments. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. Authentication is a **static credential** held by the installing workspace (Basic Auth with Atlassian account email + API token for Cloud, or a Bearer **Personal Access Token (PAT)** for Data Center), resolved server-side so the credential is never exposed to the agent.
+The legacy Jira connector exposes [Atlassian Jira](https://www.atlassian.com/software/jira) issue tracking as tools and Builder instructions, for both **Jira Cloud** and **Jira Data Center**. It ships as two apps: the **Jira** app (slug `jira`), which holds the credential and every Jira operation, and the **Jira MCP** app (slug `jira-mcp`), a JSON-RPC 2.0 Model Context Protocol (MCP) server that imports the Jira app and re-exposes 12 of its operations as MCP tools. Install the Jira app alone to call Jira from Builder automations; install Jira MCP when an **Agent Creator** agent must call Jira as tools.
+
+The `type` setting (`cloud` or `datacenter`) selects both the credential scheme and the REST API version: Cloud is called on `/rest/api/3` with HTTP Basic authentication, Data Center on `/rest/api/2` with a Bearer personal access token.
 
 <CardGroup cols={3}>
   <Card title="Issue management" icon="ticket">
-    Search with JQL, then create, read, update and delete issues, including custom fields once they are resolved by id.
+    Search with JQL, then create, read, update and delete issues, including custom fields once their ids are resolved.
   </Card>
   <Card title="Workflow operations" icon="diagram-project">
-    List and apply status transitions, add comments and attach files to move issues through their workflow.
+    List and apply status transitions, add comments, and attach files downloaded from a URL.
   </Card>
-  <Card title="Project & field discovery" icon="folder-open">
-    List accessible projects, inspect create screens, and discover field ids (including custom fields) before writing.
+  <Card title="Project and field discovery" icon="folder-open">
+    List accessible projects, inspect create screens, and discover field ids before writing.
   </Card>
 </CardGroup>
 
 ## Who is this for?
 
-This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
+This connector involves three roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to use Jira. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to use Jira.
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and want to know what to set up once for everyone. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-setup">
+    You run the platform and want to know what to set up once for everyone.
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call Jira operations directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations (DSUL) that call Jira operations directly.
   </Card>
 </CardGroup>
 
+<Note>
+  This legacy connector predates the App + MCP tenant-context model, so the three shared connector flows do not apply to it: there is no configuration app to enter credentials in, no central OAuth client, and no authorized-agents allowlist. Everything you need is on this page. The current [Jira](/apps-store/marketplace/connectors/jira) connector does follow those flows.
+</Note>
+
 ## Prerequisites
 
-- A **Jira Cloud** or **Jira Data Center** instance, and an account with permission on the projects you intend to use.
-- Your **base URL**: for Cloud `https://yoursite.atlassian.net`, for Data Center `https://jira.yourcompany.com`.
-- **For Jira Cloud:** an **Atlassian account email** and an **API token**, generated at [Atlassian API Tokens](https://id.atlassian.com/manage-profile/security/api-tokens). The connector uses these for Basic Auth.
-- **For Jira Data Center:** a **Personal Access Token (PAT)**, generated under your Jira profile **Personal Access Tokens**. The connector sends it as a Bearer token.
+- A **Jira Cloud** or **Jira Data Center** instance, and a Jira account with **Browse Projects** permission on the projects you intend to read, plus **Create Issues**, **Edit Issues**, **Add Comments**, **Create Attachments**, **Transition Issues** or **Delete Issues** on the projects you intend to write to.
+- The **base URL** of that instance: `https://yoursite.atlassian.net` for Cloud, or your own host (for example `https://jira.example.com`) for Data Center. Trailing slashes are stripped by the connector.
+- For **Jira Cloud**: an **Atlassian account email** and an **API token** created at [Atlassian API tokens](https://id.atlassian.com/manage-profile/security/api-tokens). The connector combines them into an HTTP Basic `Authorization` header.
+- For **Jira Data Center**: a **personal access token** created from your Jira profile. The connector sends it as a Bearer token.
+- To expose the connector to agents: a workspace running the **Jira MCP** app, with an **MCP API Key** generated for its MCP endpoint.
 
-<Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
-  **Goal:** Jira is a **per-workspace** connector: each workspace pastes its own Jira credential (see the *Workspace builder* tab), so there is **no platform-wide credential to provision** and no central OAuth client.
+## Whose Jira identity the connector uses
 
-  <Note>
-    There is no shared Jira credential for this connector. The base URL, email/API token (Cloud) or PAT (Data Center) always live in the consuming workspace's app configuration. The only optional platform task is to publish Jira as a reusable **capability** in AI Governance so agent builders can enable it from the catalog instead of pasting a raw MCP endpoint.
-  </Note>
+This connector has no per-user sign-in flow. Every call reaches Jira as the **single Atlassian account whose token was configured**, and that account's project permissions are the only limit on what agents and automations can do. Decide who that account is before you configure anything.
 
-  ## Declare the capability in AI Governance (optional)
+The `resolveAuth` helper resolves the credential in a fixed order and stops at the first complete match:
 
-  <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) the **Jira** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint** (the workspace running the connector), and set its **Scope** to:
+| Priority | Source | What supplies it | Jira sees |
+|---|---|---|---|
+| 1 | Caller-supplied credential | A Builder automation passes `authHeader`, `baseUrl` and `type` directly to the instruction. `type` is mandatory here: without it the call fails with `Missing type`. | The account behind the header the caller built. |
+| 2 | Request headers | HTTP headers on the request: `baseurl` plus `email` and `apitoken` (resolved as Cloud), or `baseurl` plus `personaltoken` (resolved as Data Center). | The account behind those headers. |
+| 3 | Per-user platform secrets | A prior `configureJira` call, which stores `jira_base_url`, `jira_type`, and either `jira_email` plus `jira_api_token` or `jira_pat`, scoped to the calling platform user. | That user's own Atlassian account. |
+| 4 | Workspace app configuration | The **Jira** app instance configuration in the workspace. This is the shared fallback used when nothing above matches. | The shared service account configured for the workspace. |
 
-      ```text
-      context_id,agent_id,user_id
-      ```
+<Warning>
+  **Shared-credential blast radius.** The workspace configuration (priority 4) is a shared service identity. Every agent and every automation that reaches the connector acts with that account's full Jira permissions, and Jira attributes every created issue, comment, transition and deletion to it, not to the person who asked. Give that account only the project permissions the use case needs, and treat the ability to call the connector as equivalent to handing out that account. The connector exposes `deleteIssue`, so a read-only deployment requires a Jira account without **Delete Issues**.
+</Warning>
 
-      The `agent_id` in the scope is what lets the connector identify the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this static-credential connector. Each workspace running the connector still owns its Jira credential.
-    </Step>
-  </Steps>
+Priority 3 is only reachable from Builder, because `configureJira` is a Builder instruction and is **not** exposed as an MCP tool. An end user chatting with an agent cannot connect their own Jira account through this connector. If you need per-user Atlassian identity, that is the reason to move to the [Jira](/apps-store/marketplace/connectors/jira) connector.
 
-  <Warning>
-    Declaring the capability makes the connector **available**; it does not provision any credential. This connector follows the **static-credential model**: the Jira base URL and token live in the consuming workspace's app configuration. There is **no OAuth auth-config JSON** to attach in Governance.
-  </Warning>
-</Accordion>
+## Platform admin setup
+
+**Goal:** make the connector reachable by agent builders. Jira is a **per-workspace** connector: each workspace holds its own Jira credential, so there is no platform-wide credential to provision and no central OAuth client.
+
+There is no shared Jira credential and no Governance OAuth auth-config JSON for this connector. The base URL, the Cloud email and API token, and the Data Center personal access token always live in the consuming workspace's app configuration or in that workspace's secrets.
+
+The one optional platform task is to publish Jira as a reusable **capability** in AI Governance, so agent builders can enable it from the catalog instead of pasting a raw MCP endpoint URL.
+
+<Steps>
+  <Step title="Open AI Governance and go to Capabilities">
+    Create or edit a **Jira** capability.
+  </Step>
+  <Step title="Point it at the MCP endpoint">
+    Set the capability's MCP server URL to the **MCP Endpoint** of the workspace running the **Jira MCP** app, and save the capability.
+  </Step>
+  <Step title="Make it available to agent builders">
+    Once saved, the capability appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; this connector has no per-capability role grant and no per-agent allowlist.
+  </Step>
+</Steps>
+
+<Warning>
+  Declaring the capability makes the connector **available**; it grants no Jira access by itself, and it does not restrict which agents may call it. This connector never reads the calling agent's or user's identity: it authenticates the MCP request with the workspace's MCP API key and then resolves the Jira credential server-side. Any agent that holds the endpoint URL and the API key gets the full toolset.
+</Warning>
 
 ---
 
@@ -94,94 +112,83 @@ This connector is used by three different roles. Jump to the section that matche
     **Goal:** let an agent you build in Agent Creator search and manage Jira through MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Jira app in a workspace (see the *Workspace builder* tab). Optionally, a *Platform admin* may have published a Jira capability in AI Governance (see the *Platform admin setup* accordion above).
+      Before an agent can call the connector, a workspace builder must have installed and configured the **Jira MCP** app in a workspace, including its **MCP API Key**: see [Workspace builder](#workspace-builder-dsul). Optionally, a platform admin may have published a Jira capability in AI Governance: see [Platform admin setup](#platform-admin-setup).
     </Note>
 
-    This connector runs on a **static credential** owned by the workspace that installed it. Your agent is identified by the `agent_id` that Agent Creator injects through the capability *Scope*; the Jira credential itself is resolved server-side and is never exposed to the agent.
+    The Jira credential is resolved server-side from that workspace's configuration and is never exposed to the agent. The agent's own identity is not propagated: all agents calling the same endpoint act as the same Jira account.
 
     <Steps>
       <Step title="Install and configure the connector in a workspace">
-        Follow the *Workspace builder* tab: install **Jira** in your workspace and provide the base URL, deployment type, and credential (Cloud email + API token, or Data Center PAT).
+        Follow [Workspace builder](#workspace-builder-dsul): install **Jira MCP**, provide the base URL, deployment type and credential, and generate the **MCP API Key**.
       </Step>
       <Step title="Add the MCP capability to your agent">
-        In your agent, add a capability pointing at the workspace's **MCP Endpoint** URL, and set its **Scope** to:
-
-        ```text
-        context_id,agent_id,user_id
-        ```
-
-        The `agent_id` lets the connector identify your agent. The credential is resolved from the workspace configuration server-side.
+        In your agent, add a capability pointing at the workspace's **MCP Endpoint** URL, and save the agent. The capability must send the workspace's MCP API key with each request: without it, tool discovery still works but every tool call is rejected.
       </Step>
       <Step title="Brief the agent">
-        Tell the agent the tools exist and when to use them. See *Brief the agent in its system prompt* below.
+        Add tool guidance to the agent's system prompt, as shown in [Brief the agent in its system prompt](#brief-the-agent-in-its-system-prompt), and publish the agent.
       </Step>
     </Steps>
+
+    <Note>
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The Jira credential is still resolved from the workspace configuration.
+    </Note>
 
     ## Brief the agent in its system prompt
 
     A short brief keeps the agent from guessing field ids or skipping discovery. Copy-pasteable starter:
 
     ```text
-    You have access to the Jira MCP server. Use searchJira with a JQL query to find issues, getIssue to read one by key (e.g. DEV-123), and createIssue / updateIssue / deleteIssue to manage them. To move an issue, call getTransitions then transitionIssue with the chosen transitionId. Use addComment and addAttachment for collaboration. Before writing a custom field, resolve its id with listFields (customOnly: true) and confirm availability with listCreateIssueTypes / getCreateIssueFields. Confirm with the user before any create, update, delete or transition.
+    You have access to the Jira MCP server. Use searchJira with a JQL query to find issues, getIssue to read one by key (for example DEV-123), and createIssue / updateIssue / deleteIssue to manage them. To move an issue, call getTransitions first, then transitionIssue with the chosen transitionId. Use addComment for collaboration, and addAttachment with a downloadable fileUrl and a filename to attach a file. Before writing a custom field, resolve its id with listFields (customOnly: true) and pass the value under the fields object. Confirm with the user before any create, update, delete or transition.
     ```
 
+    ## Available tools
+
+    The MCP server exposes 12 tools. Each tool name is also accepted with a `jira_` prefix (for example `jira_searchJira`), which the router strips before dispatch. Any other name returns the route error `ToolNotFound`.
+
+    ### Issue tools
+
+    | Tool | Description |
+    |------|-------------|
+    | `searchJira` | Search issues using JQL. |
+    | `getIssue` | Get issue details by key. |
+    | `createIssue` | Create an issue in a project. |
+    | `updateIssue` | Update an existing issue. |
+    | `deleteIssue` | Delete an issue, optionally with its sub-tasks. |
+
+    ### Workflow tools
+
+    | Tool | Description |
+    |------|-------------|
+    | `getTransitions` | Get available status transitions for an issue. |
+    | `transitionIssue` | Change an issue's status. |
+    | `addComment` | Add a comment to an issue. |
+    | `addAttachment` | Download a file from a URL and attach it to an issue. |
+
+    ### Project and field tools
+
+    | Tool | Description |
+    |------|-------------|
+    | `listProjects` | List accessible projects. |
+    | `getProject` | Get project details by key or numeric id. |
+    | `listFields` | List or search Jira fields, including custom fields. |
+
     <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent is still identified by the capability *Scope* and the credential is resolved from the workspace configuration.
+      `configureJira`, `listCreateIssueTypes` and `getCreateIssueFields` exist in the **Jira** app but are **not** MCP tools. Call them from Builder automations: see [Workspace builder](#workspace-builder-dsul).
     </Note>
 
-    ## Available Tools
+    ## Output formats
 
-    ### Issue Operations
+    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
 
-    | Tool | Description |
-    |------|-------------|
-    | `searchJira` | Search issues using JQL |
-    | `getIssue` | Get issue details by key |
-    | `createIssue` | Create a new issue |
-    | `updateIssue` | Update an existing issue |
-    | `deleteIssue` | Delete an issue |
+    - `verbose` (default): one text block containing a human-readable summary followed by the JSON payload. No `structuredContent` is returned.
+    - `structured`: one text block containing the JSON payload, plus the same payload in `structuredContent`.
+    - `both`: two text blocks (summary, then JSON payload), plus `structuredContent`.
 
-    ### Field Discovery
+    ## Tool details
 
-    | Tool | Description |
-    |------|-------------|
-    | `listFields` | List or search Jira fields, including custom fields |
-    | `listCreateIssueTypes` | List issue types available when creating issues in a project |
-    | `getCreateIssueFields` | Get fields available on the create screen for a project and issue type |
+    Arguments not listed as required are optional.
 
-    ### Workflow Operations
-
-    | Tool | Description |
-    |------|-------------|
-    | `getTransitions` | Get available status transitions |
-    | `transitionIssue` | Change issue status |
-    | `addComment` | Add a comment to an issue |
-    | `addAttachment` | Add an attachment to an issue |
-
-    ### Project Operations
-
-    | Tool | Description |
-    |------|-------------|
-    | `listProjects` | List accessible projects |
-    | `getProject` | Get project details |
-
-    ### Configuration
-
-    | Tool | Description |
-    |------|-------------|
-    | `configureJira` | Store Jira credentials for the calling user (per-user connection) |
-
-    ## Output Formats
-
-    All tools accept an `outputFormat` argument that controls the MCP response shape:
-
-    - **`verbose`** (default): human-readable text optimized for LLM consumption
-    - **`structured`**: machine-readable JSON in `structuredContent`
-    - **`both`**: both the text and the structured content
-
-    ## Tool Details
-
-    ### searchJira
+    ### searchJira tool
 
     ```json
     {
@@ -195,12 +202,14 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `jql` | Yes | JQL query string (project, status, assignee, labels, text search, …). |
-    | `maxResults` | No | Max results per page (default 50). |
-    | `nextPageToken` | No | Cursor for the next page of results. |
-    | `fields` | No | Comma-separated list of fields to return. |
+    | `jql` | Yes | JQL query string. Missing or empty, the call returns a validation error. |
+    | `maxResults` | No | Results per page. Default `50`; the tool schema documents a maximum of 100. |
+    | `nextPageToken` | No | Cursor for the next page. Returned by Jira Cloud only. |
+    | `fields` | No | Comma-separated list of fields to return. When omitted, the connector requests `*navigable`. |
 
-    ### getIssue
+    Cloud queries `/rest/api/3/search/jql`; Data Center queries `/rest/api/2/search`. The returned issues are flattened to `key`, `id`, `summary`, `status`, `priority`, `assignee`, `issueType`, `created` and `updated`.
+
+    ### getIssue tool
 
     ```json
     {
@@ -213,9 +222,11 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `issueKey` | Yes | The issue key, e.g. `DEV-123`. |
+    | `issueKey` | Yes | The issue key, for example `DEV-123`. |
+    | `fields` | No | Comma-separated fields to return. |
+    | `expand` | No | Comma-separated expansions, for example `changelog` or `renderedFields`. |
 
-    ### createIssue
+    ### createIssue tool
 
     ```json
     {
@@ -226,6 +237,7 @@ This connector is used by three different roles. Jump to the section that matche
         "summary": "Implement new feature",
         "description": "Detailed description here",
         "priority": "High",
+        "labels": ["backend"],
         "fields": {
           "customfield_10016": 8
         }
@@ -236,19 +248,25 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `projectKey` | Yes | Target project key. |
-    | `issueType` | Yes | Issue type name (e.g. `Task`, `Bug`, `Story`). |
-    | `summary` | Yes | Issue summary / title. |
-    | `description` | No | Issue description. |
-    | `priority` | No | Priority name (e.g. `High`). |
-    | `fields` | No | Map of additional fields by id, e.g. `customfield_10016`. Resolve custom-field ids with `listFields` first. |
+    | `issueType` | Yes | Issue type name, for example `Task`, `Bug`, `Story`, `Epic`. |
+    | `summary` | Yes | Issue summary or title. |
+    | `description` | No | Plain text. Converted to an Atlassian Document Format paragraph for Cloud, sent as plain text for Data Center. |
+    | `assignee` | No | Account id on Cloud, username on Data Center. |
+    | `reporter` | No | Account id on Cloud, username on Data Center. Requires the **Modify Reporter** permission. |
+    | `priority` | No | Priority name, for example `High`. |
+    | `labels` | No | Array of label strings. |
+    | `parentKey` | No | Parent issue key, for sub-tasks. |
+    | `fields` | No | Map of additional Jira fields by id, for example `customfield_10016`. Resolve custom-field ids with `listFields` first. |
 
-    ### listFields
+    `fields` is merged first and the typed arguments above win over it, so `project`, `issuetype` and `summary` always come from `projectKey`, `issueType` and `summary`.
+
+    ### listFields tool
 
     ```json
     {
       "name": "listFields",
       "arguments": {
-        "query": "testPrismeField",
+        "query": "story points",
         "customOnly": true,
         "maxResults": 50
       }
@@ -257,13 +275,14 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `query` | No | Substring to match field names. |
-    | `customOnly` | No | Restrict to custom fields when `true`. |
-    | `maxResults` | No | Max fields to return. |
+    | `query` | No | Substring matched against field names or ids. Applied by Jira Cloud only; on Data Center the connector reads the full field list and ignores `query`. |
+    | `customOnly` | No | Keep only custom fields. Default `false`. Applied by the connector after fetching. |
+    | `maxResults` | No | Maximum fields to return. Default `50`. |
+    | `startAt` | No | Pagination offset, zero-based. Default `0`. |
 
-    Use the returned `customfield_...` id in `createIssue` or `updateIssue` only after Jira reports the field as available for that project and issue type (confirm with `listCreateIssueTypes` / `getCreateIssueFields`).
+    Use the returned `customfield_...` id in `createIssue` or `updateIssue` only after Jira reports the field as available for that project and issue type. From Builder, confirm availability with `listCreateIssueTypes` and `getCreateIssueFields`.
 
-    ### transitionIssue
+    ### transitionIssue tool
 
     ```json
     {
@@ -279,32 +298,31 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `issueKey` | Yes | The issue to transition. |
-    | `transitionId` | Yes | The transition id from `getTransitions`. |
-    | `comment` | No | Optional comment added with the transition. |
+    | `transitionId` | Yes | A transition id returned by `getTransitions`. |
+    | `comment` | No | Comment added with the transition. |
 
-    ### configureJira
+    ### addAttachment tool
+
+    The connector downloads the file from `fileUrl` and uploads it to Jira, so `fileUrl` must be reachable by the platform without additional authentication.
 
     ```json
     {
-      "name": "configureJira",
+      "name": "addAttachment",
       "arguments": {
-        "baseUrl": "https://yoursite.atlassian.net",
-        "type": "cloud",
-        "email": "you@example.com",
-        "apiToken": "your-api-token"
+        "issueKey": "DEV-123",
+        "fileUrl": "https://files.example.com/report.pdf",
+        "filename": "report.pdf",
+        "contentType": "application/pdf"
       }
     }
     ```
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `baseUrl` | Yes | Jira base URL. |
-    | `type` | Yes | `cloud` or `datacenter`. |
-    | `email` | For Cloud | Atlassian account email. |
-    | `apiToken` | For Cloud | Atlassian API token. |
-    | `personalAccessToken` | For Data Center | PAT for Jira Data Center. |
-
-    Stores the credential securely in the calling user's platform secrets, so a per-user connection persists across requests without relying on the shared workspace credential.
+    | `issueKey` | Yes | The issue to attach the file to. |
+    | `fileUrl` | Yes | URL the connector downloads the file from. |
+    | `filename` | Yes | Filename stored in Jira. |
+    | `contentType` | No | MIME type. Default `application/octet-stream`. |
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
@@ -314,82 +332,93 @@ This connector is used by three different roles. Jump to the section that matche
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **Jira** and install it
-    3. Configure the app instance with your Jira base URL, deployment type, and credential (Cloud email + API token, or Data Center PAT)
+    1. In your workspace, go to **Apps**.
+    2. To call Jira only from your own automations, search for **Jira** and install it. To also expose the tools to Agent Creator agents, search for **Jira MCP** and install that instead: it imports the Jira app and adds the MCP endpoint.
+    3. Open the installed app instance and fill in the configuration fields below, then save the configuration.
 
-    ## Configuration
+    ## Configuration fields
+
+    The **Jira** app instance exposes these fields:
 
     | Field | Description |
     |-------|-------------|
-    | **Jira Base URL** | The instance URL: `https://yoursite.atlassian.net` (Cloud) or `https://jira.yourcompany.com` (Data Center). |
-    | **Deployment Type** | `cloud` or `datacenter`. |
-    | **Atlassian Email** | Cloud only: the Atlassian account email used with the API token. Stored as a workspace secret. |
-    | **API Token** | Cloud only: the Atlassian API token (Basic Auth). Stored as a workspace secret. |
-    | **Personal Access Token** | Data Center only: the PAT sent as a Bearer token. Stored as a workspace secret. |
+    | **Jira Base URL** | The instance URL, for example `https://yoursite.atlassian.net` for Cloud or `https://jira.example.com` for Data Center. |
+    | **Deployment Type** | `cloud` or `datacenter`. Any other value fails every call with `Invalid type`. |
+    | **Atlassian Email (Cloud)** | The Atlassian account email used with the API token. Stored as a workspace secret. |
+    | **API Token (Cloud)** | The Atlassian API token. Stored as a workspace secret. |
+    | **Personal Access Token (DC)** | The Data Center personal access token, sent as a Bearer token. Stored as a workspace secret. |
 
-    The connector resolves credentials with the following priority, so the same instance works for shared and per-user setups:
+    The **Jira MCP** app instance nests the same fields under **Jira Configuration** and adds one more:
+
+    | Field | Description |
+    |-------|-------------|
+    | **MCP API Key** | The key that authenticates MCP `tools/call` requests to this instance. Generate it from the connector's **API Key** page. Stored as a workspace secret. |
+
+    <Warning>
+      Without an **MCP API Key**, every `tools/call` request is rejected with `API key not configured. Generate one from the API Key page.` The MCP handshake methods (`initialize`, `notifications/initialized`, `tools/list`) stay open and are answered without a key: they disclose the server's tool list, never Jira content.
+    </Warning>
+
+    Which credential a given call uses is decided by the resolution order described in [Whose Jira identity the connector uses](#whose-jira-identity-the-connector-uses). In practice you will use one of these two:
 
     | Auth source | What you provide | Best for |
     |-------------|------------------|----------|
-    | Workspace config (default) | Base URL + type + Cloud email/API token or Data Center PAT | Shared workspace connection; all callers use the same Jira account |
-    | Per-user secrets | Call `configureJira` once per user | A personal Jira connection scoped to the calling user |
+    | Workspace configuration | Base URL, deployment type, and either the Cloud email plus API token or the Data Center personal access token | A shared workspace connection. All callers, including every agent, use the same Jira account. |
+    | Per-user secrets | One `configureJira` call per platform user | A personal Jira connection for automations that run as an identified user. Overrides the workspace configuration for that user. |
 
-    <Note>
-      Credentials are stored as workspace (or per-user) secrets and resolved server-side. Jira Cloud uses Basic Auth (email + API token); Jira Data Center uses a Bearer PAT.
-    </Note>
+    ## Available instructions
 
-    ## Available Instructions
+    Every instruction resolves credentials through the same order and returns the same envelope shape:
 
-    Every instruction resolves credentials from the workspace configuration (or per-user secrets).
+    ```yaml
+    operation: list          # create, read, update, delete, list, transition or configure
+    structuredData: { }      # the payload, described in the Returns column below
+    itemType: issue          # the kind of item returned
+    ```
 
-    ### Issues
+    Read your values from `structuredData`, for example `{{results.structuredData.issues}}`.
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `searchJira` | Search issues with a `jql` query; page with `maxResults`/`nextPageToken`, narrow with `fields`. | `{ issues: [{ key, fields }], nextPageToken }` |
-    | `getIssue` | Fetch a single issue by `issueKey` (e.g. `DEV-123`). | `{ key, fields: { summary, status, … } }` |
-    | `createIssue` | Create an issue from `projectKey`, `issueType`, `summary` (+ optional `description`, `priority`, `fields` map). | `{ id, key, self }` |
-    | `updateIssue` | Update an existing issue by `issueKey`; pass changed `fields`. | Empty (HTTP 204) |
-    | `deleteIssue` | Delete an issue by `issueKey`. | Empty (HTTP 204) |
+    ### Issue instructions
 
-    ### Field Discovery
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `searchJira` | Search issues with a required `jql` query; page with `maxResults` and `nextPageToken`, narrow with `fields`. | `{ issues, total, count, pagination, jql }` |
+    | `getIssue` | Fetch one issue by `issueKey`, with optional `fields` and `expand`. | `{ key, id, summary, description, status, priority, issueType, assignee, reporter, labels, created, updated, project }` |
+    | `createIssue` | Create an issue from `projectKey`, `issueType` and `summary`, plus optional `description`, `assignee`, `reporter`, `priority`, `labels`, `parentKey` and `fields`. | `{ key, id, self }` |
+    | `updateIssue` | Update an issue by `issueKey` with any of `summary`, `description`, `assignee`, `reporter`, `priority`, `labels` and `fields`. | `{ success, issueKey, updatedFields }` |
+    | `deleteIssue` | Delete an issue by `issueKey`; `deleteSubtasks: true` also deletes its sub-tasks. | `{ success, issueKey, deleted }` |
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listFields` | List or search Jira fields by `query`; `customOnly: true` restricts to custom fields. | `[{ id, name, custom, schema }]` |
-    | `listCreateIssueTypes` | List issue types available when creating issues in a project. | `{ issueTypes: [{ id, name }] }` |
-    | `getCreateIssueFields` | Get fields available on the create screen for a `projectKeyOrId` + `issueTypeId`. | `{ fields: [{ fieldId, required, schema }] }` |
+    ### Workflow instructions
 
-    ### Workflow
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `getTransitions` | Get available status transitions for an `issueKey`. | `{ issueKey, transitions, count }` |
+    | `transitionIssue` | Change an issue's status by `issueKey` and `transitionId`, with an optional `comment`. | `{ success, issueKey, transitionId }` |
+    | `addComment` | Add a comment to `issueKey`; `body` is the comment text. | `{ id, issueKey, author, created }` |
+    | `addAttachment` | Download `fileUrl` and attach it to `issueKey` as `filename`, with an optional `contentType`. | `{ issueKey, filename, attachments }` |
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `getTransitions` | Get available status transitions for an `issueKey`. | `{ transitions: [{ id, name, to }] }` |
-    | `transitionIssue` | Change an issue's status by `issueKey` + `transitionId`, with an optional `comment`. | Empty (HTTP 204) |
-    | `addComment` | Add a comment to an issue by `issueKey`; `body` is the comment text. | `{ id, body, author, created }` |
-    | `addAttachment` | Attach a file to an issue by `issueKey`. | `[{ id, filename, size }]` |
+    ### Project and field instructions
 
-    ### Projects
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `listProjects` | List accessible projects; `maxResults`, `startAt`, and `query` to filter by name (Cloud only). | `{ projects, total, count }` |
+    | `getProject` | Get a project by `projectKeyOrId`. | `{ id, key, name, description, projectTypeKey, lead, url }` |
+    | `listFields` | List or search fields with `query`, `customOnly`, `maxResults` and `startAt`. | `{ fields, total, count, query, customOnly, pagination }` |
+    | `listCreateIssueTypes` | List issue types available on the create screen for `projectKeyOrId`. `maxResults` defaults to `50`. | `{ issueTypes, total, count, projectKeyOrId }` |
+    | `getCreateIssueFields` | List fields on the create screen for `projectKeyOrId` and `issueTypeId`. `maxResults` defaults to `100`. | `{ fields, total, count, projectKeyOrId, issueTypeId }` |
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listProjects` | List projects accessible to the configured account. | `[{ id, key, name }]` |
-    | `getProject` | Get a project's details by key or id. | `{ id, key, name, projectTypeKey }` |
+    ### Credential instruction
 
-    ### Configuration
+    | Instruction | Description | `structuredData` |
+    |-------------|-------------|------------------|
+    | `configureJira` | Store Jira credentials in the calling platform user's secrets. Requires `baseUrl` and `type`, plus `email` and `apiToken` for `cloud` or `personalAccessToken` for `datacenter`. | `{ success, configuration: { baseUrl, type, email }, authMethod }` |
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `configureJira` | Store Jira credentials in the calling user's platform secrets (Cloud email + API token, or Data Center PAT). | `{ success, configuration: { baseUrl, type } }` |
+    <Warning>
+      Call `configureJira` only from an automation that receives the credential securely, for example from a form submission handled server-side. Never hard-code an API token or personal access token in a DSUL file, an agent prompt, or a committed workspace export.
+    </Warning>
 
-    <Note>
-      `Returns` shows the shape of the operation output.
-    </Note>
+    ## DSUL examples
 
-    ## DSUL Examples
-
-    **Search issues:**
+    Search issues:
 
     ```yaml
     - Jira.searchJira:
@@ -398,7 +427,7 @@ This connector is used by three different roles. Jump to the section that matche
       output: results
     ```
 
-    **Get issue details:**
+    Read one issue:
 
     ```yaml
     - Jira.getIssue:
@@ -406,13 +435,11 @@ This connector is used by three different roles. Jump to the section that matche
       output: issue
     ```
 
-    **Create an issue with a custom field:**
-
-    Jira custom fields must already exist and be available for the target project and issue type. Resolve the technical field id with `listFields`, then pass values through `fields`.
+    Create an issue with a custom field. The custom field must already exist and be available for the target project and issue type. Resolve the technical field id with `listFields`, then pass values through `fields`:
 
     ```yaml
     - Jira.listFields:
-        query: testPrismeField
+        query: Story Points
         customOnly: true
       output: fieldLookup
 
@@ -420,16 +447,17 @@ This connector is used by three different roles. Jump to the section that matche
         projectKey: KAN
         issueType: Task
         summary: Create issue with a custom labels field
+        labels:
+          - prisme-test
         fields:
           customfield_10104:
-            - prisme-test
             - label-type
       output: newIssue
     ```
 
-    If Jira rejects a custom field during creation, verify the field context and the create screen/layout. For team-managed projects the field must be added to the work-type layout; confirm availability with `listCreateIssueTypes` and `getCreateIssueFields` before creating.
+    If Jira rejects a custom field during creation, check the field context and the create screen. For team-managed projects the field must be added to the work-type layout; confirm availability with `listCreateIssueTypes` and `getCreateIssueFields` before creating.
 
-    **Transition an issue and comment:**
+    Transition an issue with a comment:
 
     ```yaml
     - Jira.transitionIssue:
@@ -439,7 +467,7 @@ This connector is used by three different roles. Jump to the section that matche
       output: result
     ```
 
-    **Add a comment:**
+    Add a comment:
 
     ```yaml
     - Jira.addComment:
@@ -447,47 +475,171 @@ This connector is used by three different roles. Jump to the section that matche
         body: "This issue has been reviewed."
       output: comment
     ```
+
+    Attach a file downloaded from a URL:
+
+    ```yaml
+    - Jira.addAttachment:
+        issueKey: DEV-123
+        fileUrl: "https://files.example.com/report.pdf"
+        filename: report.pdf
+        contentType: application/pdf
+      output: attachment
+    ```
   </Tab>
 </Tabs>
 
 ---
 
-## Error Handling
+## Verify the setup
 
-| HTTP Status | Error | Solution |
-|-------------|-------|----------|
-| 401 | Unauthorized | Verify the API token (Cloud) or PAT (Data Center) and the account email. |
-| 403 | Forbidden | Check the account's permissions on the target Jira project. |
-| 404 | Not Found | Verify the issue key, project key, or transition id exists and is visible to the account. |
-| 422 | Unprocessable | A field value is invalid or a required field is missing; resolve field ids with `listFields` / `getCreateIssueFields`. |
-| 429 | Rate Limited | Wait and retry. |
-| 500 | Server error | Transient Jira error; retry shortly. |
+Run these checks after configuring the connector, in order. The first two are read-only.
 
-### Common Issues
+<Steps>
+  <Step title="Verify the credential and base URL">
+    From a Builder automation, call `Jira.listProjects` with no arguments. A working configuration returns `structuredData.projects` with at least one project. An `Authentication failed` or `Not configured` envelope means the credential or base URL is wrong; see [Error handling](#error-handling).
+  </Step>
+  <Step title="Verify the deployment type">
+    Call `Jira.searchJira` with `jql: ORDER BY updated DESC` and `maxResults: 1`. If `type` does not match the instance, the call fails on a route that does not exist for that deployment: Cloud uses `/rest/api/3/search/jql`, Data Center uses `/rest/api/2/search`.
+  </Step>
+  <Step title="Verify the MCP endpoint">
+    Send a `tools/list` JSON-RPC request to the **MCP Endpoint**. It must return the 12 tools listed in [Available tools](#available-tools). This method needs no API key.
+  </Step>
+  <Step title="Verify tool execution and the API key">
+    From your agent, ask a read-only question such as "list my Jira projects". A rejected API key surfaces as a JSON-RPC error with code `-32001`; see [Error handling](#error-handling).
+  </Step>
+  <Step title="Verify write attribution">
+    Create one throwaway issue in a test project, then open it in Jira and check the **Reporter** field. It shows the configured service account, not the person who asked the agent. Delete the issue afterwards.
+  </Step>
+</Steps>
 
-**"Not configured" / "Jira not configured"**: No base URL or credential is set. Open the Jira app configuration and provide the base URL, deployment type, and the matching credential (Cloud email + API token, or Data Center PAT). Agent builders should confirm with the workspace owner that the connector is configured.
+## Error handling
 
-**"Missing credentials"**: The deployment type is set but the matching secret is empty: Cloud needs `email` + `apiToken`; Data Center needs `personalAccessToken`. Fill the missing field in the app configuration.
+Jira operations never throw. They return an envelope with `error`, `message` and, for HTTP failures, `status`. Check `{{result.error}}` before reading `structuredData`.
 
-**"Invalid type"**: `type` is neither `cloud` nor `datacenter`. Set it to one of those two values.
+| Status | `error` | Meaning and resolution |
+|--------|---------|------------------------|
+| 400 | `Bad request` | Invalid parameters. `searchJira` adds a JQL syntax hint, `transitionIssue` points you back to `getTransitions`, `createIssue` points at `projectKey`, the issue type name, and required fields. |
+| 401 | `Authentication failed` | The API token, personal access token or account email is wrong or revoked. Reconfigure the credential. |
+| 403 | `Access denied` | The account lacks permission on the target Jira project. Grant it in Jira. |
+| 404 | `Not found` | The issue key, project key or transition id does not exist or is not visible to the account. |
+| 429 | `Rate limited` | Jira is throttling the account. Wait and retry. |
+| Any other 4xx or 5xx | `Jira API error` | The provider response body is deliberately not returned, to avoid exposing sensitive metadata. Only the HTTP status is reported. |
+| None | `Network error` | The request to Jira failed before a response, for example a DNS or TLS failure on a Data Center host. |
 
-**"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`. Set the Scope to `context_id,agent_id,user_id` on the capability.
+Credential resolution fails before any HTTP call, with these envelopes:
 
-**Custom field rejected on create**: The field is not on the create screen for that project/issue type, or you used the wrong id. Resolve the id with `listFields` (`customOnly: true`), then confirm availability with `listCreateIssueTypes` and `getCreateIssueFields`. For team-managed projects, add the field to the work-type layout in Jira first.
+| `error` | `message` | Resolution |
+|---------|-----------|------------|
+| `Not configured` | `Jira not configured. Set baseUrl, type, and credentials in the app configuration, or provide them via headers.` | No base URL was found in any source. Fill in **Jira Base URL** in the app configuration. |
+| `Missing credentials` | `Cloud deployment requires email and apiToken in app configuration.` | **Deployment Type** is `cloud` but **Atlassian Email (Cloud)** or **API Token (Cloud)** is empty. |
+| `Missing credentials` | `Data Center deployment requires personalAccessToken in app configuration.` | **Deployment Type** is `datacenter` but **Personal Access Token (DC)** is empty. |
+| `Invalid type` | `Invalid Jira deployment type. Set config.type to 'cloud' or 'datacenter'.` | **Deployment Type** is neither `cloud` nor `datacenter`. |
+| `Missing type` | Explains that `type` must be `cloud` (with `baseUrl`, `email` and `apiToken`) or `datacenter` (with `baseUrl` and `personalAccessToken`). | A caller passed `authHeader` and `baseUrl` but omitted `type`. Pass `type` alongside them. |
 
-## External Resources
+## Common issues
+
+### Tool not found
+
+**Symptom:** the MCP call returns `_routeError: ToolNotFound` and the message `Tool not found:` followed by the name that was called.
+
+**Cause:** the tool name is not one of the 12 routed tools. The router accepts the bare name or the same name with a `jira_` prefix, and nothing else.
+
+**Owner:** agent builder.
+
+**Fix:** use an exact name from [Available tools](#available-tools). Names are case-sensitive, for example `searchJira`, not `searchjira`.
+
+**Verify:** call `tools/list` on the endpoint and compare the returned names.
+
+### API key not configured. Generate one from the API Key page.
+
+**Symptom:** every `tools/call` request fails with JSON-RPC error code `-32001`, while `tools/list` still works.
+
+**Cause:** the **Jira MCP** app instance has no **MCP API Key**.
+
+**Owner:** workspace builder.
+
+**Fix:** open the connector's **API Key** page, generate a key, and save the configuration.
+
+**Verify:** re-run a read-only tool call from the agent.
+
+### Missing or invalid API key header
+
+**Symptom:** `tools/call` fails with JSON-RPC error code `-32001` and one of these messages:
+
+```text
+Missing mcp-api-key header. Add header "mcp-api-key" with a valid API key.
+Invalid mcp-api-key. Check that the API key value is correct.
+```
+
+**Cause:** the capability wired into the agent sends no API key, or sends one that does not match the value stored on the app instance.
+
+**Owner:** agent builder, with the workspace builder who holds the key.
+
+**Fix:** copy the current key from the **Jira MCP** app instance and update the capability's configuration in the agent, then save the agent.
+
+**Verify:** re-run a read-only tool call from the agent.
+
+### A custom field is rejected on create
+
+**Symptom:** `createIssue` returns `Bad request` mentioning the field.
+
+**Cause:** the field is not on the create screen for that project and issue type, or the wrong id was used.
+
+**Owner:** workspace builder, with a Jira project admin.
+
+**Fix:** resolve the id with `listFields` using `customOnly: true`, then confirm availability with `listCreateIssueTypes` and `getCreateIssueFields`. For team-managed projects, add the field to the work-type layout in Jira first.
+
+**Verify:** re-run `getCreateIssueFields` for the project and issue type and confirm the field id appears in `structuredData.fields`.
+
+### Searches succeed but return no issues
+
+**Symptom:** `searchJira` returns `count: 0` for a JQL query that returns rows in the Jira UI.
+
+**Cause:** the configured service account lacks **Browse Projects** on those projects. Jira filters JQL results by the calling account's permissions instead of failing.
+
+**Owner:** Jira project admin.
+
+**Fix:** grant the service account **Browse Projects** on the target projects, or narrow the JQL to projects it can see.
+
+**Verify:** call `listProjects` and confirm the project appears in the result.
+
+## Rotate, revoke and remove
+
+The credential is a static token, so rotation and revocation are manual.
+
+- **Rotate the Jira credential.** Create a new API token or personal access token in Jira, paste it into **API Token (Cloud)** or **Personal Access Token (DC)**, save the configuration, verify with `listProjects`, then revoke the old token in Jira. Calls made between saving and revoking keep working, so revoke last.
+- **Rotate the MCP API key.** Generate a new key on the connector's **API Key** page and save, then update every agent capability that points at the endpoint. The old key stops working as soon as the new one is saved, so plan for a short interruption.
+- **Revoke access for one agent.** Remove the Jira capability from the agent and republish it. This connector has no per-agent allowlist, so removing the capability from the agent is the only revocation point short of rotating the key.
+- **Revoke a per-user connection.** Per-user credentials stored by `configureJira` live in that user's platform secrets under `jira_base_url`, `jira_type`, `jira_email`, `jira_api_token` and `jira_pat`. Clear those secrets, and revoke the underlying token in Jira.
+- **Offboard the service account.** Revoke its API token or personal access token in Jira first, then update the app configuration with the replacement account's credential. Issues, comments and transitions already attributed to the old account stay attributed to it in Jira history.
+- **Remove the connector.** Uninstall the **Jira MCP** app, then the **Jira** app, from the workspace's **Apps** page. Uninstalling removes the stored configuration and secrets from the workspace but does not revoke the Jira tokens: revoke them in Jira as well.
+
+Connector activity is observable in the workspace activity feed through the events the connector emits: `jira.issues.searched`, `jira.issue.read`, `jira.issue.created`, `jira.issue.updated`, `jira.issue.deleted`, `jira.issue.transitioned`, `jira.transitions.read`, `jira.comment.added`, `jira.attachment.added`, `jira.projects.listed`, `jira.project.read` and `jira.fields.listed`. These record what was done, not who asked: with a shared credential, attribution to an individual has to come from the agent conversation.
+
+## Migrate to the Jira connector
+
+Move to the [Jira](/apps-store/marketplace/connectors/jira) connector when you need per-user Atlassian identity, per-agent authorization, or the operations this connector does not cover (users, versions, components, agile boards and sprints). Expect these differences:
+
+- **Tool shape.** The 12 flat tools here become seven entity tools driven by an `action` argument, so agent prompts and any code that names tools must be rewritten.
+- **Identity.** The shared service account is replaced by per-user Atlassian OAuth, so Jira attributes writes to the person who asked. Jira permissions are then enforced per user, and a user who cannot see a project gets no results from it.
+- **Configuration.** The base URL, email, API token and personal access token fields are replaced by a deployment setting and an authentication mode configured in the connector's configuration app.
+
+Read the [Jira](/apps-store/marketplace/connectors/jira) page before starting: it lists the supported authentication modes, the Atlassian OAuth scopes, and the Data Center constraints.
+
+## External resources
 
 <CardGroup cols={2}>
   <Card title="Jira Cloud REST API" icon="book" href="https://developer.atlassian.com/cloud/jira/platform/rest/v3/">
-    Official API documentation for Jira Cloud.
+    Reference for the Jira Cloud platform REST API v3, used when **Deployment Type** is `cloud`.
   </Card>
   <Card title="Jira Data Center REST API" icon="book" href="https://docs.atlassian.com/software/jira/docs/api/REST/latest/">
-    Official API documentation for Jira Data Center.
+    Reference for the Jira Data Center REST API v2, used when **Deployment Type** is `datacenter`.
   </Card>
-  <Card title="Atlassian API Tokens" icon="key" href="https://id.atlassian.com/manage-profile/security/api-tokens">
-    Generate API tokens for Jira Cloud.
+  <Card title="Atlassian API tokens" icon="key" href="https://id.atlassian.com/manage-profile/security/api-tokens">
+    Create and revoke the API tokens used for Jira Cloud.
   </Card>
-  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
-    Learn how Agent Creator agents consume MCP tools in Prisme.ai.
+  <Card title="Agent capabilities" icon="robot" href="/products/agent-factory/capabilities">
+    How Agent Creator agents consume MCP tools in Prisme.ai.
   </Card>
 </CardGroup>

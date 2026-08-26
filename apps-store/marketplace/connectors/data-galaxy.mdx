@@ -1,6 +1,6 @@
 ---
 title: 'DataGalaxy'
-description: 'Read and write the DataGalaxy data catalog from Agent Creator agents and Builder workflows'
+description: 'Read and write the DataGalaxy data catalog from Agent Creator agents and Builder workflows, with a workspace-owned integration token'
 ---
 
 <img
@@ -12,19 +12,19 @@ description: 'Read and write the DataGalaxy data catalog from Agent Creator agen
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The DataGalaxy app exposes the [DataGalaxy](https://www.datagalaxy.com) data catalog API. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. It covers the full catalog (dictionary with sources, containers, structures and fields, glossary, usages, data processings) plus links, comments and tasks, and a global search across every object.
+The DataGalaxy app exposes the [DataGalaxy](https://www.datagalaxy.com) data catalog API. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call through twelve entity tools, or as a Builder app whose instructions you call directly from DSUL. It covers the dictionary (sources, containers, structures, fields), the glossary (properties), usages, data processings, links, comments and tasks, plus a global search across the catalog.
 
-Authentication is a single **DataGalaxy Personal Access Token (PAT) or integration token** stored in the workspace configuration: the connector exchanges it server-side for a short-lived access token. The credential is never exposed to the agent; agents are identified by the capability **Scope** `context_id,agent_id,user_id` and the connector resolves the token from its own app configuration.
+It runs in the **tenant app-instance context**: each workspace stores its own DataGalaxy **integration token**, resolved server-side and never exposed to the agent. Agents are identified by the capability **Scope** `context_id,agent_id,user_id` and gated by a per-workspace authorized-agents allowlist.
 
 <CardGroup cols={3}>
   <Card title="Catalog dictionary" icon="book">
-    Create, read, update and delete sources, containers, structures and fields, with the generic object operations for any entity type.
+    Create, read, update and delete sources, containers, structures and fields, plus generic object operations that work on any entity type.
   </Card>
-  <Card title="Glossary, usages & data processing" icon="diagram-project">
-    Manage glossary properties (business terms, concepts, indicators), usages (applications, dashboards, datasets) and data flows / processings.
+  <Card title="Glossary, usages and data processing" icon="diagram-project">
+    Manage glossary properties, usages and data processings with the same list, get, create, update and delete actions.
   </Card>
-  <Card title="Links & collaboration" icon="link">
-    Relate any two catalog entities, post comments and manage tasks across the catalog, with full-text search over everything.
+  <Card title="Links and collaboration" icon="link">
+    Relate any two catalog entities, post comments, manage tasks, and run a full-text search across the catalog.
   </Card>
 </CardGroup>
 
@@ -33,53 +33,66 @@ Authentication is a single **DataGalaxy Personal Access Token (PAT) or integrati
 This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to read and write the DataGalaxy catalog. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to read and write the DataGalaxy catalog. Opens the **Agent builder** section.
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and want to publish DataGalaxy as a reusable capability. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and want to publish DataGalaxy as a reusable capability. Opens the **Platform admin** section.
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call DataGalaxy operations directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations (DSUL) that call DataGalaxy operations directly. Opens the **Workspace builder** section.
   </Card>
 </CardGroup>
 
+## Operating model and runtime identity
+
+This connector supports **one credential mode**: a DataGalaxy **integration token** stored in the consuming workspace. There is no OAuth flow, no per-user delegated identity and no platform-wide credential.
+
+| Property | Value |
+|---|---|
+| Credential | One DataGalaxy integration token per installed app instance, stored in the workspace secret `dataGalaxyAuth` as `{ mode, token, baseUrl }` with `mode` set to `apiKey`. |
+| Identity seen by DataGalaxy | The DataGalaxy account that owns the integration token. Every agent, every end user and every automation acts as that single account. |
+| Permission enforcement | DataGalaxy, based on the space rights granted to the integration token. |
+| Prisme.ai authorization gate | The `dataGalaxyAuthorizedAgents` allowlist, checked on every MCP `tools/call`. |
+| Audit attribution | DataGalaxy records the integration-token account, not the individual Prisme.ai user. |
+
+<Warning>
+  The integration token is a **shared service credential**. Anything the token can read or write in DataGalaxy, every allowlisted agent can read or write, and DataGalaxy audit entries name the token's account rather than the person who prompted the agent. Grant the token the narrowest space rights that cover your use case, and keep the **Authorized agents** allowlist explicit instead of enabling **Allow all agents** in production.
+</Warning>
+
 ## Prerequisites
 
-- A **DataGalaxy account** with API access to the workspaces (client spaces) you intend to manage.
-- A **Personal Access Token (PAT)** or **integration token**: generated in DataGalaxy under your account / integration settings. The connector exchanges it server-side for a short-lived access token.
-- Your **DataGalaxy API base URL**: default `https://api.datagalaxy.com` (override only for a region-specific or self-hosted instance).
-- The token's user must hold the DataGalaxy roles needed for the operations you call (read for list/get, write for create/update/delete on the relevant workspace version).
+- A **DataGalaxy account** with access to the workspaces (client spaces) you intend to manage.
+- A DataGalaxy **integration token**. A **Client Admin** creates it in the DataGalaxy web application under **Administration > Integration**. A newly created token has no metamodel access: a workspace admin must then grant it **Admin** or **Access** rights per workspace under **Settings > Access**. Read rights cover the `list` and `get` actions; write rights are required for `create`, `update` and `delete`.
+- Your **DataGalaxy API base URL**. The connector defaults to `https://api.datagalaxy.com`; copy the exact base URL of your tenant from the DataGalaxy web application if it differs.
+- A Prisme.ai workspace where you can install apps and where the connector's configuration app can write workspace secrets. That requires the `owner`, `editor` or `admin` role on the workspace, as listed in [Before you begin](/apps-store/marketplace/connectors/install-in-workspace#before-you-begin).
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
-  **Goal:** DataGalaxy is a **per-workspace** connector: each workspace pastes its own DataGalaxy token in the app configuration (see the *Workspace builder* tab), so there is **no platform-wide credential to provision** and no central OAuth client.
+  **Goal:** DataGalaxy is a **per-workspace** connector: each workspace stores its own DataGalaxy integration token through the connector's configuration app (see [Workspace builder](#workspace-builder-dsul)), so there is **no platform-wide credential to provision** and **no central OAuth client**.
 
   <Note>
-    There is no shared DataGalaxy credential. The PAT / integration token always lives in the consuming workspace's app configuration and is resolved server-side. A Governance capability you publish here points at a specific workspace's MCP endpoint; that workspace still owns the credential.
+    There is no shared DataGalaxy credential. The integration token always lives in the consuming workspace's secrets, written by the connector's configuration app. The platform operator has nothing to register centrally.
   </Note>
 
-  ## Declare the capability in AI Governance (optional)
+  ## Declare the capability (optional)
 
-  <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) the **DataGalaxy** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint** (the workspace running the connector), and set its **Scope** to:
+  If you want agent builders to pick DataGalaxy from the capability catalog instead of pasting an MCP endpoint URL by hand, publish it as a reusable **capability**. The generic procedure is documented once in [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability); the DataGalaxy configuration app exposes both paths:
 
-      ```text
-      context_id,agent_id,user_id
-      ```
+  - **Organization-wide.** The configuration app's **Capabilities catalog** section, visible only to `org:owner` and `org:admin`, publishes the connector with **Add to catalog** (or **Update catalog entry** when one already exists). See [Publish the connector to the Capabilities catalog](/apps-store/marketplace/connectors/declare-capability#publish-the-connector-to-the-capabilities-catalog).
+  - **By hand.** Author the **DataGalaxy** entry yourself in **Governance > Org > Capabilities**. See [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance).
 
-      The `agent_id` in the scope is what lets the connector identify the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
-    </Step>
-  </Steps>
+  Either way, the entry points at the MCP endpoint of the app instance running the connector — the configuration app renders the exact URL under **MCP endpoint** — and carries the **Scope**:
+
+  ```text
+  context_id,agent_id,user_id
+  ```
+
+  The `agent_id` in the scope is what lets the connector identify and authorize the calling agent; see [What the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means). Catalog visibility then follows your organization's existing roles; there is **no per-capability role grant** for this tenant-context connector. DataGalaxy authenticates with a server-side integration token, so the catalog entry carries **no** `oauth2` authorization block.
+
+  To smoke-test the wiring, enable the capability on a test agent, allowlist that agent in the connector's configuration app, then ask the agent to run the `catalog` tool's `listWorkspaces` action. A successful read confirms the capability, the allowlist and the integration token at once.
 
   <Warning>
-    Declaring the capability makes the connector **available**; it does not provision any credential. This connector resolves a single DataGalaxy token from the consuming workspace's app configuration; there is **no OAuth auth-config JSON** to attach in Governance and **no per-user OAuth flow**.
+    Declaring the capability makes the connector **available** to agent builders; it does not authorize a specific agent and does not provision any DataGalaxy credential. Per-agent gating remains the configuration app's **Authorized agents** allowlist, and the integration token still lives in the workspace running the connector. There is **no OAuth auth-config JSON** to attach here.
   </Warning>
 </Accordion>
 
@@ -89,74 +102,98 @@ This connector is used by three different roles. Jump to the section that matche
   <Tab title="Agent builder (Agent Creator)">
     ## Agent builder
 
-    **Goal:** let an agent you build in Agent Creator read and write the DataGalaxy catalog through MCP tools.
+    **Goal:** let an agent you build in Agent Creator read and write the DataGalaxy catalog through twelve MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the DataGalaxy app in a workspace (see the *Workspace builder* tab). Optionally, a *Platform admin* may have published a DataGalaxy capability in AI Governance (see the *Platform admin setup* accordion above).
+      Before an agent can call the connector, a workspace builder must have installed and configured the DataGalaxy app in a workspace (see [Workspace builder](#workspace-builder-dsul)). Optionally, a platform administrator may have published a DataGalaxy capability to the Capabilities catalog (see [Platform admin setup](#platform-admin-governance-one-time-platform-setup)).
     </Note>
 
-    The DataGalaxy credential is resolved server-side from the app configuration, never exposed to the agent. Your agent is identified by the `agent_id` that Agent Creator injects through the capability *Scope*.
+    Your agent is authorized two ways at once: it is identified by the `agent_id` that Agent Creator injects through the capability **Scope**, and that agent must appear in the connector's **Authorized agents** allowlist. The DataGalaxy integration token itself is resolved server-side from the workspace configuration and never reaches the agent.
 
     <Steps>
       <Step title="Install and configure the connector in a workspace">
-        Follow the *Workspace builder* tab: install **DataGalaxy** in a workspace and provide the PAT / integration token and (optionally) the base URL.
+        Install **DataGalaxy** in a workspace and enter the integration token (and the base URL if it differs from the default) in its configuration app, as described under [Workspace builder](#workspace-builder-dsul) and in [Configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app).
+      </Step>
+      <Step title="Allowlist your agent">
+        In the same configuration app, open **Authorized agents**, tick your agent and save. Enabling **Allow all agents** disables the per-agent gate entirely; avoid it in production. See [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector).
       </Step>
       <Step title="Add the MCP capability to your agent">
-        In your agent, add a capability pointing at that workspace's **MCP Endpoint** URL, and set its **Scope** to:
+        Selecting **Install capability** on your agent's row in **Authorized agents** allowlists the agent and wires the tool in one action; see [Install the capability on one agent](/apps-store/marketplace/connectors/declare-capability#install-the-capability-on-one-agent). To wire it by hand instead, add a capability pointing at that app instance's MCP endpoint URL and set its **Scope** to:
 
         ```text
         context_id,agent_id,user_id
         ```
 
-        The `agent_id` is what lets the connector identify your agent.
+        Without `agent_id` in the scope, every call is rejected with an explicit "calling agent could not be identified" message.
       </Step>
-      <Step title="Brief the agent">
-        Tell the agent the tools exist and when to reach for them. Copy-pasteable starter:
-
-        ```text
-        You have access to the DataGalaxy MCP server. Use it whenever the user asks about catalog content: sources, containers, structures (tables), fields, glossary terms, usages, data processings, links, comments or tasks. Each tool takes an `action` argument selecting the concrete operation. Examples: "Find all glossary terms tagged GDPR" (catalog search), "List the structures of the Snowflake source", "Add a comment to the customer table", "Create a task to review the orders dataset". DataGalaxy IDs use the DoubleUuid format and most operations need a `versionId` (use the catalog tool's listWorkspaces / listVersions actions to discover it). Prefer calling a tool over guessing, and confirm with the user before any destructive action (delete a structure, remove a glossary term).
-        ```
-
-        Refine the trigger keywords (source names, glossary domains, project tags) so the agent reliably picks up the right intent in your context.
+      <Step title="Verify with a read-only call">
+        Ask the agent to list the DataGalaxy workspaces, then the versions of one of them. Two successful reads confirm the allowlist, the token exchange and the base URL before you attempt any write.
       </Step>
     </Steps>
 
     <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The DataGalaxy token is still resolved server-side from the installed app configuration.
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the MCP endpoint URL. The agent must still be allowlisted, and its identity must still be propagated so the connector can read its `agent_id`.
     </Note>
 
-    ## Available Tools
+    ## Brief the agent in its system prompt
 
-    Tools are **entity-grouped**: each tool takes an `action` argument selecting the concrete operation, plus the per-action parameters. Most operations need a `versionId` (a DataGalaxy workspace version); discover it with the `catalog` tool.
+    Every tool takes an `action` argument, and almost every action is scoped to a DataGalaxy workspace version. A short brief avoids the agent guessing:
 
-    | Tool | Description |
-    |------|-------------|
-    | `catalog` | Catalog metadata + global search. Actions: `listWorkspaces`, `listVersions`, `listAttributes`, `search`. |
-    | `sources` | Sources: top-level dictionary entities. Actions: `list`, `get`, `create`, `update`, `delete`. |
-    | `containers` | Containers (models, directories). Actions: `list`, `get`, `create`, `update`, `delete`. |
-    | `structures` | Structures (tables, datasets, views). Actions: `list`, `get`, `create`, `update`, `delete`. |
-    | `fields` | Fields (columns of a structure). Actions: `list`, `get`, `create`, `update`, `delete`. |
-    | `properties` | Glossary properties (business terms, concepts, indicators, …). Actions: `list`, `get`, `create`, `update`, `delete`. |
-    | `usages` | Usages (applications, dashboards, datasets, …). Actions: `list`, `get`, `create`, `update`, `delete`. |
-    | `dataProcessings` | Data flows and processings. Actions: `list`, `get`, `create`, `update`, `delete`. |
-    | `links` | Relationships between entities. Actions: `get`, `create`, `delete`. |
-    | `comments` | Comments on an entity (rich-text HTML). Actions: `list`, `create`. |
-    | `tasks` | Tasks assigned across the catalog. Actions: `list`, `create`, `update`. |
-    | `objects` | Generic object operations for any entity type. Actions: `get`, `update`. |
+    ```text
+    You have access to the DataGalaxy MCP server (tools: catalog, sources, containers, structures,
+    fields, properties, usages, dataProcessings, links, comments, tasks, objects). Each tool takes an
+    `action` argument selecting the concrete operation.
+    Almost every action needs a `versionId`. Discover it first: catalog/listWorkspaces, then
+    catalog/listVersions with that workspaceId. Never invent a versionId or an entity id.
+    Use catalog/search for open-ended lookups, then the entity tool to read or edit the object.
+    Prefer list and get actions. Before any create, update or delete, restate the target entity and
+    the exact change, and wait for explicit user confirmation.
+    ```
 
-    ## Output Formats
+    Refine the trigger keywords (source names, glossary domains, project tags) so the agent reliably picks up the right intent in your context.
 
-    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
+    <Note>
+      **Restricting to read-only (least privilege).** The connector exposes write actions on every tool and has no read-only switch. The boundary is enforced by DataGalaxy: grant the integration token **Access** rather than **Admin** rights on the target workspaces, so write attempts fail at the provider. Reinforce it in the agent prompt, but treat the DataGalaxy space rights as the real control.
+    </Note>
 
-    - **`verbose`** (default): human-readable text optimized for LLM consumption
-    - **`structured`**: concise machine-readable JSON in `structuredContent`
-    - **`both`**: the structured payload, with its JSON also rendered as text
+    ## Available tools
 
-    ## Tool Details
+    Tools are **entity-grouped**: each tool takes an `action` argument selecting the concrete operation, plus the per-action parameters. Most actions require a `versionId` (a DataGalaxy workspace version); discover it with the `catalog` tool.
 
-    ### catalog: search
+    | Tool | Actions |
+    |------|---------|
+    | `catalog` | `listWorkspaces`, `listVersions`, `listAttributes`, `search` |
+    | `sources` | `list`, `get`, `create`, `update`, `delete` |
+    | `containers` | `list`, `get`, `create`, `update`, `delete` |
+    | `structures` | `list`, `get`, `create`, `update`, `delete` |
+    | `fields` | `list`, `get`, `create`, `update`, `delete` |
+    | `properties` | `list`, `get`, `create`, `update`, `delete` |
+    | `usages` | `list`, `get`, `create`, `update`, `delete` |
+    | `dataProcessings` | `list`, `get`, `create`, `update`, `delete` |
+    | `links` | `get`, `create`, `delete` |
+    | `comments` | `list`, `create` |
+    | `tasks` | `list`, `create`, `update` |
+    | `objects` | `get`, `update` |
 
-    Global full-text search across every catalog object.
+    <Note>
+      `type`, `status`, `columnDataType` and link type codes are free-form strings passed straight to DataGalaxy. The accepted values depend on your client space metamodel; use the `catalog` tool's `listAttributes` action, or the [DataGalaxy API reference](https://developers.datagalaxy.com/docs/api/overview), to discover them instead of guessing.
+    </Note>
+
+    ## Output formats
+
+    Every tool accepts an `outputFormat` argument:
+
+    | Value | Response |
+    |-------|----------|
+    | `verbose` | Default. A formatted text summary of the operation in the MCP text content. |
+    | `structured` | The DataGalaxy payload serialized as JSON in the text content, and the same payload in `structuredContent`. |
+    | `both` | Identical to `structured` in this connector. |
+
+    Set `outputFormat` to `structured` whenever the agent needs to reason over the raw DataGalaxy payload.
+
+    ## Tool details
+
+    ### catalog
 
     ```json
     {
@@ -164,59 +201,52 @@ This connector is used by three different roles. Jump to the section that matche
       "arguments": {
         "action": "search",
         "query": "customer",
-        "versionId": "abcd-1234...",
-        "limit": 50,
-        "filters": { "Status": ["Validated"] }
+        "versionId": "00000000-0000-0000-0000-000000000000",
+        "limit": 50
       }
     }
     ```
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | Yes | One of `listWorkspaces`, `listVersions`, `listAttributes`, `search`. |
-    | `query` | For search | Search query text. |
-    | `versionId` | No | Scope the search to a workspace version. |
-    | `limit` | No | Max results. |
-    | `filters` | No | Attribute filter object. |
-    | `workspaceId` | For listVersions | Workspace (client space) id. |
+    | `action` | Yes | `listWorkspaces`, `listVersions`, `listAttributes` or `search`. |
+    | `workspaceId` | For `listVersions` | DataGalaxy workspace (client space) id. |
+    | `query` | For `search` | Full-text search query. |
+    | `versionId` | No | Scopes a `search` to one workspace version. |
+    | `limit` | No | Maximum number of search results. |
+    | `filters` | No | Attribute filter object forwarded to the DataGalaxy [advanced search](https://developers.datagalaxy.com/docs/api/guides/basics/advanced-search). |
 
-    ### sources: create
+    `listWorkspaces` and `listAttributes` take no parameters.
 
-    ```json
-    {
-      "name": "sources",
-      "arguments": {
-        "action": "create",
-        "versionId": "abcd-1234...",
-        "name": "Customer Database",
-        "type": "Database",
-        "technicalName": "customer_db",
-        "owners": ["alice@example.com"],
-        "status": "Validated"
-      }
-    }
-    ```
+    ### sources, containers, structures and fields
+
+    The four dictionary tools share the same action set and the same attribute parameters. They differ in their id parameter and in what a `create` attaches to.
+
+    | Tool | Id parameter | `create` attaches to | Extra parameters |
+    |------|--------------|----------------------|------------------|
+    | `sources` | `sourceId` | `versionId` only | none |
+    | `containers` | `containerId` | `parentId` | `parentId` also filters `list` |
+    | `structures` | `structureId` | `parentId` | `parentId` also filters `list` |
+    | `fields` | `fieldId` | `structureId` | `columnDataType`, `size`; `parentId` filters `list` |
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | Yes | One of `list`, `get`, `create`, `update`, `delete`. |
-    | `versionId` | Yes | Workspace version id. |
-    | `name` | For create | Source display name. |
-    | `type` | For create | Entity type code (DataGalaxy-specific). |
-    | `sourceId` | For get/update/delete | Source id (UUID). |
-    | `technicalName` / `description` / `summary` / `status` / `owners` / `stewards` / `tags` | No | Standard catalog attributes (`status`: `Proposed`, `InRevision`, `Validated`, `InValidation`, `Obsolete`). |
-
-    ### fields: create
-
-    Creates a field (column) under a structure.
+    | `action` | Yes | `list`, `get`, `create`, `update` or `delete`. |
+    | `versionId` | Yes | Workspace version id, required by every action. |
+    | *id parameter* | For `get`, `update`, `delete` | The entity id, as listed above. |
+    | `parentId` / `structureId` | For `create` | Parent entity the new object is created under. |
+    | `limit`, `page` | No | Pagination for `list`. |
+    | `includeAttributes` | No | Comma-separated attribute names to include in `list` results. |
+    | `name`, `type` | For `create` | Display name and entity type code. `type` is not accepted by `update`. |
+    | `technicalName`, `description`, `summary`, `status`, `owners`, `stewards`, `tags` | No | Catalog attributes accepted by `create` and `update`. `owners`, `stewards` and `tags` are arrays of strings. |
 
     ```json
     {
       "name": "fields",
       "arguments": {
         "action": "create",
-        "versionId": "abcd-1234...",
-        "structureId": "struct-id",
+        "versionId": "00000000-0000-0000-0000-000000000000",
+        "structureId": "11111111-1111-1111-1111-111111111111",
         "name": "email",
         "type": "Column",
         "columnDataType": "varchar",
@@ -225,52 +255,44 @@ This connector is used by three different roles. Jump to the section that matche
     }
     ```
 
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `action` | Yes | One of `list`, `get`, `create`, `update`, `delete`. |
-    | `versionId` | Yes | Workspace version id. |
-    | `structureId` | For create | Parent structure id. |
-    | `name` / `type` | For create | Field name and type code (`Column`, `Field`). |
-    | `columnDataType` | No | Free-form data type (e.g. `varchar`, `int`, `date`). |
-    | `size` | No | Column size. |
-    | `fieldId` | For get/update/delete | Field id (UUID). |
+    ### properties, usages and data processings
 
-    ### links: create
+    `properties` (glossary entries), `usages` and `dataProcessings` share the dictionary action set with one difference: `list` accepts `versionId`, `limit`, `page` and `includeAttributes` but no `parentId`. Their id parameters are `propertyId`, `usageId` and `dataProcessingId`; `create` attaches the new object to a `parentId`.
+
+    ### links
 
     ```json
     {
       "name": "links",
       "arguments": {
         "action": "create",
-        "versionId": "abcd-1234...",
-        "fromId": "field-id",
-        "toId": "business-term-id",
-        "type": "implements"
+        "versionId": "00000000-0000-0000-0000-000000000000",
+        "fromId": "22222222-2222-2222-2222-222222222222",
+        "toId": "33333333-3333-3333-3333-333333333333",
+        "type": "IsImplementedBy"
       }
     }
     ```
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | Yes | One of `get`, `create`, `delete`. |
+    | `action` | Yes | `get`, `create` or `delete`. |
     | `versionId` | Yes | Workspace version id. |
-    | `fromId` | Yes | Source entity id. |
-    | `toId` | For create/delete | Target entity id. |
-    | `type` | For create | Link type code. |
-    | `linkType` | For delete | Link type code to remove. |
+    | `fromId` | Yes | Origin entity id. `get` returns every link starting from it. |
+    | `toId` | For `create`, `delete` | Target entity id. |
+    | `type` | For `create` | Link type code. |
+    | `linkType` | For `delete` | Link type code of the link to remove. |
 
-    ### comments: create
-
-    Rich-text HTML is supported in the `content` field.
+    ### comments
 
     ```json
     {
       "name": "comments",
       "arguments": {
         "action": "create",
-        "versionId": "abcd-1234...",
-        "entityId": "object-id",
-        "content": "<p>Reviewed and validated.</p>"
+        "versionId": "00000000-0000-0000-0000-000000000000",
+        "entityId": "44444444-4444-4444-4444-444444444444",
+        "content": "Reviewed and validated."
       }
     }
     ```
@@ -280,160 +302,162 @@ This connector is used by three different roles. Jump to the section that matche
     | `action` | Yes | `list` or `create`. |
     | `versionId` | Yes | Workspace version id. |
     | `entityId` | Yes | Entity the comment is attached to. |
-    | `content` | For create | Comment body (rich-text HTML supported). |
+    | `content` | For `create` | Comment body. |
+
+    ### tasks
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `list`, `create` or `update`. |
+    | `versionId` | For `create`, `update` | Workspace version id. |
+    | `entityId` | For `create`, `update` | Entity the task is attached to. |
+    | `taskId` | For `update` | Task id. |
+    | `title`, `description`, `status`, `assignee` | No | Task fields accepted by `create` and `update`. |
+    | `type` | No | Task type code, accepted by `create` only. |
+
+    The `list` action takes no parameters and returns the tasks the integration token can see.
+
+    ### objects
+
+    Use `objects` when you hold an entity id but not its type.
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | `get` or `update`. |
+    | `versionId` | Yes | Workspace version id. |
+    | `objectId` | Yes | Id of any catalog object. |
+    | `name`, `technicalName`, `description`, `summary`, `status`, `owners`, `stewards`, `tags` | No | Attributes accepted by `update`. |
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
     ## Workspace builder
 
-    **Goal:** install the connector in a workspace, paste your DataGalaxy token, and call catalog operations from your automations.
+    **Goal:** install the connector in a workspace, store your DataGalaxy integration token and the agent allowlist through its configuration app, and call catalog operations from your automations.
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **DataGalaxy** and install it
-    3. Open the app instance configuration and fill in the **Authentication Token** (and the base URL if it differs from the default)
+    DataGalaxy follows the standard App + MCP installation flow: [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace) documents it end to end, from [Install the app](/apps-store/marketplace/connectors/install-in-workspace#install-the-app) through [Copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint) and [Verify the installation](/apps-store/marketplace/connectors/install-in-workspace#verify-the-installation). The DataGalaxy-specific values to use at each point:
+
+    | Step in the shared flow | DataGalaxy value |
+    |---|---|
+    | [Install the app](/apps-store/marketplace/connectors/install-in-workspace#install-the-app) | Search for **DataGalaxy** in **Apps**. |
+    | [Configure credentials](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app) | One mode only. Paste the **Integration token**, and fill **Base URL (optional)** only if your tenant is not on `https://api.datagalaxy.com`. Then select **Save authentication**. |
+    | Test the credential | **Test connection**. The connector exchanges the integration token for an access token and lists your DataGalaxy workspaces, so a success confirms both the token and the base URL. It reports `Connection OK — API key valid.` |
+    | [Authorize the agents](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector) | Open **Authorized agents**, tick each Agent Creator agent allowed to call this instance, then select **Save allowlist**. Leave the list empty if only DSUL automations call the connector. |
+    | [Copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint) | Rendered under **MCP endpoint**. Hand it to the agent builder with the Scope `context_id,agent_id,user_id`. |
+
+    There is **no OAuth callback URL** to register for DataGalaxy, and no per-user connection to complete: the integration token is the only credential.
 
     ## Configuration
 
     | Field | Description |
     |-------|-------------|
-    | **DataGalaxy API Base URL** | Base URL of the DataGalaxy API (default `https://api.datagalaxy.com`). |
-    | **Authentication Token** | DataGalaxy PAT or integration token, stored as a workspace secret. Exchanged server-side for a short-lived access token. |
-    | **MCP Endpoint** | Auto-populated on install: the URL of the MCP endpoint for this instance, used when wiring the connector into an agent (see the *Agent builder* tab). |
+    | **Configuration app** | Auto-populated on install (`configAppUrl`, read-only). Opens the credential form, the connection test, the **Authorized agents** allowlist, and the MCP endpoint URL for this app instance. |
 
-    The connector resolves its credential through the following order at call time:
+    The configuration app drives everything; the app instance itself has no per-field credential form. It writes two workspace secrets, both resolved server-side at call time:
 
-    | Source | What you provide | Best for |
-    |--------|------------------|----------|
-    | Workspace configuration (default) | The **Authentication Token** in the app config | Standard setup: the token is exchanged server-side and cached |
-    | `configureDataGalaxy` session credential | A PAT (and optional base URL) stored in the session via the `configureDataGalaxy` instruction | Per-session override without changing the app config |
-    | `Authorization: Bearer` header | A caller-supplied access token (optional `x-datagalaxy-url` for the base URL) | Externally-minted / short-lived tokens |
+    | Secret | Shape | Purpose |
+    |--------|-------|---------|
+    | `dataGalaxyAuth` | `{ mode: "apiKey", token, baseUrl }` | The DataGalaxy integration token and API base URL. |
+    | `dataGalaxyAuthorizedAgents` | Comma-separated agent ids, or `*` | Agents allowed to call the MCP endpoint. `*` allows every agent. |
 
-    <Note>
-      All IDs use DataGalaxy's DoubleUuid format and `versionId` refers to a workspace version id returned by `listVersions`.
-    </Note>
+    This connector uses a single auth mode:
 
-    ## Available Instructions
-
-    Every instruction resolves credentials from the workspace configuration.
-
-    ### Search & Workspaces
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `search` | Full-text search across all DataGalaxy objects by name, technical name, description or summary; optional `versionId`, `limit`, `filters`. | `{ results: [{ id, name, type, … }] }` |
-    | `listWorkspaces` | List all DataGalaxy workspaces (client spaces) accessible to the token. | `[{ id, name, … }]` |
-    | `listVersions` | List versions of a workspace by `workspaceId`. | `[{ id, versionName, … }]` |
-    | `listAttributes` | List all attributes (custom and built-in) defined in your client space. | `[{ attributeKey, dataType, … }]` |
-
-    ### Generic Object Operations
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `getObject` | Get any object by `versionId` + `objectId`. | The object resource `{ id, name, type, … }` |
-    | `updateObject` | Update any object by `versionId` + `objectId` (`name`, `technicalName`, `description`, `summary`, `status`, `owners`, `stewards`, `tags`). | The updated object resource |
-
-    `status` accepts `Proposed`, `InRevision`, `Validated`, `InValidation`, `Obsolete`.
-
-    ### Sources
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listSources` | List sources for a `versionId` (`limit`, `page`, `includeAttributes`). | `[{ id, name, … }]` |
-    | `getSource` | Get a source by `versionId` + `sourceId`. | The source resource |
-    | `createSource` | Create a source from `name` + `type` (+ standard attributes). | The created source |
-    | `updateSource` | Update a source by `sourceId`. | The updated source |
-    | `deleteSource` | Delete a source by `sourceId`. | Empty / acknowledgement |
-
-    ### Containers
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listContainers` | List containers for a `versionId` (optional `parentId`). | `[{ id, name, … }]` |
-    | `getContainer` | Get a container by `containerId`. | The container resource |
-    | `createContainer` | Create a container under `parentId` from `name` + `type` (`Model`, `Directory`, `Equipment`). | The created container |
-    | `updateContainer` | Update a container by `containerId`. | The updated container |
-    | `deleteContainer` | Delete a container by `containerId`. | Empty / acknowledgement |
-
-    ### Structures
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listStructures` | List structures for a `versionId` (optional `parentId`). | `[{ id, name, … }]` |
-    | `getStructure` | Get a structure by `structureId`. | The structure resource |
-    | `createStructure` | Create a structure under `parentId` from `name` + `type` (`Table`, `Document`, `File`, `SubStructure`, `Tag`, `View`). | The created structure |
-    | `updateStructure` | Update a structure by `structureId`. | The updated structure |
-    | `deleteStructure` | Delete a structure by `structureId`. | Empty / acknowledgement |
-
-    ### Fields
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listFields` | List fields for a `versionId` (optional `parentId`). | `[{ id, name, … }]` |
-    | `getField` | Get a field by `fieldId`. | The field resource |
-    | `createField` | Create a field under `structureId` from `name` + `type` (`Column`, `Field`), with `columnDataType` + `size`. | The created field |
-    | `updateField` | Update a field by `fieldId`. | The updated field |
-    | `deleteField` | Delete a field by `fieldId`. | Empty / acknowledgement |
-
-    ### Glossary Properties
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listProperties` | List glossary properties for a `versionId`. | `[{ id, name, … }]` |
-    | `getProperty` | Get a property by `propertyId`. | The property resource |
-    | `createProperty` | Create a property under `parentId` from `name` + `type` (`Universe`, `BusinessDomain`, `ReferenceData`, `Concept`, `Indicator`, `BusinessTerm`, …). | The created property |
-    | `updateProperty` | Update a property by `propertyId`. | The updated property |
-    | `deleteProperty` | Delete a property by `propertyId`. | Empty / acknowledgement |
-
-    ### Usages
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listUsages` | List usages for a `versionId`. | `[{ id, name, … }]` |
-    | `getUsage` | Get a usage by `usageId`. | The usage resource |
-    | `createUsage` | Create a usage under `parentId` from `name` + `type` (`Application`, `Dashboard`, `DataSet`, `Report`, `Process`, …). | The created usage |
-    | `updateUsage` | Update a usage by `usageId`. | The updated usage |
-    | `deleteUsage` | Delete a usage by `usageId`. | Empty / acknowledgement |
-
-    ### Data Processing
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listDataProcessing` | List data processings for a `versionId`. | `[{ id, name, … }]` |
-    | `getDataProcessing` | Get a data processing by `dataProcessingId`. | The data processing resource |
-    | `createDataProcessing` | Create a data processing under `parentId` from `name` + `type` (`DataFlow`, `DataProcessing`). | The created data processing |
-    | `updateDataProcessing` | Update a data processing by `dataProcessingId`. | The updated data processing |
-    | `deleteDataProcessing` | Delete a data processing by `dataProcessingId`. | Empty / acknowledgement |
-
-    ### Links
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `getLinks` | Get all links (relationships) from an entity by `fromId`. | `[{ fromId, toId, type, … }]` |
-    | `createLink` | Create a link from `fromId` to `toId` with a `type`. | The created link |
-    | `deleteLink` | Delete a link by `fromId` + `toId` + `linkType`. | Empty / acknowledgement |
-
-    ### Comments
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listComments` | List comments on an entity by `entityId`. | `[{ id, content, author, … }]` |
-    | `createComment` | Create a comment on `entityId` with `content` (rich-text HTML). | The created comment |
-
-    ### Tasks
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listTasks` | List tasks assigned to the current user. | `[{ id, title, status, … }]` |
-    | `createTask` | Create a task on `entityId` (`title`, `description`, `type`, `assignee`, `status`). | The created task |
-    | `updateTask` | Update a task by `taskId` (`title`, `description`, `status`, `assignee`). | The updated task |
+    | Auth mode | What you provide | Best for |
+    |-----------|------------------|----------|
+    | **Integration token** (`apiKey`) | A DataGalaxy integration token and, optionally, a tenant-specific base URL | Every workspace; each stores its own token, and no platform-level setup is required |
 
     <Note>
-      `Returns` shows the shape of the operation output.
+      The base URL is normalized before use: a trailing `/v2` and any trailing slashes are stripped, so `https://api.datagalaxy.com`, `https://api.datagalaxy.com/` and `https://api.datagalaxy.com/v2` are equivalent.
     </Note>
 
-    ## DSUL Examples
+    ### How the token is exchanged and cached
+
+    The connector never sends the integration token to a catalog endpoint. On the first call of a session it performs `GET {baseUrl}/v2/credentials` with the integration token as the bearer, and uses the returned access token for the actual request. DataGalaxy access tokens expire after two hours; the connector caches one for 110 minutes, keyed on a fingerprint of the integration token, so replacing the token immediately invalidates the cached access token. If a request still returns `401`, the connector re-exchanges once and retries the request.
+
+    ## Available instructions
+
+    Every instruction resolves the integration token from the workspace configuration and returns the raw DataGalaxy payload. On a credential failure they return `{ error: "..." }` instead of raising, so branch on `{{result.error}}` after each call.
+
+    ### Search and catalog metadata
+
+    | Instruction | Description |
+    |-------------|-------------|
+    | `search` | Full-text search across the catalog. Accepts `query`, `versionId`, `limit`, `filters`. |
+    | `listWorkspaces` | List the DataGalaxy workspaces (client spaces) the token can access. No parameters. |
+    | `listVersions` | List the versions of a workspace by `workspaceId`. |
+    | `listAttributes` | List every attribute defined in the client space. No parameters. |
+
+    ### Generic object operations
+
+    | Instruction | Description |
+    |-------------|-------------|
+    | `getObject` | Get any object by `versionId` and `objectId`. |
+    | `updateObject` | Update any object by `versionId` and `objectId` (`name`, `technicalName`, `description`, `summary`, `status`, `owners`, `stewards`, `tags`). |
+
+    ### Dictionary
+
+    | Instruction | Description |
+    |-------------|-------------|
+    | `listSources` | List sources for a `versionId` (`limit`, `page`, `includeAttributes`). |
+    | `getSource` | Get a source by `versionId` and `sourceId`. |
+    | `createSource` | Create a source under `versionId` from `name` and `type`, plus the standard attributes. |
+    | `updateSource` | Update a source by `sourceId`. `type` cannot be changed. |
+    | `deleteSource` | Delete a source by `sourceId`. |
+    | `listContainers` | List containers for a `versionId`, optionally filtered by `parentId`. |
+    | `getContainer` | Get a container by `containerId`. |
+    | `createContainer` | Create a container under `parentId`. |
+    | `updateContainer` | Update a container by `containerId`. |
+    | `deleteContainer` | Delete a container by `containerId`. |
+    | `listStructures` | List structures for a `versionId`, optionally filtered by `parentId`. |
+    | `getStructure` | Get a structure by `structureId`. |
+    | `createStructure` | Create a structure under `parentId`. |
+    | `updateStructure` | Update a structure by `structureId`. |
+    | `deleteStructure` | Delete a structure by `structureId`. |
+    | `listFields` | List fields for a `versionId`, optionally filtered by `parentId`. |
+    | `getField` | Get a field by `fieldId`. |
+    | `createField` | Create a field under `structureId`, with `columnDataType` and `size`. |
+    | `updateField` | Update a field by `fieldId`. |
+    | `deleteField` | Delete a field by `fieldId`. |
+
+    ### Glossary, usages and data processing
+
+    | Instruction | Description |
+    |-------------|-------------|
+    | `listProperties` | List glossary properties for a `versionId`. |
+    | `getProperty` | Get a property by `propertyId`. |
+    | `createProperty` | Create a property under `parentId`. |
+    | `updateProperty` | Update a property by `propertyId`. |
+    | `deleteProperty` | Delete a property by `propertyId`. |
+    | `listUsages` | List usages for a `versionId`. |
+    | `getUsage` | Get a usage by `usageId`. |
+    | `createUsage` | Create a usage under `parentId`. |
+    | `updateUsage` | Update a usage by `usageId`. |
+    | `deleteUsage` | Delete a usage by `usageId`. |
+    | `listDataProcessing` | List data processings for a `versionId`. |
+    | `getDataProcessing` | Get a data processing by `dataProcessingId`. |
+    | `createDataProcessing` | Create a data processing under `parentId`. |
+    | `updateDataProcessing` | Update a data processing by `dataProcessingId`. |
+    | `deleteDataProcessing` | Delete a data processing by `dataProcessingId`. |
+
+    ### Links, comments and tasks
+
+    | Instruction | Description |
+    |-------------|-------------|
+    | `getLinks` | List every link starting from `fromId` in a `versionId`. |
+    | `createLink` | Create a link from `fromId` to `toId` with a `type`. |
+    | `deleteLink` | Delete the link identified by `versionId`, `fromId`, `linkType` and `toId`. |
+    | `listComments` | List the comments on `entityId` in a `versionId`. |
+    | `createComment` | Add a comment with `content` on `entityId`. |
+    | `listTasks` | List tasks. No parameters. |
+    | `createTask` | Create a task on `entityId` (`title`, `description`, `type`, `assignee`, `status`). |
+    | `updateTask` | Update a task by `versionId`, `entityId` and `taskId` (`title`, `description`, `status`, `assignee`). |
+
+    <Note>
+      There is no App-mode instruction for deleting a comment, a task or an arbitrary object; those operations are not exposed by this connector in either mode.
+    </Note>
+
+    ## DSUL examples
 
     ### Discover a version, then search the catalog
 
@@ -450,7 +474,7 @@ This connector is used by three different roles. Jump to the section that matche
         output: results
     ```
 
-    ### Create a Source
+    ### Create a source
 
     ```yaml
     - DataGalaxy.createSource:
@@ -461,11 +485,10 @@ This connector is used by three different roles. Jump to the section that matche
         description: Production customer database
         owners:
           - alice@example.com
-        status: Validated
         output: source
     ```
 
-    ### Create a Structure and a Field
+    ### Create a structure and a field
 
     ```yaml
     - DataGalaxy.createStructure:
@@ -484,52 +507,93 @@ This connector is used by three different roles. Jump to the section that matche
         output: field
     ```
 
-    ### Link Two Entities and Comment
+    ### Link two entities and comment
 
     ```yaml
     - DataGalaxy.createLink:
         versionId: '{{versionId}}'
         fromId: '{{field.id}}'
         toId: '{{businessTermId}}'
-        type: implements
+        type: IsImplementedBy
     - DataGalaxy.createComment:
         versionId: '{{versionId}}'
         entityId: '{{field.id}}'
-        content: <p>Linked to business term.</p>
+        content: Linked to a business term.
+    ```
+
+    ### Handle a credential failure
+
+    ```yaml
+    - DataGalaxy.listWorkspaces:
+        output: workspaces
+    - conditions:
+        '{{workspaces.error}}':
+          - emit:
+              event: catalog.sync.failed
+              payload:
+                reason: '{{workspaces.error}}'
+          - break: {}
     ```
   </Tab>
 </Tabs>
 
 ---
 
-## Error Handling
+## Error handling
 
-| HTTP Status | Error | Solution |
-|-------------|-------|----------|
-| 401 | Unauthorized | Verify the PAT / integration token and `baseUrl`. The token is exchanged server-side; an invalid token fails the exchange. |
-| 403 | Forbidden | Check the DataGalaxy role and scopes on the workspace version. |
-| 404 | Not Found | Verify `versionId`, `objectId` and any parent IDs (DoubleUuid format). |
-| 422 | Unprocessable | A required attribute is missing or an enum value (`type`, `status`) is invalid. |
-| 429 | Rate Limited | Back off and retry with exponential delay. |
-| 500 | Server Error | Transient DataGalaxy error; retry shortly. |
+DataGalaxy HTTP failures are mapped to these messages, where `<operation>` names the failing operation:
 
-### Common Issues
+| Status | Message | What to check |
+|--------|---------|---------------|
+| `400` | `Bad request while <operation>: ...` | A malformed body, an unknown attribute or an invalid type code. |
+| `401` | `Authentication failed while <operation>. Your token may be expired or invalid.` | The integration token. The connector already retried once with a fresh access token. |
+| `404` | `Resource not found while <operation>.` | `versionId`, the entity id and any parent id. |
+| `429` | `Rate limit exceeded while <operation>. Please wait before retrying.` | DataGalaxy rate limiting; back off before retrying. |
+| `500` | `DataGalaxy server error while <operation>.` | A transient DataGalaxy failure; retry shortly. |
+| Any other status | `Error <status> while <operation>: ...` | Statuses such as `403` and `422` fall here and carry the DataGalaxy message verbatim. |
 
-**"DataGalaxy not configured"**: No token could be resolved. Complete the app install with a valid token, call `configureDataGalaxy` to store one in the session, or pass an `Authorization: Bearer` header.
+### Common issues
 
-**"DataGalaxy credentials exchange failed"**: The provided PAT / integration token was rejected when exchanging it for an access token. Re-generate the token in DataGalaxy and re-paste it in the app config; confirm the base URL points at the right region.
+Authorization and installation failures that every App + MCP connector shares — an empty **Configuration app** field, an allowlist secret left holding an unresolved binding, calls denied for a ticked agent — are covered in [Troubleshooting](/apps-store/marketplace/connectors/install-in-workspace#troubleshooting). The entries below are the DataGalaxy-specific ones.
 
-**"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`. Set the Scope to `context_id,agent_id,user_id` on the capability.
+- **"This agent is not authorized to use this connector"**: the calling agent is not in the allowlist. Open the configuration app, tick the agent under **Authorized agents** (or enable **Allow all agents**) and save. The message includes the agent id that was rejected.
+- **"The calling agent could not be identified"**: the MCP capability **Scope** does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allowlist the agent. See [What the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means).
+- **"DataGalaxy is not configured for this workspace"**: no integration token could be resolved. Open the connector's configuration app and enter the token. There is no session credential, no request header and no platform-level fallback: the workspace secret is the only source.
+- **"DataGalaxy credentials exchange failed"**: DataGalaxy rejected the integration token when exchanging it for an access token. The message carries the HTTP status. Confirm the token is still valid in **Administration > Integration**, and that the base URL points at your tenant.
+- **"Authenticated call failed"** in the connection test: the token exchange succeeded but listing DataGalaxy workspaces did not. The token most likely has no space rights yet; grant it **Admin** or **Access** on the target workspaces under **Settings > Access**.
+- **"DataGalaxy request build failed for ... Missing required path param"**: a path parameter was omitted, most often `versionId` or an entity id. Resolve the id first with `catalog` → `listWorkspaces` → `listVersions`, or with a `list` action.
+- **"Direct calls are not allowed"** with HTTP `403`: an entity tool endpoint was called directly instead of through the connector's MCP endpoint. Use the MCP endpoint, or use the App-mode instructions from DSUL.
+- **"Unknown tool"** or **"Unknown action"**: the tool or `action` name does not exist. The error message lists the accepted values for that tool.
+- **Empty results from `search`**: the search is scoped to `versionId` when you pass one. Drop it to search every version, or confirm the version id with `catalog` → `listVersions`.
 
-**`versionId` errors**: Most operations are scoped to a workspace version. Use the `catalog` tool's `listWorkspaces` then `listVersions` actions (or the `listWorkspaces` / `listVersions` instructions) to obtain a valid `versionId` before calling entity operations.
+## Rotate, revoke and remove
 
-## External Resources
+The mechanics are the shared ones, in [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall). What is specific to DataGalaxy:
+
+- **Rotate the integration token**: create a new token in DataGalaxy under **Administration > Integration**, grant it the same space rights, paste it in the connector's configuration app and save, then delete the old token in DataGalaxy. The connector keys its access-token cache on a fingerprint of the integration token, so the new token takes effect on the next call with no restart. There is no per-user consent to renew.
+- **Revoke an agent's access**: remove the agent from **Authorized agents** in the configuration app and save. Subsequent `tools/call` requests from that agent are rejected. If **Allow all agents** is enabled, disable it first, otherwise the per-agent gate stays off.
+- **Revoke all access immediately**: delete the integration token in DataGalaxy. Every subsequent call fails the credentials exchange. Cached access tokens are session-scoped and expire within 110 minutes.
+- **Uninstall the connector**: uninstall the DataGalaxy app from **Apps**. Uninstalling does not delete the workspace secrets it provisioned; clear `dataGalaxyAuth` and `dataGalaxyAuthorizedAgents` in the workspace secrets afterwards, delete the corresponding integration token in DataGalaxy, and remove the DataGalaxy entry from the Capabilities catalog if you published one.
+
+## External resources
 
 <CardGroup cols={2}>
-  <Card title="DataGalaxy API" icon="book" href="https://apidocs.datagalaxy.com">
-    Official DataGalaxy API documentation.
+  <Card title="Install a connector in your workspace" icon="puzzle-piece" href="/apps-store/marketplace/connectors/install-in-workspace">
+    The shared workspace builder flow: install, configure credentials, allowlist agents, copy the MCP endpoint, verify, rotate.
+  </Card>
+  <Card title="Declare a connector capability" icon="plug" href="/apps-store/marketplace/connectors/declare-capability">
+    Wire DataGalaxy onto one agent, or publish it to your organization's Capabilities catalog.
+  </Card>
+  <Card title="DataGalaxy developer documentation" icon="book" href="https://developers.datagalaxy.com/docs/api/overview">
+    Official DataGalaxy API guides: authentication, pagination, advanced search and entity models.
+  </Card>
+  <Card title="DataGalaxy API reference" icon="code" href="https://api.datagalaxy.com/v2/documentation">
+    Interactive reference for the v2 endpoints this connector calls.
+  </Card>
+  <Card title="Connector architecture" icon="diagram-project" href="/apps-store/marketplace/connectors/architecture">
+    How App+MCP connectors resolve credentials, identify agents and expose tools.
   </Card>
   <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
-    Learn how Agent Creator agents consume MCP tools in Prisme.ai.
+    How Agent Creator agents consume MCP tools and capabilities in Prisme.ai.
   </Card>
 </CardGroup>

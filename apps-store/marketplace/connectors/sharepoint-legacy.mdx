@@ -1,10 +1,12 @@
 ---
 title: 'SharePoint (legacy)'
-description: 'Browse and download files from SharePoint document libraries'
+description: 'Browse SharePoint Online sites, document libraries and files from Builder automations and MCP tool calls, with Microsoft Graph application credentials or per-user delegated OAuth'
 ---
 
 <Note>
-  This is the **legacy SharePoint connector**, superseded by the new **[SharePoint](/apps-store/marketplace/connectors/sharepoint)** connector (App+MCP, tenant-context, per-user Microsoft Entra OAuth). Use the new SharePoint connector for new work; it adds sites/drives/items/search/permissions/lists/directory tools, central or tenant OAuth, and per-agent authorization. This page is kept for reference only.
+  This is the **legacy** SharePoint connector. It is built from two workspaces, **Sharepoint** (`sharepoint-app`) and **Sharepoint MCP** (`sharepoint-mcp`), and it authenticates either with Azure application credentials (from the app configuration, from request headers, or stored per user) or with a per-user delegated OAuth connection held by the Sharepoint MCP workspace.
+
+  It is superseded by the **[SharePoint](/apps-store/marketplace/connectors/sharepoint)** connector (App+MCP, tenant app-instance context, central or tenant Microsoft Entra OAuth, with `sites`, `drives`, `items`, `search`, `permissions`, `lists`, `directory`, `workbook`, `documents` and `dataset` entity tools). Use the SharePoint connector for any new work. This page is kept for existing installations and for planning the move.
 </Note>
 
 <img
@@ -16,306 +18,634 @@ description: 'Browse and download files from SharePoint document libraries'
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The SharePoint connector provides access to Microsoft SharePoint Online document libraries via the Microsoft Graph API, enabling AI agents and automations to browse folders, list files, and download content.
+The legacy SharePoint connector exposes Microsoft SharePoint Online document libraries through the [Microsoft Graph](https://learn.microsoft.com/en-us/graph/overview) REST API (v1.0). It is read-only: it lists sites, drives, folders and files, reads item metadata, and downloads file content. No instruction and no tool creates, updates or deletes anything in SharePoint.
+
+It can be consumed two ways: as a Builder app whose instructions you call directly from DSUL, or as a remote MCP server that **Agent Creator** agents call as tools.
 
 <CardGroup cols={3}>
-  <Card title="Browse Structure" icon="folder-tree">
-    List sites, drives, and folder hierarchies
+  <Card title="Browse the hierarchy" icon="folder-tree">
+    List sites, document libraries (drives), folders and files, with pagination and recursive traversal.
   </Card>
-  <Card title="File Access" icon="file">
-    Download files with metadata for change detection
+  <Card title="Read files" icon="file">
+    Read item metadata and download content as text or base64, by identifier or from a SharePoint URL.
   </Card>
-  <Card title="Access Control" icon="shield">
-    Per-user permission validation (PBAV) for secure access
+  <Card title="Probe per-user access" icon="shield">
+    Check, with the calling user's own delegated token, which files that user is actually allowed to read.
   </Card>
 </CardGroup>
 
+## Who is this for?
+
+This connector involves three roles. Each section below is self-contained; start with the one that matches yours.
+
+<CardGroup cols={3}>
+  <Card title="Workspace builder" icon="puzzle-piece" href="#configure-the-connector">
+    You install **Sharepoint** in a workspace, fill in its configuration, and call its instructions from DSUL.
+  </Card>
+  <Card title="Agent builder" icon="robot" href="#usage-as-mcp">
+    You build agents in **Agent Creator** and attach the Sharepoint MCP endpoint as a tool.
+  </Card>
+  <Card title="Microsoft Entra admin" icon="shield-halved" href="#prerequisites">
+    You register the Azure application, grant Graph permissions, add the redirect URI, and grant admin consent.
+  </Card>
+</CardGroup>
+
+Both consumption surfaces are documented in the same tab set: [Usage as App](#usage-as-app) for the Builder instructions you call from DSUL, and [Usage as MCP](#usage-as-mcp) for the tools agents call.
+
+## How the connector is built
+
+Two workspaces cooperate. Knowing which one holds which setting saves most of the configuration guesswork.
+
+| Workspace | Slug | Responsibility |
+|---|---|---|
+| Sharepoint | `sharepoint-app` | Graph wrappers: token acquisition, site, drive, children, item and download calls, throttling retry, recursive tree building. Published as the **Sharepoint** app and installed into consuming workspaces. |
+| Sharepoint MCP | `sharepoint-mcp` | Protocol wrapper: the JSON-RPC MCP endpoint, the tool and resource catalog, the delegated OAuth flow (authorize, callback, refresh, disconnect, status) and the `connect-sharepoint` page. It imports **Sharepoint** and delegates every Graph call to it. |
+
+Sharepoint MCP also declares `registerWorkspace: true`, which publishes it in the platform workspaces registry so Knowledges can discover its MCP endpoint. Deploying and registering that workspace is a platform administrator task, documented in [Deploy the SharePoint connector for Knowledges](/self-hosting/configuration/ai-knowledge-sharepoint-connector).
+
+## Choose an authentication mode
+
+Decide before you configure anything, because the modes differ in runtime identity, in what an administrator must approve, and in which files are reachable.
+
+<CardGroup cols={2}>
+  <Card title="Application mode (client credentials)" icon="building">
+    One Azure application acts for every caller. The runtime identity is the application itself, not a person, and Graph grants it every site the application permissions cover. Best for content indexing, scheduled jobs and shared libraries.
+  </Card>
+  <Card title="Delegated mode (per-user OAuth)" icon="user-check">
+    Each end user signs in to Microsoft once from the connect page. The runtime identity is that user, and Graph enforces exactly what the user is allowed to see. Best for agents that answer for the signed-in person.
+  </Card>
+</CardGroup>
+
+| Aspect | Application mode | Delegated mode |
+|---|---|---|
+| Graph permission type | Application | Delegated |
+| Runtime identity seen by Microsoft | The Azure application (service principal) | The signed-in end user |
+| Admin consent | Required | Required only if the tenant blocks user consent |
+| Reach | Every site and library the granted application permissions cover | Only the sites and files the connected user can already open |
+| Who signs in | Nobody, the token is machine to machine | Each user, once, then silent refresh |
+| Available on the Builder surface | Yes | No |
+| Available on the MCP surface | Yes | Yes |
+| Token acquisition | `client_credentials` grant, scope `https://graph.microsoft.com/.default` | Authorization code with PKCE (`S256`), refresh token stored for 90 days |
+| Audit attribution | All actions attributed to the application | Actions attributed to the individual user |
+| Enables `validateUserAccessDelegated` | No | Yes |
+
+<Warning>
+  Application mode is a **shared credential**. Every caller that can reach the connector acts with the same Azure application, and Microsoft's audit logs cannot tell one Prisme.ai user from another. Application permissions such as `Sites.Read.All` grant read access to **every** site collection in the tenant. Scope the registration with [Microsoft's sites selected permission model](https://learn.microsoft.com/en-us/graph/permissions-reference#sitesselected) if you need to limit it, and keep the workspace `editor` role limited to the people allowed to change the Azure secrets.
+</Warning>
+
+The Sharepoint app also carries a third, historical path: a resource owner password credentials (ROPC) grant driven by the `usingDelegation` configuration object. See [Resource owner password credentials](#resource-owner-password-credentials) before considering it.
+
 ## Prerequisites
 
-- An **Azure AD Application** registered in your tenant
-- **Application permissions** granted:
-  - `Sites.Read.All` - Read sites and files
-  - `Files.Read.All` - Read file content
-  - `GroupMember.Read.All` - For PBAV group membership checks (optional)
-- **Admin consent** granted for these permissions
+<Tabs>
+  <Tab title="Application mode">
+    - A **Microsoft 365 / SharePoint Online** tenant, and an application registered in [Microsoft Entra ID](https://entra.microsoft.com) under **App registrations**.
+    - A **client secret** created on that registration under **Certificates & secrets**. Copy its value at creation time, it is shown once.
+    - The **Directory (tenant) ID** and the **Application (client) ID** of the registration.
+    - Microsoft Graph **application** permissions:
 
-<Note>
-  For Knowledges document sync with per-user access control, see the dedicated [SharePoint Connector for Knowledges](/products/ai-knowledge/connectors) documentation.
-</Note>
+      | Graph permission | Unlocks |
+      |---|---|
+      | `Sites.Read.All` | Site discovery, drive listing, folder and file listing, item metadata |
+      | `Files.Read.All` | File content download |
 
----
+    - **Admin consent** granted for those permissions by a Global Administrator or Privileged Role Administrator.
+
+    <Note>
+      The `configureSharePoint` tool description also mentions `GroupMember.Read.All`. No automation in this connector calls a group membership endpoint, so that permission is not required for any operation described on this page.
+    </Note>
+  </Tab>
+
+  <Tab title="Delegated mode">
+    - The same Microsoft 365 tenant and Entra registration, with a **client secret**. The delegated flow sends `client_secret` during the token exchange, so the registration must be a confidential client and the redirect URI must be registered under the **Web** platform.
+    - A **redirect URI** added to the registration, pointing at the `oauthCallback` webhook of the workspace that hosts **Sharepoint MCP**:
+
+      ```text
+      <api-url>/workspaces/<workspace-id>/webhooks/oauthCallback
+      ```
+
+      Replace `<api-url>` with your environment's platform API URL, for example `https://api.studio.prisme.ai/v2` on production, and `<workspace-id>` with the identifier of the workspace hosting Sharepoint MCP. A mismatch makes Microsoft return `AADSTS50011`.
+
+    - Microsoft Graph **delegated** permissions matching the scope string the connect flow requests. The shipped configuration requests:
+
+      ```text
+      openid profile email offline_access Sites.Read.All Files.Read.All User.Read
+      ```
+
+    - Either the tenant allows end users to consent to those delegated permissions, or an administrator grants consent once for the whole tenant.
+    - Every end user needs a SharePoint Online licence and their own access to the target sites.
+
+    <Note>
+      The same application registration can serve both modes. Only the **permission type** differs: application permissions for application mode, delegated permissions for delegated mode.
+    </Note>
+  </Tab>
+</Tabs>
+
+## Configure the connector
+
+Perform these steps as a workspace builder with the `editor` role on the workspace.
+
+<Steps>
+  <Step title="Install the Sharepoint app">
+    In your workspace, open **Apps**, search for **Sharepoint**, and install it. The instance is named `Sharepoint` by default; that name is the DSUL prefix you call later, for example `Sharepoint.listSites`.
+  </Step>
+  <Step title="Fill in the Sharepoint app configuration">
+    Open the app instance configuration and set the fields you need. The configuration schema declares no display titles for the credential fields, so the form shows the keys themselves.
+
+    | Key | Required | Purpose |
+    |---|---|---|
+    | `clientId` | Yes | Application (client) ID of the Entra registration. |
+    | `clientSecret` | No | Client secret value. Rendered as a password field. |
+    | `tenantId` | No | Directory (tenant) ID, used as the authority at `https://login.microsoftonline.com/<tenantId>`. |
+    | `siteId` | No | Default site identifier, in the form `hostname,siteCollectionId,siteId`. Can be used instead of `siteUrl`. |
+    | `siteUrl` | No | Default site URL. Can be used instead of `siteId`; `getFileTree` converts it to a Graph site path and resolves the identifier. |
+    | `debug` | No | **Send debug events**. Emits `debug-*` events into the workspace while troubleshooting. |
+    | `usingDelegation` | No | **Using authentication with delegation**: a **Username** and **Password** pair used only by the ROPC instruction. Leave empty. |
+
+    Select **Save**. `clientId`, `clientSecret` and `tenantId` together are what `ensureAccessToken` falls back to when a caller passes no `accessToken`; if any one of them is missing, calls fail with `No access token provided and app config (clientId, tenantId, clientSecret) is incomplete. Cannot authenticate.`
+  </Step>
+  <Step title="Store the Azure values as workspace secrets">
+    Rather than typing the client secret into the configuration form, store it in **Secrets** and reference it from the configuration. The Sharepoint MCP workspace declares four secrets for exactly this purpose:
+
+    | Secret | Title | Purpose |
+    |---|---|---|
+    | `azureClientId` | **Azure Client ID** | Application (client) ID. |
+    | `azureClientSecret` | **Azure Client Secret** | Client secret value. Rendered as a password field. |
+    | `azureTenant` | **Azure Tenant ID** | Directory (tenant) ID. |
+    | `azureSiteId` | **Default SharePoint Site ID** | Optional default site identifier, in the form `hostname,siteCollectionId,siteId`. |
+  </Step>
+  <Step title="Configure Sharepoint MCP, for the MCP surface only">
+    If agents will call the connector as tools, the workspace hosting **Sharepoint MCP** needs its own configuration. It ships without a configuration schema, so you edit these keys directly in the workspace configuration:
+
+    | Key | Purpose |
+    |---|---|
+    | `sharepoint.clientId`, `sharepoint.clientSecret`, `sharepoint.tenant` | Workspace-level application credentials, used when no other credential source resolves. |
+    | `sharepoint.siteId` | Default site identifier used when a tool call passes no `siteId`. |
+    | `oauth.clientId`, `oauth.clientSecret`, `oauth.tenant` | Delegated OAuth client used by the connect flow. |
+    | `oauth.scopes` | The space-separated scope string requested at connect time. |
+    | `oauth.mode` | Set to `multi_tenant` to authorize against the `organizations` endpoint instead of `oauth.tenant`. |
+    | `mcpTools`, `mcpResources` | The catalog returned by `tools/list` and `resources/list`. |
+
+    Reference the secrets rather than pasting values, for example `clientId: '{{secret.azureClientId}}'`. Select **Save**.
+  </Step>
+  <Step title="Optional: override credentials per group or per organization">
+    Two list-valued keys let one Sharepoint MCP workspace serve several Azure tenants:
+
+    - `credentialsByGroup`: each entry carries a `group` matched against the caller's `user.groups`.
+    - `credentialsByOrg`: each entry carries an `org` matched against the caller's `session.org.slug`.
+
+    Both entry shapes accept `clientId`, `clientSecret`, `tenant`, `scopes` and `mode`. A group match is evaluated first and wins over an organization match; the first matching entry is used. Set `mode: delegated` on an entry to forbid the client-credentials fallback for those callers: they must connect through OAuth, and any other call is refused with `Delegated auth required`.
+  </Step>
+</Steps>
+
+## Connect a Microsoft account in delegated mode
+
+End users connect once from the `connect-sharepoint` page hosted by the Sharepoint MCP workspace. The page is reachable at `<pages-url>/connect-sharepoint`, where `<pages-url>` is the pages URL of that workspace. It carries the `public` label, so it loads without workspace access, but the flow itself requires a signed-in Prisme.ai user.
+
+<Steps>
+  <Step title="Open the connect page">
+    Sign in to Prisme.ai first. Without a session the OAuth webhook answers HTTP `401` with `Authentication required. Please log in to Prisme.ai first.`
+
+    If the delegated client is not configured, the page shows `OAuth is not configured. Contact the workspace administrator.` instead of a button.
+  </Step>
+  <Step title="Select Connect with Microsoft">
+    When the page loads, it generates a PKCE code verifier and challenge (`S256`) and a CSRF `state`, stores both in the user scope, and builds the Microsoft authorization URL. The **Connect with Microsoft** button links straight to `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize`.
+
+    If your organization is configured with `mode: delegated`, the page also shows `Your organization requires OAuth authentication to access SharePoint.`
+  </Step>
+  <Step title="Sign in and consent">
+    Sign in with your Microsoft account and approve the requested permissions. Microsoft redirects back to the `oauthCallback` webhook of the Sharepoint MCP workspace.
+  </Step>
+  <Step title="Let the callback store the tokens">
+    The callback validates `state`, exchanges the code with the PKCE verifier at `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`, and stores:
+
+    - `sp_delegated_token`: the access token, as a user-scoped platform secret, with a time to live equal to `expires_in`.
+    - `sp_refresh_token`: the refresh token, as a user-scoped platform secret, with a time to live of `7776000` seconds (90 days).
+    - `user.sharepoint.oauth`: metadata only, holding `expiresAt`, `tokenType`, `scope` and `authMethod: delegated`.
+
+    The callback also deletes any client credentials previously stored for that user (`sp_client_secret` and the cached `sp_cc_token`), so a person is connected through exactly one method at a time. It then emits `sharepoint.oauth.connected` and returns you to the connect page.
+  </Step>
+  <Step title="Verify the connection">
+    The connect page shows `Successfully connected — you can now use SharePoint with your personal permissions.` and then `Connected — delegated access is active.` on subsequent visits, alongside a **Disconnect** button. This is the observable success state to check before reporting a problem elsewhere.
+  </Step>
+</Steps>
+
+When the access token nears expiry, the connector exchanges the stored refresh token for a new one without user interaction, and stores a rotated refresh token if Microsoft returns one. Tokens are held as platform secrets and never written into user metadata.
+
+## Resource owner password credentials
+
+The Sharepoint app ships one instruction, `auth/getAccessTokenWithDelegation` (slug `authgetAccessTokenWi`), that performs a `password` grant against `https://login.microsoftonline.com/<tenantId>/oauth2/v2.0/token` using the `usingDelegation.username` and `usingDelegation.password` configuration fields, requesting the scope `.default`. It returns a raw access token and is called by no other instruction.
+
+<Warning>
+  This path stores an end user's password in the app configuration and bypasses multi-factor authentication and conditional access. [Microsoft advises against the resource owner password credentials grant](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth-ropc). Do not enable it. Use application mode for unattended workloads and delegated mode for per-user access.
+</Warning>
 
 <Tabs>
   <Tab title="Usage as App">
     ## Usage as App
 
-    ## Installation
+    Call the installed app instance from DSUL using its instance name as prefix. Every Graph instruction accepts an optional `accessToken`; when it is omitted, `ensureAccessToken` acquires an application token from `clientId`, `tenantId` and `clientSecret`.
 
-    1. Go to **Apps** in your workspace
-    2. Search for **Sharepoint** and install it
-    3. Configure the app instance with your Azure AD credentials
+    ### Browsing and reading instructions
 
-    ## Configuration
+    | Instruction | What it does | Required arguments |
+    |---|---|---|
+    | `listSites` | Lists sites reachable with the token, through `GET /sites?search=*`. Returns the Graph response body, with the sites in `value`. | none |
+    | `listDrives` | Lists the document libraries of a site. Returns the Graph response body. | `siteId` |
+    | `listChildren` | Lists folders and files at one location. `itemId` defaults to `root`. Throttled requests are retried through `fetchWithRetry`. | `siteId`, `driveId` |
+    | `getItem` | Reads the Graph `driveItem` metadata of one file or folder. | `siteId`, `driveId`, `itemId` |
+    | `downloadFile` | Downloads file content. `asBase64` defaults to `true`; set it to `false` for text files. | `siteId`, `driveId`, `itemId` |
+    | `getFileTree` | Builds a recursive tree of every document library of a site. Returns an object keyed by drive identifier, each value a nested `{ name, path, content }` tree. | none, uses the app configuration |
+    | `getFiles` | Runs `getFileTree`, filters the tree with the `crawledPathsRegex` regular expression, then returns each match as base64 content or as a download URL. | `crawledPathsRegex` |
 
-    | Field | Value |
-    |-------|-------|
-    | **Client ID** | Application (client) ID from Azure AD |
-    | **Client Secret** | Client secret value |
-    | **Tenant ID** | Directory (tenant) ID |
-    | **Site URL** | Optional, default SharePoint site URL |
-    | **Site ID** | Optional, default SharePoint site ID |
+    `getFileTree` and `getFiles` both accept a `configOverride` object with `siteId`, `siteUrl`, `clientId`, `tenantId` and `clientSecret`, merged over the app configuration for that call. `getFiles` also accepts `outputMode`, which takes `base64` (default) or `url`. A SharePoint download URL can be used once, so the instruction returns content or a URL, never both.
 
-    ## Available Automations
+    ### Token and helper instructions
 
-    ### Site Operations
+    | Instruction | What it does |
+    |---|---|
+    | `ensureAccessToken` | Returns the `accessToken` argument as-is, or acquires an application token from the app configuration. Every Graph instruction calls it first. |
+    | `getAccessToken` | Acquires an application token. It reads the tenant from `configOverride.authority`, not from the `tenantId` configuration field, so always pass `configOverride`. |
+    | `fetchWithRetry` | Fetch wrapper that retries on HTTP `429`, honouring the `Retry-After` header and waiting 5 seconds when that header is absent. `maxRetries` caps the number of attempts and defaults to `3`. |
+    | `recursivelyBuildFileTree` | Walks one drive from a folder and returns the nested tree used by `getFileTree`. |
+    | `auth/getAccessTokenWithDelegation` | The ROPC grant described in [Resource owner password credentials](#resource-owner-password-credentials). Do not use. |
+    | `getFileTree_previousStrategy` | A superseded tree builder, kept for regression comparison only. Do not use. |
 
-    | Automation | Description |
-    |------------|-------------|
-    | `listSites` | List SharePoint sites accessible to the app |
+    ### Error shape
 
-    ### Drive Operations
+    When Microsoft Graph answers with a status of `400` or higher, the instructions return an object rather than raising:
 
-    | Automation | Description |
-    |------------|-------------|
-    | `listDrives` | List document libraries in a site |
+    ```json
+    {
+      "error": "SharePoint API Error",
+      "status": 403,
+      "message": "<the Graph error message>",
+      "details": { }
+    }
+    ```
 
-    ### File & Folder Operations
+    Missing arguments are reported the same way, with `error: true` and one of `Site ID is required`, `Drive ID is required` or `Item ID is required`. Always test `{{result.error}}` before using a result.
 
-    | Automation | Description |
-    |------------|-------------|
-    | `listChildren` | List items in a folder or drive root |
-    | `getItem` | Get item metadata by ID |
-    | `getFiles` | List files with metadata |
-    | `getFileTree` | Get recursive folder structure |
-    | `downloadFile` | Download file content |
+    ### DSUL examples
 
-    ### Authentication
-
-    | Automation | Description |
-    |------------|-------------|
-    | `ensureAccessToken` | Get or refresh access token |
-    | `getAccessToken` | Get a new access token |
-
-    ## DSUL Examples
-
-    ### List Sites
+    List the sites the application can reach:
 
     ```yaml
     - Sharepoint.listSites:
         output: sites
     ```
 
-    ### List Document Libraries
+    List the document libraries of one site:
 
     ```yaml
     - Sharepoint.listDrives:
-        siteId: "contoso.sharepoint.com,abc-123,def-456"
+        siteId: "contoso.sharepoint.com,11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222"
         output: drives
     ```
 
-    ### List Files in a Folder
+    List the root of a library, then browse one folder:
 
     ```yaml
     - Sharepoint.listChildren:
-        siteId: "contoso.sharepoint.com,abc-123,def-456"
-        driveId: "b!xyz..."
-        itemId: "01ABCDEF..."
-        output: items
+        siteId: '{{siteId}}'
+        driveId: '{{driveId}}'
+        output: rootItems
+    - Sharepoint.listChildren:
+        siteId: '{{siteId}}'
+        driveId: '{{driveId}}'
+        itemId: '{{rootItems.value[0].id}}'
+        output: folderItems
     ```
 
-    ### Download a File
+    Download a text file as text rather than base64:
 
     ```yaml
     - Sharepoint.downloadFile:
-        siteId: "contoso.sharepoint.com,abc-123,def-456"
-        driveId: "b!xyz..."
-        itemId: "01ABCDEF..."
+        siteId: '{{siteId}}'
+        driveId: '{{driveId}}'
+        itemId: '{{itemId}}'
+        asBase64: false
         output: fileContent
     ```
 
-    ### Get Folder Tree
+    Crawl one folder of a site and get the matching files as download URLs:
 
     ```yaml
-    - Sharepoint.getFileTree:
-        siteId: "contoso.sharepoint.com,abc-123,def-456"
-        driveId: "b!xyz..."
-        output: tree
+    - Sharepoint.getFiles:
+        crawledPathsRegex: '^/root/Shared Documents/Contracts/.*$'
+        outputMode: url
+        output: files
     ```
   </Tab>
 
   <Tab title="Usage as MCP">
     ## Usage as MCP
 
-    ## MCP Setup
+    The Sharepoint MCP workspace exposes a JSON-RPC 2.0 endpoint implementing MCP protocol version `2025-06-18`, under the server name `prisme-ai-sharepoint-mcp-server`.
 
-    1. Open your **Knowledges project**
-    2. Go to **Advanced > Tools**
-    3. Click **Add** and select the **MCP** tab
-    4. Enter the MCP endpoint URL
-    5. In the **Headers** field, add your credentials
+    ### Endpoint
 
-    ## Authentication
-
-    The MCP server supports both service-to-service and delegated authentication:
-
-    ### Service Account (Client Credentials)
-
-    Configure workspace secrets:
-
-    | Secret | Description |
-    |--------|-------------|
-    | `azureClientId` | Azure AD client ID |
-    | `azureClientSecret` | Azure AD client secret |
-    | `azureTenant` | Azure AD tenant ID |
-    | `azureSiteId` | Optional default SharePoint site ID |
-
-    ### Delegated Auth (OAuth)
-
-    For per-user access with PBAV (Permission-Based Access Validation), users connect their Microsoft account via OAuth. This enables:
-
-    - Per-user file access validation
-    - Respecting SharePoint permissions at query time
-    - Secure document access in multi-tenant environments
-
-    ## Available Tools
-
-    | Tool | Description |
-    |------|-------------|
-    | `configureSharePoint` | Configure credentials for service-to-service auth |
-    | `listSharePointFolders` | List folders and document libraries |
-    | `listSharePointFiles` | List files with metadata for RAG indexing |
-    | `downloadSharePointFile` | Download file content |
-
-    ## Tool Details
-
-    ### configureSharePoint
-
-    Configure SharePoint credentials for Client Credentials Flow.
-
-    ```json
-    {
-      "name": "configureSharePoint",
-      "arguments": {
-        "clientId": "your-azure-client-id",
-        "clientSecret": "your-client-secret",
-        "tenant": "your-tenant-id"
-      }
-    }
+    ```text
+    <api-url>/workspaces/<workspace-id>/webhooks/mcp
     ```
 
-    ### listSharePointFolders
+    Replace `<api-url>` with your environment's platform API URL, for example `https://api.studio.prisme.ai/v2` on production, and `<workspace-id>` with the identifier of the workspace hosting Sharepoint MCP.
 
-    List folders and document libraries with metadata for change detection. Supports pagination.
+    Every method, `initialize` included, requires an authenticated Prisme.ai user. A request without one answers HTTP `401` and the JSON-RPC error code `-32001` with the message `Authentication required`. There is no MCP API key on this connector.
+
+    ### Attach the endpoint to an agent
+
+    <Steps>
+      <Step title="Open the tools configuration">
+        In **Agent Creator**, open the agent and add the MCP endpoint as a tool. Legacy Knowledges agents without a native MCP picker use **Advanced > Tools > MCP** instead.
+      </Step>
+      <Step title="Paste the endpoint URL">
+        Enter the endpoint URL shown above.
+      </Step>
+      <Step title="Optional: add credential headers">
+        Only fill the **Headers** field when the agent must use an Azure application other than the one configured on the workspace:
+
+        ```json
+        {
+          "azure-client-id": "<your-client-id>",
+          "azure-client-secret": "<your-client-secret>",
+          "azure-tenant": "<your-tenant-id>",
+          "azure-site-id": "<default-site-id>"
+        }
+        ```
+
+        These headers take precedence over every other credential source, including the calling user's delegated connection. Leave them out for delegated mode.
+      </Step>
+      <Step title="Verify the tool list">
+        Send a `tools/list` request, or open the tool picker, and confirm the four advertised tools appear. Then run `listSharePointFolders` with no arguments as a safe read-only check.
+      </Step>
+    </Steps>
+
+    ### Credential resolution order
+
+    Sharepoint MCP resolves credentials for every tool call in this order:
+
+    1. The `azure-client-id`, `azure-client-secret` and `azure-tenant` request headers, exchanged for an application token (`header_credentials`).
+    2. Per-user credentials previously stored by the `configureSharePoint` tool, with the secret read back from the user-scoped `sp_client_secret` platform secret (`user_credentials`).
+    3. The calling user's stored delegated OAuth tokens, refreshed automatically when expired (`delegated`).
+    4. The group or organization credential override, then the workspace `sharepoint` configuration (`workspace_config`).
+
+    Steps 1, 2 and 4 all end in a `client_credentials` exchange. Results of steps 2 and 4 are cached in the user-scoped `sp_cc_token` platform secret, and the cache is considered stale 300 seconds before the token actually expires. Header credentials and delegated tokens are never cached.
+
+    <Warning>
+      The `Not configured` message lists an `Authorization` bearer token as a first option. That path is not implemented in this version of the connector: passing a Microsoft Graph access token in the `Authorization` header has no effect. Use one of the four sources above.
+    </Warning>
+
+    ### Advertised tools
+
+    These four tools are returned by `tools/list`. Each one accepts `outputFormat`.
+
+    | Tool | What it does | Arguments |
+    |---|---|---|
+    | `configureSharePoint` | Stores Azure application credentials for the calling user, and clears that user's OAuth connection. | `clientId`, `clientSecret` and `tenant` are required. |
+    | `listSharePointFolders` | With no `siteId`, lists sites. With `siteId` only, lists that site's document libraries. With `siteId` and `driveId`, lists the folders at that location. | `siteId`, `driveId`, `folderId`, `pageToken` |
+    | `listSharePointFiles` | Lists the files of one folder with metadata for change detection, including `eTag`, `cTag` and `contentHash` (the Graph `quickXorHash`). | `siteId` and `driveId` are required unless `pageToken` is given; `folderId`, `includeDownloadUrl` (default `false`), `pageToken` |
+    | `downloadSharePointFile` | Reads the item metadata, refuses anything that is not a file, then downloads its content. | `driveId` and `fileId` are required; `siteId` |
+
+    ### Tools reachable but not advertised
+
+    The router also dispatches three tool names that `tools/list` does not return. A client that discovers tools dynamically will not offer them; call them by name.
+
+    | Tool | What it does | Arguments |
+    |---|---|---|
+    | `listSharePointFilesRecursive` | Walks a drive breadth-first and returns one flat file list for the whole subtree, following pagination up to 50 pages per folder. | `siteId` and `driveId` are required; `folderId`, `includeDownloadUrl` (default `false`), `maxFolders` (default `500`), `outputFormat` |
+    | `downloadSharePointFileFromUrl` | Resolves a SharePoint or Microsoft sharing URL through the Graph `shares` endpoint, then downloads the file. Falls back to a site and library lookup for simple `/sites/<site>/<library>/<path>` and `/teams/<team>/<library>/<path>` URLs. | `url` is required; `outputFormat` |
+    | `validateUserAccessDelegated` | Probes, in one Graph `$batch` request, whether the calling user can read each listed file. HTTP `200` means accessible, anything else means denied. | `files`, an array of `{ siteId, driveId, itemId }`, at most 20 entries |
+
+    `validateUserAccessDelegated` requires the caller to be connected in delegated mode. Otherwise it returns `requiresOAuth: true` with an empty `results` array and the text `User does not have a delegated SharePoint session. Please connect your SharePoint account for personalized access.` It always returns structured content and ignores `outputFormat`.
+
+    ### Resources
+
+    `resources/list` advertises two URI families, and `resources/read` resolves paths under them:
+
+    | URI | Levels |
+    |---|---|
+    | `sharepoint://folders` | `sharepoint://folders[/{siteId}[/{driveId}[/{itemId}]]]` |
+    | `sharepoint://files` | `sharepoint://files[/{siteId}[/{driveId}[/{itemId}[/content]]]]` |
+
+    Reading a `/content` URI returns `text` for text-like MIME types (`text/*`, `application/json`, `application/xml`, `application/javascript`, and any `+json` or `+xml` subtype) and a base64 `blob` for everything else. An unrecognized URI returns the JSON-RPC error `-32602` with `Invalid resource URI: <uri>`.
+
+    ### Default site resolution
+
+    `listSharePointFiles`, `downloadSharePointFile` and `listSharePointFilesRecursive` resolve the site from the `siteId` argument, then the `azure-site-id` header, then `sharepoint.siteId` in the workspace configuration. `listSharePointFolders` follows the same order but only falls back to the configured default when the call already carries a `driveId` or a `folderId`, so a bare call always lists sites.
+
+    ### JSON-RPC examples
+
+    List the document libraries of a site:
 
     ```json
     {
       "name": "listSharePointFolders",
       "arguments": {
-        "siteId": "contoso.sharepoint.com,abc-123,def-456",
-        "driveId": "b!xyz...",
-        "folderId": "01ABCDEF..."
+        "siteId": "contoso.sharepoint.com,11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222"
       }
     }
     ```
 
-    | Parameter | Description |
-    |-----------|-------------|
-    | `siteId` | SharePoint site ID (optional if default configured) |
-    | `driveId` | Document library ID (omit to list all drives) |
-    | `folderId` | Folder item ID (omit for root) |
-    | `pageToken` | Pagination token from previous response |
-
-    ### listSharePointFiles
-
-    List files with full metadata for RAG indexing. Returns `eTag`, `cTag`, `contentHash` for change detection.
+    List the files of a library root, with download URLs:
 
     ```json
     {
       "name": "listSharePointFiles",
       "arguments": {
-        "siteId": "contoso.sharepoint.com,abc-123,def-456",
-        "driveId": "b!xyz...",
+        "siteId": "contoso.sharepoint.com,11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222",
+        "driveId": "b!EXAMPLEDRIVEID",
         "includeDownloadUrl": true
       }
     }
     ```
 
-    | Parameter | Description |
-    |-----------|-------------|
-    | `siteId` | SharePoint site ID (optional if default configured) |
-    | `driveId` | Document library ID (required unless using pageToken) |
-    | `folderId` | Folder item ID (omit for drive root) |
-    | `includeDownloadUrl` | Include pre-signed download URLs (default: false) |
-    | `pageToken` | Pagination token from previous response |
-
-    ### downloadSharePointFile
-
-    Download file content as text or base64-encoded binary.
+    Download one file:
 
     ```json
     {
       "name": "downloadSharePointFile",
       "arguments": {
-        "siteId": "contoso.sharepoint.com,abc-123,def-456",
-        "driveId": "b!xyz...",
-        "fileId": "01ABCDEF..."
+        "siteId": "contoso.sharepoint.com,11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222",
+        "driveId": "b!EXAMPLEDRIVEID",
+        "fileId": "01EXAMPLEITEMID"
       }
     }
     ```
 
-    ## Output Formats
+    ### Output formats
 
-    All tools support an `outputFormat` parameter:
+    Every tool except `validateUserAccessDelegated` accepts `outputFormat`:
 
-    - **`verbose`** (default) - Human-readable text for LLM consumption
-    - **`structured`** - Machine-readable JSON in `structuredContent`
-    - **`both`** - Both text and structured content
+    - `verbose` (default): human-readable text sized for model consumption, with the payload in a fenced JSON block.
+    - `structured`: machine-readable JSON in `structuredContent`.
+    - `both`: identical to `structured` in this implementation, text and structured content together.
 
-    ## Permission-Based Access Validation (PBAV)
-
-    When using delegated OAuth, PBAV ensures that RAG query results respect each user's SharePoint permissions:
-
-    1. User submits a query to the Knowledges agent
-    2. RAG retrieves relevant document chunks
-    3. For each SharePoint chunk, the system validates user access via their OAuth token
-    4. Chunks from inaccessible files are filtered out before the LLM responds
-
-    See [SharePoint Connector for Knowledges](/products/ai-knowledge/connectors) for detailed PBAV documentation.
+    `downloadSharePointFile` and `downloadSharePointFileFromUrl` truncate the content preview to the first 1000 characters in `verbose` mode; the full content is only present in `structuredContent`.
   </Tab>
 </Tabs>
 
----
+## Verify the setup
 
-## Error Handling
+Run these checks in order. Each one has an observable result, so a failure tells you which layer to fix.
 
-| HTTP Status | Error | Solution |
-|-------------|-------|----------|
-| 401 | Unauthorized | Verify Azure AD credentials |
-| 403 | Forbidden | Check app permissions or user access |
-| 404 | Not Found | Verify site/drive/item IDs exist |
-| 429 | Rate Limited | Wait and retry |
+| Check | How | Expected result |
+|---|---|---|
+| Application token | Call `Sharepoint.listSites` from Builder with no `accessToken` | Returns a body whose `value` array lists sites, not an `error` object |
+| Site targeting | Call `Sharepoint.listDrives` with your site identifier | Returns the document libraries you expect for that site |
+| Delegated connection | Open `<pages-url>/connect-sharepoint` as an end user | The page shows `Connected — delegated access is active.` and a **Disconnect** button |
+| Connection state, machine readable | Call the `checkAuthStatus` webhook of the Sharepoint MCP workspace | Returns `connected`, `hasOAuth`, `hasCredentials`, `oauthExpiresAt` and `oauthMode` for the calling user |
+| MCP session gate | Send `tools/list` without a Prisme.ai session | HTTP `401` with JSON-RPC error `-32001` and `Authentication required` |
+| MCP read path | Call `listSharePointFolders` with no arguments | Lists sites, and the verbose text reads `Found <n> SharePoint sites.` |
+| Negative access, delegated mode | As a user without access to a site, call `listSharePointFiles` on it | Returns the Graph `403` error text, not the file list |
+| Per-user probe | Call `validateUserAccessDelegated` with two files, one the user can open and one they cannot | `summary.accessibleCount` is `1` and `summary.deniedCount` is `1` |
+| Download path | Call `downloadSharePointFile` on a small text file | Returns the file name, size, MIME type and a content preview |
 
-### Common Issues
+## Troubleshoot
 
-**"Site not found"** - The site ID format is `hostname,siteCollectionId,siteId`. Use Graph Explorer to find the correct format.
+### SharePoint credentials not configured
 
-**"Access denied"** - The Azure AD app needs `Sites.Read.All` permission with admin consent.
+```text
+SharePoint credentials not configured. Options: 1. Pass Authorization Bearer token header with Graph API access token 2. Pass azure-client-id, azure-client-secret, azure-tenant headers 3. Call configureSharePoint tool to store credentials in session 4. Connect via OAuth on the connect-sharepoint page 5. Configure workspace-level credentials
+```
 
-**"Token expired"** - OAuth tokens expire after 1 hour. Use `ensureAccessToken` to refresh.
+No credential source resolved for the calling user. The workspace builder fixes this by setting `sharepoint.clientId`, `sharepoint.clientSecret` and `sharepoint.tenant` in the Sharepoint MCP configuration, or the end user connects from the `connect-sharepoint` page. Option 1 in this message is not implemented; ignore it. Verify with the `checkAuthStatus` webhook.
 
-## External Resources
+### Delegated auth required
+
+```text
+Delegated auth required
+Your organization requires OAuth authentication. Please connect via the connect-sharepoint page.
+```
+
+A `credentialsByGroup` or `credentialsByOrg` entry that matches this caller sets `mode: delegated`, and the caller has no OAuth session. The end user fixes this by connecting from the `connect-sharepoint` page. Verify that the page then shows `Connected — delegated access is active.`
+
+### OAuth is not configured for this workspace
+
+```text
+OAuth is not configured for this workspace. Contact the administrator.
+```
+
+The OAuth webhook answered HTTP `400` because no `clientId` resolved from the matching credential entry or from `oauth.clientId`. On the connect page the same condition renders as `OAuth is not configured. Contact the workspace administrator.` The workspace builder sets `oauth.clientId`, `oauth.clientSecret` and `oauth.tenant`, then saves.
+
+### Invalid state parameter
+
+```text
+Error: Invalid state parameter. Please retry authentication.
+```
+
+The callback answered HTTP `400` because the `state` returned by Microsoft did not match the one stored when the flow started, usually because the user reused an old authorization link or the Prisme.ai session changed mid-flow. The end user reopens the connect page and starts again.
+
+### Token exchange failed, or refresh failed
+
+```text
+Token exchange failed: <error_description>
+Refresh failed: <error_description>
+```
+
+Microsoft rejected the authorization code or the refresh token, and the connector forwards its description verbatim. The Microsoft Entra admin reads the `AADSTS` code in the description against [Microsoft's sign-in error code reference](https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes). Expired client secrets, a redirect URI that does not match the registration (`AADSTS50011`), and missing consent all surface here. After fixing the registration, the end user reconnects.
+
+### OAuth session expired
+
+```text
+OAuth session expired
+Please re-authorize: Could not retrieve refresh token. Please re-authorize.
+```
+
+The refresh exchange failed, usually because the refresh token passed its 90 day lifetime or was revoked in Microsoft Entra ID. The end user reconnects from the connect page. A related message, `OAuth token could not be retrieved. Please re-authorize via the connect-sharepoint page.`, means the stored access token secret was missing and the refresh attempt also failed.
+
+### Failed to acquire token
+
+```text
+Failed to acquire token: <error> - <error_description>
+Missing required credentials (clientId, clientSecret, or tenant)
+```
+
+The `client_credentials` exchange failed. The workspace emits `sharepoint.authentication.failed` carrying the message, the user identifier and the resolved auth method. The Microsoft Entra admin checks that the client secret has not expired and that the tenant identifier matches the registration; the workspace builder checks that all three values are set on whichever credential source resolved.
+
+### SharePoint API Error with status 403
+
+```text
+{ "error": "SharePoint API Error", "status": 403, "message": "Access denied" }
+```
+
+Microsoft Graph refused the request. In application mode, admin consent is missing on `Sites.Read.All` or `Files.Read.All`, or a sites selected permission excludes the target site. In delegated mode, the connected user simply has no access to that site or file, which is the expected behaviour. The Microsoft Entra admin grants consent or adjusts the site permission, then you re-run `Sharepoint.listDrives` on that site.
+
+### SharePoint API Error with status 404
+
+```text
+{ "error": "SharePoint API Error", "status": 404, "message": "Item not found" }
+```
+
+One identifier does not exist. Site identifiers use the form `hostname,siteCollectionId,siteId`; a bare hostname or a site URL is not accepted by the instructions that take `siteId`. Re-read the identifiers from `listSites` and `listDrives`, or confirm them in [Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer).
+
+### Throttled by Microsoft Graph
+
+```text
+{ "error": "SharePoint API Error", "status": 429 }
+```
+
+Microsoft Graph throttled the tenant. `listChildren`, `listSharePointFilesRecursive` and `validateUserAccessDelegated` go through `fetchWithRetry`, which honours `Retry-After` and makes up to `maxRetries` attempts (three by default) before returning the throttled response; every other call surfaces the `429` immediately. Reduce the crawl rate, lower `maxFolders`, or split recursive scans across runs.
+
+### Tool not found
+
+```text
+Tool not found: <name>
+```
+
+The MCP router answered JSON-RPC `-32601` because the tool name is not one of the seven it dispatches. Check the spelling against the advertised and unadvertised tool tables in [Usage as MCP](#usage-as-mcp). `Method not found: <method>` is the same error code for an unsupported JSON-RPC method.
+
+### No access token provided
+
+```text
+No access token provided and app config (clientId, tenantId, clientSecret) is incomplete. Cannot authenticate.
+```
+
+A Builder instruction was called without `accessToken`, and the Sharepoint app configuration is missing at least one of `clientId`, `tenantId` and `clientSecret`. The workspace builder completes the app configuration and saves. Verify with `Sharepoint.listSites`.
+
+## Disconnect, rotate and remove
+
+- **A user disconnects**: on the connect page, select **Disconnect**. This deletes the `sp_delegated_token` and `sp_refresh_token` user secrets, clears the `user.sharepoint.oauth` metadata, and emits `sharepoint.oauth.disconnected`. The page then shows the connect button again. The same action is available by emitting the `disconnectOAuth` event or calling its webhook.
+- **A user switches to application credentials**: calling `configureSharePoint` deletes that user's `sp_delegated_token` and `sp_refresh_token` secrets and clears `user.sharepoint.oauth`, so the two methods never coexist. It emits `sharepoint.configuration.updated` and stores the secret for one year (`31536000` seconds).
+- **An administrator revokes a user**: revoke the user's sessions or refresh tokens in Microsoft Entra ID. The next connector call fails with a re-authorization message pointing at the connect page.
+- **Rotate the client secret**: create the new secret in Entra, update `azureClientSecret` in every workspace that holds it, and save. Application mode picks up the new secret once the cached `sp_cc_token` expires. Delegated connections keep working until their refresh token is next used, then need the updated secret to be in place.
+- **Offboard a user**: have them disconnect, or revoke their Entra sessions, then remove their access to the workspace. Delegated tokens are user-scoped, so they stop resolving once the account is disabled.
+- **Remove the connector**: uninstall the **Sharepoint** app instance from the workspace, delete the `azureClientId`, `azureClientSecret`, `azureTenant` and `azureSiteId` secrets, remove the MCP endpoint from any agent that references it, and delete the redirect URI and the client secret from the Entra registration.
+
+## Migrate to the SharePoint connector
+
+Plan the move to the [SharePoint](/apps-store/marketplace/connectors/sharepoint) connector for any installation that is still growing. The differences that shape the migration:
+
+| Topic | SharePoint (legacy) | SharePoint |
+|---|---|---|
+| Surface covered | Sites, drives, folders, files, downloads | Sites, drives, items, search, permissions, lists, directory, and native Excel and Word reading |
+| Write operations | None | Create, update, move, copy and delete, with permission management |
+| Tool shape | Four advertised tools plus three undiscoverable ones | Ten entity tools driven by an `action` argument |
+| Credentials at call time | Azure client identifier, secret and tenant from configuration, headers or per-user storage | Tenant app-instance context, no credential headers |
+| OAuth client | One client per installation, registered by each customer | Central client registered once by the platform maintainer, or a tenant client |
+| Agent authorization | None beyond the Prisme.ai session | Per-agent allowlist |
+
+Migration outline: install the SharePoint connector in the target workspace, connect the accounts through its own flow, rewrite DSUL calls and agent instructions against the entity tools, verify with read-only operations, then remove the legacy installation as described in [Disconnect, rotate and remove](#disconnect%2C-rotate-and-remove).
+
+## External resources
 
 <CardGroup cols={2}>
-  <Card title="Microsoft Graph Files API" icon="book" href="https://learn.microsoft.com/en-us/graph/api/resources/driveitem">
-    Official API documentation
+  <Card title="Microsoft Graph driveItem resource" icon="book" href="https://learn.microsoft.com/en-us/graph/api/resources/driveitem">
+    Reference for the file and folder objects this connector returns
   </Card>
-  <Card title="SharePoint Sites API" icon="book" href="https://learn.microsoft.com/en-us/graph/api/resources/site">
-    Site operations reference
+  <Card title="Microsoft Graph site resource" icon="book" href="https://learn.microsoft.com/en-us/graph/api/resources/site">
+    Site identifiers, site discovery and site properties
   </Card>
-  <Card title="Graph Explorer" icon="flask" href="https://developer.microsoft.com/en-us/graph/graph-explorer">
-    Test API calls interactively
+  <Card title="Graph permissions reference" icon="user-shield" href="https://learn.microsoft.com/en-us/graph/permissions-reference">
+    Delegated compared with application permissions, per resource
   </Card>
-  <Card title="Knowledges SharePoint Connector" icon="database" href="/products/ai-knowledge/connectors">
-    Document sync and PBAV for Knowledges
+  <Card title="OAuth 2.0 authorization code flow" icon="key" href="https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow">
+    Microsoft identity platform: delegated authorization code with PKCE
+  </Card>
+  <Card title="Microsoft Graph Explorer" icon="flask" href="https://developer.microsoft.com/en-us/graph/graph-explorer">
+    Resolve site and drive identifiers interactively against your tenant
+  </Card>
+  <Card title="Deploy for Knowledges" icon="database" href="/self-hosting/configuration/ai-knowledge-sharepoint-connector">
+    Platform administrator guide to deploying and registering the Sharepoint MCP workspace
   </Card>
 </CardGroup>
