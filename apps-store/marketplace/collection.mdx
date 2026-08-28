@@ -301,6 +301,88 @@ config:
   Available property types include: `string, text, date, time, datetime, number, double, float, integer, decimal, boolean, uint8array, array, enum, enumArray, json, blob, time`
 </Note>
 
+## 🔄 Changing a Property Type
+
+Changing the `type` of a property that already holds data is **not** something
+the schema update can do on its own. The database has to convert every existing
+row, and the default conversion fails as soon as one value does not fit the new
+type — a `text` column switched to `json` chokes on the first row that is not
+valid JSON.
+
+<Warning>
+  When that conversion fails, **the whole schema update fails with it**: every
+  other column added in the same change is silently missing from the database.
+  The symptom appears much later, and somewhere else — writing to one of those
+  columns returns `Invalid update on unknown field <collection>.<column>`.
+</Warning>
+
+Declare a **migration** next to your properties to tell the database how to
+convert the existing values:
+
+```yaml
+config:
+  collectionName: agents
+  properties:
+    description:
+      type: json      # was `text` until now
+  migrations:
+    - op: alterColumnType
+      column: description
+      from: [text, character varying]
+      to: jsonb
+      description: Localized descriptions, 2026-07-21
+```
+
+The migration runs **before** the schema is synchronized, so the column already
+has its target type by the time the collection is updated.
+
+### It only runs once, by itself
+
+The `from` list is a guard checked against the column's **current** type in the
+database. Once the column has been converted, `from` no longer matches and the
+migration is skipped.
+
+<Tip>
+  Leave the declaration in place once it has run. There is no migration history
+  to maintain: the database itself is the record, so the same declaration is
+  safe on an instance that has already migrated, on a fresh one where the column
+  was created with the right type, and on every later update.
+</Tip>
+
+<Warning>
+  Never list the **target** type in `from`. With `from: [text, jsonb]` and
+  `to: jsonb`, the guard keeps matching after the conversion and the table is
+  rewritten on every single schema update.
+</Warning>
+
+### Converting to json
+
+By default (`cast: auto`), values that are already JSON objects or arrays are
+parsed, and everything else is wrapped as a JSON string. This is what you want
+for a column that accumulated both — plain text written before the type change,
+and JSON written after it.
+
+| `cast` | What happens to existing values |
+| --- | --- |
+| `auto` *(default)* | JSON objects and arrays are parsed, anything else is wrapped |
+| `wrap` | every value is wrapped as a JSON string, even valid JSON |
+| `parse` | every value is parsed, and the migration fails on the first one that is not valid JSON |
+
+<Note>
+  `auto` requires **PostgreSQL 16** or later.
+</Note>
+
+### Following what happened
+
+A migration that actually converts data emits a
+`workspaces.collections.migrated` event in the activity feed, reporting the
+column, the type it had, the type it became, the number of rows rewritten and
+how long it took. A migration that matches nothing emits nothing.
+
+If the conversion fails, the collection keeps working on its previous schema and
+a `CollectionMigrationFailed` error event tells you which column refused, so the
+failure is visible immediately instead of surfacing weeks later.
+
 ## Basic Operations
 
 Let's explore the core operations you can perform with Collection:
