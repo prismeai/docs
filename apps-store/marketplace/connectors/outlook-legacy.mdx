@@ -1,10 +1,12 @@
 ---
 title: 'Outlook (legacy)'
-description: 'Read, send, and manage emails via Microsoft Graph API'
+description: 'Read, search, send and manage Microsoft 365 mail from Builder automations and MCP tool calls, with application or delegated Microsoft Graph authentication'
 ---
 
 <Note>
-  This is the **legacy** Outlook connector (Microsoft Graph mail, application- or delegated-OAuth modes wired through `mcp-api-key` headers). It is superseded by the new **[Outlook](/apps-store/marketplace/connectors/outlook)** connector (App+MCP, tenant-context, central Microsoft Entra OAuth, with mail / calendar / contacts entity tools). Use the new Outlook connector for any new work; this page is kept for existing installations only.
+  This is the **legacy** Outlook connector. It is built from two workspaces, **Outlook App** (`outlook-app`) and **Outlook MCP** (`outlook-mcp`), and it authenticates either with Azure application credentials passed as request headers or with a per-user delegated OAuth connection stored in the Outlook MCP workspace.
+
+  It is superseded by the **[Outlook](/apps-store/marketplace/connectors/outlook)** connector (App+MCP, tenant-context, central Microsoft Entra OAuth, with `mail`, `mailFolders`, `calendars`, `events`, `contacts` and `contactFolders` entity tools). Use the Outlook connector for any new work. This page is kept for existing installations and for planning the move.
 </Note>
 
 <img
@@ -16,373 +18,451 @@ description: 'Read, send, and manage emails via Microsoft Graph API'
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Outlook connector provides full access to Microsoft Outlook mailboxes via the Microsoft Graph API, enabling AI agents and automations to read, search, send, and manage emails.
+The legacy Outlook connector exposes a Microsoft 365 mailbox through the [Microsoft Graph](https://learn.microsoft.com/en-us/graph/overview) REST API (v1.0). It can be consumed two ways: as a Builder app whose instructions you call directly from DSUL, or as a remote MCP server that **Agent Creator** agents call as tools. Mail operations are available on both surfaces; calendar operations are available on the Builder surface only.
 
 <CardGroup cols={3}>
-  <Card title="Read Operations" icon="inbox">
-    List folders, messages, and attachments with filtering and pagination
+  <Card title="Read and search mail" icon="inbox">
+    Browse mail folders, list and read messages, run KQL searches, and download attachments as base64.
   </Card>
-  <Card title="Send Operations" icon="paper-plane">
-    Send, reply, reply-all, forward emails with HTML support
+  <Card title="Send and reply" icon="paper-plane">
+    Send mail, send an existing draft, reply, reply all and forward, with HTML or text bodies.
   </Card>
-  <Card title="Manage Messages" icon="folder-open">
-    Move, copy, delete, and update message properties
+  <Card title="Manage messages and calendar" icon="folder-open">
+    Create drafts, update read status and importance, move, copy and soft-delete messages; list, create, update and answer calendar events from Builder.
   </Card>
 </CardGroup>
 
-## Choose your authentication mode
+## Who is this for?
 
-The connector supports two **mutually exclusive** authentication modes. Pick the one that matches your use case before configuring the connector.
+This connector involves three roles. Each section below is self-contained; start with the one that matches yours.
+
+<CardGroup cols={3}>
+  <Card title="Workspace builder" icon="puzzle-piece" href="#configure-the-connector">
+    You install **Outlook App** in a workspace, fill in its configuration, and call its instructions from DSUL.
+  </Card>
+  <Card title="Agent builder" icon="robot" href="#usage-as-mcp">
+    You build agents in **Agent Creator** and attach the Outlook MCP endpoint as a tool.
+  </Card>
+  <Card title="Microsoft Entra admin" icon="shield-halved" href="#prerequisites">
+    You register the Azure application, grant Graph permissions, add the redirect URI, and apply mailbox access policies.
+  </Card>
+</CardGroup>
+
+Workspace builders continue in [Usage as App](#usage-as-app) for the instruction catalog and the DSUL examples. Microsoft Entra admins read [Restrict application mode to one mailbox](#restrict-application-mode-to-one-mailbox) before granting application permissions.
+
+<Note>
+  This legacy connector predates the App + MCP tenant-context model, so the three shared connector flows do not apply to it: there is no configuration app to enter credentials in, no central OAuth client, and no authorized-agents allowlist. Everything you need is on this page. The current [Outlook](/apps-store/marketplace/connectors/outlook) connector does follow those flows.
+</Note>
+
+## How the connector is built
+
+Two workspaces cooperate. Knowing which one holds which setting saves most of the configuration guesswork.
+
+| Workspace | Slug | Responsibility |
+|---|---|---|
+| Outlook App | `outlook-app` | Business logic: authentication resolution, Graph calls, data shaping, scope gating. Published as the **Outlook App** app and installed into consuming workspaces. |
+| Outlook MCP | `outlook-mcp` | Protocol wrapper: the JSON-RPC MCP endpoint, the tool catalog, the delegated OAuth flow (authorize, callback, refresh, disconnect) and the `connect-outlook` page. It imports **Outlook App** and delegates every tool call to it. |
+
+Outlook App itself imports the shared **Microsoft Graph Auth** app, which performs the Azure client-credentials token exchange, builds Graph base URLs, and maps Graph HTTP errors to messages.
+
+## Choose an authentication mode
+
+The connector supports two operating models. Decide before you configure anything, because they differ in runtime identity, in what an administrator must approve, and in which mailboxes are reachable.
 
 <CardGroup cols={2}>
-  <Card title="Application mode (app-only)" icon="building">
-    A single Azure AD app acts on behalf of the workspace. Can reach any mailbox in the tenant (restrictable). No per-user login. Best for back-office automations and service accounts.
+  <Card title="Application mode (client credentials)" icon="building">
+    One Azure application acts for the whole workspace. Its runtime identity is the application itself, not a person. It can reach any mailbox in the tenant unless you restrict it. Best for back-office automations, scheduled jobs and shared service mailboxes.
   </Card>
-  <Card title="Delegated mode (OAuth per-user)" icon="user-check">
-    Each end user signs into Microsoft once via an OAuth popup. Access is scoped to that user's own mailbox. Best for agents that act on behalf of the logged-in user.
+  <Card title="Delegated mode (per-user OAuth)" icon="user-check">
+    Each end user signs in to Microsoft once. The runtime identity is that user, and Graph enforces exactly what the user is allowed to see. Best for agents that act on behalf of the signed-in person.
   </Card>
 </CardGroup>
 
-| Aspect | Application mode | Delegated (OAuth) mode |
+| Aspect | Application mode | Delegated mode |
 |---|---|---|
-| Azure permission type | Application | Delegated |
-| Admin consent | Required | Optional (user consent if tenant allows) |
-| Mailbox reach | All tenant mailboxes (restrictable) | Connected user's mailbox only |
-| Who authenticates | No end-user login | Each user signs in once |
-| `userId` tool argument | Required (target mailbox) | Ignored (always the connected user) |
-| Token acquisition | Client credentials per request | Authorization code + PKCE; refresh token stored |
-| Best for | Back-office / service automations | User-facing agents, per-user data |
+| Graph permission type | Application | Delegated |
+| Runtime identity seen by Microsoft | The Azure application (service principal) | The signed-in end user |
+| Admin consent | Required | Required only if the tenant blocks user consent |
+| Mailbox reach | Every mailbox in the tenant, unless an application access policy restricts it | The connected user's own mailbox only |
+| Who signs in | Nobody, the token is machine-to-machine | Each user, once, then silent refresh |
+| `userId` argument | Selects the target mailbox, falls back to `defaultUserId` | Ignored, calls always target `/me` |
+| Graph URL used | `https://graph.microsoft.com/v1.0/users/{userId}` | `https://graph.microsoft.com/v1.0/me` |
+| Token acquisition | Client credentials, cached as a platform secret with a 300 second safety margin | Authorization code with PKCE (S256), refresh token stored for 90 days |
+| Audit attribution | All actions attributed to the application | Actions attributed to the individual user |
+| Calendar operations | Supported (Builder surface) | Not covered by the delegated scope string requested at connect time |
 
----
+<Warning>
+  Application mode is a **shared credential**. Every caller that can reach the connector acts with the same Azure application, and Microsoft's audit logs cannot tell one Prisme.ai user from another. Application Graph permissions such as `Mail.ReadWrite` grant access to **all** mailboxes in the tenant by default. Restrict the blast radius with an application access policy, as described in [Restrict application mode to one mailbox](#restrict-application-mode-to-one-mailbox), and keep the workspace `editor` role limited to the people allowed to change the Azure secrets.
+</Warning>
 
 ## Prerequisites
 
 <Tabs>
   <Tab title="Application mode">
-    ## Application mode
+    - A **Microsoft 365** tenant with Exchange Online, and an application registered in [Microsoft Entra ID](https://entra.microsoft.com) under **App registrations**.
+    - A **client secret** created on that registration under **Certificates & secrets**. Note its value at creation time, it is shown once.
+    - The **Directory (tenant) ID** and the **Application (client) ID** of the registration.
+    - Microsoft Graph **application** permissions, granted for the operations you intend to use:
 
-    - An **Azure AD Application** registered in your tenant
-    - **Application permissions** granted (not Delegated):
-      - `Mail.Read`: Read mail in all mailboxes
-      - `Mail.ReadWrite`: Create drafts, update, delete, move, copy
-      - `Mail.Send`: Send, reply, reply-all, forward
-      - `MailboxSettings.Read`: Read mailbox settings
-    - **Admin consent** granted for these permissions
-    - A **client secret** created on the app registration
+      | Graph permission | Unlocks |
+      |---|---|
+      | `Mail.Read` | Folder, message, search and attachment reads |
+      | `Mail.ReadWrite` | The reads above, plus drafts, updates, move, copy and soft delete |
+      | `Mail.Send` | `sendMail`, `sendDraft`, `replyMessage`, `replyAllMessage`, `forwardMessage` |
+      | `MailboxSettings.Read` | `getMailboxSettings` |
+      | `Calendars.Read` | Calendar and event reads (Builder surface) |
+      | `Calendars.ReadWrite` | Calendar reads, plus create, update, delete and meeting responses |
+
+    - **Admin consent** granted for those permissions by a Global Administrator or Privileged Role Administrator.
+    - The email address or user object ID of the mailbox the connector should target.
 
     <Note>
-      **Minimal permissions:** If you only need read access, `Mail.Read` and `MailboxSettings.Read` are sufficient. Add `Mail.Send` and/or `Mail.ReadWrite` only if you use write tools.
+      Grant only what you use. `Mail.Read` plus `MailboxSettings.Read` is enough for a read-only installation. `Mail.ReadWrite` already covers every read, so you do not need `Mail.Read` alongside it.
+    </Note>
+
+    <Note>
+      Optional: to let the `listGrantedPermissions` instruction report what Microsoft actually granted, also grant `Application.Read.All` or `Directory.Read.All` with admin consent. Without one of them the instruction returns `Could not read the configured Azure app service principal. Grant Application.Read.All or Directory.Read.All application permission with admin consent, then retry.`, or reports permissions as `unknown`.
     </Note>
   </Tab>
 
-  <Tab title="Delegated (OAuth) mode">
-    ## Delegated (OAuth) mode
+  <Tab title="Delegated mode">
+    - The same Microsoft 365 tenant and Entra application registration, with a **client secret**. The delegated flow sends `client_secret` during the token exchange, so the registration must be a confidential client and the redirect URI must be registered under the **Web** platform.
+    - A **redirect URI** added to the registration, pointing at the `oauthCallback` webhook of the workspace that hosts **Outlook MCP**:
 
-    - An **Azure AD Application** registered in your tenant with a **Web** platform configured
-    - A **Redirect URI** added to the app registration:
-
-      ```
-      {platformApiUrl}/workspaces/{workspaceId}/webhooks/oauthCallback
+      ```text
+      <api-url>/workspaces/<workspace-id>/webhooks/oauthCallback
       ```
 
-      Example (sandbox, workspace `oOFlMpO`):
+      Replace `<api-url>` with your environment's platform API URL, for example `https://api.studio.prisme.ai/v2` on production, and `<workspace-id>` with the identifier of the workspace hosting Outlook MCP.
 
-      ```
-      https://api.sandbox.prisme.ai/v2/workspaces/oOFlMpO/webhooks/oauthCallback
+    - Microsoft Graph **delegated** permissions matching the scope string the connect flow requests:
+
+      ```text
+      openid profile email offline_access Mail.Read Mail.Send Mail.ReadWrite MailboxSettings.Read User.Read
       ```
 
-    - **Delegated permissions** granted (Microsoft Graph):
-      - `Mail.Read`
-      - `Mail.ReadWrite`
-      - `Mail.Send`
-      - `MailboxSettings.Read`
-      - `User.Read`: sign-in and profile
-      - `offline_access`: issue refresh tokens
-      - `openid`, `profile`, `email`: ID token / user identity
-    - A **client secret** (the connector uses the authorization code flow with PKCE as a **confidential client**, so "Allow public client flows" must stay **No**)
-    - Either the tenant allows end-user consent, or an admin grants consent once to the delegated scopes above
+    - Either the tenant allows end users to consent to those delegated permissions, or an administrator grants consent once for the whole tenant.
+    - Every end user needs an Exchange Online licence on their own account.
 
     <Note>
-      You can reuse the same Azure app registration for both modes, but the **permission types differ**: Application permissions for app-only mode, Delegated permissions for OAuth mode.
+      The same application registration can serve both modes. Only the **permission type** differs: application permissions for application mode, delegated permissions for delegated mode.
     </Note>
+
+    <Warning>
+      The delegated scope string requested at connect time does not include `Calendars.Read` or `Calendars.ReadWrite`. Calendar instructions therefore work in application mode only, unless a maintainer changes the scope string in the Outlook MCP workspace configuration and every user reconnects.
+    </Warning>
   </Tab>
 </Tabs>
 
----
+## Configure the connector
 
-## OAuth flow (Delegated mode)
-
-When Delegated mode is enabled, end users connect their Microsoft account through a built-in flow implemented by the `outlook-mcp` workspace.
+Perform these steps as a workspace builder with the `editor` role on the workspace.
 
 <Steps>
-  <Step title="User opens the connect page">
-    The user visits `{pagesUrl}/connect-outlook`. The page shows a **Connect Outlook** button when OAuth is configured and the user has no active connection.
+  <Step title="Install Outlook App">
+    In your workspace, open **Apps**, search for **Outlook App**, and install it. The instance is named `Outlook App` by default; that name is the DSUL prefix you call later, for example `Outlook App.listMessages`.
   </Step>
-  <Step title="Initiate">
-    The page (or the `initiateOAuth` webhook) generates a PKCE **code verifier / code challenge (S256)** and a CSRF **state**, stores them in the user scope, and builds the Microsoft authorize URL.
-  </Step>
-  <Step title="Microsoft login & consent">
-    The user is redirected to `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize` and consents to the delegated scopes.
-  </Step>
-  <Step title="Callback & token exchange">
-    Microsoft redirects back to `/webhooks/oauthCallback?code=...&state=...`. The workspace validates the `state`, exchanges the code (with the PKCE `code_verifier`) for tokens at `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`, and stores:
+  <Step title="Fill in the Outlook App configuration">
+    Open the app instance configuration and set the fields you need:
 
-    - `outlook_delegated_token`: platform secret, user scope, TTL = `expires_in`
-    - `outlook_refresh_token`: platform secret, user scope, TTL = **90 days** (`7776000` s)
-    - `user.outlook.oauth`: metadata only (`expiresAt`, `scope`, `authMethod: delegated`)
+    | Field | Key | Purpose |
+    |---|---|---|
+    | **Azure Client ID** | `clientId` | Application (client) ID of the Entra registration. |
+    | **Azure Client Secret** | `clientSecret` | Client secret value. Stored as a password field. |
+    | **Azure Tenant ID** | `tenant` | Directory (tenant) ID. |
+    | **Default User ID** | `defaultUserId` | Mailbox targeted when a call passes no `userId`. Email address or user object ID. Application mode only. |
+    | **OAuth Connect URL** | `oauthConnectUrl` | Page URL returned to users who must connect their Microsoft account. Used as a fallback when the caller sends no connect URL header. |
+    | **Enabled Microsoft Graph scopes** | `enabledScopes` | Allowlist of Graph scopes. Any instruction whose scope is not enabled is refused before Microsoft is called. |
+
+    The stock configuration binds `clientId`, `clientSecret`, `tenant` and `defaultUserId` to the workspace secrets `azureClientId`, `azureClientSecret`, `azureTenant` and `defaultUserId`, so store the real values in **Secrets** rather than typing them into the configuration form.
   </Step>
-  <Step title="Automatic refresh">
-    When the access token is about to expire, `refreshOAuthToken` silently exchanges the refresh token for a new access token (and rotates the refresh token if Microsoft returns a new one).
+  <Step title="Restrict the connector with enabledScopes">
+    `enabledScopes` accepts any of `Mail.Read`, `Mail.ReadWrite`, `Mail.Send`, `MailboxSettings.Read`, `Calendars.Read` and `Calendars.ReadWrite`. Leave it empty to enable all six.
+
+    Every instruction checks this list first. A refused call returns `error: true`, `scopeDenied: true` and a message naming the missing scope, and the workspace emits an `outlook.scope.denied` event carrying the tool name, the required scopes and the enabled scopes. No Graph call is made.
+
+    A second app instance with a narrower list is a supported way to expose a read-only surface next to a full one. For example, install **Outlook App** a second time under the name `OutlookNoSend` with `enabledScopes` set to `Mail.Read`, `Mail.ReadWrite` and `MailboxSettings.Read`: `OutlookNoSend.sendMail` is then refused while `OutlookNoSend.listMessages` keeps working.
+
+    Select **Save**. The change applies to the next call; no republish is required.
   </Step>
-  <Step title="Disconnect">
-    Users can call the `disconnectOAuth` webhook (or trigger the `disconnectOAuth` event) to clear all stored tokens and metadata.
+  <Step title="Configure Outlook MCP, for the MCP surface only">
+    If agents will call the connector as tools, the workspace hosting **Outlook MCP** needs its own configuration under **Outlook Configuration**:
+
+    | Field | Key | Purpose |
+    |---|---|---|
+    | **Azure Client ID** | `outlook.clientId` | Application (client) ID. |
+    | **Azure Client Secret** | `outlook.clientSecret` | Client secret value. |
+    | **Azure Tenant ID** | `outlook.tenant` | Directory (tenant) ID. |
+    | **Default User ID** | `outlook.defaultUserId` | Default target mailbox for application mode. |
+    | **MCP API Key** | `outlook.mcpApiKey` | Key that MCP clients must present on `tools/call`. |
+
+    These bind to the workspace secrets `azureClientId`, `azureClientSecret`, `azureTenant`, `defaultUserId` and `mcpApiKey`. The delegated OAuth client (`oauth.clientId`, `oauth.clientSecret`, `oauth.tenant`) reuses the same three Azure secrets, and the requested scope string is the one listed under [Delegated mode](#delegated-mode) in the prerequisites.
   </Step>
 </Steps>
 
-<Note>
-  **Security properties:**
-  - PKCE (S256) protects the authorization code
-  - CSRF `state` is validated on callback
-  - Tokens are stored as **platform secrets** (opaque references), never as plain user metadata
-  - `redirectTo` is validated against the platform host to prevent open-redirect attacks
-</Note>
+## Connect a Microsoft account in delegated mode
 
----
+End users connect once from the `connect-outlook` page hosted by the Outlook MCP workspace. The page is reachable at `<pages-url>/connect-outlook`, where `<pages-url>` is the pages URL of that workspace.
+
+<Steps>
+  <Step title="Open the connect page">
+    Sign in to Prisme.ai first. The page requires an authenticated session; without one the OAuth webhook answers HTTP `401` with `Authentication required. Please log in to Prisme.ai first.`
+
+    If the delegated client is not configured, the page shows `OAuth is not configured. Contact the workspace administrator.` instead of a button.
+  </Step>
+  <Step title="Select Connect with Microsoft">
+    When the page loads, it generates a PKCE code verifier and challenge (S256) and a CSRF `state`, stores both in the user scope, and builds the Microsoft authorization URL. The **Connect with Microsoft** button links straight to `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize`.
+  </Step>
+  <Step title="Sign in and consent">
+    Sign in with your Microsoft account and approve the requested permissions. Microsoft redirects back to the `oauthCallback` webhook of the Outlook MCP workspace.
+  </Step>
+  <Step title="Let the callback store the tokens">
+    The callback validates `state`, exchanges the code with the PKCE verifier at `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`, and stores:
+
+    - `outlook_delegated_token`: the access token, as a user-scoped platform secret, with a time to live equal to `expires_in`.
+    - `outlook_refresh_token`: the refresh token, as a user-scoped platform secret, with a time to live of `7776000` seconds (90 days).
+    - `user.outlook.oauth`: metadata only, holding `expiresAt`, `tokenType`, `scope` and `authMethod: delegated`.
+
+    The callback also deletes any previously stored client credentials for that user, so a person is connected through exactly one method at a time. It then emits `outlook.oauth.connected` and returns you to the connect page.
+  </Step>
+  <Step title="Verify the connection">
+    The connect page shows `Successfully connected — you can now use Outlook with your personal permissions.` and then `Connected — delegated access is active.` on subsequent visits, alongside a **Disconnect** button. This is the observable success state to check before reporting a problem elsewhere.
+  </Step>
+</Steps>
+
+When the access token nears expiry, the connector exchanges the stored refresh token for a new one without user interaction, and stores a rotated refresh token if Microsoft returns one. Tokens are held as platform secrets and never written into user metadata.
+
+<Note>
+  Message subjects, body content, body previews and attachment bytes are registered as interaction secrets before any event is emitted, so platform events show redacted values and keep only identifiers visible.
+</Note>
 
 <Tabs>
   <Tab title="Usage as App">
     ## Usage as App
 
-    ## Installation
+    Call the installed app instance from DSUL using its instance name as prefix. Every instruction accepts an optional `userId` (application mode only) and returns a metadata envelope containing `operation`, `structuredData` and display hints.
 
-    1. Go to **Apps** in your workspace
-    2. Search for **Outlook App** and install it
-    3. Configure the app instance for your chosen mode (Application or Delegated)
+    ### Mail instructions
 
-    ## Configuration
+    | Instruction | What it does | Required arguments | Graph scope |
+    |---|---|---|---|
+    | `listMailFolders` | Lists mail folders with total and unread counts. `includeHiddenFolders` adds hidden folders, which are excluded by default. | none | `Mail.Read` or `Mail.ReadWrite` |
+    | `getMailFolder` | Reads one folder by ID or well-known name. | `folderId` | `Mail.Read` or `Mail.ReadWrite` |
+    | `listMessages` | Lists message summaries with `top`, `skip`, `filter`, `orderBy`, `search` and `select`. Defaults to the `inbox` folder. | none | `Mail.Read` or `Mail.ReadWrite` |
+    | `getMessage` | Reads one message with full body. `includeHeaders` expands internet headers, `bodyType` selects `text` or `html` (default `html`). | `messageId` | `Mail.Read` or `Mail.ReadWrite` |
+    | `searchMessages` | Runs a KQL search across subject, sender and body, optionally inside one folder. | `query` | `Mail.Read` or `Mail.ReadWrite` |
+    | `listAttachments` | Lists attachment metadata without content bytes. | `messageId` | `Mail.Read` or `Mail.ReadWrite` |
+    | `getAttachment` | Returns attachment metadata plus `contentBytes` in base64. | `messageId`, `attachmentId` | `Mail.Read` or `Mail.ReadWrite` |
+    | `getMailboxSettings` | Returns time zone, language, automatic replies and working hours. | none | `MailboxSettings.Read` |
+    | `sendMail` | Sends a message. `saveToSentItems` defaults to `true`. | `message` with `subject`, `body` and `toRecipients` | `Mail.Send` |
+    | `sendDraft` | Sends an existing draft, which moves to Sent Items. | `messageId` | `Mail.Send` |
+    | `replyMessage` | Replies to the sender, with `comment` or a full `message` override. | `messageId` | `Mail.Send` |
+    | `replyAllMessage` | Replies to every original recipient. | `messageId` | `Mail.Send` |
+    | `forwardMessage` | Forwards a message, with an optional `comment`. | `messageId`, `toRecipients` | `Mail.Send` |
+    | `createDraft` | Creates a draft in Drafts. Accepts `toRecipients`, `ccRecipients`, `bccRecipients` and `importance`. | `subject`, `body` | `Mail.ReadWrite` |
+    | `updateMessage` | Updates `isRead`, `importance`, `categories` and `inferenceClassification` on any message, and body or recipients on drafts. | `messageId` | `Mail.ReadWrite` |
+    | `deleteMessage` | Soft-deletes, moving the message to Deleted Items. | `messageId` | `Mail.ReadWrite` |
+    | `moveMessage` | Moves a message. The message gets a new ID at the destination. | `messageId`, `destinationId` | `Mail.ReadWrite` |
+    | `copyMessage` | Copies a message, leaving the original in place. | `messageId`, `destinationId` | `Mail.ReadWrite` |
 
-    <Tabs>
-      <Tab title="Application mode">
-        | Field | Value |
-        |-------|-------|
-        | **Azure Client ID** | Application (client) ID from Azure AD |
-        | **Azure Client Secret** | Client secret value |
-        | **Azure Tenant ID** | Directory (tenant) ID |
-        | **Default User ID** | Email address or user object ID of the target mailbox |
-      </Tab>
-      <Tab title="Delegated (OAuth) mode">
-        | Field | Value |
-        |-------|-------|
-        | **OAuth Client ID** (`oauth.clientId`) | Azure AD application (client) ID |
-        | **OAuth Client Secret** (`oauth.clientSecret`) | Azure AD client secret |
-        | **OAuth Tenant** (`oauth.tenant`) | Directory (tenant) ID, or `common` / `organizations` |
-        | **OAuth Scopes** (`oauth.scopes`) | Default: `openid profile email offline_access Mail.Read Mail.Send Mail.ReadWrite MailboxSettings.Read User.Read` |
+    Well-known folder names accepted by `folderId` and `destinationId` are `inbox`, `drafts`, `sentitems`, `deleteditems`, `junkemail`, `archive` and `outbox`.
 
-        `Default User ID` is **not used** in Delegated mode; each user operates on their own mailbox.
-      </Tab>
-    </Tabs>
+    ### Calendar instructions
 
-    ## Available Automations
+    Calendar instructions exist on the Builder surface only. They are not exposed as MCP tools.
 
-    The automation names and Graph permissions below are identical in both modes; only the **permission type** (Application vs Delegated) granted in Azure AD differs.
+    | Instruction | What it does | Required arguments | Graph scope |
+    |---|---|---|---|
+    | `listCalendars` | Lists the calendars of the mailbox. | none | `Calendars.Read` or `Calendars.ReadWrite` |
+    | `listEvents` | Lists events in a calendar. Recurring events appear as series masters only. | none | `Calendars.Read` or `Calendars.ReadWrite` |
+    | `getCalendarView` | Lists every occurrence in a time window, expanding recurrences. Use this to answer agenda questions. | `startDateTime`, `endDateTime` | `Calendars.Read` or `Calendars.ReadWrite` |
+    | `getEvent` | Reads one event with body, attendees and online meeting details. | `eventId` | `Calendars.Read` or `Calendars.ReadWrite` |
+    | `createEvent` | Creates an event. Supports `attendees`, `location`, `recurrence`, `isAllDay`, `isOnlineMeeting`, `importance`, `showAs` and `reminderMinutesBeforeStart`. Invitations are sent automatically. | `subject`, `start`, `end` | `Calendars.ReadWrite` |
+    | `updateEvent` | Patches an event. Only the provided fields change. | `eventId` | `Calendars.ReadWrite` |
+    | `deleteEvent` | Moves the event to Deleted Items. | `eventId` | `Calendars.ReadWrite` |
+    | `respondToEvent` | Answers a meeting invitation. `response` accepts `accept`, `decline` or `tentativelyAccept`. `sendResponse` defaults to `true`. | `eventId`, `response` | `Calendars.ReadWrite` |
 
-    ### Read Operations
+    ### Setup and diagnostic instructions
 
-    | Automation | Description | Graph permission |
-    |------------|-------------|------------------|
-    | `listMailFolders` | List all mail folders with message counts | Mail.Read |
-    | `getMailFolder` | Get folder details by ID or well-known name | Mail.Read |
-    | `listMessages` | List messages with filtering, pagination, sorting | Mail.Read |
-    | `getMessage` | Get full message content and metadata | Mail.Read |
-    | `searchMessages` | Search messages using KQL syntax | Mail.Read |
-    | `listAttachments` | List all attachments for a message | Mail.Read |
-    | `getAttachment` | Get attachment content as base64 | Mail.Read |
-    | `getMailboxSettings` | Get timezone, locale, automatic replies | MailboxSettings.Read |
+    | Instruction | What it does |
+    |---|---|
+    | `configureOutlook` | Stores per-user Azure client credentials in the user scope, used when no credential header is supplied. Requires `clientId`, `clientSecret`, `tenant` and `userId`, and emits `outlook.credentials.configured`. |
+    | `getOAuthScopes` | Returns the effective scope string and the enabled scope list computed from `enabledScopes`. |
+    | `listGrantedPermissions` | Reads the Entra service principal and reports the application and delegated Graph permissions actually granted, plus a calendar readiness summary. |
 
-    ### Send Operations
+    ### DSUL examples
 
-    | Automation | Description | Graph permission |
-    |------------|-------------|------------------|
-    | `sendMail` | Send an email (to/cc/bcc, HTML/text, importance) | Mail.Send |
-    | `sendDraft` | Send an existing draft message | Mail.Send |
-    | `replyMessage` | Reply to a message | Mail.Send |
-    | `replyAllMessage` | Reply-all to a message | Mail.Send |
-    | `forwardMessage` | Forward a message to recipients | Mail.Send |
-
-    ### Write Operations
-
-    | Automation | Description | Graph permission |
-    |------------|-------------|------------------|
-    | `createDraft` | Create a draft email in Drafts folder | Mail.ReadWrite |
-    | `updateMessage` | Update properties (read status, importance) | Mail.ReadWrite |
-    | `deleteMessage` | Soft-delete (move to Deleted Items) | Mail.ReadWrite |
-    | `moveMessage` | Move message to another folder | Mail.ReadWrite |
-    | `copyMessage` | Copy message to another folder | Mail.ReadWrite |
-
-    ## DSUL Examples
-
-    ### List Messages
+    List the ten most recent unread messages in the inbox:
 
     ```yaml
     - Outlook App.listMessages:
-        userId: user@company.com   # Application mode only; ignored in Delegated mode
+        userId: user@example.com   # application mode only, ignored in delegated mode
         folderId: inbox
         top: 10
         filter: "isRead eq false"
         output: messages
     ```
 
-    ### Send an Email
+    Send an email. Note that recipients, subject and body live inside the `message` object:
 
     ```yaml
     - Outlook App.sendMail:
-        userId: user@company.com
-        to: recipient@example.com
-        subject: Meeting Follow-up
-        body: "<p>Thank you for the meeting today.</p>"
-        contentType: HTML
+        userId: user@example.com
+        message:
+          subject: Meeting follow-up
+          body:
+            contentType: HTML
+            content: "<p>Thank you for the meeting today.</p>"
+          toRecipients:
+            - emailAddress:
+                address: recipient@example.com
+        saveToSentItems: true
         output: result
     ```
 
-    ### Search Messages
+    Search messages with KQL:
 
     ```yaml
     - Outlook App.searchMessages:
-        userId: user@company.com
-        query: "from:john@example.com subject:project"
+        userId: user@example.com
+        query: "from:john subject:project"
         top: 20
         output: results
     ```
 
-    ### Reply to a Message
+    Reply with a short comment:
 
     ```yaml
     - Outlook App.replyMessage:
-        userId: user@company.com
-        messageId: "{{messageId}}"
-        comment: "Thanks for the update!"
+        userId: user@example.com
+        messageId: '{{messageId}}'
+        comment: "Thanks for the update."
         output: result
+    ```
+
+    Read this week's agenda, occurrences expanded:
+
+    ```yaml
+    - Outlook App.getCalendarView:
+        userId: user@example.com
+        startDateTime: "2026-06-01T00:00:00Z"
+        endDateTime: "2026-06-08T00:00:00Z"
+        timeZone: Europe/Paris
+        top: 50
+        output: agenda
     ```
   </Tab>
 
   <Tab title="Usage as MCP">
     ## Usage as MCP
 
-    ## MCP Setup
+    The Outlook MCP workspace exposes a JSON-RPC 2.0 endpoint. `initialize`, `notifications/initialized` and `tools/list` answer without a key; `tools/call` requires the configured API key.
 
-    1. Open your **Knowledges project**
-    2. Go to **Advanced > Tools**
-    3. Click **Add** and select the **MCP** tab
-    4. Enter the MCP endpoint URL
-    5. In the **Headers** field, add the credentials for your chosen mode
+    ### Endpoint
 
-    <Tabs>
-      <Tab title="Application mode headers">
+    ```text
+    <api-url>/workspaces/<workspace-id>/webhooks/mcp
+    ```
+
+    Replace `<api-url>` with your environment's platform API URL, for example `https://api.studio.prisme.ai/v2` on production, and `<workspace-id>` with the identifier of the workspace hosting Outlook MCP.
+
+    ### Attach the endpoint to an agent
+
+    <Steps>
+      <Step title="Open the tools configuration">
+        In your Knowledges project, go to **Advanced > Tools**, select **Add**, then the **MCP** tab.
+      </Step>
+      <Step title="Paste the endpoint URL">
+        Enter the endpoint URL shown above.
+      </Step>
+      <Step title="Add the credential headers">
+        Fill the **Headers** field with the header set matching your chosen mode.
+
+        Application mode, where the connector performs a client-credentials exchange and targets the mailbox named by `userId` or by the workspace default:
+
         ```json
         {
-          "mcp-api-key": "your-mcp-api-key",
-          "azure-client-id": "your-client-id",
-          "azure-client-secret": "your-client-secret",
-          "azure-tenant": "your-tenant-id"
+          "mcp-api-key": "<your-mcp-api-key>",
+          "azure-client-id": "<your-client-id>",
+          "azure-client-secret": "<your-client-secret>",
+          "azure-tenant": "<your-tenant-id>"
         }
         ```
 
-        The MCP server uses the client credentials flow against Microsoft Graph and targets the mailbox specified by `userId` (or the workspace default).
-      </Tab>
-      <Tab title="Delegated (OAuth) mode headers">
+        Delegated mode, where the connector uses the calling user's stored OAuth tokens:
+
         ```json
         {
-          "mcp-api-key": "your-mcp-api-key",
+          "mcp-api-key": "<your-mcp-api-key>",
           "auth-mode": "oauth"
         }
         ```
 
-        No `azure-*` headers. The end user must have completed the OAuth flow once via `{pagesUrl}/connect-outlook`. If they haven't, the tool returns a structured error containing a `connectUrl` pointing to the connect page.
+        The API key value must match the **MCP API Key** configured on the Outlook MCP workspace.
+      </Step>
+      <Step title="Verify the tool list">
+        Send a `tools/list` request, or open the tool picker, and confirm the 18 mail tools listed below appear. Then run `listMailFolders` as a safe read-only check before enabling any write tool.
+      </Step>
+    </Steps>
 
-        <Warning>
-          `auth-mode: oauth` **forces** Delegated mode and disables all fallbacks. If no valid delegated token is stored for the user, the request fails immediately with a `connectUrl`; it will not fall back to client credentials.
-        </Warning>
-      </Tab>
-    </Tabs>
+    <Warning>
+      The `auth-mode` header set to `oauth` **forces** delegated mode and disables every fallback. If the calling user has no stored delegated token, the call fails immediately with `OAuth authentication required. Please visit the following URL to connect your Microsoft account:` followed by the connect URL. It never falls back to client credentials.
+    </Warning>
 
-    <Note>
-      The `mcp-api-key` value must match the **MCP API Key** secret configured in the workspace secrets (`mcpApiKey`).
-    </Note>
+    ### Credential resolution order
 
-    ## Authentication
+    Outlook App resolves credentials in this order:
 
-    The MCP server resolves credentials in the following priority order (see `outlook-app/resolveAuth.yml`):
+    1. The `auth-mode` header set to `oauth`, which requires a stored delegated token for the calling user and has no fallback.
+    2. An `authorization` header carrying a `Bearer` Microsoft Graph access token, used as-is.
+    3. The `azure-client-id`, `azure-client-secret` and `azure-tenant` headers, exchanged for an application token.
+    4. Stored delegated OAuth tokens for the calling user, refreshed automatically when expired.
+    5. Per-user credentials previously stored by `configureOutlook`.
+    6. The workspace configuration credentials, backed by the `azureClientId`, `azureClientSecret` and `azureTenant` secrets.
 
-    1. `auth-mode: oauth` header → **requires** a stored delegated token for the user; no fallback
-    2. `Authorization: Bearer <token>` header (pre-resolved Graph access token)
-    3. `azure-client-id` / `azure-client-secret` / `azure-tenant` custom headers (Application mode)
-    4. Stored OAuth delegated tokens (`user.outlook.oauth` + platform secrets), with automatic refresh
-    5. Per-user credentials from `configureOutlook` (`user.outlook.credentials`)
-    6. Workspace secrets client credentials (`azureClientId`, `azureClientSecret`, `azureTenant`)
+    Steps 3, 5 and 6 all end in a client-credentials exchange whose result is cached as a user-scoped platform secret named `outlook_cc_token`, with a 300 second safety margin subtracted from the token lifetime.
 
-    ### Workspace Secrets
+    ### Mailbox targeting
 
-    | Secret | Used by | Description |
-    |--------|---------|-------------|
-    | `azureClientId` | Application mode | Azure AD client ID |
-    | `azureClientSecret` | Application mode | Azure AD client secret |
-    | `azureTenant` | Application mode | Azure AD tenant ID |
-    | `defaultUserId` | Application mode | Default mailbox email or user object ID |
-    | `mcpApiKey` | Both | API key for authenticating MCP requests |
+    - **Application mode**: the `userId` tool argument selects the mailbox, falling back to the credentials stored by `configureOutlook`, then to `defaultUserId`. If none resolves, the call fails with `userId is required for mailbox operations. Provide userId in arguments, call configureOutlook, or set defaultUserId in config.` Accepted formats are a user principal name such as `user@example.com` or a user object ID.
+    - **Delegated mode**: `userId` is ignored and every call targets `/me`, the mailbox of the connected user.
 
-    Delegated mode reads its configuration from `config.oauth.*` (`clientId`, `clientSecret`, `tenant`, `scopes`), which by default resolves to the same Azure secrets above; the same app registration can serve both modes.
+    ### Available tools
 
-    ### Mailbox Targeting
+    Every tool accepts the arguments of the matching Builder instruction, plus `outputFormat`. Calendar operations are not exposed here.
 
-    - **Application mode**: the `userId` tool argument (or `defaultUserId` workspace secret) selects which mailbox to act on. Resolution order: tool argument `userId` > workspace secret `defaultUserId`. If neither is set, the request fails.
-      - **User Principal Name**: `user@yourdomain.com`
-      - **User Object ID**: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
-    - **Delegated (OAuth) mode**: `userId` is **ignored**. All calls run against `/me`, the mailbox of the user whose OAuth token is used.
+    | Tool | Arguments beyond `userId` and `outputFormat` |
+    |---|---|
+    | `listMailFolders` | `includeHiddenFolders` |
+    | `getMailFolder` | `folderId` |
+    | `listMessages` | `folderId`, `top`, `skip`, `filter`, `orderBy`, `search`, `select` |
+    | `getMessage` | `messageId`, `includeHeaders`, `bodyType` |
+    | `searchMessages` | `query`, `folderId`, `top`, `skip`, `orderBy` |
+    | `listAttachments` | `messageId` |
+    | `getAttachment` | `messageId`, `attachmentId` |
+    | `getMailboxSettings` | none |
+    | `sendMail` | `message`, `saveToSentItems` |
+    | `sendDraft` | `messageId` |
+    | `replyMessage` | `messageId`, `comment`, `message` |
+    | `replyAllMessage` | `messageId`, `comment`, `message` |
+    | `forwardMessage` | `messageId`, `toRecipients`, `comment` |
+    | `createDraft` | `subject`, `body`, `toRecipients`, `ccRecipients`, `bccRecipients`, `importance` |
+    | `updateMessage` | `messageId`, `isRead`, `importance`, `categories`, `inferenceClassification`, `subject`, `body`, `toRecipients`, `ccRecipients`, `bccRecipients` |
+    | `deleteMessage` | `messageId` |
+    | `moveMessage` | `messageId`, `destinationId` |
+    | `copyMessage` | `messageId`, `destinationId` |
 
-    ## Available Tools
+    A call to any other tool name returns `Tool not found: <name>`.
 
-    ### Read Operations
+    ### JSON-RPC examples
 
-    | Tool | Description | Graph permission |
-    |------|-------------|------------------|
-    | `listMailFolders` | List all mail folders with message counts | Mail.Read |
-    | `getMailFolder` | Get folder details by ID or well-known name | Mail.Read |
-    | `listMessages` | List messages with filtering, pagination, sorting | Mail.Read |
-    | `getMessage` | Get full message content and metadata | Mail.Read |
-    | `searchMessages` | Search messages using KQL syntax | Mail.Read |
-    | `listAttachments` | List all attachments for a message | Mail.Read |
-    | `getAttachment` | Get attachment content as base64 | Mail.Read |
-    | `getMailboxSettings` | Get timezone, locale, automatic replies | MailboxSettings.Read |
-
-    ### Send Operations
-
-    | Tool | Description | Graph permission |
-    |------|-------------|------------------|
-    | `sendMail` | Send an email (to/cc/bcc, HTML/text, importance) | Mail.Send |
-    | `sendDraft` | Send an existing draft message | Mail.Send |
-    | `replyMessage` | Reply to a message (comment or full body) | Mail.Send |
-    | `replyAllMessage` | Reply-all to a message | Mail.Send |
-    | `forwardMessage` | Forward a message to recipients | Mail.Send |
-
-    ### Write Operations
-
-    | Tool | Description | Graph permission |
-    |------|-------------|------------------|
-    | `createDraft` | Create a draft email in Drafts folder | Mail.ReadWrite |
-    | `updateMessage` | Update properties (read status, importance, categories) | Mail.ReadWrite |
-    | `deleteMessage` | Soft-delete (move to Deleted Items) | Mail.ReadWrite |
-    | `moveMessage` | Move message to another folder | Mail.ReadWrite |
-    | `copyMessage` | Copy message to another folder | Mail.ReadWrite |
-
-    ## JSON-RPC Examples
-
-    ### List Messages
+    List unread inbox messages:
 
     ```json
     {
       "name": "listMessages",
       "arguments": {
-        "userId": "user@company.com",
+        "userId": "user@example.com",
         "folderId": "inbox",
         "top": 10,
         "filter": "isRead eq false"
@@ -390,121 +470,237 @@ When Delegated mode is enabled, end users connect their Microsoft account throug
     }
     ```
 
-    ### Send an Email
+    Send an email:
 
     ```json
     {
       "name": "sendMail",
       "arguments": {
-        "userId": "user@company.com",
-        "to": "recipient@example.com",
-        "subject": "Meeting Follow-up",
-        "body": "<p>Thank you for the meeting today.</p>",
-        "contentType": "HTML"
+        "userId": "user@example.com",
+        "message": {
+          "subject": "Meeting follow-up",
+          "body": {
+            "contentType": "HTML",
+            "content": "<p>Thank you for the meeting today.</p>"
+          },
+          "toRecipients": [
+            { "emailAddress": { "address": "recipient@example.com" } }
+          ]
+        },
+        "saveToSentItems": true
       }
     }
     ```
 
-    ### Search Messages
+    Search messages:
 
     ```json
     {
       "name": "searchMessages",
       "arguments": {
-        "userId": "user@company.com",
-        "query": "from:john@example.com subject:project",
+        "userId": "user@example.com",
+        "query": "from:john subject:project",
         "top": 20
       }
     }
     ```
 
-    ## Output Formats
+    ### Output formats
 
-    All tools support an `outputFormat` parameter:
+    Every tool accepts `outputFormat`:
 
-    - **`verbose`** (default): Human-readable text for LLM consumption
-    - **`structured`**: Machine-readable JSON in `structuredContent`
-    - **`both`**: Both text and structured content
+    - `verbose` (default): human-readable text sized for model consumption.
+    - `structured`: machine-readable JSON in `structuredContent`.
+    - `both`: text and structured content together.
   </Tab>
 </Tabs>
 
----
+## Verify the setup
 
-## Security: Restrict to One Mailbox (Application mode only)
+Run these checks in order. Each one has an observable result, so a failure tells you which layer to fix.
 
-<Note>
-  This section applies only to **Application mode**. Delegated (OAuth) mode is already restricted to the consenting user's own mailbox and does not need an Application Access Policy.
-</Note>
+| Check | How | Expected result |
+|---|---|---|
+| Scope gate | Call `getOAuthScopes` from Builder | Returns the effective scope string and the enabled scope list you configured |
+| Azure grant, application mode | Call `listGrantedPermissions` from Builder | Lists the application permissions granted on the registration, without `unknown` entries |
+| Delegated connection | Open `<pages-url>/connect-outlook` as an end user | The page shows `Connected — delegated access is active.` and a **Disconnect** button |
+| Read path | Call `listMailFolders`, or the equivalent MCP tool | Returns folders with total and unread counts for the intended mailbox |
+| Mailbox targeting | Call `getMailboxSettings` | Returns the time zone and language of the mailbox you expect, not of another user |
+| Negative access | In application mode, call `listMailFolders` with a `userId` outside the allowed group | Fails with `Access denied. Check permissions.` once an application access policy is in place |
+| Write path | Call `createDraft`, check the draft in Outlook, then `deleteMessage` | The draft appears in Drafts, then moves to Deleted Items |
 
-Application permissions grant access to **all mailboxes** in the tenant by default. To restrict this connector to a single mailbox, use an **Application Access Policy** in Exchange Online:
+## Restrict application mode to one mailbox
+
+This section applies to application mode only. Delegated mode is already limited to the connected user's own mailbox and needs no policy.
+
+Application permissions reach every mailbox in the tenant. To scope the Entra application to a single mailbox, apply an application access policy in Exchange Online.
 
 ```powershell
 # 1. Connect to Exchange Online
 Connect-ExchangeOnline
 
-# 2. Create a mail-enabled security group with only the target mailbox
-New-DistributionGroup -Name "OutlookMCP-Allowed" -Type Security -Members user@yourdomain.com
+# 2. Create a mail-enabled security group holding only the target mailbox
+New-DistributionGroup -Name "OutlookMCP-Allowed" -Type Security -Members user@example.com
 
-# 3. Restrict the Azure AD app to only access that group's mailboxes
+# 3. Restrict the Entra application to that group's mailboxes
 New-ApplicationAccessPolicy -AppId "<your-azure-client-id>" `
   -PolicyScopeGroupId "OutlookMCP-Allowed" `
   -AccessRight RestrictAccess `
-  -Description "Restrict Outlook connector to single mailbox"
+  -Description "Restrict Outlook connector to a single mailbox"
 
-# 4. Verify (may take up to 30 minutes to propagate)
-Test-ApplicationAccessPolicy -AppId "<your-azure-client-id>" -Identity user@yourdomain.com
+# 4. Verify
+Test-ApplicationAccessPolicy -AppId "<your-azure-client-id>" -Identity user@example.com
 # Expected: Granted
 ```
 
 <Warning>
-  The PowerShell commands above are provided as general guidance. Always refer to the [official Microsoft documentation](https://learn.microsoft.com/en-us/graph/auth-limit-mailbox-access) for the most up-to-date syntax.
+  These commands are general guidance and policy changes take time to propagate across Exchange Online. Follow [Microsoft's mailbox access limitation guide](https://learn.microsoft.com/en-us/graph/auth-limit-mailbox-access) for the authoritative syntax and propagation behaviour.
 </Warning>
 
----
+## Troubleshoot
 
-## Error Handling
+### Credentials not configured
 
-| HTTP Status | Error | Solution |
-|-------------|-------|----------|
-| 401 | Unauthorized (Application mode) | Verify `clientId`, `clientSecret`, `tenant` |
-| 401 | User not connected / expired refresh token (Delegated mode) | The response includes a `connectUrl`; the end user must (re)connect at `/connect-outlook` |
-| 403 | Forbidden | Grant admin consent or check Application Access Policy |
-| 404 | Not Found | Verify user email/ID exists in tenant |
-| 429 | Rate Limited | Wait and retry |
+```text
+Credentials not configured. Options: 1. Pass Authorization Bearer token header 2. Pass Azure-Client-Id, Azure-Client-Secret, Azure-Tenant headers 3. Configure app-level credentials
+```
 
-### Common Issues
+No credential source resolved. The Microsoft Entra admin or the workspace builder fixes this. Set `azureClientId`, `azureClientSecret` and `azureTenant` in the workspace secrets, or send the three Azure headers on the request, or call `configureOutlook` once for the calling user. Verify with `listMailFolders`.
 
-**`AADSTS700016`**: App not found in the directory. Check tenant ID matches the app registration.
+### OAuth authentication required
 
-**`AADSTS65001`**: User has not consented to the required delegated scopes. Either enable user consent in the tenant or have an admin grant consent once.
+```text
+OAuth authentication required. Please visit the following URL to connect your Microsoft account:
+```
 
-**`MailboxNotEnabledForRESTAPI`**: The user needs an Exchange Online license assigned.
+The request forced delegated mode but the calling user has no stored delegated token. The end user fixes this by opening the connect URL returned alongside the message and selecting **Connect with Microsoft**. Verify that the connect page shows `Connected — delegated access is active.`
 
-**`invalid_grant` on refresh**: The refresh token has expired (>90 days) or been revoked. The user must reconnect via `/connect-outlook`.
+### OAuth session expired, please re-authorize
 
-**`invalid_client`**: The Azure AD client secret is wrong or has expired. Rotate the secret in Azure AD and update the workspace configuration.
+```text
+OAuth session expired
+```
 
-**`ErrorAccessDenied` with Application Access Policy**: The target mailbox is not in the allowed security group. Takes up to 30 minutes to propagate after policy changes.
+The refresh exchange failed, usually because the refresh token passed its 90 day lifetime or was revoked in Entra. The end user reconnects from the connect page. If the message instead reads `OAuth configuration is incomplete (tenant/clientId/clientSecret unresolved). An administrator must fix the workspace secrets.`, a workspace administrator must repair the `azureTenant`, `azureClientId` and `azureClientSecret` secrets, which resolved empty.
 
-## External Resources
+### Token exchange failed, or refresh failed
+
+```text
+Token exchange failed: <error_description>
+Refresh failed: <error> - <error_description>
+```
+
+Microsoft rejected the authorization code or the refresh token, and the connector forwards its description verbatim. The Microsoft Entra admin reads the `AADSTS` code in the description against [Microsoft's sign-in error code reference](https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes). Expired client secrets, missing user consent and a tenant identifier that does not match the registration all surface here. After fixing the registration, the end user reconnects.
+
+### Authentication failed or token expired
+
+```text
+Authentication failed or token expired.
+```
+
+Microsoft Graph answered HTTP `401`. In application mode, verify the client ID, secret and tenant, and confirm the secret has not expired. In delegated mode, reconnect from the connect page.
+
+### Access denied, check permissions
+
+```text
+Access denied. Check permissions.
+```
+
+Microsoft Graph answered HTTP `403`. Either admin consent is missing on the required Graph permission, or an application access policy excludes the target mailbox. The Microsoft Entra admin grants consent or adds the mailbox to the allowed security group, then waits for propagation. Verify with `getMailboxSettings` on that mailbox.
+
+### The tool is disabled, it requires the Microsoft Graph scope
+
+```text
+The "sendMail" tool is disabled: it requires the Microsoft Graph scope Mail.Send, but the Outlook app configuration only enables: Mail.Read, Mail.ReadWrite, MailboxSettings.Read. An administrator must add the required scope to the "Enabled Microsoft Graph scopes" (enabledScopes) app configuration, then users must reconnect their Microsoft account.
+```
+
+This is the `enabledScopes` allowlist refusing the call before Microsoft is contacted, and the workspace emits `outlook.scope.denied`. The workspace builder adds the scope to **Enabled Microsoft Graph scopes** and saves, or routes the call to a fuller app instance. In delegated mode, users then reconnect so consent covers the added scope.
+
+### userId is required for mailbox operations
+
+```text
+userId is required for mailbox operations. Provide userId in arguments, call configureOutlook, or set defaultUserId in config.
+```
+
+Application mode resolved no target mailbox. The workspace builder sets **Default User ID**, or the caller passes `userId`. This message never appears in delegated mode, which always targets `/me`.
+
+### Unexpected response from Microsoft Graph
+
+```text
+Unexpected response from Microsoft Graph: the message list is missing. This indicates an authentication or connectivity problem, not an empty folder.
+```
+
+Graph returned no message array. Treat it as an authentication or connectivity failure rather than an empty mailbox, and re-run the credential checks in [Verify the setup](#verify-the-setup).
+
+### Rate limited
+
+```text
+Rate limited. Please wait and retry.
+Rate limited. Retry after <n> seconds.
+```
+
+Microsoft Graph throttled the tenant with HTTP `429`. Retry after the delay Microsoft reports, and reduce `top` or the call rate in scheduled automations. The connector adds no throttling of its own.
+
+### Delegated authentication is not yet implemented
+
+```text
+Delegated authentication is not yet implemented. Use auth mode 'application' or omit the header.
+```
+
+A request set the `azure-auth-mode` header to `delegated`. That header belongs to the shared Microsoft Graph Auth layer and does not select this connector's delegated OAuth mode. Remove it and set the `auth-mode` header to `oauth` instead.
+
+### MCP API key errors
+
+```text
+API key not configured. Generate one from the API Key page.
+Missing mcp-api-key header. Add header "mcp-api-key" with a valid API key.
+Invalid mcp-api-key. Check that the API key value is correct.
+```
+
+These JSON-RPC errors (code `-32001`) come from the MCP router on `tools/call`. The workspace builder sets the **MCP API Key** on the Outlook MCP workspace, and the agent builder copies the same value into the MCP headers. `initialize` and `tools/list` keep answering without a key, so a working tool list does not prove the key is right.
+
+## Disconnect, rotate and remove
+
+- **A user disconnects**: on the connect page, select **Disconnect**. This deletes the `outlook_delegated_token`, `outlook_refresh_token`, `outlook_cc_token` and `outlook_client_secret` user secrets, clears the `user.outlook.oauth` and `user.outlook.credentials` metadata, and emits `outlook.oauth.disconnected`. The page then shows the connect button again. The same action is available by emitting the `disconnectOAuth` event.
+- **An administrator revokes a user**: revoke the user's sessions or refresh tokens in Microsoft Entra ID. The next connector call fails with a re-authorization message pointing at the connect page.
+- **Rotate the client secret**: create the new secret in Entra, update the `azureClientSecret` secret in every workspace that holds it, and save. Application mode picks up the new secret once the cached `outlook_cc_token` expires. Delegated connections keep working until their refresh token is used, then need the updated secret to be in place.
+- **Offboard a user**: have them disconnect, or revoke their Entra sessions, then remove their access to the workspace. Delegated tokens are user-scoped, so they stop resolving once the account is disabled.
+- **Reduce the surface without uninstalling**: empty out the write scopes in **Enabled Microsoft Graph scopes** and save. Every write instruction is refused immediately, with no Graph call.
+- **Remove the connector**: uninstall the **Outlook App** instance from the workspace, delete the `azureClientId`, `azureClientSecret`, `azureTenant`, `defaultUserId` and `mcpApiKey` secrets, remove the MCP endpoint from any agent that references it, and delete the redirect URI and the client secret from the Entra registration.
+
+## Migrate to the Outlook connector
+
+Plan the move to the [Outlook](/apps-store/marketplace/connectors/outlook) connector for any installation that is still growing. The differences that shape the migration:
+
+| Topic | Outlook (legacy) | Outlook |
+|---|---|---|
+| Tool shape | 18 flat mail tools | Six entity tools driven by an `action` argument, covering mail, calendar and contacts |
+| Credentials at call time | Azure client ID, secret and tenant passed as request headers, or a forced `auth-mode` header | Tenant app-instance context, no credential headers |
+| OAuth client | One client per installation, registered by each customer | Central client registered once by the platform maintainer, or a tenant client |
+| Calendar | Builder surface only | Available on both surfaces |
+| Agent authorization | None beyond the API key | Per-agent allowlist |
+
+Migration outline: install the Outlook connector in the target workspace, connect the accounts through its own flow, rewrite DSUL calls and agent instructions against the entity tools, verify with read-only operations, then remove the legacy installation as described in [Disconnect, rotate and remove](#disconnect%2C-rotate-and-remove).
+
+## External resources
 
 <CardGroup cols={2}>
-  <Card title="Microsoft Graph Mail API" icon="book" href="https://learn.microsoft.com/en-us/graph/api/resources/mail-api-overview">
-    Official API documentation
+  <Card title="Microsoft Graph mail API" icon="book" href="https://learn.microsoft.com/en-us/graph/api/resources/mail-api-overview">
+    Reference for the mail resources and operations this connector wraps
   </Card>
   <Card title="OAuth 2.0 authorization code flow" icon="key" href="https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow">
-    Microsoft identity platform: delegated auth code + PKCE
+    Microsoft identity platform: delegated authorization code with PKCE
   </Card>
-  <Card title="Delegated permissions reference" icon="user-shield" href="https://learn.microsoft.com/en-us/graph/permissions-reference">
-    Microsoft Graph: delegated vs application permissions
+  <Card title="Graph permissions reference" icon="user-shield" href="https://learn.microsoft.com/en-us/graph/permissions-reference">
+    Delegated compared with application permissions, per resource
   </Card>
-  <Card title="Application Access Policies" icon="shield" href="https://learn.microsoft.com/en-us/graph/auth-limit-mailbox-access">
-    Restrict mailbox access per application (app-only mode)
+  <Card title="Limit mailbox access per application" icon="shield" href="https://learn.microsoft.com/en-us/graph/auth-limit-mailbox-access">
+    Application access policies for app-only Graph access
   </Card>
-  <Card title="Graph Explorer" icon="flask" href="https://developer.microsoft.com/en-us/graph/graph-explorer">
-    Test API calls interactively
+  <Card title="Microsoft Graph Explorer" icon="flask" href="https://developer.microsoft.com/en-us/graph/graph-explorer">
+    Test Graph calls interactively against your tenant
   </Card>
-  <Card title="MCP Specification" icon="robot" href="https://modelcontextprotocol.io">
-    Model Context Protocol specification
+  <Card title="Model Context Protocol" icon="robot" href="https://modelcontextprotocol.io">
+    Specification for the JSON-RPC tool protocol used by the MCP endpoint
   </Card>
 </CardGroup>

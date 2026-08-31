@@ -12,17 +12,17 @@ description: 'Extract text and structured data from images and documents with Az
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Azure OCR app exposes two Azure AI services behind a single Prisme.ai connector: **Azure Computer Vision** for lightweight image OCR and visual analysis (Read, Caption, Tags, Objects, People) and **Azure Document Intelligence** for structured extraction of documents (layouts, invoices, receipts, ID documents). It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call through two entity tools (`image`, `document`), or as a Builder app whose instructions you call directly from DSUL. It runs in the **tenant app-instance context**: each workspace pastes its own per-service Azure credentials (endpoint hostname + API key), resolved server-side and never exposed to the agent. Agents are identified by the capability **Scope** `context_id,agent_id,user_id` and gated by a per-workspace authorized-agents allowlist.
+The Azure OCR app exposes two Azure AI services behind a single Prisme.ai connector: **Azure Computer Vision** for image OCR and visual analysis (Read, Caption, Tags, Objects, People) and **Azure Document Intelligence** for structured extraction of documents (layout, read, invoices, receipts, ID documents, business cards). It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call through two entity tools (`image`, `document`), or as a Builder app whose instructions you call directly from DSUL. It runs in the **tenant app-instance context**: each workspace stores its own per-service Azure credentials (endpoint hostname + API key) in its workspace secrets, resolved server-side and never exposed to the agent. Agents are identified by the capability **Scope** `context_id,agent_id,user_id,attachment_urls` and gated by a per-workspace authorized-agents allowlist.
 
 <CardGroup cols={3}>
   <Card title="Computer Vision" icon="image">
-    Fast image OCR and visual analysis through a single synchronous `image` tool (Read, Caption, Tags, Objects, People).
+    Image OCR and visual analysis through a single synchronous `image` tool (Read, Caption, Tags, Objects, People).
   </Card>
   <Card title="Document Intelligence" icon="file-lines">
-    Structured extraction for PDFs and complex layouts via the `document` tool, with prebuilt models (layout, read, invoice, receipt, ID document); async submit-and-poll is handled internally.
+    Structured extraction for PDFs and complex layouts via the `document` tool, with prebuilt models (layout, read, invoice, receipt, ID document, business card); async submit-and-poll is handled internally.
   </Card>
-  <Card title="LLM-ready output" icon="wand-magic-sparkles">
-    Return flattened text or markdown for LLM pipelines, or the structured Azure response with tables, key-value pairs and pages.
+  <Card title="Chat uploads supported" icon="paperclip">
+    Files the user attaches in the conversation are handed to Azure through a short-lived share link, with no manual hosting step.
   </Card>
 </CardGroup>
 
@@ -31,71 +31,67 @@ The Azure OCR app exposes two Azure AI services behind a single Prisme.ai connec
 This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to extract text from images and documents. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to extract text from images and documents.
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and want to know what to set up once for everyone. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and want to know what to set up once for everyone.
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call Azure OCR operations directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations (DSUL) that call Azure OCR instructions directly.
   </Card>
 </CardGroup>
 
 ## Prerequisites
 
 - An **Azure subscription** with access to Azure AI services.
-- A **Computer Vision** (or Multi-Service Cognitive) resource, for the `image` tool. From the Azure portal, under the resource's **Keys and Endpoint** page, note its **endpoint hostname** (e.g. `az-aismsa-xxx.cognitiveservices.azure.com`) and one of its **API keys**.
-- A **Document Intelligence** resource, for the `document` tool. Same **Keys and Endpoint** page: note the **endpoint hostname** (e.g. `az-di-xxx.cognitiveservices.azure.com`) and an **API key**.
-- A **publicly accessible URL** for the files you analyze (see below), or base64 content for documents.
+- A **Computer Vision** (or multi-service Cognitive Services) resource, for the `image` tool. In the Azure portal, on the resource's **Keys and Endpoint** page, note its **endpoint hostname** (for example `az-aismsa-xxx.cognitiveservices.azure.com`) and one of its **API keys**.
+- A **Document Intelligence** resource, for the `document` tool. On the same **Keys and Endpoint** page, note the **endpoint hostname** (for example `az-di-xxx.cognitiveservices.azure.com`) and an **API key**.
+- The `owner`, `editor`, or `admin` role on the Prisme.ai workspace that will host the connector, so you can open its configuration app and write its secrets. See [Before you begin](/apps-store/marketplace/connectors/install-in-workspace#before-you-begin).
 
 <Note>
-  You can configure only one of the two services; each tool only requires the service it targets to be configured. The Computer Vision and Document Intelligence keys are independent and not interchangeable.
+  You can configure only one of the two services. Each tool requires only the service it targets. The Computer Vision and Document Intelligence endpoints and keys are independent and are not interchangeable: calling `document` with a Computer Vision key fails.
 </Note>
 
-## The `source` URL must be publicly accessible
+## How Azure reaches your files
+
+Neither Azure service receives the file bytes by default: the connector forwards a **URL**, and Azure downloads it server-side, anonymously. Three cases follow from that.
+
+| Source | What the connector does | What you must ensure |
+|---|---|---|
+| A file uploaded in the conversation or hosted on Prisme.ai (`/v2/files/...`) | Mints a **10-minute share link** for the file (`expiresIn: 600`) and hands that tokenised URL to Azure. A URL that already carries a `token=` parameter passes through unchanged. | Nothing. This is automatic for `image`, `document`, and the matching DSUL instructions. |
+| An external URL | Passes it through untouched. | The URL must be reachable by Azure without authentication. Intranet hosts, `localhost`, and anything behind a login or an `Authorization` header fail. Azure Blob Storage requires an unexpired **SAS token** on a storage account open to public networks, never one behind a VNet or firewall ([Document Intelligence FAQ](https://learn.microsoft.com/en-us/azure/ai-services/document-intelligence/faq)). |
+| A base64 payload | Sends it inline to Document Intelligence as `base64Source`. | Use `sourceType: base64` on `document` or `analyzeDocument`. Computer Vision has no per-call base64 mode; use the source-forwarding options under [Workspace builder (DSUL)](#workspace-builder-dsul) instead. |
+
+<Note>
+  When the MCP capability declares the `attachment_urls` scope, the URL of the first file the user attached in the conversation takes precedence over the `source` the model passed. This is deliberate: models routinely invent a plausible public URL from an attachment's filename instead of forwarding the real one.
+</Note>
 
 <Warning>
-  Azure downloads the file itself: the connector only forwards the URL. Intranet hosts, `localhost` and anything behind a login or an `Authorization` header fail. Microsoft requires a [publicly accessible image URL](https://learn.microsoft.com/en-us/azure/ai-services/computer-vision/how-to/call-analyze-image-40) for Computer Vision, and for Document Intelligence a blob URL with a **SAS token** on a storage account open to public networks — never one behind a VNet or firewall ([FAQ](https://learn.microsoft.com/en-us/azure/ai-services/document-intelligence/faq)).
-
-  Use a signed URL (SAS, S3 pre-signed) for private files, or `sourceType: base64` on `document`. The `image` tool has **no base64 mode**, so an unreachable image must first be made reachable.
+  If share links minted by your Prisme.ai instance are themselves unreachable from Azure, for example on a self-hosted or network-restricted deployment, turn on the connector's source-forwarding options (**Download images before sending them to Computer Vision** and **Send documents to Document Intelligence as base64**, described under [Workspace builder (DSUL)](#workspace-builder-dsul)). The connector then downloads the file itself and sends its bytes, at the cost of one extra download per call.
 </Warning>
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
-  **Goal:** Azure OCR is a **per-workspace** connector: each workspace pastes its own Azure endpoints and API keys in the connector's configuration app (see the *Workspace builder* tab), so there is **no platform-wide credential to provision** and **no central OAuth client**.
+  **Goal:** Azure OCR is a **per-workspace** connector: each workspace stores its own Azure endpoints and API keys through the connector's configuration app (see [Workspace builder (DSUL)](#workspace-builder-dsul)), so there is **no platform-wide credential to provision** and **no central OAuth client**.
 
   <Note>
-    There is no shared Azure credential for this connector. The Computer Vision and Document Intelligence keys always live in the consuming workspace's secrets, written by the connector's configuration app. The platform operator has nothing to register centrally.
+    There is no shared Azure credential for this connector. The Computer Vision and Document Intelligence endpoints and keys always live in the consuming workspace's secrets, written by the connector's configuration app. The platform operator has nothing to register centrally, and no central OAuth client applies: authentication is a server-side Azure API key, not a per-user OAuth flow.
   </Note>
 
   ## Declare the capability in AI Governance (optional)
 
-  If you want agent builders to pick Azure OCR from the capability catalog instead of pasting an MCP endpoint URL by hand, expose it as a reusable **capability** in AI Governance, pointing at the MCP endpoint of the workspace that runs the connector.
+  The only optional platform task is publishing Azure OCR to your organization's **Capabilities catalog**, so agent builders pick it from the catalog instead of pasting an MCP endpoint URL by hand. The procedure is the standard one: use the configuration app's one-click **Add to catalog** button, described in [Publish the connector to the Capabilities catalog](/apps-store/marketplace/connectors/declare-capability#publish-the-connector-to-the-capabilities-catalog), or author the entry yourself as described in [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance).
 
-  <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) the **Azure OCR** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the **MCP Endpoint** of the workspace running the connector, and set its **Scope** to:
+  Two values are specific to Azure OCR. Set the capability's server URL to the **MCP Endpoint** of the workspace running the connector, rendered by that workspace's configuration app, and set its **Scope** to:
 
-      ```text
-      context_id,agent_id,user_id
-      ```
+  ```text
+  context_id,agent_id,user_id,attachment_urls
+  ```
 
-      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; there is **no per-capability role grant** for this tenant-context connector.
-    </Step>
-  </Steps>
-
-  <Note>
-    The connector's configuration app also offers a one-click **Add to catalog** button (owner / admin only) that publishes the capability to the organization-wide Capabilities catalog for you, the easiest way to expose Azure OCR to agent builders without hand-editing Governance.
-  </Note>
+  `agent_id` is what lets the connector identify and authorize the calling agent. `attachment_urls` passes the URLs of files the user uploaded in the chat, so the `image` and `document` tools analyze them directly instead of a URL the model invented. There is **no OAuth authorization block** to attach for this connector.
 
   <Warning>
-    Declaring the capability makes the connector **available** to agent builders; it does not authorize a specific agent and does not provision any Azure credential. Per-agent gating remains the config-app **authorized-agents allowlist**, and the Computer Vision / Document Intelligence keys still live in the workspace running the connector. There is **no OAuth auth-config JSON** to attach here: authentication is a server-side Azure API key, not a per-user OAuth flow.
+    Declaring the capability makes the connector **available** to agent builders; it does not authorize a specific agent and does not provision any Azure credential. Per-agent gating remains the config-app **Authorized agents** allowlist, and the Computer Vision and Document Intelligence keys still live in the workspace running the connector. See [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization).
   </Warning>
 </Accordion>
 
@@ -108,35 +104,36 @@ This connector is used by three different roles. Jump to the section that matche
     **Goal:** let an agent you build in Agent Creator extract text and structured data from images and documents through the `image` and `document` MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Azure OCR app in a workspace (see the *Workspace builder* tab), or a *Platform admin* must have published an Azure OCR capability in AI Governance (see the *Platform admin setup* accordion above).
+      Before an agent can call the connector, a workspace builder must have installed and configured the Azure OCR app in a workspace (see [Workspace builder (DSUL)](#workspace-builder-dsul)), or a platform administrator must have published an Azure OCR capability in AI Governance (see [Platform admin (Governance): one-time platform setup](#platform-admin-governance-one-time-platform-setup)).
     </Note>
 
-    This connector runs in the **tenant app-instance context**: your agent is identified by the `agent_id` that Agent Creator injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The Azure credentials themselves are resolved server-side and never exposed to the agent.
+    This connector runs in the **tenant app-instance context**: your agent is identified by the `agent_id` that Agent Creator injects through the capability **Scope**, and that agent must appear in the connector's **Authorized agents** allowlist (managed in the configuration app). The Azure credentials themselves are resolved server-side and never exposed to the agent.
+
+    Wiring the capability follows the standard flow: the fastest path is **Install capability** on the agent's row in the configuration app, which allowlists the agent and attaches the tool in one action ([Install the capability on one agent](/apps-store/marketplace/connectors/declare-capability#install-the-capability-on-one-agent)). If an organization owner or admin has published Azure OCR to the catalog, pick it there instead, with the endpoint and Scope already wired ([Publish the connector to the Capabilities catalog](/apps-store/marketplace/connectors/declare-capability#publish-the-connector-to-the-capabilities-catalog)). Either way the connector still enforces this workspace's allowlist, so only the agents you ticked can call it.
 
     <Steps>
       <Step title="Install and configure the connector in your workspace">
-        Follow the *Workspace builder* tab: install **Azure OCR** in your workspace, open its **Configuration app**, and paste the Azure endpoint hostname + API key for the service(s) you use (Computer Vision, Document Intelligence, or both).
+        Follow [Workspace builder (DSUL)](#workspace-builder-dsul): install **Azure OCR** in your workspace, open its **Configuration app**, and set the Azure endpoint hostname and API key for the service or services you use (Computer Vision, Document Intelligence, or both).
       </Step>
-      <Step title="Allowlist your agent">
-        In that workspace's config app, open **Authorized agents** and tick your agent (the **Install capability** button does this for you), or enable **Allow all agents**.
+      <Step title="Allowlist your agent and attach the tool">
+        In that workspace's configuration app, open **Authorized agents** and select **Install capability** on your agent's row. To wire it by hand instead, tick the agent, save, then add a capability on the agent pointing at **your workspace's MCP Endpoint** URL. Enabling **Allow all agents** stores the wildcard `*` and disables the per-agent gate entirely ([The allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard)).
       </Step>
-      <Step title="Add the MCP capability to your agent">
-        In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
+      <Step title="Set the capability Scope">
+        Azure OCR needs one identifier more than most connectors. Set the capability **Scope** to:
 
         ```text
-        context_id,agent_id,user_id
+        context_id,agent_id,user_id,attachment_urls
         ```
 
-        The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "agent could not be identified" message.
+        `agent_id` lets the connector identify and authorize your agent; without it every call is rejected with an explicit "calling agent could not be identified" message. `attachment_urls` carries the URLs of files the user uploaded in the conversation, which both tools analyze directly. See [What the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means).
       </Step>
       <Step title="Brief the agent">
-        Tell the agent the tools exist and when to use each (see *Brief the agent in its system prompt* below).
+        Tell the agent the tools exist and when to use each (see [Brief the agent in its system prompt](#brief-the-agent-in-its-system-prompt)), then save the agent.
+      </Step>
+      <Step title="Verify">
+        In the agent preview, attach a scanned PDF or a photo of a receipt and ask the agent to extract its text. The agent calls `document` or `image` with `action: analyze` and answers with the extracted content. An unauthorized agent instead returns the "not authorized to use this connector" text.
       </Step>
     </Steps>
-
-    <Note>
-      **Easiest path: Add to catalog.** Instead of wiring the capability by hand, a workspace owner can click **Add to catalog** in the connector's configuration app to publish Azure OCR to the organization-wide Capabilities catalog (see the *Platform admin setup* accordion). Agent builders then enable it from the catalog with the endpoint and Scope already wired.
-    </Note>
 
     ## Brief the agent in its system prompt
 
@@ -144,38 +141,42 @@ This connector is used by three different roles. Jump to the section that matche
 
     ```text
     You have access to the Azure OCR MCP server (tools: image, document). Each tool takes an `action: analyze` argument.
-    - image: for a single image (photo, screenshot, receipt picture). Pass a PUBLICLY ACCESSIBLE image URL as `source` — Azure downloads it itself, so intranet or login-protected URLs fail. Default feature is Read (OCR); add Caption, Tags, Objects or People only when the user asks for visual analysis. Synchronous.
-    - document: for PDFs and multi-page or structured documents. Pass a publicly accessible document URL (or base64 with sourceType: base64 when the file is private) as `source`, and pick the model by intent: prebuilt-read for plain text, prebuilt-layout for tables and structure, prebuilt-invoice / prebuilt-receipt / prebuilt-idDocument for those specific document types.
-    Prefer outputContentFormat: markdown when feeding the result back into your own reasoning. Always pass a public URL when you have one; base64 inflates the request. Never retry an unreachable URL — ask for a signed link, or fall back to document + base64.
+    - image: for a single image (photo, screenshot, receipt picture). Pass the image URL as `source`; when the user attached the file to the conversation, the attachment URL is used automatically, so never invent a URL from a filename. Default feature is Read (OCR); add Caption, Tags, Objects or People only when the user asks for visual analysis. Synchronous.
+    - document: for PDFs and multi-page or structured documents. Pass the document URL as `source` (or base64 content with sourceType: base64), and pick the model by intent: prebuilt-read for plain text, prebuilt-layout for tables and structure, prebuilt-invoice / prebuilt-receipt / prebuilt-idDocument / prebuilt-businessCard for those specific document types.
+    Prefer outputContentFormat: markdown when feeding the result back into your own reasoning. Azure downloads external URLs itself, so an intranet or login-protected link will fail: never retry it, ask for a signed link instead, or fall back to document + base64.
     ```
 
     <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the config app and its identity propagated so the connector can read its `agent_id`.
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the configuration app and its identity propagated so the connector can read its `agent_id`.
     </Note>
 
-    ## Available Tools
+    ## Available tools
 
-    Each tool takes an `action` argument (currently `analyze`) plus per-action parameters.
+    Each tool takes an `action` argument (`analyze` is the only supported value) plus per-action parameters.
 
     | Tool | Description |
     |------|-------------|
-    | `image` | Azure Computer Vision: image OCR and visual analysis. `action: analyze` sends a **publicly accessible** image URL and returns the extracted read text, captions, tags, objects and people. Synchronous. |
-    | `document` | Azure Document Intelligence: structured document extraction. `action: analyze` submits a document (**publicly accessible** URL, or base64) to a prebuilt model, polls for completion, and returns the analysis (content, pages, tables, key-value pairs, paragraphs). Asynchronous. |
+    | `image` | Azure Computer Vision: image OCR and visual analysis. `action: analyze` sends an image URL and returns the extracted read text, captions, tags, objects and people. Synchronous. |
+    | `document` | Azure Document Intelligence: structured document extraction. `action: analyze` submits a document (URL or base64) to a prebuilt model, polls for completion, and returns the simplified analysis (content, pages, tables, key-value pairs, paragraphs). Asynchronous. |
 
-    ## Output Formats
+    <Note>
+      Both tools are reachable only through the MCP endpoint. A direct HTTP call to their own endpoint is refused with HTTP `403` and the message `Direct calls are not allowed — use the MCP endpoint.` From Builder automations, call the `analyzeImage`, `analyzeImageBinary`, and `analyzeDocument` instructions instead (see [Workspace builder (DSUL)](#workspace-builder-dsul)).
+    </Note>
+
+    ## Output formats
 
     Both tools accept an `outputFormat` argument that controls the MCP response shape:
 
     - **`both`** (default): the structured payload, with its JSON also rendered as text.
-    - **`verbose`**: a human-readable text view, optimized for LLM consumption.
-    - **`structured`**: concise machine-readable JSON in `structuredContent`.
+    - **`structured`**: machine-readable JSON in `structuredContent`, with the same JSON as text.
+    - **`verbose`**: a human-readable text view, `Analysis complete.` on success.
 
     The underlying analysis is unchanged by `outputFormat`; it only wraps the result:
 
     - **`image`** returns the Azure Image Analysis body (`readResult`, `captionResult`, `tagsResult`, `objectsResult`, `peopleResult`, depending on the requested `features`).
-    - **`document`** returns a simplified `analyzeResult` (flattened `content` in text or markdown, plus `pages`, `tables`, `keyValuePairs`, `paragraphs`).
+    - **`document`** returns the simplified `analyzeResult`: `content` (flattened text or markdown), `pages` (page count), `tables`, `keyValuePairs`, and `paragraphs`. The raw Azure response is not exposed over MCP; use the `analyzeDocument` instruction with `outputFormat: raw` in Builder for that.
 
-    ## Tool Details
+    ## Tool details
 
     ### image: analyze
 
@@ -196,14 +197,14 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `action` | Yes | `analyze`. |
-    | `source` | Yes | **Publicly accessible** URL of the image to analyze. No base64 alternative on this tool. |
-    | `features` | No | Comma-separated Computer Vision features (default `Read`). Accepted: `Read`, `Caption`, `Tags`, `Objects`, `People`. |
-    | `language` | No | Language hint (default `en`, e.g. `fr`). |
-    | `outputFormat` | No | `both` (default), `verbose`, or `structured`. |
+    | `source` | Yes | URL of the image to analyze. Superseded by the conversation attachment URL when the capability declares `attachment_urls`. No per-call base64 alternative on this tool. |
+    | `features` | No | Comma-separated Computer Vision features (default `Read`). Accepted: `Read`, `Caption`, `Tags`, `Objects`, `People`. Spaces are stripped, so `Read, Caption` is accepted. |
+    | `language` | No | Language hint (default `en`, for example `fr`). |
+    | `outputFormat` | No | `both` (default), `structured`, or `verbose`. |
 
     ### document: analyze
 
-    Submit a document to Azure Document Intelligence, poll for completion (2s interval, 60s timeout), and return the extraction. Uses Document Intelligence API `2024-11-30`.
+    Submit a document to Azure Document Intelligence, poll for completion (2s interval, 30 attempts, so a 60s ceiling), and return the extraction. Uses Document Intelligence API `2024-11-30`.
 
     ```json
     {
@@ -221,20 +222,20 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `action` | Yes | `analyze`. |
-    | `source` | Yes | **Publicly accessible** document URL, or base64 content when `sourceType` is `base64`. |
-    | `sourceType` | No | `url` (default) or `base64`. Use `base64` whenever the document is not reachable from Azure's network. |
-    | `model` | No | Document Intelligence model (default `prebuilt-layout`); see model table below. |
-    | `pages` | No | Pages to analyze, e.g. `1-3,5,7-9`. |
-    | `locale` | No | Locale hint, e.g. `fr-FR`. |
+    | `source` | Yes | Document URL, or base64 content when `sourceType` is `base64`. Superseded by the conversation attachment URL when the capability declares `attachment_urls`. |
+    | `sourceType` | No | `url` (default) or `base64`. Use `base64` when the document is not reachable from Azure's network. |
+    | `model` | No | Document Intelligence model (default `prebuilt-layout`); see the model table below. |
+    | `pages` | No | Pages to analyze, for example `1-3,5,7-9`. Omit to analyze every page. |
+    | `locale` | No | Locale hint, for example `fr-FR`. |
     | `outputContentFormat` | No | `text` (default) or `markdown`. |
-    | `outputFormat` | No | `both` (default), `verbose`, or `structured`. |
+    | `outputFormat` | No | `both` (default), `structured`, or `verbose`. |
 
     Available **prebuilt models**:
 
     | Model | Use case |
     |-------|----------|
     | `prebuilt-read` | Pure text extraction (fastest, lightweight) |
-    | `prebuilt-layout` | Text + tables + structure (default) |
+    | `prebuilt-layout` | Text, tables and structure (default) |
     | `prebuilt-invoice` | Structured invoice fields |
     | `prebuilt-receipt` | Structured receipt fields |
     | `prebuilt-idDocument` | Passports, IDs, driver's licences |
@@ -244,53 +245,77 @@ This connector is used by three different roles. Jump to the section that matche
   <Tab title="Workspace builder (DSUL)">
     ## Workspace builder
 
-    **Goal:** install the connector in a workspace, configure the per-service Azure credentials and the agent allowlist through its configuration app, and call its instructions from your automations.
+    **Goal:** install the connector in a workspace, set the per-service Azure credentials and the agent allowlist through its configuration app, and call its instructions from your automations.
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **Azure OCR** and install it
-    3. Open the **Configuration app** (the link auto-populated on install) to paste the Azure endpoint hostname + API key for the service(s) you use, and to allow the agents that may call the connector
+    Azure OCR installs through the standard connector flow: [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace). Search for **Azure OCR** in **Apps** ([Install the app](/apps-store/marketplace/connectors/install-in-workspace#install-the-app)), enter the credentials in the configuration app opened from the **Configuration app** link ([Configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app)), and tick the agents in **Authorized agents** ([Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector)).
+
+    Four things are specific to this connector:
+
+    - **Install provisions five flat secrets**, not the usual auth-object plus allowlist pair, and fills in the **Configuration app** link ([What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions)).
+    - **The credential is an endpoint hostname plus an API key, per Azure service.** Fill in Computer Vision, Document Intelligence, or both; each tool needs only the service it targets.
+    - **There is no OAuth mode and no callback URL to register.** Skip every per-user OAuth step of the shared flow.
+    - **The allowlist gates agents only.** DSUL instructions called from your own automations are not gated by it, so this step is needed only if agents will use the connector.
+
+    Finish with the configuration app's connection test: it reports, per service, whether an endpoint and an API key are present, and echoes the two source-forwarding options. See [Verify the setup](#verify-the-setup) for the exact response shape.
 
     ## Configuration
 
-    | Field | Description |
-    |-------|-------------|
-    | **Configuration app** | Auto-populated on install; open this link to set the per-service Azure credentials (Computer Vision and/or Document Intelligence endpoint + API key) and manage the authorized-agents allowlist. |
+    | Field | Type | Default | Description |
+    |-------|------|---------|-------------|
+    | **Configuration app** (`configAppUrl`) | string, read only | auto-generated on install | Open this link to configure the connector (Azure credentials and authorized agents) for this workspace. |
+    | **Download images before sending them to Computer Vision** (`forceImageOcrPreDownload`) | boolean | `false` | Off by default: the connector passes the image URL and Azure downloads it. Turn on when Azure cannot reach that URL (self-hosted or network-restricted Prisme.ai file storage): the connector downloads the image itself and posts the raw bytes. Costs one extra download per call. |
+    | **Send documents to Document Intelligence as base64** (`forceDocumentIntelligenceBase64`) | boolean | `false` | Off by default: the connector passes the document URL and Azure downloads it. Turn on when Azure cannot reach that URL: the connector downloads the document itself and sends its base64 content. Costs one extra download per call and a larger request. |
 
-    The configuration app drives everything; the app instance itself has no per-field credential form. Credentials are stored as a workspace secret (`azureOcrAuth`) shaped as `{ computervision: { endpoint, apiKey }, documentIntelligence: { endpoint, apiKey } }`, and the allowlist as a second secret (`azureOcrAuthorizedAgents`). Both are resolved server-side at call time.
+    The configuration app drives everything; the app instance has no per-field credential form. Credentials and the allowlist are stored as five separate workspace secrets:
+
+    | Secret | Contents |
+    |--------|----------|
+    | `azureOcrComputerVisionEndpoint` | Bare Azure Computer Vision hostname, for example `az-aismsa-xxx.cognitiveservices.azure.com`. |
+    | `azureOcrComputerVisionApiKey` | API key for the Azure Computer Vision resource (masked field). |
+    | `azureOcrDocumentIntelligenceEndpoint` | Bare Azure Document Intelligence hostname, for example `az-di-xxx.cognitiveservices.azure.com`. |
+    | `azureOcrDocumentIntelligenceApiKey` | API key for the Azure Document Intelligence resource (masked field). |
+    | `azureOcrAuthorizedAgents` | Comma-separated agent ids authorized to call the MCP endpoint, or `*` for all agents. |
+
+    At call time the app instance resolves `config.auth.computervision.*` and `config.auth.documentIntelligence.*` from the workspace configuration, which in turn resolves each secret. Nothing is sent to the agent or the MCP client.
 
     This connector uses a single auth mode:
 
-    | Auth mode | What you provide | Best for |
-    |-----------|------------------|----------|
-    | **Static API key (per service)** | The Azure endpoint hostname + an API key for each service you use (Computer Vision, Document Intelligence) | All workspaces; each pastes its own Azure keys; no platform-level setup |
+    | Auth mode | Runtime identity at Azure | What you provide | Best for |
+    |-----------|---------------------------|------------------|----------|
+    | **Static API key, per service** | The Azure resource the key belongs to, shared by every caller in this workspace. Azure logs the resource, not the Prisme.ai user or agent. | The Azure endpoint hostname and an API key for each service you use | All workspaces; each stores its own Azure keys, with no platform-level setup |
+
+    <Warning>
+      The API key is a **shared workspace credential**: every agent you allowlist and every automation in this workspace bills and acts against the same Azure resource, and Azure-side attribution stops at the resource. Keep the allowlist to the agents that need OCR, and use a dedicated Azure resource per environment so you can revoke one without affecting the others.
+    </Warning>
 
     <Note>
-      Endpoints are stored as **hostnames only**: the connector automatically strips `https://` and trailing slashes, so both `https://xxx.cognitiveservices.azure.com/` and `xxx.cognitiveservices.azure.com` work. The agent allowlist (**Authorized agents**) gates which Agent Creator agents may call the MCP endpoint; see the *Agent builder* tab.
+      Endpoints are stored as **hostnames only**. The connector strips `https://`, `http://` and slashes, so both `https://xxx.cognitiveservices.azure.com/` and `xxx.cognitiveservices.azure.com` work, but a hostname with a path does not survive normalization.
     </Note>
 
-    ## Available Instructions
+    ## Available instructions
 
-    Every instruction resolves the Azure endpoint and API key from the workspace configuration.
+    Every instruction resolves the Azure endpoint and API key from the workspace configuration, and returns the provider body on success or a structured error payload on failure (see [Error handling](#error-handling)). None of them raise.
 
     ### Computer Vision
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `analyzeImage` | Synchronous OCR and visual analysis of an image by **publicly accessible** URL (`source`). `features` selects analysis (default `Read`; also `Caption`, `Tags`, `Objects`, `People`); `language` is a hint. | Raw Azure Image Analysis body: `{ readResult, captionResult, tagsResult, objectsResult, peopleResult }` (subset per requested features) |
+    | `analyzeImage` | Synchronous OCR and visual analysis of an image by URL (`source`). `features` selects the analysis (default `Read`; also `Caption`, `Tags`, `Objects`, `People`); `language` is a hint (default `en`). A Prisme.ai-hosted `source` is re-hosted with a share token before Azure downloads it. | Raw Azure Image Analysis body: `readResult`, `captionResult`, `tagsResult`, `objectsResult`, `peopleResult` (subset per requested features) |
+    | `analyzeImageBinary` | Same arguments and same result as `analyzeImage`, but the connector downloads the image first and posts its bytes to Azure as `application/octet-stream`. Use it when the source URL is not anonymously downloadable by Azure. | Same as `analyzeImage` |
 
     ### Document Intelligence
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `analyzeDocument` | Submit a document (**publicly accessible** `source` URL, or base64 when `sourceType: base64`) to a prebuilt `model`, poll to completion, and return the extraction. `pages`, `locale`, `outputContentFormat` (`text`/`markdown`) and `outputFormat` (`simple`/`raw`) tune the output. | `simple`: flattened text/markdown + key fields. `raw`: full Azure `analyzeResult` `{ pages, tables, keyValuePairs, paragraphs, content }` |
+    | `analyzeDocument` | Submit a document (`source` URL, or base64 when `sourceType: base64`) to a prebuilt `model`, poll to completion, and return the extraction. `pages`, `locale`, `outputContentFormat` (`text`/`markdown`) and `outputFormat` (`simple`/`raw`) tune the output. | `simple` (default): `content`, `pages` (page count), `tables`, `keyValuePairs`, `paragraphs`. `raw`: the full Azure `analyzeResult` |
 
     <Note>
-      `Returns` shows the shape of the operation output. These DSUL instructions return the provider body directly (or, on failure, a structured error payload; see *Error Handling*). The MCP `image` / `document` tools wrap the same operations in an MCP tool-result envelope.
+      `Returns` shows the shape of the instruction output. The MCP `image` and `document` tools wrap the same operations in an MCP tool-result envelope, and `document` always uses the `simple` shape.
     </Note>
 
-    ## DSUL Examples
+    ## DSUL examples
 
     Analyze an image (OCR only):
 
@@ -313,7 +338,7 @@ This connector is used by three different roles. Jump to the section that matche
         output: invoice
     ```
 
-    Analyze a base64 document with a page range — the fallback when the file has no public URL:
+    Analyze a base64 document with a page range, the fallback when Azure cannot download the file:
 
     ```yaml
     - Azure OCR.analyzeDocument:
@@ -324,7 +349,16 @@ This connector is used by three different roles. Jump to the section that matche
         output: layout
     ```
 
-    Run KYC-style extraction on a passport scan, then branch on the result:
+    Run the binary variant when the image URL is not reachable by Azure:
+
+    ```yaml
+    - Azure OCR.analyzeImageBinary:
+        source: '{{private_image_url}}'
+        features: Read
+        output: ocr
+    ```
+
+    Run ID-document extraction on a passport scan, then branch on the result:
 
     ```yaml
     - Azure OCR.analyzeDocument:
@@ -347,9 +381,48 @@ This connector is used by three different roles. Jump to the section that matche
 
 ---
 
-## Error Handling
+## Verify the setup
 
-Both operations return a structured error payload (and emit an `error` event) instead of raising. The MCP `image` / `document` tools surface the same failure as an `isError` tool result. The payload shape is:
+Run these three checks in order. Each one is independent of the previous role's claims.
+
+1. **Configuration.** In the connector's configuration app, run the connection test. It reports which services are configured, without echoing any credential:
+
+   ```json
+   {
+     "ok": true,
+     "services": { "computervision": true, "documentIntelligence": false },
+     "options": {
+       "forceImageOcrPreDownload": false,
+       "forceDocumentIntelligenceBase64": false
+     }
+   }
+   ```
+
+   `ok` is `true` as soon as at least one service has both an endpoint and an API key. A service reported as `false` returns `ConfigurationError` on every call. The test is user-gated: an unauthenticated call returns HTTP `401` and `{"ok": false, "error": "Unauthorized"}`.
+
+2. **Builder path.** From an automation, call `analyzeImage` on a small public image and check that `readResult` is present and `{{ocr.error}}` is empty.
+
+3. **Agent path.** In the agent preview, attach a one-page PDF and ask for its text. The agent calls `document` with `action: analyze` and answers from the extracted content. A rejected call returns the allowlist or identity message instead, both listed under [Common issues](#common-issues).
+
+For the connector-agnostic checks that surround these three, including confirming that a non-allowlisted agent is denied, see [Verify the installation](/apps-store/marketplace/connectors/install-in-workspace#verify-the-installation) and [Verify the capability](/apps-store/marketplace/connectors/declare-capability#verify-the-capability).
+
+## Data retention at Azure
+
+- **Computer Vision (`image`, `analyzeImage`, `analyzeImageBinary`)**: Image Analysis 4.0 is synchronous. The image is processed in-memory and the response returns in the same HTTP call, with no Azure-side persistence afterwards.
+- **Document Intelligence (`document`, `analyzeDocument`)**: the API is asynchronous, and Azure temporarily stores the submitted document and the analyze result in the same region, for up to **24 hours** by default ([Microsoft data privacy and security](https://learn.microsoft.com/en-us/azure/foundry/responsible-ai/document-intelligence/data-privacy-security)). The connector **purges the stored result** as soon as the analysis finishes, by calling Azure's [Delete Analyze Result](https://learn.microsoft.com/en-us/rest/api/aiservices/document-models/delete-analyze-result?view=rest-aiservices-v4.0+(2024-11-30)) endpoint on the operation URL. Cleanup runs on every post-submit path: success, processing failure, and timeout. The delete is best-effort, so a failed purge does not fail the call and Azure expires the data after 24 hours anyway.
+
+## Rotate, revoke, and remove
+
+The generic procedure, including what uninstalling does and does not delete, is in [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall). The Azure specifics:
+
+- **Rotate an Azure key**: regenerate the key in the Azure portal (**Keys and Endpoint**, key 2 first so calls keep working on key 1), paste the new value in the configuration app, save, then regenerate the other key. Running calls pick up the new secret on their next invocation. There is no per-user reconsent, because the key is a shared workspace credential.
+- **Revoke one agent**: in the configuration app, untick the agent under **Authorized agents** and save. Its next MCP call is refused with the "not authorized" message. If **Allow all agents** is on, turning it off restores per-agent gating for every caller.
+- **Cut off all Azure access**: clear the endpoint and API key secrets for the service, or delete the Azure resource. Every call then returns `ConfigurationError` or `Unauthorized` instead of reaching Azure.
+- **Remove the connector**: uninstall the Azure OCR app from the workspace, then delete the five secrets it provisioned: `azureOcrComputerVisionEndpoint`, `azureOcrComputerVisionApiKey`, `azureOcrDocumentIntelligenceEndpoint`, `azureOcrDocumentIntelligenceApiKey`, and `azureOcrAuthorizedAgents`. Uninstalling alone leaves them in place. If you published a capability to the Capabilities catalog, remove that entry in AI Governance as well, or agent builders keep seeing an endpoint that no longer answers ([Remove or update a capability](/apps-store/marketplace/connectors/declare-capability#remove-or-update-a-capability)).
+
+## Error handling
+
+The instructions return a structured error payload (and emit an `error` event) instead of raising. The MCP `image` and `document` tools surface the same failure as an `isError` tool result carrying the payload's `message`. The payload shape is:
 
 ```json
 {
@@ -357,7 +430,7 @@ Both operations return a structured error payload (and emit an `error` event) in
   "message": "Human-readable explanation",
   "details": {
     "service": "computervision | documentIntelligence",
-    "automation": "analyzeImage | analyzeDocument",
+    "automation": "analyzeImage | analyzeImageBinary | analyzeDocument",
     "status": 401,
     "body": {}
   }
@@ -366,31 +439,34 @@ Both operations return a structured error payload (and emit an `error` event) in
 
 | Error | Typical cause |
 |-------|---------------|
-| `ConfigurationError` | The targeted service has no endpoint or API key in the connector config |
-| `ValidationError` | `source` argument is empty |
-| `AzureError` | Azure rejected the request (typically HTTP 400); often a `source` URL Azure could not download |
-| `NetworkError` | Endpoint unreachable; check hostname format (no scheme, no path) |
-| `Unauthorized` | Invalid or revoked API key (HTTP 401) |
-| `Forbidden` | The resource exists but the key lacks access, or the API is not enabled (HTTP 403) |
-| `NotFound` | `prebuilt-<model>` does not exist, or a wrong endpoint hostname (HTTP 404) |
-| `RateLimited` | Azure throttling; retry with back-off (HTTP 429) |
-| `ServerError` | Azure 5xx |
+| `ConfigurationError` | The targeted service has no endpoint or no API key in the connector configuration |
+| `ValidationError` | `source` is empty and no attachment URL was injected |
+| `AzureError` | Azure rejected the request without a more specific mapping, typically HTTP `400`, often a `source` URL Azure could not download. Document Intelligence also reports HTTP `403` this way |
+| `NetworkError` | Endpoint unreachable; check the hostname format (no scheme, no path) |
+| `Unauthorized` | Invalid or revoked API key (HTTP `401`) |
+| `Forbidden` | Computer Vision only: the resource exists but the key is denied access (HTTP `403`) |
+| `NotFound` | Computer Vision: resource not found. Document Intelligence: `Model <model> not found` (HTTP `404`) |
+| `RateLimited` | Azure throttling; retry with back-off (HTTP `429`) |
+| `ServerError` | Azure `5xx`, or no `Operation-Location` header in the Document Intelligence submit response |
 | `ProcessingFailed` | Document Intelligence could not process the document (corrupted, password-protected, unsupported format) |
-| `Timeout` | Document Intelligence polling exceeded 60s; try `prebuilt-read` or fewer pages |
+| `Timeout` | Document Intelligence polling exceeded the 60s ceiling; try `prebuilt-read` or fewer pages |
 
-### Common Issues
+### Common issues
 
-- **"This agent is not authorized to use this connector"**: The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (or enable **Allow all agents**) and Save. The **Install capability** button does this for you.
-- **"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allow the agent in the config app.
-- **`ConfigurationError` ("… is not configured")**: The targeted service has no endpoint or API key in the connector configuration. Each workspace must paste its own Azure endpoint and key in the config app; there is no platform-level credential to fall back on. Configure only the service(s) you call.
-- **`Unauthorized` (401, invalid key)**: Azure rejected the key. Regenerate or copy a current key from the resource's **Keys and Endpoint** page, and confirm it matches the service you are calling (Computer Vision keys do not work on Document Intelligence and vice versa).
-- **`Forbidden` (403, API not enabled)**: The key is valid but the resource does not expose the requested API. Confirm the resource type (a Document Intelligence key cannot serve Image Analysis) and that the feature is enabled on the Azure resource.
-- **`NetworkError` / `NotFound` (404, bad endpoint)**: Almost always a malformed endpoint. Store the **hostname only** (no `https://`, no path); the connector strips a leading scheme and trailing slash but cannot recover a wrong host.
-- **Azure cannot download the `source` URL**: a URL that works in your browser is not necessarily one Azure can reach. Symptom: a 4xx in `details.body`, e.g. `InvalidRequest - Image URL is badly formatted or not accessible`. Check it needs no authentication, is not on an intranet, and — for blob storage — carries an unexpired SAS token on a publicly reachable account. For documents, `sourceType: base64` sidesteps it.
-- **`Timeout` on `document`**: Document Intelligence is asynchronous: the connector submits the document, then polls for up to 60s. Long or heavy PDFs can exceed this limit. Reduce `pages`, switch to the lighter `prebuilt-read` model, or split the document upstream.
-- **Service-specific gotcha**: `image` is synchronous and `document` is an async submit-and-poll cycle handled internally; both return their error payload instead of raising. After a DSUL call, always branch on `{{result.error}}`; a failed extraction is a normal value, not an exception, so a missing check silently passes the error object downstream.
+- **`This agent is not authorized to use this connector.`**: the calling agent is not in the allowlist. Open the configuration app, go to **Authorized agents**, tick the agent named by the id in the message, and save, or enable **Allow all agents**. The **Install capability** button does this for you. Full resolution: [Troubleshooting](/apps-store/marketplace/connectors/install-in-workspace#troubleshooting).
+- **`The calling agent could not be identified, so it cannot be authorized.`**: the MCP capability **Scope** does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id,attachment_urls` on the capability, then allow the agent in the configuration app. Full resolution: [Troubleshooting](/apps-store/marketplace/connectors/declare-capability#troubleshooting).
+- **`Unknown tool` or `Tool <name> failed (<status>)`**: the MCP client called a tool this connector does not expose, or the tool's own automation failed. Only `image` and `document` exist; the second message carries the underlying HTTP status and error text.
+- **`Direct calls are not allowed — use the MCP endpoint.` (HTTP `403`)**: something called the `image` or `document` endpoint directly. From Builder, call `analyzeImage`, `analyzeImageBinary`, or `analyzeDocument` instead.
+- **`ConfigurationError` ("... is not configured")**: the targeted service has no endpoint or API key. Each workspace stores its own Azure endpoint and key in the config app; there is no platform-level credential to fall back on. Configure only the service or services you call.
+- **`Unauthorized` (401, invalid key)**: Azure rejected the key. Copy a current key from the resource's **Keys and Endpoint** page, and confirm it matches the service you are calling. Computer Vision keys do not work on Document Intelligence and vice versa.
+- **`Forbidden` (403) on Computer Vision**: the key is valid but the resource denies the requested API. Confirm the resource type and that Image Analysis is enabled on it. On Document Intelligence the same HTTP status surfaces as `AzureError`, with the Azure body in `details.body`.
+- **`NetworkError` or `NotFound` (404, bad endpoint)**: almost always a malformed endpoint. Store the **hostname only** (no `https://`, no path); the connector strips a scheme and slashes but cannot recover a wrong host. On `document`, a `404` more often means the `model` name is wrong.
+- **Azure cannot download the `source` URL**: a URL that works in your browser is not necessarily one Azure can reach. Symptom: a `4xx` in `details.body`, for example `InvalidRequest - Image URL is badly formatted or not accessible`. Check that it needs no authentication and is not on an intranet, and that a blob URL carries an unexpired SAS token on a publicly reachable account. Files uploaded in Prisme.ai are handled automatically through a share link; if those links are unreachable from Azure on your deployment, turn on the source-forwarding options described in [How Azure reaches your files](#how-azure-reaches-your-files).
+- **`Could not download the document before sending it to Azure Document Intelligence`**: **Send documents to Document Intelligence as base64** is on, and the connector itself failed to fetch the file. Check that the source URL is reachable from the Prisme.ai runtime, and that a Prisme.ai file URL still exists.
+- **`Timeout` on `document`**: Document Intelligence is asynchronous. The connector submits the document, then polls every 2s for up to 30 attempts, a 60s ceiling. Long or heavy PDFs exceed it. Reduce `pages`, switch to the lighter `prebuilt-read` model, or split the document upstream.
+- **A failed extraction is a value, not an exception**: after a DSUL call, always branch on `{{result.error}}`. A missing check silently passes the error object downstream.
 
-## External Resources
+## External resources
 
 <CardGroup cols={2}>
   <Card
@@ -412,7 +488,7 @@ Both operations return a structured error payload (and emit an `error` event) in
     icon="link"
     href="https://learn.microsoft.com/en-us/azure/ai-services/computer-vision/how-to/call-analyze-image-40"
   >
-Microsoft's Analyze API guide: the image URL must be publicly accessible.
+    Microsoft's Analyze API guide: the requirements an image URL must meet.
   </Card>
   <Card
     title="Tool Agents"
@@ -420,5 +496,19 @@ Microsoft's Analyze API guide: the image URL must be publicly accessible.
     href="/products/agent-factory/capabilities"
   >
     How Agent Creator agents consume MCP tools and capabilities.
+  </Card>
+  <Card
+    title="Install a connector in your workspace"
+    icon="puzzle-piece"
+    href="/apps-store/marketplace/connectors/install-in-workspace"
+  >
+    The standard install, credential, allowlist, verification and uninstall flow shared by every App + MCP connector.
+  </Card>
+  <Card
+    title="Declare a connector capability"
+    icon="plug"
+    href="/apps-store/marketplace/connectors/declare-capability"
+  >
+    Attach Azure OCR to one agent, or publish it to your organization's Capabilities catalog.
   </Card>
 </CardGroup>

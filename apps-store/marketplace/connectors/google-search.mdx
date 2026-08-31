@@ -1,6 +1,6 @@
 ---
 title: 'Google Search'
-description: 'Run Google web searches from Agent Creator agents and Builder workflows: synthesized grounded answers or rich filtered results, with a Google API key or service account'
+description: 'Run Google web searches from Agent Creator agents and Builder automations, through Gemini Grounding or the Custom Search JSON API, with a Google Cloud API key or a service account'
 ---
 
 <img
@@ -12,117 +12,143 @@ description: 'Run Google web searches from Agent Creator agents and Builder work
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Google Search app exposes Google web search through a single `search` tool. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as a tool, or as a Builder app whose instruction you call directly from DSUL. It runs in the **tenant app-instance context** (it resolves the installing workspace's own Google credential) and automatically routes between two backends depending on the tenant configuration:
+The Google Search connector (workspace slug `google-search`) exposes Google web search through a single operation named `search`. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents attach as a capability, or as a Builder app whose `search` instruction you call directly from DSUL. It runs in the **tenant app-instance context**, which means it resolves the installing workspace's own Google credential, and it routes automatically between two backends:
 
-- **Gemini Grounding** (default, when no `cx` is set): behaves like a real google.com search of the **entire web** and returns a synthesized `answer` with cited sources.
-- **Custom Search JSON API** (legacy, when a Programmable Search Engine `cx` is set): returns ranked organic results with rich filters (date, site, language, file type) and image search, but searches **only the sites whitelisted in the Programmable Search Engine's context**, never the open web. Google has **removed the "Search the entire web" option for new Programmable Search Engines**, so this backend cannot cover the whole web; use Grounding (leave `cx` empty) for that.
+- **Gemini Grounding** (default, when no `cx` is configured): calls the Gemini `generateContent` endpoint with the `google_search` tool enabled, and returns a synthesized `answer` plus the sources Gemini cited.
+- **Custom Search JSON API** (legacy, when a Programmable Search Engine ID `cx` is configured): calls `customsearch/v1` and returns ranked organic results, with rich filters (result count, date, site, language, file type) and image search. Its coverage is whatever the Programmable Search Engine behind `cx` is configured to search.
 
-Authentication is a **Google Cloud API key** (`AIza…`) or a **service-account JSON** (signed into a short-lived Bearer token). Agents are identified by the capability **Scope** `context_id,agent_id,user_id` and gated by a per-workspace authorized-agents allowlist.
+Authentication is a **Google Cloud API key** (`AIza...`, sent as the `X-goog-api-key` header) or a **service-account JSON** (signed into a JWT and exchanged for a short-lived bearer token). There is no per-user sign-in. Agents are identified by the `agent_id` that Agent Creator injects through the capability **Scope** `context_id,agent_id,user_id`, and are gated by a per-workspace authorized-agents allowlist.
 
 <CardGroup cols={3}>
   <Card title="Web search as a tool" icon="magnifying-glass">
-    A single `search` tool gives agents fresh, post-cutoff web information (news, prices, schedules, official docs, product specs) instead of guessing.
+    A single `search` tool gives agents fresh, post-cutoff web information such as news, prices, schedules, official documentation and product specifications, instead of guessing.
   </Card>
   <Card title="Grounded answers" icon="robot">
-    The default Gemini Grounding backend returns a synthesized answer plus cited sources, rendered as clickable source cards in the chat.
+    The default Gemini Grounding backend returns a synthesized answer plus cited sources, attached as `url_citation` annotations that render as clickable source cards.
   </Card>
-  <Card title="Filtered & image search" icon="image">
-    With a Programmable Search Engine (`cx`), switch to the Custom Search backend for date/site/language filters, file-type restriction and image search.
+  <Card title="Filtered and image search" icon="image">
+    With a Programmable Search Engine ID (`cx`), switch to the Custom Search backend for date, site, language and file-type filters, pagination and image search.
   </Card>
 </CardGroup>
 
 ## Who is this for?
 
-This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
+Three roles are involved. Each section below is self-contained; start with the one that matches your role.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to search the web. → *Agent builder* tab.
+  <Card title="Platform maintainer" icon="shield-halved" href="#platform-maintainer-set-the-platform-global-google-key">
+    You hold `owner`, `editor` or `admin` on the core `google-search` workspace. You optionally set a platform global Google key that every workspace without its own credential falls back to.
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and set up a shared Google Search key once for everyone. → *Platform admin setup* accordion below.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You install the app in your Builder workspace, set the Google credential and the agent allowlist, and call the `search` instruction from DSUL.
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call the `search` instruction directly. → *Workspace builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in Agent Creator. You attach the MCP endpoint as a capability and brief the agent on when to search.
   </Card>
 </CardGroup>
 
-## Prerequisites (Google side)
-
-- A **Google** account with a **Google Cloud project**.
-- The matching API must be **enabled** in that project:
-  - **Gemini API** (listed as **Generative Language API**, `generativelanguage.googleapis.com`), for the default Gemini Grounding backend.
-  - **Custom Search API** (`customsearch.googleapis.com`), for the legacy `cx` backend.
-- A **credential**, one of:
-  - A **Google Cloud API key** (`AIza…`): *APIs & Services > Credentials > Create credentials > API key*.
-  - A **service-account key** JSON, for server-to-server use (signed JWT exchanged for a Bearer token).
-- For the Custom Search backend only: a **Programmable Search Engine** (the `cx` id), created at [programmablesearchengine.google.com](https://programmablesearchengine.google.com). A PSE searches **only the sites you add to its context**; Google has **retired the "Search the entire web" option for newly created engines**, so the Custom Search backend can no longer span the open web. For whole-web coverage, leave `cx` empty and use the Grounding backend.
+The generic App + MCP procedures these roles share are documented once, and this page links to the exact step you need: [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace) and [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability). Everything Google-specific stays here.
 
 <Note>
-  The Gemini API free tier is limited (e.g. ~20 requests/day for `gemini-2.5-flash`). For production traffic, enable billing on the Cloud project or use the Custom Search backend (100 free queries/day, then paid).
+  This connector authenticates with a server-side Google credential, an API key or a service-account JSON, plus an optional platform global key held on the core workspace. That is not a central OAuth client: there is no per-user sign-in, no consent screen and no callback URL anywhere in this connector.
 </Note>
 
-<Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
-  **Goal:** two optional one-time tasks: (1) set a **shared platform Google key** so workspaces that have not configured their own credential can still search, and (2) expose Google Search as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
+## Operating model and runtime identity
+
+Understand what the connector does on your behalf before you configure it.
+
+| Property | Value |
+|---|---|
+| Authentication methods | A Google Cloud API key, or a Google service-account JSON exchanged for an OAuth 2.0 bearer token through the `urn:ietf:params:oauth:grant-type:jwt-bearer` grant |
+| Runtime identity seen by Google | The API key or the service account configured on the workspace, never the end user |
+| Credential scope | Shared across every agent and every automation that can reach the app instance of that workspace |
+| Fallback identity | A workspace with no credential of its own proxies its searches through the core `google-search` workspace and runs on the platform global key, if a maintainer set one |
+| Caller authorization | `tools/call` accepts an agent only if its `agent_id` is in the workspace allowlist, or if the allowlist holds the `*` sentinel, or if the call reaches the core workspace endpoint while a platform global key is set |
+| Audit attribution in Google | All searches appear as the configured key or service account, not as the invoking user |
+| Write access | None. The connector performs read-only web search and writes nothing to your systems |
+
+<Warning>
+  The Google credential is a shared service credential. Every agent you allowlist, and every automation in the workspace, searches with the same identity and consumes the same Google quota. Keep the allowlist tight, and prefer ticking individual agents over enabling **Allow all agents**, which disables the calling-agent verification entirely.
+</Warning>
+
+### Choose a backend
+
+The backend is not a free choice per call: it is decided by the workspace configuration, before the call is routed.
+
+| Backend | Selected when | Choose it for |
+|---|---|---|
+| **Gemini Grounding** (default, recommended) | No `cx` is configured | Whole-web questions where a synthesized answer with cited sources is the useful output. Requires the Generative Language API. |
+| **Custom Search JSON API** (legacy) | A `cx` is configured | Deterministic ranked results, enforced filters, pagination and structured image results, scoped to your Programmable Search Engine. Requires the Custom Search API. |
+
+Because the backend is resolved from the workspace configuration before routing, passing `options.cx` on a call does **not** switch a Grounding workspace to Custom Search. It only overrides the engine when the workspace already runs the Custom Search backend.
+
+## Prerequisites
+
+### Google prerequisites
+
+- A **Google** account with a **Google Cloud project**.
+- The API matching your backend enabled in that project, from **APIs & Services > Library**:
+  - **Generative Language API** (`generativelanguage.googleapis.com`) for Gemini Grounding. Grounding is not a separate API to enable; it is the `google_search` tool inside the Gemini `generateContent` call.
+  - **Custom Search API** (`customsearch.googleapis.com`) for the legacy `cx` backend.
+- A credential, one of:
+  - A **Google Cloud API key** (`AIza...`), created from **APIs & Services > Credentials > Create credentials > API key**.
+  - A **service-account key JSON**, for server-to-server use. The connector signs an RS256 JWT with the `private_key` in that JSON, requests the scopes `https://www.googleapis.com/auth/generative-language` and `https://www.googleapis.com/auth/cloud-platform`, and exchanges it at the `token_uri` declared in the JSON, which defaults to `https://oauth2.googleapis.com/token`.
+- For the Custom Search backend only: a **Programmable Search Engine**, created at [programmablesearchengine.google.com](https://programmablesearchengine.google.com), whose engine ID is the `cx` value. The engine returns results only from the sources its own configuration covers.
+
+<Note>
+  The Gemini API free tier is low, around 20 requests per day for `gemini-2.5-flash`. Enable billing on the Cloud project for production traffic, or switch to the Custom Search backend. Check the [Gemini API rate limits](https://ai.google.dev/gemini-api/docs/rate-limits) and the [Custom Search JSON API pricing](https://developers.google.com/custom-search/v1/overview) for the quotas that apply to your project.
+</Note>
+
+### Prisme.ai prerequisites
+
+- **Workspace builder**: the `owner`, `editor` or `admin` role on the Builder workspace where you install the app, as described in [Before you begin](/apps-store/marketplace/connectors/install-in-workspace#before-you-begin).
+- **Agent builder**: an agent in Agent Creator that you can edit.
+- **Platform maintainer**: the `owner`, `editor` or `admin` role on the core `google-search` workspace. This role is checked on that workspace itself; being a platform superadmin elsewhere does not grant it.
+- **Capabilities catalog publishing**: the `org:owner` or `org:admin` role in the organization, as described in [Before you begin](/apps-store/marketplace/connectors/declare-capability#before-you-begin).
+
+<Accordion title="Platform maintainer: set the platform global Google key" icon="shield-halved">
+  **Goal:** set one Google credential on the core `google-search` workspace, used as a fallback by every workspace that has not configured its own, and optionally publish the connector to the organization Capabilities catalog.
 
   <Note>
-    Both tasks are optional. If every workspace pastes its own Google key, you can skip this section entirely; there is no per-tenant credential to register on the platform.
+    This whole section is optional. If every workspace supplies its own Google credential, skip it. There is no per-workspace credential to register on the platform.
   </Note>
 
-  ## 1. Configure the shared platform key
+  ## 1. Set the global key
 
   <Steps>
-    <Step title="Enable the right API in the Cloud project">
-      The backend you use decides which API to enable in the Google Cloud project:
-
-      - **Gemini Grounding (default).** Enable the **Gemini API**, listed in the Cloud Console as **Generative Language API** (`generativelanguage.googleapis.com`); the two names are the same service. *Grounding with Google Search* is **not** a separate API to enable: it is the `google_search` tool exposed inside the Gemini `generateContent` call, so enabling the Gemini API is all that the Grounding backend needs.
-      - **Custom Search (legacy, `cx` set).** Enable the **Custom Search API** (`customsearch.googleapis.com`) and create a **Programmable Search Engine** at [programmablesearchengine.google.com](https://programmablesearchengine.google.com), noting its `cx`. Note the scope: a PSE returns results **only from the sites whitelisted in its context**, never the whole web; Google has **removed the "Search the entire web" option for new engines**. For broad web coverage, leave `cx` empty and use the Grounding backend instead.
-
-      Enable it from **APIs & Services > Library** (or run `gcloud services enable generativelanguage.googleapis.com`).
+    <Step title="Prepare the Google credential">
+      In the Google Cloud project that will carry the platform quota, enable the **Generative Language API** for Grounding, or the **Custom Search API** plus a Programmable Search Engine for the legacy backend, then create an API key or a service-account key JSON as described in the prerequisites.
     </Step>
-    <Step title="Get a Google credential">
-      In the [Google Cloud Console](https://console.cloud.google.com/apis/credentials), in that same project, create an **API key** (or a service-account key JSON). For a service account, the connector requests the `https://www.googleapis.com/auth/generative-language` scope when exchanging the JWT.
+    <Step title="Open the maintainer view">
+      In Builder, open the core `google-search` workspace and open its configuration app. Hosted on that workspace, the app renders the **Platform global Google key** maintainer view instead of the per-workspace configuration form. If you see **Access restricted** instead, you do not hold `owner`, `editor` or `admin` on the core workspace.
     </Step>
-    <Step title="Enter the key through the core workspace's config app">
-      Open the central `google-search` workspace and launch its **Configuration app** maintainer view: `<studio>/apps/google-search` (e.g. `https://studio.prisme.ai/apps/google-search`). Follow the in-app instructions to paste the **platform global key** (and optional `cx`). The app stores it in the core workspace's secrets for you; do not edit Studio's raw Secrets by hand. The global key stays in the `google-search` workspace and is never inherited by tenant instances; only search **results** are returned to tenants (proxied through the core `centralSearch` webhook).
+    <Step title="Fill in the form and save">
+      Set **Connection type** to **Gemini Grounding** or **Legacy Custom Search**, paste the credential into **API credential (API key or service-account JSON)**, then fill in **Programmable Search Engine ID (cx)** for the legacy mode or **Gemini model** for Grounding. Select **Save global key**. The app confirms that the global key is saved, and clears the credential field. Reopening the view shows that a global key is set, and prefills `cx` and the Gemini model; the credential itself is never returned. To change only `cx` or the model later, leave the credential field empty and save again.
     </Step>
   </Steps>
 
-  <Note>
-    When a platform global key is set, the shared connector instance becomes a **global endpoint**: the per-agent allowlist no longer applies there, and every agent granted the capability (Option A in the *Agent builder* tab) is accepted. The global key is the gate.
-  </Note>
-
-  ## 2. Declare the capability in AI Governance
-
-  Generic connectors (broad tool surfaces meant to be shared across many agents) are best exposed as a named **capability** in the org Capabilities catalog. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
-
-  <Note>
-    **Easiest path: the one-click "Add to catalog" button.** The configuration app has an **Add to catalog** button (in the *MCP endpoint* section) that registers the connector org-wide in one click: it creates an `mcp`-type catalog entry pointing at this workspace's MCP endpoint with the *Scope* `context_id,agent_id,user_id` already set. It also detects an existing entry and offers **Update catalog entry** instead. The button is shown only to **org owners / admins**, and the published entry is **org-wide**; every builder in the org can then attach the connector. Use this instead of the manual steps below; they remain for when you want to author the capability by hand.
-  </Note>
-
-  <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) the **Google Search** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
-
-      ```text
-      context_id,agent_id,user_id
-      ```
-
-      The `agent_id` in the scope is what lets the connector identify the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant.
-    </Step>
-    <Step title="Smoke-test">
-      From an agent that has the capability, trigger any web question. The agent calls `search` and grounds its answer on the returned sources.
-    </Step>
-  </Steps>
+  The credential is written to the `googleSearchCentralAuth` secret of the core workspace. It never leaves that workspace: a workspace without its own credential posts its query to the core `centralSearch` webhook, which runs the search and returns only the results.
 
   <Warning>
-    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model**: when a workspace runs its own instance (Option B), which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app. There is **no OAuth auth-config JSON** to attach in Governance: authentication is a server-side Google key, not a per-user OAuth flow.
+    Setting the global key changes who may call the core workspace's own MCP endpoint. On that endpoint the per-agent allowlist stops applying and every calling agent is accepted, because the global key itself is the gate. Per-workspace app instances are unaffected: they keep enforcing their own allowlist.
+  </Warning>
+
+  ## 2. Publish the connector to the Capabilities catalog
+
+  Publishing the connector to the organization Capabilities catalog lets agent builders attach it from the catalog instead of pasting an endpoint URL. Follow [Publish the connector to the Capabilities catalog](/apps-store/marketplace/connectors/declare-capability#publish-the-connector-to-the-capabilities-catalog); the **Capabilities catalog** section sits in this same maintainer view, and its button stays disabled until the global key is saved. To author the entry by hand instead, follow [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance).
+
+  These are the values this connector publishes:
+
+  | Field | Value |
+  |---|---|
+  | Capability type | `mcp` |
+  | Name | `google_search`, displayed as **Google Search** |
+  | Server URL | The core `google-search` workspace MCP endpoint |
+  | **Scope** | `context_id,agent_id,user_id` |
+  | Authorization block | None. Authentication is a server-side Google credential, not a per-user flow |
+
+  <Warning>
+    Publishing the capability makes the connector reachable; it does not by itself authorize a specific agent against a specific workspace. A workspace running its own app instance still gates callers with its **Authorized agents** allowlist. See [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization). There is no OAuth authorization block to attach: authentication is a server-side Google credential, not a per-user flow.
   </Warning>
 </Accordion>
 
@@ -135,110 +161,123 @@ This connector is used by three different roles. Jump to the section that matche
     **Goal:** let an agent you build in Agent Creator search the web through the `search` MCP tool.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Google Search app in a workspace (see the *Workspace builder* tab), or a *Platform admin* must have set a shared platform key and published the capability (see the *Platform admin setup* accordion above).
+      Before an agent can call the connector, a workspace builder must have installed and configured the app in a workspace ([Workspace builder](#workspace-builder-dsul)), or a platform maintainer must have set the global key and published the capability ([Platform maintainer: set the platform global Google key](#platform-maintainer-set-the-platform-global-google-key)).
     </Note>
 
-    This connector runs in the **tenant app-instance context**: your agent is identified by the `agent_id` that Agent Creator injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The Google credential itself is resolved server-side and never exposed to the agent.
+    Your agent is identified by the `agent_id` that Agent Creator injects through the capability **Scope**, and that agent must be authorized by the connector. The Google credential is resolved server-side and is never exposed to the agent.
 
-    There are two ways to wire it up. Pick based on how much isolation you need.
+    ## Option A: attach the shared capability from the catalog
 
-    ## Option A: Enable the shared capability from the catalog
-
-    The fastest path: an *org owner / admin* has published a **Google Search** capability to the org Capabilities catalog (typically via the config app's one-click **Add to catalog** button; see the *Platform admin setup* accordion above, §2), so you just pick it from the catalog. When the published entry points at a shared instance backed by a platform Google key, no per-agent allowlist applies.
+    Use this when an `org:owner` or `org:admin` has published the **Google Search** capability against the core workspace endpoint, backed by the platform global key. On that endpoint every agent granted the capability is accepted, so there is no allowlist step on your side.
 
     <Steps>
       <Step title="Open your agent in Agent Creator">
-        Open the agent you want to extend and go to its capabilities / tools.
+        Open the agent you want to extend and go to its capabilities.
       </Step>
       <Step title="Add the Google Search capability">
-        Browse the capability catalog, select **Google Search**, and enable it. The MCP endpoint URL and the *Scope* (`context_id,agent_id,user_id`) are already wired by the admin; nothing to paste, and the shared instance accepts every agent granted the capability, so there is no allowlist step on your side.
+        Browse the capability catalog, select **Google Search**, and enable it. The server URL and the **Scope** `context_id,agent_id,user_id` come from the catalog entry, so there is nothing to paste.
       </Step>
-      <Step title="Use it">
-        No sign-in is needed; the platform key backs every call. Ask the agent a question that needs the web; it calls `search` and grounds its answer with cited sources.
+      <Step title="Save the agent">
+        Select **Save**. The agent discovers the `search` tool through `tools/list` on the next run.
       </Step>
     </Steps>
 
     <Note>
-      Convenient, but your agent runs against a **shared, platform-managed instance**: its Google credential and quota are owned by the platform and the instance accepts every agent that is granted the capability. Prefer Option B for anything beyond quick experiments.
+      Convenient, but the agent then runs against a platform-managed instance whose Google credential and quota are owned by the platform, and which accepts every agent granted the capability. Prefer Option B beyond quick experiments.
     </Note>
 
-    ## Option B: Run it from your own workspace (recommended)
+    ## Option B: run it from your own workspace (recommended)
 
-    For production agents, install the connector in **your own workspace** and point the agent at *that* workspace's MCP endpoint.
+    For production agents, install the connector in your own workspace and point the agent at that workspace's MCP endpoint.
 
     <Warning>
-      **Prefer this mode for security.** Because the MCP runs in *your* app-instance context, the Google credential, the search quota and the authorized-agents allowlist are all **scoped to your workspace**, not shared platform-wide. You decide exactly which agents may call it and which Google key / backend backs them, and a misconfiguration elsewhere can never consume your quota. The shared catalog capability (Option A) is a broad surface many agents can reach; your own workspace is an isolated, least-privilege boundary.
+      Prefer this mode. Because the MCP endpoint runs in your app-instance context, the Google credential, the search quota and the authorized-agents allowlist are all scoped to your workspace. You decide which agents may call it and which credential and backend serve them, and a change made elsewhere cannot consume your quota.
     </Warning>
 
     <Steps>
       <Step title="Install and configure the connector in your workspace">
-        Follow the *Workspace builder* tab: install **Google Search** in your workspace, open its **Configuration app**, paste your Google API key (or service-account JSON) and, optionally, a Programmable Search Engine `cx`.
+        Follow [Workspace builder](#workspace-builder-dsul): install **Google Search**, open its configuration app, and save a Google credential.
       </Step>
-      <Step title="Allowlist your agent">
-        In that workspace's config app, open **Authorized agents** and tick your agent (the **Install capability** button does this for you), or enable **Allow all agents**.
+      <Step title="Authorize your agent and install the capability">
+        In that configuration app, open **Authorized agents**, tick your agent, then select **Install capability** on its row, as described in [Install the capability on one agent](/apps-store/marketplace/connectors/declare-capability#install-the-capability-on-one-agent). For this connector the button adds an MCP tool named `google_search` pointing at your workspace's endpoint, with the **Scope** already set to `context_id,agent_id,user_id`.
       </Step>
-      <Step title="Add the MCP capability to your agent">
-        In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
-
-        ```text
-        context_id,agent_id,user_id
-        ```
-
-        The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "agent could not be identified" message.
+      <Step title="Or wire the capability by hand">
+        To add the capability yourself, copy the URL shown under **MCP endpoint** in the configuration app ([Copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint)), then follow [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance) with the **Scope** set to `context_id,agent_id,user_id`. Without `agent_id` in the scope, every call is rejected because the connector cannot identify the caller. There is no authorization block to add: this connector has no per-user OAuth flow.
       </Step>
     </Steps>
 
-    <Note>
-      To skip pasting the endpoint by hand, an org owner / admin can use the config app's one-click **Add to catalog** button to register *this workspace's* endpoint as a Capabilities-catalog entry; then any builder picks it from the catalog (Option A). The connector still enforces this workspace's authorized-agents allowlist, so only the agents you ticked can actually call it.
-    </Note>
+    The endpoint URL has this shape, and the configuration app displays the exact value with a copy button:
+
+    ```text
+    <api-url>/workspaces/slug:<workspace-slug>/webhooks/<app-instance-slug>.mcp
+    ```
 
     ## Brief the agent in its system prompt
 
-    Whichever option you pick, wiring the capability is not enough: the agent must know the tool exists and when to use it. Copy-pasteable starter:
+    Attaching the capability is not enough; the agent also needs to know when to reach for the tool. Use this starter and adapt the trigger topics to your context.
 
     ```text
-    You have access to the Google Search MCP server (tool: search). Use it whenever the question needs fresh, post-cutoff or external web information (news, prices, schedules, official docs, product specs); prefer calling search over guessing. Pass the user's intent as `q`; combine Google operators (site:, intitle:, -exclude, "exact phrase") inside q. When the tool returns an `answer` with sources, ground your reply on them and cite the links.
+    You have access to the Google Search MCP server (tool: search). Use it whenever the question needs fresh, post-cutoff or external web information: news, prices, schedules, official docs, product specs. Prefer calling search over guessing. Pass the user's intent as `q`, and combine Google operators (site:, intitle:, -exclude, "exact phrase") inside q. When the tool returns an `answer` with sources, ground your reply on them and cite the links.
     ```
 
     <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the config app and its identity propagated so the connector can read its `agent_id`.
+      For AI Knowledge agents that have no native MCP capability picker, add the connector under **Advanced > Tools** on the **MCP** tab and paste the same endpoint URL. The agent still has to be allowlisted, and its identity still has to reach the connector as `agent_id`. Prefer the Agent Creator capability path for new agents; see [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance).
     </Note>
 
-    ## Available Tools
+    ## Tool reference
+
+    The connector exposes one tool.
 
     | Tool | Description |
     |------|-------------|
-    | `search` | Google web search returning top organic results plus, when available, a synthesized `answer` with cited sources. Backend auto-selected per tenant: Custom Search (with a configured `cx`, rich filters + image search) or Gemini Grounding (whole-web search of the entire web). Only `q` is required; combine Google operators inside `q`. |
+    | `search` | Google web search returning top organic results plus, when available, a synthesized `answer` with cited sources. The backend is selected per workspace: Custom Search when a `cx` is configured, Gemini Grounding otherwise. Only `q` is required. |
 
-    ## Output Formats
+    ### search arguments
 
-    The `search` tool accepts an `outputFormat` argument that controls the MCP response shape:
+    | Argument | Type | Required | Description |
+    |---|---|---|---|
+    | `q` | string | Yes | Search query. Supports Google operators such as `site:`, `intitle:`, `-exclude` and `"exact phrase"`. An empty value returns an error result. |
+    | `options` | object | No | Fine-grained search parameters. Enforced by Custom Search, transposed into prompt hints by Grounding. |
+    | `outputFormat` | string | No | `verbose` (default), `structured` or `both`. Controls only the MCP response shape, not the search. |
 
-    - **`verbose`** (default): a human-readable markdown view (answer + sources with links + the queries actually run), optimized for LLM consumption and clickable source cards.
-    - **`structured`**: concise machine-readable JSON in `structuredContent`.
-    - **`both`**: the structured payload, with its JSON also rendered as text.
+    ### options reference
 
-    The structured payload shape is:
-
-    ```json
-    {
-      "query": "…",
-      "backend": "grounding | customSearch",
-      "answer": "synthesized answer (Grounding only)",
-      "totalResults": "123000",
-      "searchQueries": ["…"],
-      "items": [{ "title": "…", "link": "…", "displayLink": "…", "snippet": "…" }],
-      "warnings": []
-    }
-    ```
+    | Option | Type | Description |
+    |---|---|---|
+    | `cx` | string | Programmable Search Engine ID. Overrides the workspace `cx` for this call, and only when the workspace already runs the Custom Search backend. |
+    | `num` | number | Number of results, from 1 to 10. Defaults to 10. Custom Search only. |
+    | `start` | number | Index of the first result, from 1 to 91. Pagination, Custom Search only. |
+    | `lr` | string | Language restriction in `lang_XX` form, for example `lang_fr`. |
+    | `gl` | string | Country boost, ISO 3166-1 alpha-2 code, for example `fr`. |
+    | `cr` | string | Country restriction, for example `countryFR`. |
+    | `hl` | string | Interface language for results, for example `en`. |
+    | `safe` | string | SafeSearch level, `active` or `off`. Defaults to `off`. |
+    | `dateRestrict` | string | Date restriction as `d{n}`, `w{n}`, `m{n}` or `y{n}`, for example `d7` for the last 7 days. |
+    | `exactTerms` | string | A phrase that every result must contain verbatim. |
+    | `excludeTerms` | string | A word or phrase that no result may contain. |
+    | `orTerms` | string | Space-separated terms; results contain at least one. |
+    | `siteSearch` | string | Limit results to a site, for example `wikipedia.org`. |
+    | `siteSearchFilter` | string | `i` to include only `siteSearch`, `e` to exclude it. |
+    | `fileType` | string | Restrict to a file type, for example `pdf`. |
+    | `filter` | string | Duplicate-content filter, `1` on (default) or `0` off. |
+    | `sort` | string | Sort expression, for example `date`. |
+    | `searchType` | string | Set to `image` for an image search. |
+    | `imgSize` | string | `huge`, `icon`, `large`, `medium`, `small`, `xlarge` or `xxlarge`. |
+    | `imgType` | string | `clipart`, `face`, `lineart`, `stock`, `photo` or `animated`. |
+    | `imgColorType` | string | `color`, `gray`, `mono` or `trans`. |
+    | `imgDominantColor` | string | `black`, `blue`, `brown`, `gray`, `green`, `orange`, `pink`, `purple`, `red`, `teal`, `white` or `yellow`. |
+    | `rights` | string | Creative Commons rights filter, for example `cc_publicdomain`. |
+    | `c2coff` | string | Toggle Simplified and Traditional Chinese search, `1` disables it. |
+    | `linkSite` | string | Results must contain a link to this URL. |
+    | `hq` | string | Additional terms appended with AND logic. |
+    | `lowRange` | string | Search range starting value. |
+    | `highRange` | string | Search range ending value. |
 
     <Note>
-      In Grounding mode, most `options.*` parameters are *hints* Gemini may ignore; anything skipped is reported in `warnings`. `searchType: "image"` is rejected in Grounding mode (Custom Search only).
+      In Grounding mode these options are not sent to Google as parameters. Those that can be expressed in words are prepended to the prompt as instructions, so Gemini follows them only when it finds them reasonable. The ones that cannot be expressed in words, `start`, `sort`, `filter`, `rights`, `c2coff`, `linkSite`, `hq`, `lowRange`, `highRange` and `cx`, are dropped and listed in the `warnings` array of the response. `searchType: image` is likewise turned into a prompt hint: Grounding returns image-bearing web pages rather than the structured image fields that Custom Search provides, and it adds a warning saying so.
     </Note>
 
-    ## Tool Details
-
-    ### search
+    ### Call example
 
     ```json
     {
@@ -254,79 +293,117 @@ This connector is used by three different roles. Jump to the section that matche
     }
     ```
 
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `q` | Yes | Search query. Supports Google operators (`site:`, `intitle:`, `-exclude`, `"exact phrase"`). |
-    | `options.cx` | No | Programmable Search Engine id; overrides the tenant `cx` for this call (Custom Search only). |
-    | `options.num` | No | Number of results, 1-10 (Custom Search only). |
-    | `options.dateRestrict` | No | Restrict by date: `d{n}` / `w{n}` / `m{n}` / `y{n}` (e.g. `d7` = last 7 days). |
-    | `options.siteSearch` | No | Limit to a site (e.g. `wikipedia.org`); pair with `options.siteSearchFilter` (`i` include / `e` exclude). |
-    | `options.lr` / `options.gl` / `options.hl` | No | Language restriction (`lang_fr`), country boost (`fr`), interface language. |
-    | `options.searchType` | No | Set to `image` for an image search (**Custom Search only**; rejected in Grounding). Pair with `imgSize` / `imgType` / `imgColorType` / `imgDominantColor`. |
-    | `outputFormat` | No | `verbose` (default), `structured`, or `both`. |
+    ### Response format
+
+    `outputFormat` controls the MCP response shape:
+
+    - **`verbose`** (default): a single text block holding a markdown view with the answer, the numbered sources with links and snippets, the queries Gemini actually ran, and any warnings.
+    - **`structured`**: the structured payload as `structuredContent`, with its JSON also rendered in the text block.
+    - **`both`**: same as `structured`.
+
+    Whatever the format, when the result carries sources, `url_citation` annotations are attached to the first content block so the interface can render clickable source cards.
+
+    The structured payload has this shape:
+
+    ```json
+    {
+      "query": "prisme.ai pricing",
+      "backend": "grounding",
+      "answer": "synthesized answer, Grounding only",
+      "totalResults": "3",
+      "searchTime": 0,
+      "searchQueries": ["prisme ai pricing"],
+      "items": [
+        { "title": "...", "link": "...", "displayLink": "...", "snippet": "..." }
+      ],
+      "warnings": []
+    }
+    ```
+
+    `backend` is `grounding` or `customSearch`. In Grounding mode `answer` holds the synthesized response, `items` are the cited sources, `searchQueries` are the queries Gemini ran, `totalResults` is the number of cited sources, and `searchTime` is `0`. In Custom Search mode `answer` is empty, `searchQueries` is empty, `totalResults` and `searchTime` are Google's own estimate and timing, `items` are the ranked organic results, and each item may also carry `fileFormat` and, for image searches, an `image` object with `contextLink`, `thumbnailLink`, `width` and `height`.
+
+    Failures inside the tool come back as a tool result with `isError` set to `true` and a text block carrying the message, not as a JSON-RPC error.
+
+    ## MCP protocol surface
+
+    The endpoint speaks JSON-RPC 2.0 over HTTP POST.
+
+    | Method | Result |
+    |--------|--------|
+    | `initialize` | Handled by MCP Core, with `serverInfo` `{ "name": "google-search-mcp", "version": "1.0.0" }` |
+    | `tools/list` | Handled by MCP Core; returns the `search` tool definition and its input schema |
+    | `tools/call` | Authorizes the calling agent, resolves the credential, routes to the selected backend, and returns the tool result |
+    | Notifications | Any request without a JSON-RPC `id`, such as `notifications/initialized`, returns HTTP `202` with an empty body |
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
     ## Workspace builder
 
-    **Goal:** install the connector in a workspace, configure the Google credential and the agent allowlist, and call `search` from your automations.
+    **Goal:** install the connector in a workspace, set the Google credential and the agent allowlist, and call `search` from your automations.
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **Google Search** and install it
-    3. Open the **Configuration app** (the link auto-populated on install) to paste your Google credential, optionally set a Programmable Search Engine `cx`, and allow the agents that may call the connector
+    The install and allowlist flow is the standard one, documented in [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace). Follow it, with these Google-specific values.
 
-    ## Configuration
+    <Steps>
+      <Step title="Install the app">
+        Search for **Google Search** in **Apps** and install it, as described in [Install the app](/apps-store/marketplace/connectors/install-in-workspace#install-the-app). For this connector the install provisions the `googleSearchAuth` and `googleSearchAuthorizedAgents` secrets and fills in the read-only **Configuration app** field ([What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions)).
+      </Step>
+      <Step title="Save the Google credential">
+        Open the **Configuration app** link and follow [Configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app). Under **Google API credential**, set **Connection type** to **Gemini Grounding** or **Legacy Custom Search**, paste your key or service-account JSON into **API credential (API key or service-account JSON)**, then set **Programmable Search Engine ID (cx)** in legacy mode or **Gemini model** in Grounding mode. Select **Save credential**. There is no callback URL to register and no account to connect: this connector has no per-user OAuth mode.
+      </Step>
+      <Step title="Authorize the agents that may call the connector">
+        Under **Authorized agents**, tick each agent allowed to call the MCP endpoint, as described in [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector). Each tick is saved immediately, with no separate save button. **Allow all agents (disables selection + verification)** removes the gate entirely; read [The allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard) before enabling it.
+      </Step>
+    </Steps>
+
+    ## Configuration reference
 
     | Field | Description |
     |-------|-------------|
-    | **Configuration app** | Auto-populated on install; open this link to set the Google credential (API key or service-account JSON), choose the backend via `cx`, and manage the authorized-agents allowlist. |
+    | **Configuration app** | Read-only, filled in on install. Opens the app that manages the credential, the backend and the agent allowlist. |
+    | **Connection type** | **Gemini Grounding** (recommended) or **Legacy Custom Search**. Selecting Grounding clears `cx` when you save, which is how the server detects the backend. |
+    | **API credential (API key or service-account JSON)** | A Google Cloud API key starting with `AIza`, sent as `X-goog-api-key`, or a full service-account JSON starting with `{`, signed into a JWT and exchanged for a bearer token. |
+    | **Programmable Search Engine ID (cx)** | Legacy mode only. The Custom Search engine to query. |
+    | **Gemini model** | Grounding mode only, optional. Defaults to `gemini-2.5-flash`. |
 
-    The configuration app drives everything; the app instance itself has no per-field credential form. From it you provide a credential, which selects the auth mode:
+    The values are stored in the workspace secrets, not in a visible configuration field:
 
-    | Credential | What you provide | Best for |
-    |-----------|------------------|----------|
-    | **Google Cloud API key** | An `AIza…` key (sent as `X-goog-api-key`) | Simplest setup; interactive / low-volume use |
-    | **Service-account JSON** | A Google service-account key JSON (signed into a short-lived Bearer token, cached) | Server-to-server, no interactive key rotation |
-
-    The **backend** is selected automatically from the `cx` field:
-
-    | Backend | Selected when | Behavior |
-    |---------|---------------|----------|
-    | **Gemini Grounding** (default) | `cx` is empty | Real google.com search of the whole web; returns a synthesized `answer` + cited sources. `options.*` are hints. |
-    | **Custom Search JSON API** (legacy) | `cx` is set (a Programmable Search Engine id) | Ranked organic results with rich filters (`num`, `dateRestrict`, `siteSearch`, language) and image search. Scoped to the **sites whitelisted in the PSE context**, never the open web (Google retired "Search the entire web" for new engines). |
+    | Secret | Content |
+    |---|---|
+    | `googleSearchAuth` | Object holding the credential and the backend configuration: `apiKey`, `cx`, `geminiModel`, `baseUrl`. |
+    | `googleSearchAuthorizedAgents` | Comma-separated agent IDs allowed to call the MCP endpoint, or `*` for all. |
 
     <Note>
-      Credentials are provisioned into the workspace's Secrets and resolved server-side. The agent allowlist (**Authorized agents**) gates which Agent Creator agents may call the MCP endpoint; see the *Agent builder* tab. A workspace with no credential of its own transparently falls back to the platform global key (if a *Platform admin* set one).
+      `baseUrl` overrides the Google host the connector calls, defaulting to `https://generativelanguage.googleapis.com` for Grounding and `https://customsearch.googleapis.com` for Custom Search. The configuration app does not expose it; set it directly on the `googleSearchAuth` secret if you need it.
     </Note>
 
-    ## Available Instructions
+    <Note>
+      A workspace with no credential of its own does not fail. Its searches are proxied to the core `google-search` workspace and run on the [platform global Google key](#platform-maintainer-set-the-platform-global-google-key), if a maintainer set one. To keep searches on your own quota, always save a credential.
+    </Note>
 
-    Every instruction resolves the credential from the workspace configuration.
+    ## Available instructions
 
-    ### Web Search
+    The instruction resolves the credential and the backend from the workspace configuration.
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `search` | Run a Google web search. `q` (required) is the query; combine Google operators inside it (`site:`, `intitle:`, `-exclude`, `"exact phrase"`). `options` carries fine-grained filters (date, site, language, file type, image search) honored by the Custom Search backend and treated as hints by Grounding. The backend is auto-selected from the tenant `cx`. | `{ query, backend, answer, totalResults, searchQueries, items: [{ title, link, displayLink, snippet }], warnings }` |
+    | `search` | Runs a Google web search. `q` is required; combine Google operators inside it. `options` carries the fine-grained filters. | `{ query, backend, answer, totalResults, searchTime, searchQueries, items, warnings }`, or `{ error }` on failure |
 
-    <Note>
-      `Returns` shows the shape of the operation output. In Grounding mode `answer` is the synthesized response and `items` are the cited sources; in Custom Search mode `answer` is empty and `items` are the ranked organic results.
-    </Note>
+    The `options` object accepts the same parameters as the MCP tool, except `filter`, `sort`, `c2coff`, `linkSite`, `hq`, `lowRange` and `highRange`, which the instruction does not declare. See the [options reference](#options-reference) table in the [Agent builder](#agent-builder-agent-creator) tab for the full list. The instruction has no `outputFormat` argument: it always returns the structured payload.
 
-    ## DSUL Examples
+    ## DSUL examples
 
-    **Grounded web search (default backend):**
+    Grounded web search on the default backend:
 
     ```yaml
     - Google Search.search:
         q: "latest Prisme.ai release notes"
       output: result
-    # result.answer = synthesized answer, result.items = cited sources
+    # result.answer holds the synthesized answer, result.items the cited sources
     ```
 
-    **Recent news restricted to a site:**
+    Recent news restricted to a site:
 
     ```yaml
     - Google Search.search:
@@ -339,7 +416,7 @@ This connector is used by three different roles. Jump to the section that matche
       output: news
     ```
 
-    **Image search (Custom Search backend; requires a `cx`):**
+    Image search, which needs the Custom Search backend and therefore a configured `cx`:
 
     ```yaml
     - Google Search.search:
@@ -352,7 +429,7 @@ This connector is used by three different roles. Jump to the section that matche
       output: images
     ```
 
-    **Find PDFs on a specific domain:**
+    Find PDFs on a specific domain:
 
     ```yaml
     - Google Search.search:
@@ -366,41 +443,91 @@ This connector is used by three different roles. Jump to the section that matche
 
 ---
 
-## Error Handling
+## Verify the connector
 
-| HTTP code | Meaning |
-|-----------|---------|
-| `400` | Bad request: invalid parameters or a malformed query. |
-| `401` | Authentication failed: the Google API key is missing, invalid or revoked. |
-| `403` | Forbidden: the key lacks access, or the matching API is not enabled (Generative Language API for Grounding, Custom Search API for the legacy `cx` backend). |
-| `404` | Not found: wrong endpoint or resource. |
-| `429` | Rate limit / quota exceeded: back off and retry (the Gemini free tier is especially low). |
-| `500` / `503` | Google service error: transient; retry shortly. |
+Run these checks in order. Stop at the first failure and use the matching entry in the troubleshooting section.
 
-### Common Issues
+1. In the configuration app, select **Test connection**. It saves the credential, then makes one lightweight authenticated call: `GET v1beta/models` in Grounding mode, which costs no model usage, or `customsearch/v1` with `num=1` in legacy mode. Expected result: a success message reporting the resolved backend, `grounding`, `customSearch`, or `central` when the workspace runs on the platform global key.
+2. From Builder, run the `search` instruction with `q` set to any question. Expected result: an output object whose `backend` matches the backend you configured, with a non-empty `items` array and, in Grounding mode, a non-empty `answer`.
+3. From an agent that has the capability, ask a question that requires a fresh web source. Expected result: the agent calls `search` and answers with the links returned by the tool, rendered as source cards.
+4. From an agent you did **not** tick, ask the same question. Expected result: the call is denied with `This agent is not authorized to use this connector`. A success means the allowlist holds `*`, or the agent is calling the core workspace endpoint while a platform global key is set.
 
-**"This agent is not authorized to use this connector"**: The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (or enable **Allow all agents**) and Save.
+For the generic post-install and capability checks, see [Verify the installation](/apps-store/marketplace/connectors/install-in-workspace#verify-the-installation) and [Verify the capability](/apps-store/marketplace/connectors/declare-capability#verify-the-capability). The "who am I" check listed there does not apply: this connector exposes no identity operation, because it never acts as the end user.
 
-**"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allow the agent in the config app.
+## Error handling
 
-**"The platform global Google key is not configured" / "No platform global Google key is configured"**: The workspace has no credential of its own and no platform global key is set. Paste a Google API key in the config app, or ask the platform administrator to set the global key on the core `google-search` workspace.
+Google errors are normalized before they reach the caller. `<operation>` is the action in progress, such as `searching Google via Grounding`, `searching Google`, `testing Gemini Grounding auth`, or `testing Custom Search auth`. `<detail>` is the message Google returned, or `(no further detail)` when the response carries none.
 
-**"Google API credential is malformed"**: The pasted value is neither a valid `AIza…` API key nor a parseable service-account JSON. Re-copy the credential from the Google Cloud Console.
+| Status | Message |
+|--------|---------|
+| `400` | `Bad request while <operation>: <detail>` |
+| `401` | `Authentication failed while <operation>. Check the Google API key. Detail: <detail>` |
+| `403` | `Forbidden while <operation>. Check the key has access and the matching Google API is enabled (Generative Language API for Grounding, or Custom Search API for the legacy cx backend). Detail: <detail>` |
+| `404` | `Resource not found while <operation>. Detail: <detail>` |
+| `429` | `Rate limit / quota exceeded while <operation>. <detail>` |
+| `500` | `Google server error while <operation>. Detail: <detail>` |
+| Any other | `Error <status> while <operation>: <detail>` |
 
-**Image search returns nothing / an error**: `searchType: image` only works on the **Custom Search** backend. Configure a Programmable Search Engine `cx` in the config app; in Grounding mode image search is rejected.
+The raw Google response body is never echoed back, so credentials or provider metadata in an unrecognized error shape cannot leak into an agent transcript.
 
-**Filters seem ignored**: In Grounding mode most `options.*` parameters (`num`, `dateRestrict`, `siteSearch`, …) are *hints* Gemini may not honor; check the `warnings` array in the structured output. Set a `cx` to switch to Custom Search, where filters are enforced.
+## Troubleshooting
 
-## External Resources
+Installation and capability failures shared by every App + MCP connector are documented in [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace#troubleshooting) and [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability#troubleshooting). The entries below are the ones specific to Google Search.
+
+**`This agent is not authorized to use this connector`**: the calling agent is not in the workspace allowlist. Tick it under **Authorized agents**, or use **Install capability**, which allowlists and wires in one step. See [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector).
+
+**`The calling agent could not be identified, so it cannot be authorized`**: the MCP capability **Scope** does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the capability **Scope** to `context_id,agent_id,user_id`, which is separate from any OAuth scope, then allowlist the agent. See [What the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means).
+
+**``Google API credential is malformed: Credential starts with `{` but is not valid JSON.``**: the pasted service-account JSON is truncated or corrupted. Re-copy the whole key file from the Google Cloud Console.
+
+**`Google API credential is malformed: JSON does not look like a Google service account (missing type/client_email/private_key).`**: the pasted JSON parses but is not a service-account key. Download a service-account key from **IAM & Admin > Service Accounts > Keys**, not an OAuth client JSON.
+
+**`Service account missing client_email or private_key.`** or **`JWT signing failed: <message>`**: the service-account JSON is incomplete, or its `private_key` is not a usable RSA private key, often because newlines were lost when copying. Paste the file contents unchanged.
+
+**`OAuth2 token exchange failed (HTTP <status>). Detail: <detail>`**: Google refused the JWT exchange. Check that the service account still exists and is enabled, that its key has not been deleted, and that the project has the Generative Language API enabled.
+
+**`The platform global Google key is not configured on the Google Search core workspace.`** or **`No platform global Google key is configured. Set your own credential in the connector config app, or ask the platform administrator to set the global service key on the Google Search core workspace.`**: the workspace has no credential of its own and no global key exists. Save a credential in the configuration app, or ask a platform maintainer to set the global key.
+
+**`Central Google Search proxy error - HTTP <status>.`**: the fallback call to the core `google-search` workspace failed. Confirm that the core workspace is reachable and that its global key is still valid, or save a credential of your own to stop using the fallback.
+
+**`Authenticated, but the Google test call failed (status <status>).`**: the credential resolved but Google rejected the call. In Grounding mode, enable the Generative Language API on the key's project. In legacy mode, check the `cx` value and enable the Custom Search API.
+
+**`` `q` is required and must be a non-empty string. ``**: the call carried no query. Have the agent always pass a non-empty `q`.
+
+**``Missing `cx` (Programmable Search Engine ID). Pass it as an argument or configure it on the app instance.``**: the Custom Search backend ran without an engine ID. Set **Programmable Search Engine ID (cx)** in the configuration app, or pass `options.cx` on the call.
+
+**`Forbidden - you must be an editor of the Google Search core workspace.`**: you tried to set the platform global key without the `owner`, `editor` or `admin` role on the core `google-search` workspace. Ask a member of that workspace to grant it, or to set the key for you.
+
+**Filters seem ignored**: in Grounding mode the options are prompt hints, not enforced parameters, and the ones that cannot be expressed in words are dropped. Read the `warnings` array of the response to see what was skipped, and configure a `cx` to switch to Custom Search, where filters are enforced.
+
+**Image search returns pages instead of images**: Grounding returns image-bearing web pages, not structured image fields. Configure a `cx` to switch to the Custom Search backend, which returns `image` objects with thumbnails and dimensions.
+
+**A rotated credential is not picked up**: with an API key the change applies on the next call. With a service account the exchanged bearer token is cached for about 50 minutes, keyed by a fingerprint of the JSON, so replacing the JSON invalidates the cache immediately, while re-uploading the same JSON does not.
+
+## Rotate credentials and remove access
+
+The generic revoke, rotate and uninstall flow is documented in [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall), and capability removal in [Remove or update a capability](/apps-store/marketplace/connectors/declare-capability#remove-or-update-a-capability). These are the Google Search specifics.
+
+- **Rotate the Google credential**: create the new key or service-account key in Google Cloud, paste it into **API credential** in the configuration app, select **Test connection** to confirm it works, then delete the old credential in Google Cloud.
+- **Switch backend**: change **Connection type** and select **Save credential**. Saving keeps only the fields of the selected mode, so leaving legacy mode clears `cx` and returns the workspace to Grounding.
+- **Revoke one agent**: in the configuration app, untick the agent under **Authorized agents**. The change is saved immediately. Removing the MCP capability from the agent in Agent Creator also stops it from discovering the tool.
+- **Disable the connector for a workspace**: clear the **API credential** field and save. Be aware that this does not stop searches when a platform global key exists, because the workspace then falls back to it. To stop them entirely, also untick every agent and turn off **Allow all agents**.
+- **Disable the fallback platform-wide**: a platform maintainer replaces or clears the global key from the maintainer view on the core `google-search` workspace. Every workspace without its own credential then fails with the missing-global-key message instead of searching.
+- **Uninstall completely**: remove the MCP capability from every agent that points at the endpoint, uninstall the **Google Search** app from the workspace, delete the `googleSearchAuth` and `googleSearchAuthorizedAgents` secrets, then delete the API key or service account in Google Cloud if nothing else uses it.
+
+## Related
 
 <CardGroup cols={2}>
-  <Card title="Custom Search JSON API" icon="google" href="https://developers.google.com/custom-search/v1/overview">
-    Official reference for the Custom Search JSON API, query parameters and Programmable Search Engines.
+  <Card title="Connectors overview" icon="plug" href="/apps-store/marketplace/connectors/overview">
+    Compare the App and MCP usage modes across the connector catalog.
   </Card>
-  <Card title="Grounding with Google Search" icon="robot" href="https://ai.google.dev/gemini-api/docs/google-search">
-    How Gemini grounds answers with Google Search, the default backend of this connector.
+  <Card title="Agent capabilities" icon="robot" href="/products/agent-factory/capabilities">
+    Attach MCP servers to agents in Agent Creator.
   </Card>
-  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
-    Learn how Agent Creator agents consume MCP tools in Prisme.ai.
+  <Card title="Grounding with Google Search" icon="google" href="https://ai.google.dev/gemini-api/docs/google-search">
+    Google reference for the `google_search` tool used by the default backend.
+  </Card>
+  <Card title="Custom Search JSON API" icon="magnifying-glass" href="https://developers.google.com/custom-search/v1/overview">
+    Google reference for the legacy backend, its query parameters and Programmable Search Engines.
   </Card>
 </CardGroup>

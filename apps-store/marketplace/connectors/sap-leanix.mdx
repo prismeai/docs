@@ -1,6 +1,6 @@
 ---
 title: 'SAP LeanIX'
-description: 'Query and manage SAP LeanIX Enterprise Architecture from Agent Creator agents and Builder workflows: fact sheets, Integration API and surveys'
+description: 'Read and manage SAP LeanIX Enterprise Architecture from Agent Creator agents and Builder automations: fact sheets over Pathfinder GraphQL, the Integration API and Poll v2 surveys.'
 ---
 
 <img
@@ -12,22 +12,16 @@ description: 'Query and manage SAP LeanIX Enterprise Architecture from Agent Cre
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The SAP LeanIX app exposes the [SAP LeanIX](https://www.leanix.net) Enterprise Architecture Management platform through three entity tools. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. It runs in the **tenant app-instance context** (it resolves the installing workspace's own LeanIX credential) and covers three LeanIX surfaces:
-
-- **Fact sheets** (Pathfinder GraphQL): search, read, create, update and archive Applications, IT Components, Business Capabilities, Projects and any other fact sheet type, plus a raw GraphQL passthrough for relations, diagrams, tags and introspection.
-- **Integration API** (LDIF): start and monitor bulk inbound/outbound synchronization runs and list processor configurations.
-- **Surveys** (Poll v2): list surveys, read their runs and fetch results.
-
-Authentication is a **LeanIX API token** (exchanged server-side for a short-lived bearer at the mtm token endpoint) or a **caller-supplied access token**. Agents are identified by the capability **Scope** `context_id,agent_id,user_id` and gated by a per-workspace authorized-agents allowlist.
+The SAP LeanIX connector exposes the [SAP LeanIX](https://www.leanix.net) Enterprise Architecture Management platform to your Prisme.ai workspaces. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as three entity tools (`factSheets`, `integration`, `surveys`), or as a Builder app whose 15 instructions you call directly from DSUL. Authentication is a SAP LeanIX **API token**, exchanged server-side for a short-lived bearer, or a **caller-managed access token**. Credentials are resolved server-side and never reach the agent.
 
 <CardGroup cols={3}>
   <Card title="Enterprise Architecture fact sheets" icon="diagram-project">
-    Search, read, create, update and archive fact sheets (Applications, IT Components, Business Capabilities, Projects) through the Pathfinder GraphQL API, with a raw query passthrough for anything else.
+    Search, read, create, update and archive fact sheets (Applications, IT Components, Business Capabilities, Projects) through the Pathfinder GraphQL API, plus a raw query passthrough for anything the typed actions do not cover.
   </Card>
   <Card title="Bulk Integration API" icon="arrows-rotate">
-    Drive LDIF synchronization runs (inbound/outbound), poll their status and results, and list available processor configurations.
+    Start inbound and outbound LDIF synchronization runs, poll their status and results, and list the available processor configurations.
   </Card>
-  <Card title="Surveys & polls" icon="square-poll-vertical">
+  <Card title="Surveys and polls" icon="square-poll-vertical">
     List surveys, browse their runs and pull results through the Poll v2 API.
   </Card>
 </CardGroup>
@@ -37,53 +31,75 @@ Authentication is a **LeanIX API token** (exchanged server-side for a short-live
 This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to query and manage LeanIX. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to query and manage SAP LeanIX.
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and want to publish LeanIX as a reusable capability. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and want to publish SAP LeanIX as a reusable capability.
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call LeanIX operations directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations (DSUL) that call `SAPLeanIX.<instruction>` directly.
   </Card>
 </CardGroup>
 
-## Prerequisites (SAP LeanIX side)
+## Prerequisites
 
-- A **SAP LeanIX** workspace and an account that can create technical-user API tokens.
-- A **LeanIX API token**, generated in LeanIX under **Administration > Technical Users** (or use a caller-managed access token instead).
-- Your **instance URL**: the bare workspace host, e.g. `https://eu.leanix.net` (the connector derives the mtm token host from it automatically).
-- The technical user must have the LeanIX permissions for the resources you intend to use (fact sheets, Integration API, surveys).
+On the SAP LeanIX side:
+
+- A **SAP LeanIX** workspace, and an account allowed to create technical users in it.
+- A **technical user** and its **API token**, created under **Administration > Technical Users**. SAP LeanIX shows the token once, at creation, and lets you set its expiration date ([Technical Users](https://help.sap.com/docs/leanix/ea/technical-users)).
+- The **instance URL**: the bare workspace host, for example `https://eu.leanix.net`. The connector derives the token host from it.
+- Permissions on the technical user for every surface you intend to use: fact sheets (Pathfinder), the Integration API, and surveys.
+
+On the Prisme.ai side, the standard connector prerequisites apply: see [what a workspace builder needs before installing](/apps-store/marketplace/connectors/install-in-workspace#before-you-begin) for the workspace role, and [what an agent builder needs before wiring a capability](/apps-store/marketplace/connectors/declare-capability#before-you-begin) for the agent path.
+
+## How the connector reaches SAP LeanIX
+
+SAP LeanIX splits its hosts: the data APIs (Pathfinder GraphQL, Integration API, Poll v2) answer on the instance host you configure, while the token service answers on its `-svc` sibling. The connector handles the split for you.
+
+1. You store the instance host, for example `https://eu.leanix.net`. Any scheme, path or trailing slash you paste is stripped.
+2. The connector derives the token host by replacing `.leanix.net` with `-svc.leanix.net`, giving `https://eu-svc.leanix.net`. A host that does not contain `.leanix.net` is used as-is. The optional `tokenHost` field overrides the derivation for instances whose token service is not the `-svc` sibling.
+3. In `apiToken` mode, the connector calls `POST <token-host>/services/mtm/v1/oauth2/token` with HTTP Basic authentication (username `apitoken`, password the API token) and the form body `grant_type=client_credentials`.
+4. The returned bearer is cached on the session, keyed to a non-reversible fingerprint of the API token, and reused until `expires_in` elapses minus a 120 second safety margin. If SAP LeanIX returns no `expires_in`, the connector assumes 3600 seconds. Changing the API token invalidates the cache.
+5. Data calls then go to the instance host: `services/pathfinder/v1/graphql`, `/services/integration-api/v1/...` and `/services/poll/v2/...`, with `Authorization: Bearer <access token>`.
+
+GraphQL calls that come back with HTTP `401` are retried once after a forced token re-exchange, which absorbs a bearer that expired mid-flight. REST calls (Integration API, Poll v2) are not retried, so a `401` there surfaces directly.
+
+<Warning>
+  **Runtime identity is shared.** Whichever mode you pick, the connector acts as the single SAP LeanIX technical user that owns the stored credential, for every agent and every automation in the workspace. SAP LeanIX permission checks and audit records attribute all activity to that technical user, not to the invoking Prisme.ai end user. Scope the technical user to the least privilege the workspace needs, and remember that write actions (`create`, `update`, `archive`, `startRun`) apply to the whole LeanIX workspace. There is no per-user delegated mode for this connector.
+</Warning>
+
+## Authentication modes
+
+The configuration app stores one `mode` and its credentials. Pick `apiToken` unless an external system already mints bearers for you.
+
+| Mode | You provide | What the connector does | Best for |
+|------|-------------|-------------------------|----------|
+| `apiToken` (default) | The **API token** and the **instance URL**, plus an optional `tokenHost` override | Exchanges the token for a short-lived bearer at the token host, caches it on the session, and refreshes it on expiry | The standard setup. The long-lived credential stays server-side and the bearer is renewed automatically |
+| `accessToken` | A **bearer access token** and the **instance URL** | Uses the bearer as-is, with no exchange and no refresh | Externally minted, short-lived tokens. You are responsible for replacing the value before it expires |
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
-  **Goal:** SAP LeanIX is a **per-workspace** connector: each workspace configures its own LeanIX credential (see the *Workspace builder* tab), so there is **no platform-wide credential to provision**. The only optional platform task is to publish LeanIX as a reusable **capability** in AI Governance so agent builders can enable it from the catalog instead of pasting a raw MCP endpoint.
-
   <Note>
-    There is no shared LeanIX credential and no central OAuth client for this connector. The LeanIX API token and the authorized-agents allowlist always live in the consuming workspace. A Governance capability you publish here points at a specific workspace's MCP endpoint; that workspace still owns the credential and the allowlist.
+    **No platform-level credential is required.** SAP LeanIX uses the per-workspace credential model: each workspace stores its own API token and instance URL in the connector's configuration app, and the connector resolves them server-side. There is no shared platform key, no central OAuth client, and no per-user OAuth flow to register.
   </Note>
 
   ## Declare the capability in AI Governance (optional)
 
-  <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) the **SAP LeanIX** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint** (the workspace running the connector), and set its **Scope** to:
+  To let agent builders pick SAP LeanIX from the capability catalog instead of pasting an MCP endpoint URL by hand, declare it once as a named capability. The procedure is the standard one: follow [Publish the connector to the Capabilities catalog](/apps-store/marketplace/connectors/declare-capability#publish-the-connector-to-the-capabilities-catalog), or [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance) if you author the entry by hand.
 
-      ```text
-      context_id,agent_id,user_id
-      ```
+  The values SAP LeanIX expects are:
 
-      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant. Which agents may actually call this tenant-context connector is gated separately by the per-workspace allowlist (see below).
-    </Step>
-  </Steps>
+  | Field | Value |
+  |-------|-------|
+  | Capability type | `mcp` |
+  | MCP server URL | The **MCP endpoint** of the workspace that owns the app instance: `<api-url>/workspaces/slug:<your-workspace-slug>/webhooks/<app-instance-slug>.mcp` |
+  | **Scope** | `context_id,agent_id,user_id` |
+  | Authorization block | None. SAP LeanIX has no per-user OAuth flow, so there is no `oauth2` block to attach. |
+
+  The `agent_id` in the Scope is what lets the connector identify and authorize the calling agent. It is unrelated to any SAP LeanIX permission. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
 
   <Warning>
-    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model**: which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is **no OAuth auth-config JSON** to attach in Governance: authentication is a server-side LeanIX token, not a per-user OAuth flow.
+    Declaring the capability makes the connector **discoverable**; it does not authorize any agent, as explained in [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization). This connector follows the **tenant-context model**: which agents may actually call it is gated per workspace by the **Authorized agents** allowlist in the configuration app, described under [Workspace builder](#workspace-builder-dsul). There is no OAuth auth-config JSON to attach in Governance, because authentication is a server-side SAP LeanIX token rather than a per-user OAuth flow.
   </Warning>
 </Accordion>
 
@@ -93,68 +109,118 @@ This connector is used by three different roles. Jump to the section that matche
   <Tab title="Agent builder (Agent Creator)">
     ## Agent builder
 
-    **Goal:** let an agent you build in Agent Creator query and manage SAP LeanIX through MCP tools.
+    **Goal:** let an agent you build in Agent Creator read and manage SAP LeanIX through MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the SAP LeanIX app in a workspace (see the *Workspace builder* tab). Optionally, a *Platform admin* may have published a LeanIX capability in AI Governance (see the *Platform admin setup* accordion above).
+      Before an agent can call the connector, a workspace builder must have installed and configured the SAP LeanIX app in a workspace, as described under [Workspace builder](#workspace-builder-dsul), so an API token and an **MCP endpoint** exist. The [platform admin setup](#platform-admin-governance-one-time-platform-setup) is optional; it only publishes a reusable capability.
     </Note>
 
-    This connector runs in the **tenant app-instance context**: your agent is identified by the `agent_id` that Agent Creator injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The LeanIX credential itself is resolved server-side, never exposed to the agent.
-
-    <Note>
-      **Easiest registration: one-click "Add to catalog".** In the configuration app, org owners/admins see an **Add to catalog** button (under *Capabilities catalog*). It publishes the connector to your organization's **Capabilities catalog** as a ready-to-use capability (MCP endpoint and Scope `context_id,agent_id,user_id` pre-wired) so any builder can attach it from the picker without wiring the endpoint by hand. This is the recommended path; the manual steps below remain available if you prefer to wire the capability yourself.
-    </Note>
+    The SAP LeanIX credential is resolved server-side from the workspace configuration and is never exposed to the agent. Your agent is identified by the `agent_id` that Agent Creator injects through the capability **Scope**, and it must appear in the connector's **Authorized agents** allowlist.
 
     <Steps>
-      <Step title="Install and configure the connector in your workspace">
-        Follow the *Workspace builder* tab: install **SAP LeanIX** in your workspace, open its **Configuration app**, and provide the LeanIX API token (or access token) and instance URL.
+      <Step title="Install and configure SAP LeanIX in a workspace">
+        Follow [Workspace builder](#workspace-builder-dsul): install **SAP LeanIX** in a workspace, open its **Configuration app**, and store the API token (or access token) with the instance URL.
       </Step>
-      <Step title="Allowlist your agent">
-        In that workspace's config app, open **Authorized agents** and tick your agent (the **Install capability** button does this for you), or enable **Allow all agents**.
+      <Step title="Allow your agent and wire the capability">
+        Use [Install the capability on one agent](/apps-store/marketplace/connectors/declare-capability#install-the-capability-on-one-agent) from the same configuration app: it allowlists your agent and attaches the MCP tool in a single action. If a platform admin published a **SAP LeanIX** capability, you can instead pick it from the catalog, but your agent still has to appear in the **Authorized agents** allowlist.
       </Step>
-      <Step title="Add the MCP capability to your agent">
-        In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
+      <Step title="Check the capability values">
+        Whichever path you took, the capability must point at your workspace's **MCP endpoint**:
+
+        ```text
+        <api-url>/workspaces/slug:<your-workspace-slug>/webhooks/<app-instance-slug>.mcp
+        ```
+
+        with its **Scope** set to:
 
         ```text
         context_id,agent_id,user_id
         ```
 
-        The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "agent could not be identified" message.
+        Without `agent_id` in the Scope, every call is refused with the "could not be identified" message listed under [Common issues](#common-issues). See [What the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means) for what each identifier does.
       </Step>
-      <Step title="Brief the agent">
-        Tell the agent the tools exist and when to use them. Copy-pasteable starter:
-
-        ```text
-        You have access to the SAP LeanIX MCP server (tools: factSheets, integration, surveys). Each tool takes an `action` argument. Use factSheets to search, read, create, update or archive Enterprise Architecture fact sheets (Applications, IT Components, Business Capabilities, Projects), or its `graphql` action for anything advanced. Use integration for bulk LDIF synchronization runs, and surveys to read polls. Prefer calling a tool over guessing, and confirm with the user before any create/update/archive.
-        ```
+      <Step title="Save the agent">
+        Save the agent. Its next run lists the three tools and can call them.
       </Step>
     </Steps>
 
+    ## Brief the agent in its system prompt
+
+    Wiring the capability is not enough: the agent must know the tools exist and when to use them. Copy-pasteable starter:
+
+    ```text
+    You have access to the SAP LeanIX MCP server (tools: factSheets, integration, surveys). Every tool takes an `action` argument. Use factSheets to search, read, create, update or archive Enterprise Architecture fact sheets (Applications, IT Components, Business Capabilities, Projects), and its `graphql` action for anything the typed actions do not cover, such as relations, tags or introspection. Use integration for bulk LDIF synchronization runs, and surveys to read polls and their results. Prefer calling a tool over guessing, and always confirm with the user before create, update, archive or startRun.
+    ```
+
+    Refine the trigger keywords (fact sheet type names, business domains, typical user phrasings) so the agent picks up the right intent in your context.
+
     <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the config app and its identity propagated so the connector can read its `agent_id`.
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP endpoint** URL. The agent still has to be allowed in the configuration app, and its identity still has to be propagated so the connector can read its `agent_id`.
     </Note>
 
-    ## Available Tools
+    ## Available tools
 
-    Each tool takes an `action` argument selecting the concrete operation, plus the per-action parameters.
+    Each tool exposes several operations selected by a required `action` argument, plus the arguments for that action.
 
-    | Tool | Description |
-    |------|-------------|
-    | `factSheets` | Enterprise Architecture fact sheets (Pathfinder GraphQL). Actions: `search`, `get`, `create`, `update`, `archive`, `graphql` (raw query passthrough). |
-    | `integration` | Integration API (bulk LDIF import/export). Actions: `startRun`, `runStatus`, `runResults`, `listRunStatuses`, `listProcessors`. |
-    | `surveys` | Surveys / polls (Poll v2 API). Actions: `list`, `get`, `listRuns`, `results`. |
+    | Tool | Actions |
+    |------|---------|
+    | `factSheets` | `search`, `get`, `create`, `update`, `archive`, `graphql` |
+    | `integration` | `startRun`, `runStatus`, `runResults`, `listRunStatuses`, `listProcessors` |
+    | `surveys` | `list`, `get`, `listRuns`, `results` |
 
-    ## Output Formats
+    ## Output formats
 
-    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
+    Every tool accepts an `outputFormat` argument:
 
-    - **`verbose`** (default): human-readable text optimized for LLM consumption
-    - **`structured`**: concise machine-readable JSON in `structuredContent`
-    - **`both`**: the structured payload, with its JSON also rendered as text
+    - `verbose` (default): a confirmation line followed by the payload rendered as JSON in a fenced block, in the text `content`.
+    - `structured`: the payload as JSON in the text `content` and, identically, in `structuredContent`.
+    - `both`: same result as `structured`.
 
-    ## Tool Details
+    When the payload is empty, `structured` and `both` fall back to the verbose text plus a small `structuredContent` marker carrying `empty: true`.
 
-    ### factSheets: search
+    ## Tool details
+
+    ### factSheets
+
+    Fact sheet operations run against the Pathfinder GraphQL API (`services/pathfinder/v1/graphql`).
+
+    | Argument | Required for | Description |
+    |----------|--------------|-------------|
+    | `action` | All | One of `search`, `get`, `create`, `update`, `archive`, `graphql`. |
+    | `factSheetType` | Optional on `search` | One fact sheet type to filter on (`Application`, `ITComponent`, `BusinessCapability`, `Project`, and any other type in your workspace). Applied as a `FactSheetTypes` facet filter. |
+    | `fullTextSearch` | Optional on `search` | Full-text term. Ignored if `filter.fullTextSearch` is already set. |
+    | `first` | Optional on `search` | Page size. Default `50`, clamped to `100`. |
+    | `after` | Optional on `search` | Pagination cursor, the `pageInfo.endCursor` of the previous page. |
+    | `filter` | Optional on `search` | Raw `FactSheetFilter` object: `{ facetFilters: [{ facetKey, operator, keys }], fullTextSearch, ids }`. Merged with `factSheetType` and `fullTextSearch`. |
+    | `sort` | Optional on `search` | Sorting array, for example `[{ "key": "displayName", "order": "asc" }]`. |
+    | `id` | `get`, `update`, `archive` | Fact sheet id (UUID). |
+    | `name` | `create` | Fact sheet display name. |
+    | `type` | `create` | Fact sheet type. |
+    | `patches` | `update` | Non-empty array of JSON-patch operations `{ op: "add" \| "replace" \| "remove", path: "/field", value }`. Optional on `create`. Ignored on `archive`. |
+    | `comment` | Optional on `update`, `archive` | Change comment recorded in SAP LeanIX. |
+    | `validateOnly` | Optional on `create`, `update` | Dry-run: validate without persisting. |
+    | `query` | `graphql` | A raw GraphQL query or mutation document string. |
+    | `variables` | Optional on `graphql` | GraphQL variables object. |
+    | `outputFormat` | Optional | `verbose` (default), `structured` or `both`. |
+
+    The typed actions request a fixed field set, so their responses are predictable and small:
+
+    | Action | Returned selection |
+    |--------|--------------------|
+    | `search` | `allFactSheets { totalCount edges { cursor node { id type name description } } pageInfo { hasNextPage endCursor } }` |
+    | `get` | `factSheet { id type name description }` |
+    | `create` | `createFactSheet { factSheet { id name type rev } }` |
+    | `update` | `updateFactSheet { factSheet { id type name description rev } }` |
+    | `archive` | `updateFactSheet { factSheet { id type name } }` |
+    | `graphql` | Whatever your document selects, as the raw GraphQL response |
+
+    Use the `graphql` action when you need fields, relations, tags or introspection that the typed selections do not return.
+
+    <Warning>
+      SAP LeanIX has no hard delete for fact sheets. The `archive` action is an `updateFactSheet` mutation that applies the patch `{ "op": "replace", "path": "/status", "value": "ARCHIVED" }`. Any `patches` you pass to `archive` are ignored. To restore a fact sheet, run `update` with a patch setting `/status` back to its previous value.
+    </Warning>
+
+    **Search Applications matching a term:**
 
     ```json
     {
@@ -168,15 +234,7 @@ This connector is used by three different roles. Jump to the section that matche
     }
     ```
 
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `action` | Yes | One of `search`, `get`, `create`, `update`, `archive`, `graphql`. |
-    | `factSheetType` | No | Filter on one type (`Application`, `ITComponent`, `BusinessCapability`, `Project`, …). |
-    | `fullTextSearch` | No | Full-text term. |
-    | `first` / `after` | No | Page size (max 100, default 50) and pagination cursor (`pageInfo.endCursor`). |
-    | `filter` | No | Raw `FactSheetFilter` `{ facetFilters:[{facetKey,operator,keys}], fullTextSearch, ids }`. |
-
-    ### factSheets: create
+    **Create a fact sheet and set a field:**
 
     ```json
     {
@@ -193,15 +251,30 @@ This connector is used by three different roles. Jump to the section that matche
     }
     ```
 
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `action` | Yes | `create`. |
-    | `name` | Yes | Fact sheet display name. |
-    | `type` | Yes | Fact sheet type (e.g. `Application`). |
-    | `patches` | No | JSON-patch ops `{ op: add\|replace\|remove, path: "/field", value }` to set fields. |
-    | `validateOnly` | No | Dry-run if `true`. |
+    ### integration
 
-    ### integration: startRun
+    Integration API operations drive bulk LDIF import and export.
+
+    | Argument | Required for | Description |
+    |----------|--------------|-------------|
+    | `action` | All | One of `startRun`, `runStatus`, `runResults`, `listRunStatuses`, `listProcessors`. |
+    | `body` | `startRun` | The LDIF run payload `{ connectorType, connectorId, connectorVersion, processingDirection: "inbound" \| "outbound", processingMode, content }`. |
+    | `id` | `runStatus`, `runResults` | Synchronization run id. |
+    | `outputFormat` | Optional | `verbose` (default), `structured` or `both`. |
+
+    | Action | SAP LeanIX request |
+    |--------|--------------------|
+    | `startRun` | `POST /services/integration-api/v1/synchronizationRuns` |
+    | `runStatus` | `GET /services/integration-api/v1/synchronizationRuns/{id}/status` |
+    | `runResults` | `GET /services/integration-api/v1/synchronizationRuns/{id}/results` |
+    | `listRunStatuses` | `GET /services/integration-api/v1/synchronizationRuns` |
+    | `listProcessors` | `GET /services/integration-api/v1/processorConfigurations` |
+
+    Runs are asynchronous: `startRun` returns a run id, then poll `runStatus` until SAP LeanIX reports the run finished or failed. The connector does not poll for you and applies no timeout of its own.
+
+    <Note>
+      `listRunStatuses` calls `GET /services/integration-api/v1/synchronizationRuns`, the path shown in the table above. The connector's own description and its OpenAPI specification both name `/services/integration-api/v1/synchronizationRuns/status` instead; the executed path is the one without `/status`. If you compare the connector spec against real traffic, expect that difference.
+    </Note>
 
     ```json
     {
@@ -220,13 +293,27 @@ This connector is used by three different roles. Jump to the section that matche
     }
     ```
 
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `action` | Yes | One of `startRun`, `runStatus`, `runResults`, `listRunStatuses`, `listProcessors`. |
-    | `body` | For startRun | The LDIF run payload `{ connectorType, connectorId, connectorVersion, processingDirection: inbound\|outbound, processingMode, content }`. |
-    | `id` | For runStatus/runResults | Synchronization run id. |
+    ### surveys
 
-    ### surveys: list
+    Survey operations read the Poll v2 API. They are read-only: the tool creates and starts nothing.
+
+    | Argument | Required for | Description |
+    |----------|--------------|-------------|
+    | `action` | All | One of `list`, `get`, `listRuns`, `results`. |
+    | `pollId` | `get`, `listRuns` | Poll id. |
+    | `pollRunId` | `results` | Poll run id. |
+    | `page` | Optional on `list`, `listRuns`, `results` | Page index. |
+    | `size` | Optional on `list`, `listRuns`, `results` | Page size, clamped to `100`. |
+    | `sort` | Optional on `list`, `listRuns` | Sort expression. |
+    | `search` | Optional on `list` | Search term. |
+    | `outputFormat` | Optional | `verbose` (default), `structured` or `both`. |
+
+    | Action | SAP LeanIX request |
+    |--------|--------------------|
+    | `list` | `GET /services/poll/v2/polls` |
+    | `get` | `GET /services/poll/v2/polls/{pollId}` |
+    | `listRuns` | `GET /services/poll/v2/polls/{pollId}/pollRuns` |
+    | `results` | `GET /services/poll/v2/pollRuns/{pollRunId}/pollResults` |
 
     ```json
     {
@@ -240,107 +327,122 @@ This connector is used by three different roles. Jump to the section that matche
     }
     ```
 
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `action` | Yes | One of `list`, `get`, `listRuns`, `results`. |
-    | `pollId` | For get/listRuns | Poll id. |
-    | `pollRunId` | For results | Poll run id. |
-    | `page` / `size` / `sort` / `search` | No | Pagination, ordering and (for `list`) a search term. `size` max 100. |
+    <Note>
+      The `surveys` tool targets the **Poll v2** API. If your instance exposes a different survey API, reach it through the `factSheets` tool's `graphql` action or through a Builder automation of your own.
+    </Note>
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
     ## Workspace builder
 
-    **Goal:** install the connector in a workspace, configure authentication and the agent allowlist, and call LeanIX operations from your automations.
+    **Goal:** install the connector in a workspace, store the SAP LeanIX credential, decide which agents may call it, and invoke LeanIX operations from your automations.
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **SAP LeanIX** and install it
-    3. Open the **Configuration app** (the link auto-populated on install) to choose the auth mode, paste your LeanIX credential and instance URL, and allow the agents that may call the connector
+    SAP LeanIX follows the standard App + MCP installation flow: [Install the app](/apps-store/marketplace/connectors/install-in-workspace#install-the-app), [Configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app), [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector), then [Copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint). Search the Apps catalog for **SAP LeanIX**.
+
+    What is specific to this connector:
+
+    - **The credential fields.** Choose `apiToken` or `accessToken` (see [Authentication modes](#authentication-modes)), paste the SAP LeanIX credential, and store the instance URL, for example `https://eu.leanix.net`. There is no OAuth connection to start and no callback URL to register.
+    - **The connection test.** Select **Test connexion**. The connector resolves the credential and runs the GraphQL query `{ allFactSheets(first: 1) { totalCount } }` against Pathfinder. A successful test returns `{ "ok": true, "baseUrl": "https://eu.leanix.net" }` and echoes no credential.
+    - **What installing provisions.** The two workspace secrets listed below, plus the read-only **Configuration app** link. See [What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions) for the mechanism.
 
     ## Configuration
 
+    The app instance exposes one field:
+
     | Field | Description |
     |-------|-------------|
-    | **Configuration app** | Auto-populated on install: open this link to configure authentication (mode + credentials), set the instance URL, and manage the authorized-agents allowlist. |
+    | **Configuration app** | Read-only, auto-generated on install. Open this link to set the authentication mode and credentials and to manage the authorized-agents allowlist. |
 
-    The configuration app drives everything; the app instance itself has no per-field credential form. From it you pick one of:
+    Everything else is stored in two workspace secrets, provisioned on install and written by the configuration app:
 
-    | Auth mode | What you provide | Best for |
-    |-----------|------------------|----------|
-    | `apiToken` (default) | A LeanIX **API token** + the **instance URL** (e.g. `https://eu.leanix.net`) | Standard setup; the token is exchanged server-side for a short-lived bearer and cached |
-    | `accessToken` | A caller-managed **bearer access token** + the **instance URL** | Short-lived / externally-minted tokens, no exchange |
+    | Secret | Contents |
+    |--------|----------|
+    | `sapLeanixAuth` | The auth object `{ mode, instanceUrl, apiToken, accessToken, tokenHost }`. `mode` is `apiToken` (default) or `accessToken`. `tokenHost` is optional and only used in `apiToken` mode. |
+    | `sapLeanixAuthorizedAgents` | Comma-separated agent ids allowed to call the MCP endpoint, or `*` to allow all agents. |
 
     <Note>
-      Credentials are provisioned into the workspace's Secrets and resolved server-side. The agent allowlist (**Authorized agents**) gates which Agent Creator agents may call the MCP endpoint; see the *Agent builder* tab.
+      Credentials live in the workspace's secrets and are resolved server-side at call time. Never paste an API token into an agent prompt, an automation literal or a chat message. The **Authorized agents** allowlist gates the MCP endpoint only; it has no effect on DSUL instructions, which any automation in the workspace can call. Enabling **Allow all agents** stores `*` and removes the per-agent gate entirely, as described under [The allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard).
     </Note>
 
-    ## Available Instructions
+    ## Available instructions
 
-    Every instruction resolves credentials from the workspace configuration. Operations are grouped by LeanIX surface; the MCP server exposes the same operations behind the three entity tools (see the *Agent builder* tab).
+    Call an instruction as `<app-instance-slug>.<instruction>`, where the app instance slug is the one shown on the app in your workspace (`SAPLeanIX` by default, the same prefix as the MCP endpoint). Every instruction resolves the credential from the workspace configuration on its own. When the credential cannot be resolved, the instruction returns `{ "error": "..." }` instead of raising, so branch on `{{result.error}}` after each call.
 
-    ### Fact Sheets
+    ### Fact sheets
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `searchFactSheets` | Search/list fact sheets (Pathfinder `allFactSheets`). Filter by `factSheetType`, `fullTextSearch` or a raw `filter`; cursor-paginate with `first`/`after`. | `{ data: { allFactSheets: { totalCount, edges: [{ node }], pageInfo: { endCursor, hasNextPage } } } }` |
-    | `getFactSheet` | Fetch a single fact sheet by `id` (UUID). | `{ data: { factSheet } }` |
-    | `createFactSheet` | Create a fact sheet from `name` + `type`, with optional `patches` and `validateOnly` dry-run. | `{ data: { createFactSheet: { factSheet } } }` |
-    | `updateFactSheet` | Update a fact sheet by `id` via JSON-patch `patches`; optional `comment`, `validateOnly`. | `{ data: { updateFactSheet: { factSheet } } }` |
-    | `archiveFactSheet` | Archive a fact sheet by `id` (sets status `ARCHIVED`; LeanIX has no hard delete). | `{ data: { updateFactSheet: { factSheet } } }` |
-    | `graphqlQuery` | Raw Pathfinder GraphQL passthrough: `query` document + optional `variables` (relations, diagrams, tags, subscriptions, introspection). | The raw GraphQL response `{ data, errors? }` |
+    | Instruction | Arguments | Returns |
+    |-------------|-----------|---------|
+    | `searchFactSheets` | `factSheetType`, `fullTextSearch`, `first`, `after`, `filter`, `sort` | `{ data: { allFactSheets: { totalCount, edges: [{ cursor, node }], pageInfo: { hasNextPage, endCursor } } } }` |
+    | `getFactSheet` | `id` | `{ data: { factSheet } }` |
+    | `createFactSheet` | `name`, `type`, `input`, `patches`, `validateOnly` | `{ data: { createFactSheet: { factSheet } } }` |
+    | `updateFactSheet` | `id`, `patches`, `comment`, `validateOnly` | `{ data: { updateFactSheet: { factSheet } } }` |
+    | `archiveFactSheet` | `id`, `comment` | `{ data: { updateFactSheet: { factSheet } } }` |
+    | `graphqlQuery` | `query`, `variables` | The raw GraphQL response `{ data, errors? }` |
+
+    `createFactSheet` also accepts a raw `input` object (`BaseFactSheetInput`), which takes precedence over `name` and `type`. It is available in DSUL only; the MCP `factSheets` tool does not declare it.
 
     ### Integration API
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `startSyncRun` | Start a synchronization run; `body` = the LDIF payload `{ connectorType, connectorId, connectorVersion, processingDirection, processingMode, content }`. | `{ id }` (the run id) |
-    | `getSyncRunStatus` | Get a run status by `id`; poll until `FINISHED`/`FAILED`. | `{ id, status, … }` |
-    | `getSyncRunResults` | Get a run's results by `id` (meaningful for outbound runs). | The run results document |
-    | `listSyncRunStatuses` | List synchronization run statuses. | `{ data: [{ id, status, … }] }` |
-    | `listProcessors` | List available processor configurations. | `{ data: [{ id, name, … }] }` |
-
-    ### Surveys / Polls
-
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listPolls` | List surveys/polls; supports `page`/`size`/`sort`/`search`. | `{ data: [{ id, name, … }], total }` |
-    | `getPoll` | Get a survey/poll by `pollId`. | A Poll resource `{ id, name, … }` |
-    | `listPollRuns` | List runs of a survey by `pollId`; supports `page`/`size`/`sort`. | `{ data: [{ id, … }] }` |
-    | `getPollResults` | Get the results of a poll run by `pollRunId`; supports `page`/`size`. | `{ data: [{ … }] }` |
+    | Instruction | Arguments | SAP LeanIX request |
+    |-------------|-----------|--------------------|
+    | `startSyncRun` | `body` (the LDIF payload) | `POST /services/integration-api/v1/synchronizationRuns` |
+    | `getSyncRunStatus` | `id` | `GET /services/integration-api/v1/synchronizationRuns/{id}/status` |
+    | `getSyncRunResults` | `id` | `GET /services/integration-api/v1/synchronizationRuns/{id}/results` |
+    | `listSyncRunStatuses` | None | `GET /services/integration-api/v1/synchronizationRuns` |
+    | `listProcessors` | None | `GET /services/integration-api/v1/processorConfigurations` |
 
     <Note>
-      `Returns` shows the shape of the operation output. Fact-sheet operations return the underlying Pathfinder GraphQL envelope (`{ data, errors? }`); Integration API and Poll v2 operations return the LeanIX REST resource.
+      The `listSyncRunStatuses` instruction description and the connector's OpenAPI specification both name `/services/integration-api/v1/synchronizationRuns/status`, but the instruction executes `/services/integration-api/v1/synchronizationRuns`, without `/status`. The table above shows the path actually called.
     </Note>
 
-    ## DSUL Examples
+    ### Surveys and polls
 
-    **Search Applications by name:**
+    | Instruction | Arguments | SAP LeanIX request |
+    |-------------|-----------|--------------------|
+    | `listPolls` | `page`, `size`, `sort`, `search` | `GET /services/poll/v2/polls` |
+    | `getPoll` | `pollId` | `GET /services/poll/v2/polls/{pollId}` |
+    | `listPollRuns` | `pollId`, `page`, `size`, `sort` | `GET /services/poll/v2/polls/{pollId}/pollRuns` |
+    | `getPollResults` | `pollRunId`, `page`, `size` | `GET /services/poll/v2/pollRuns/{pollRunId}/pollResults` |
+
+    <Note>
+      Fact sheet instructions return the Pathfinder GraphQL envelope (`{ data, errors? }`). Integration API and Poll v2 instructions return the SAP LeanIX REST resource as-is. In both cases `size`, `first` and `pageSize` above `100` are clamped to `100` before the request leaves Prisme.ai.
+    </Note>
+
+    ## DSUL examples
+
+    **Search Applications by term:**
 
     ```yaml
-    - SAP LeanIX.searchFactSheets:
+    - SAPLeanIX.searchFactSheets:
         factSheetType: Application
         fullTextSearch: 'CRM'
         first: 25
       output: apps
     ```
 
-    **Create a fact sheet, then set fields:**
+    **Create a fact sheet with an initial description:**
 
     ```yaml
-    - SAP LeanIX.createFactSheet:
+    - SAPLeanIX.createFactSheet:
         name: 'Billing Service'
         type: Application
         patches:
           - { op: replace, path: /description, value: 'Handles invoicing' }
       output: created
+    - conditions:
+        '{{created.error}}':
+          - emit:
+              event: leanix.createFailed
+              payload:
+                error: '{{created.error}}'
     ```
 
-    **Start a sync run and poll its status:**
+    **Start a synchronization run and poll its status:**
 
     ```yaml
-    - SAP LeanIX.startSyncRun:
+    - SAPLeanIX.startSyncRun:
         body:
           connectorType: '{{connectorType}}'
           connectorId: '{{connectorId}}'
@@ -349,20 +451,22 @@ This connector is used by three different roles. Jump to the section that matche
           processingMode: partial
           content: '{{ldifContent}}'
       output: run
-    - SAP LeanIX.getSyncRunStatus:
+    - SAPLeanIX.getSyncRunStatus:
         id: '{{run.id}}'
-      output: status
+      output: runStatus
     ```
 
-    **Raw GraphQL passthrough (fact sheet with relations):**
+    **Read a fact sheet with its relations through the passthrough:**
 
     ```yaml
-    - SAP LeanIX.graphqlQuery:
+    - SAPLeanIX.graphqlQuery:
         query: |
           query($id: ID!) {
             factSheet(id: $id) {
               id name
-              ... on Application { relApplicationToITComponent { edges { node { factSheet { id name } } } } }
+              ... on Application {
+                relApplicationToITComponent { edges { node { factSheet { id name } } } }
+              }
             }
           }
         variables:
@@ -374,41 +478,81 @@ This connector is used by three different roles. Jump to the section that matche
 
 ---
 
-## Error Handling
+## Verify the setup
 
-| HTTP code | Meaning |
-|-----------|---------|
-| `400` | Bad request: invalid parameters, malformed GraphQL document, or an invalid LDIF/patch body. |
-| `401` | Authentication failed: the LeanIX API token / access token is missing, invalid or expired. |
-| `403` | Forbidden: the LeanIX technical user lacks permission for the requested resource. |
-| `404` | Not found: the fact sheet, run, poll or poll run id does not exist or is not visible to the user. |
-| `429` | Rate limit exceeded; wait and retry. |
-| `500` | SAP LeanIX server error (transient); retry shortly. |
+Run these three SAP LeanIX checks in order. Each one is independent of the previous role's claims. For the generic connector checks, including confirming that a non-allowlisted agent is rejected, follow [Verify the installation](/apps-store/marketplace/connectors/install-in-workspace#verify-the-installation).
 
-### Common Issues
+1. **Credential.** In the configuration app, select **Test connexion**. The connector resolves the credential and runs `{ allFactSheets(first: 1) { totalCount } }` against Pathfinder. Success returns `{ "ok": true, "baseUrl": "https://<your-instance-host>" }`. A failure returns `{ "ok": false, "error": "..." }` carrying one of the messages listed under [Common issues](#common-issues). The test is user-gated: an unauthenticated call returns HTTP `401` and `{ "ok": false, "error": "Unauthorized" }`.
 
-**"This agent is not authorized to use this connector"**: The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (or enable **Allow all agents**) and Save.
+2. **Builder path.** From an automation, call `SAPLeanIX.searchFactSheets` with `factSheetType: Application` and `first: 5`, then check that `{{apps.data.allFactSheets.totalCount}}` is present and `{{apps.error}}` is empty.
 
-**"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allow the agent in the config app.
+3. **Agent path.** In the agent preview, ask the agent to list five Applications. It calls `factSheets` with `action: search` and answers from the result. The MCP server identifies itself as `sap-leanix-mcp` and lists exactly three tools. A refused call returns the allowlist or identity message instead, both listed under [Common issues](#common-issues).
 
-**"SAP LeanIX is not configured"**: No API token / instance URL set. Open the configuration app and provide the LeanIX API token (or access token) and instance URL (e.g. `https://eu.leanix.net`).
+## Rotate, revoke, and remove
 
-**"SAP LeanIX rejected the API token"**: The token is wrong or revoked, or the instance URL points at the wrong workspace. Re-generate the token under **Administration > Technical Users** and re-paste it in the config app.
+The generic procedure is [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall), and removing a published catalog entry is covered by [Remove or update a capability](/apps-store/marketplace/connectors/declare-capability#remove-or-update-a-capability). What SAP LeanIX adds:
 
-**"SAP LeanIX token endpoint temporarily unavailable"**: A transient outage at the mtm token endpoint. Retry shortly; no reconfiguration is needed.
+- **Rotate the API token**: create a new technical user token in SAP LeanIX under **Administration > Technical Users**, paste it in the configuration app, save, then delete the old technical user in SAP LeanIX. The cached bearer is keyed to the token, so the change takes effect on the next call without any restart.
+- **Switch to a short-lived bearer**: change the mode to `accessToken` and store the bearer. No exchange happens, and no refresh: replace the value before it expires or every call fails with `401`.
+- **Revoke one agent**: in the configuration app, untick the agent under **Authorized agents** and save. Its next MCP call is refused. If **Allow all agents** is on, turning it off restores per-agent gating for every caller.
+- **Cut off all SAP LeanIX access**: delete the technical user in SAP LeanIX, or clear the `sapLeanixAuth` secret. Every call then returns a configuration or authentication error instead of reaching SAP LeanIX. Deleting the technical user also stops any credential copied elsewhere.
+- **Remove the connector**: uninstalling the app does not delete its secrets, so after uninstalling also delete `sapLeanixAuth` and `sapLeanixAuthorizedAgents` from the workspace **Secrets**. If a capability was published in AI Governance, remove that entry as well, or agent builders keep seeing an endpoint that no longer answers.
 
-**GraphQL returns partial data with warnings**: The Pathfinder API can return permission-filtered results: a `data` payload alongside non-fatal `errors`. The connector treats `errors` as fatal only when no `data` came back. If a field is missing, check the technical user's permissions on that fact sheet type.
+## Error handling
 
-## External Resources
+SAP LeanIX failures are normalized before they reach you. MCP tools return an `isError` result whose text carries the message below; DSUL instructions return `{ "error": ... }` instead of raising.
+
+| HTTP status | Message |
+|-------------|---------|
+| `400` | `Bad request while <operation>: <detail>` |
+| `401` | `Authentication failed while <operation>. Check the SAP LeanIX API token / access token and instance URL.` |
+| `403` | `Forbidden while <operation>. The LeanIX technical user lacks permission for this resource.` |
+| `404` | `Resource not found while <operation>.` |
+| `429` | `Rate limit exceeded while <operation>. Wait and retry.` |
+| `500` | `SAP LeanIX server error while <operation>.` |
+| Any other | `Error <status> while <operation>: <detail>` |
+
+`<operation>` is the operation name, for example `searchFactSheets` or `listPolls`. `<detail>` is taken from the SAP LeanIX response body, in order: `errors[0].message`, `error: error_description`, `errorMessage`, `message`, `error`. When none is present the connector reports `(no further detail)` rather than dumping the raw body.
+
+SAP LeanIX enforces API rate limits and answers HTTP `429` when they are exceeded. The connector does not retry a `429`; back off and retry from your automation or agent. See [Rate Limiting](https://help.sap.com/docs/leanix/ea/rate-limiting) for the limits that apply to your instance.
+
+### Common issues
+
+- **`This agent is not authorized to use this connector`** and **`The calling agent could not be identified, so it cannot be authorized`**: these are the two standard authorization failures. The first means the agent is missing from the **Authorized agents** allowlist; the second means the capability **Scope** does not declare `agent_id`. Both are resolved in [Troubleshooting](/apps-store/marketplace/connectors/install-in-workspace#troubleshooting); SAP LeanIX expects the Scope `context_id,agent_id,user_id`.
+- **`SAP LeanIX is not configured. Set the API token and the instance URL ... in the connector config app.`**: mode is `apiToken` and either the token or the instance URL is missing or unparsable. Store both in the configuration app.
+- **`SAP LeanIX access token / instance URL not configured. Open the connector config app (accessToken mode).`**: mode is `accessToken` and either the bearer or the instance URL is missing.
+- **`SAP LeanIX not authenticated. Configure the auth mode and its credentials in the connector config app.`**: `mode` holds a value that is neither `apiToken` nor `accessToken`. Reopen the configuration app and save a supported mode.
+- **`SAP LeanIX rejected the API token (<status>)`**: the token endpoint answered `4xx`. The token is wrong, expired or revoked, or the instance URL points at another workspace. Create a new token under **Administration > Technical Users** and store it again.
+- **`SAP LeanIX token endpoint temporarily unavailable (<status>). Retry shortly`**: the token host answered `5xx` or was unreachable. This is flagged as transient; retry without reconfiguring. If it persists, check whether your instance's token service is the `-svc` sibling of the instance host, and set `tokenHost` if it is not.
+- **`Authenticated, but the SAP LeanIX test query failed (status <status>)`**: the credential is valid but the Pathfinder query was refused. Check the technical user's permissions and that the instance URL matches the workspace holding your fact sheets.
+- **`Authentication failed while <operation>` (HTTP `401`) on an Integration API or Poll v2 call**: the retry-on-`401` re-exchange only covers GraphQL calls. Re-run the REST call, or run **Test connexion** to force a fresh exchange.
+- **`Direct calls are not allowed — use the MCP endpoint.` (HTTP `403`)**: something called the `factSheets`, `integration` or `surveys` endpoint directly. Those endpoints only accept dispatches from the MCP endpoint. From Builder, call the DSUL instructions instead, for example `SAPLeanIX.searchFactSheets`.
+- **Missing required argument `action`, or Unknown action**: the tool was called with no `action`, or with one that does not exist. The message names the tool and lists its valid actions.
+- **Unknown tool, or Tool failed with a status**: the MCP client called a tool this connector does not expose, or the tool's own automation failed. Only `factSheets`, `integration` and `surveys` exist; the failure message carries the underlying HTTP status and error text.
+- **`SAP LeanIX request build failed for <operation>: Missing required path param: <name>`**: a REST action was called without its path argument, for example `runStatus` without `id` or `results` without `pollRunId`.
+- **`SAP LeanIX GraphQL build failed for <operation>`**: a fact sheet action was called without its required arguments. `get`, `update` and `archive` require `id`; `update` also requires a non-empty `patches` array; `create` requires `name` and `type`; `graphql` requires `query`.
+- **`SAP LeanIX baseUrl not resolved — auth context returned no instance host.`**: the stored instance URL could not be parsed into a host. Store the bare host, for example `https://eu.leanix.net`.
+- **GraphQL returns data alongside warnings**: Pathfinder can return permission-filtered results, a valid `data` payload next to non-fatal `errors`. The connector treats `errors` as fatal only when no `data` came back. If a field is systematically missing, check the technical user's permissions on that fact sheet type.
+
+## External resources
 
 <CardGroup cols={2}>
-  <Card title="SAP LeanIX Developer Docs" icon="book" href="https://docs.leanix.net">
-    Official reference for the Pathfinder GraphQL, Integration API and Poll APIs.
+  <Card title="SAP LeanIX APIs" icon="book" href="https://help.sap.com/docs/leanix/ea/sap-leanix-apis">
+    Entry point for the Pathfinder GraphQL, Integration and Poll APIs.
   </Card>
-  <Card title="Pathfinder GraphQL API" icon="diagram-project" href="https://docs.leanix.net/reference/graphql-api-overview">
-    The GraphQL schema behind the fact-sheet operations and the `graphql` passthrough.
+  <Card title="GraphQL API" icon="diagram-project" href="https://help.sap.com/docs/leanix/ea/graphql-api">
+    The Pathfinder schema behind the fact sheet actions and the `graphql` passthrough.
   </Card>
-  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
-    Learn how Agent Creator agents consume MCP tools in Prisme.ai.
+  <Card title="Technical users and API tokens" icon="key" href="https://help.sap.com/docs/leanix/ea/technical-users">
+    Creating the technical user whose API token this connector uses.
+  </Card>
+  <Card title="Agent capabilities" icon="robot" href="/products/agent-factory/capabilities">
+    How Agent Creator agents consume MCP tools in Prisme.ai.
+  </Card>
+  <Card title="Install a connector in your workspace" icon="puzzle-piece" href="/apps-store/marketplace/connectors/install-in-workspace">
+    The standard installation, allowlisting, verification and uninstall flow shared by every App + MCP connector.
+  </Card>
+  <Card title="Declare a connector capability" icon="plug" href="/apps-store/marketplace/connectors/declare-capability">
+    Attach SAP LeanIX to an agent, or publish it to your organization's Capabilities catalog.
   </Card>
 </CardGroup>

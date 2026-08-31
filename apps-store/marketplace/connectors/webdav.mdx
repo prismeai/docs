@@ -1,6 +1,6 @@
 ---
 title: 'WebDAV'
-description: 'Browse, read and write files on any WebDAV server (Nextcloud, ownCloud, generic HTTPS WebDAV) from Agent Creator agents and Builder workflows'
+description: 'Browse, read and write files on any WebDAV server (Nextcloud, ownCloud, generic HTTPS WebDAV) from Agent Creator agents, Builder workflows and Knowledge connectors, with a single per-workspace service credential'
 ---
 
 <img
@@ -12,17 +12,17 @@ description: 'Browse, read and write files on any WebDAV server (Nextcloud, ownC
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The WebDAV app provides read/write access to any [WebDAV](https://datatracker.ietf.org/doc/html/rfc4918)-compatible file server: Nextcloud, ownCloud, a generic Apache `mod_dav` instance or any vendor-specific WebDAV endpoint. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. Authentication is a **per-workspace credential** (HTTP Basic username + password, or a Bearer token) pasted into the app instance and resolved server-side; agents never see it. An optional `allowedPath` restricts every operation to a subtree of the server. The connector exposes a single `files` tool that dispatches across 10 file/directory operations: listing, reading, writing, copying, moving, deleting, recursive search, full directory trees and directory creation.
+The WebDAV app provides read/write access to any [WebDAV](https://datatracker.ietf.org/doc/html/rfc4918)-compatible file server: Nextcloud, ownCloud, a generic Apache `mod_dav` instance, or any vendor-specific WebDAV endpoint. It can be consumed three ways: as a remote MCP server that **Agent Creator** agents call as tools, as a Builder app whose instructions you call directly from DSUL, and as a Knowledge connector that syncs files into a knowledge base. The MCP surface is a single entity tool, `files`, driven by an `action` argument. Authentication is a **shared service credential held by the installing workspace**: an HTTP Basic username and password, or a Bearer token. There is no OAuth and no per-user sign-in.
 
 <CardGroup cols={3}>
   <Card title="Browse" icon="folder-tree">
-    List directories, fetch metadata, walk full nested trees, search by name and modification date.
+    List directories, fetch metadata, walk full nested trees, search by file name and modification date.
   </Card>
-  <Card title="Read & Write" icon="file-pen">
-    Download file content, upload or overwrite files with a custom MIME type, create directories.
+  <Card title="Read and write" icon="file-pen">
+    Download file content, upload or overwrite files with a chosen MIME type, create directories.
   </Card>
   <Card title="Organize" icon="arrow-right-arrow-left">
-    Move, rename, copy or delete files and directories, with optional overwrite-on-target.
+    Move, rename, copy or delete files and directories, with optional overwrite on the target.
   </Card>
 </CardGroup>
 
@@ -31,136 +31,144 @@ The WebDAV app provides read/write access to any [WebDAV](https://datatracker.ie
 This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to read and write files on a WebDAV server. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to read and write files on a WebDAV server. Go to the Agent builder path.
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and want to publish WebDAV as a reusable capability. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and want to publish WebDAV as a reusable capability. Go to Platform admin (Governance).
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call WebDAV operations directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You install the connector and write Builder automations (DSUL) that call WebDAV operations directly. Go to the Workspace builder path.
   </Card>
 </CardGroup>
 
-## Prerequisites
+## Operating model and runtime identity
 
-- A reachable **WebDAV server** with a stable base URL. Examples:
-  - **Nextcloud / ownCloud**: `https://cloud.example.com/remote.php/dav/files/<username>`
-  - **Generic Apache `mod_dav`**: `https://files.example.com/dav`
-  - **Vendor-specific**: refer to the provider's documentation for the WebDAV endpoint.
-- Credentials matching the chosen authentication mode:
-  - **Basic**: a username + password (often an *app password* if the provider supports 2FA, e.g. Nextcloud).
-  - **Token**: a Bearer token issued by the provider.
-- (Optional) An **allowed path** to restrict every operation to a single subtree, useful when the WebDAV user has access to more than you want to expose.
+Read this before configuring anything: it determines what the WebDAV server sees and how much a single misconfiguration can expose.
+
+- **Single shared service credential.** The connector holds one WebDAV credential per app instance, stored in the installing workspace. Every agent, every automation and every knowledge sync reaches the server as that one account. WebDAV has no portable per-user access-control mechanism, so the connector cannot narrow results per end user.
+- **Tenant app-instance context.** The MCP endpoint belongs to the workspace that installed the app, and resolves that workspace's own configuration. There is no central credential and no platform-wide OAuth client.
+- **Provider-side attribution.** The WebDAV server logs the configured account for every operation, not the individual Prisme.ai user. Platform-side attribution stays in the Prisme.ai activity feed.
+- **Perimeter, not identity.** The optional **Allowed path** is the only scope restriction the connector enforces. Combine it with a WebDAV account that is itself least-privileged.
 
 <Warning>
-  When using `basic` auth against a Nextcloud or ownCloud instance with two-factor authentication enabled, create a dedicated **app password** in the user settings (*Security → Devices & sessions → Create new app password*) and use it as the password. The main account password will be rejected.
+  Because the credential is shared, its blast radius is everything that account can reach on the WebDAV server. Provision a dedicated service account, grant it the smallest possible share, and set an **Allowed path** whenever the account can see more than you intend to expose.
+</Warning>
+
+Two authentication modes are available, and they are not interchangeable. Choose from what your provider issues:
+
+| Mode | Config value of `type` | What you provide | Choose it when |
+|---|---|---|---|
+| Basic authentication | `basic` | A username plus a password or app password | Nextcloud, ownCloud and generic `mod_dav` servers that accept HTTP Basic |
+| Bearer token | `token` | A Bearer token issued by the provider | Your provider issues API tokens instead of passwords |
+
+## Prerequisites
+
+- A reachable **WebDAV server** with a stable base URL. The base URL is the folder the account lands in, not the server root. Examples:
+  - Nextcloud or ownCloud: `https://cloud.example.com/remote.php/dav/files/<username>`
+  - Generic Apache `mod_dav`: `https://files.example.com/dav`
+  - Vendor-specific: see the provider's documentation for its WebDAV endpoint.
+- A credential matching the chosen mode: a username and password for `basic`, or a Bearer token for `token`.
+- A Prisme.ai workspace you administer, in which you can install apps and write workspace secrets. The exact roles are listed under [Before you begin](/apps-store/marketplace/connectors/install-in-workspace#before-you-begin). The connector answers Resource calls only to members of that workspace.
+- Optional: the subtree you want to expose, to enter as **Allowed path**.
+
+<Warning>
+  On a Nextcloud or ownCloud account with two-factor authentication enabled, the main account password is rejected. Create a dedicated app password in the account settings under **Security > Devices & sessions > Create new app password** and use it as the password. This procedure is documented by the vendor in the [Nextcloud user manual](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices).
 </Warning>
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
-  **Goal:** WebDAV is a **per-workspace** connector: each workspace pastes its own WebDAV base URL and Basic / Bearer credential into the app config (see the *Workspace builder* tab), so there is **no platform-wide credential to provision** and **no central OAuth client**. The only optional platform task is to publish WebDAV as a reusable **capability** in AI Governance so agent builders can enable it from the catalog instead of pasting a raw MCP endpoint.
+  **Goal:** make WebDAV selectable as a named capability. WebDAV is a per-workspace connector: each workspace enters its own base URL and credential, so there is **no platform-wide credential to provision** and **no central OAuth client**. The only platform task is optional.
 
   <Note>
-    There is no shared WebDAV credential for this connector. The base URL, the Basic / Bearer credentials and the optional `allowedPath` always live in the consuming workspace's app configuration. A Governance capability you publish here points at a specific workspace's MCP endpoint; that workspace still owns the credential.
+    A capability you declare here points at one specific workspace's MCP endpoint. That workspace still owns the credential, the allowed path and the agent allowlist. Declaring a capability makes the connector available; it does not authorize a specific agent, which is done in the connector's configuration app.
   </Note>
 
-  ## Declare the capability in AI Governance (optional)
+  ## Declare the capability in AI Governance
 
-  <Steps>
-    <Step title="Open AI Governance > Capabilities">
-      Create (or edit) the **WebDAV** capability.
-    </Step>
-    <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint** (the workspace running the connector), and set its **Scope** to:
+  The procedure is the standard one, documented in [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance): create a capability of type `mcp` in **Governance > Org > Capabilities**, point its server URL at the **MCP endpoint** shown in the connector's configuration app, then save. WebDAV needs no authorization block, because it has no per-user OAuth.
 
-      ```text
-      context_id,agent_id,user_id
-      ```
+  Two values are specific to WebDAV.
 
-      The `agent_id` in the scope is what lets Agent Creator identify the calling agent.
-    </Step>
-    <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
-    </Step>
-  </Steps>
+  - **Scope.** Set the capability's **Scope** field to:
 
-  <Warning>
-    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. The WebDAV credential is resolved per-workspace from the app configuration; there is **no OAuth auth-config JSON** to attach in Governance, since authentication is a server-side Basic / Bearer credential, not a per-user OAuth flow.
-  </Warning>
+    ```text
+    context_id,agent_id,user_id,attachment_urls
+    ```
+
+    `agent_id` is what identifies the calling agent to the connector; without it, every tool call is refused. `attachment_urls` injects the URLs of files the user uploaded in the chat, so the `upload` action can push the real file instead of model-generated text. See [What the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means).
+  - **Access to the catalog** follows your organization's existing roles; there is no per-capability role grant for this connector.
+
+  A workspace admin can perform the equivalent org-wide publication without leaving the connector: the configuration app has a **Capabilities catalog (org-wide)** section with **Add to catalog** and **Update catalog entry** buttons that write the same entry, including the scope. That action requires catalog write rights in your organization; without them the app reports that the operation is forbidden and that catalog write rights are needed. See [Publish the connector to the Capabilities catalog](/apps-store/marketplace/connectors/declare-capability#publish-the-connector-to-the-capabilities-catalog).
 </Accordion>
 
 ---
 
 <Tabs>
   <Tab title="Agent builder (Agent Creator)">
-    ## Agent builder
+    ## Agent builder path
 
     **Goal:** let an agent you build in Agent Creator read and write files on a WebDAV server through MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the WebDAV app in a workspace (see the *Workspace builder* tab). Optionally, a *Platform admin* may have published a WebDAV capability in AI Governance (see the *Platform admin setup* accordion above).
+      A workspace admin must first install and configure the connector, then allow your agent. Both steps happen in the connector's configuration app, described in the [Workspace builder path](#workspace-builder-dsul). Until your agent is on the allowlist, every tool call is refused.
     </Note>
 
-    The WebDAV credential is resolved server-side from the app configuration of the workspace running the connector; it is never exposed to the agent. Your agent is identified by the `agent_id` that Agent Creator injects through the capability *Scope*.
+    The WebDAV credential is resolved server-side from the app instance configuration and is never exposed to the agent or to the model. Your agent is identified by the `agent_id` that Agent Creator injects through the capability **Scope**.
 
     <Steps>
-      <Step title="Install and configure the connector in your workspace">
-        Follow the *Workspace builder* tab: install **WebDAV** in your workspace, then fill in the base URL, authentication type and Basic / Bearer credentials in the app instance config.
+      <Step title="Confirm the connector is configured and your agent is allowed">
+        Ask the workspace admin for the **MCP endpoint** URL, and have them tick your agent under **Authorized agents** in the configuration app. The fastest path is the app's **Install capability** button, which allowlists the agent and attaches the MCP tool to it in one action; see [Install the capability on one agent](/apps-store/marketplace/connectors/declare-capability#install-the-capability-on-one-agent).
       </Step>
       <Step title="Add the MCP capability to your agent">
-        In your agent, add a capability pointing at your workspace's **MCP Endpoint** URL (auto-populated on install), and set its **Scope** to:
+        In your agent, add a capability pointing at that **MCP endpoint** URL, and set its **Scope** to:
 
         ```text
-        context_id,agent_id,user_id
+        context_id,agent_id,user_id,attachment_urls
         ```
 
-        The `agent_id` lets Agent Creator identify the calling agent. The WebDAV credential is resolved server-side from the app config; no credential is pasted into the agent.
+        Omitting `agent_id` makes every call fail with ``No agent id reached this connector. Add `agent_id` to the MCP capability scope so agent-factory injects it.`` Omitting `attachment_urls` means chat attachments cannot be uploaded to WebDAV.
       </Step>
       <Step title="Brief the agent in its system prompt">
-        Wiring the capability is not enough: the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
+        Wiring the capability is not enough: the agent also needs to know when to reach for it. Add a paragraph to the agent's system prompt. Adapt this starter:
 
         ```text
-        You have access to the WebDAV MCP server (mapped to <provider, e.g. Nextcloud, ownCloud, a corporate file server>) through the `files` tool, which takes an `action` argument. Use it whenever the user asks to browse files, read a document, write or overwrite a file, move/copy/rename files, walk a directory tree, or search by name or modification date. Prefer `list` for one level of children and `getTree` only when the user explicitly asks for a recursive view (it can be expensive). Always confirm with the user before destructive actions (`delete`, `move`/`upload` with overwrite of an existing file).
+        You have access to a WebDAV file server through the `files` tool, which takes an `action` argument. Use it whenever the user asks to browse files, read a document, write or overwrite a file, move, copy or rename files, walk a directory tree, or search by name or modification date. Prefer `list` for one level of children and use `getTree` only when the user explicitly asks for a recursive view, because it is expensive and unsupported on some servers. Always confirm with the user before `delete`, and before `move`, `copy` or `upload` that would overwrite an existing file.
         ```
 
-        Refine the trigger keywords (resource names, business domains, typical user phrasings) so the agent reliably picks up the right intent in your context.
+        Refine the trigger keywords (folder names, business domains, typical user phrasings) so the agent picks up the right intent in your context.
+      </Step>
+      <Step title="Publish the agent">
+        Save and publish. The published agent exposes the `files` tool with the actions listed below.
       </Step>
     </Steps>
 
-    <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The WebDAV credential is still resolved server-side from the workspace's app configuration.
-    </Note>
+    ## Tool catalog
 
-    ## Available Tools
+    The MCP server exposes a single entity tool, `files`. Its required `action` argument selects the operation. Ten actions are meant for the model; `checkAccess` is reserved for Knowledge sync and must not be called by an agent.
 
-    The MCP server exposes a single entity-level tool, `files`, which dispatches across 10 actions through its `action` argument.
+    | Action | Description | Risk |
+    |---|---|---|
+    | `list` | List files and directories at a path, with `depth` `0` or `1`. | Read |
+    | `get` | Download file content. | Read |
+    | `getProperties` | Return metadata for a file or directory without its content. | Read |
+    | `upload` | Create or overwrite a file. | Write, overwrites by default |
+    | `delete` | Delete a file or a directory, recursively. | Destructive |
+    | `move` | Move or rename a file or directory. | Write, overwrites by default |
+    | `copy` | Copy a file or directory. | Write, overwrites by default |
+    | `getTree` | Return the full nested directory tree under a path. | Read, expensive |
+    | `search` | Recursive search by file name and modification date, paginated. | Read, expensive |
+    | `createDir` | Create a directory. The parent must already exist. | Write |
+    | `checkAccess` | Report which canonical Resource URIs may be served. Called by Knowledge sync, never by the model. | Read |
 
-    ### `files`
+    Every action also accepts `outputFormat`, which controls the MCP response shape:
 
-    | Action | Description |
-    |--------|-------------|
-    | `list` | List files / directories at a given path (depth 0 or 1). |
-    | `get` | Download file content. |
-    | `getProperties` | Get metadata of a file or directory without its content. |
-    | `upload` | Upload or overwrite a file with a given MIME type. |
-    | `delete` | Delete a file or a directory (recursive). |
-    | `move` | Move or rename a file or directory. |
-    | `copy` | Copy a file or directory. |
-    | `getTree` | Walk the full nested directory tree under a path. |
-    | `search` | Search files recursively by name and modification date, with pagination. |
-    | `createDir` | Create a new directory (parent must exist). |
+    - `verbose` (default): human-readable text for the model.
+    - `structured`: machine-readable JSON in `structuredContent`.
+    - `both`: text and structured content together.
 
-    ## Output Formats
+    ## Action arguments
 
-    The `files` tool accepts an `outputFormat` argument that controls the MCP response shape:
-
-    - **`verbose`** (default): human-readable text for LLM consumption.
-    - **`structured`**: machine-readable JSON in `structuredContent`.
-    - **`both`**: both text and structured content.
-
-    ## Tool Details
-
-    ### `files` (action: `list`)
+    ### `files` with action `list`
 
     ```json
     {
@@ -174,54 +182,58 @@ This connector is used by three different roles. Jump to the section that matche
     ```
 
     | Parameter | Required | Description |
-    |-----------|----------|-------------|
+    |---|---|---|
     | `action` | Yes | Must be `list`. |
-    | `path` | No | Directory to list. Defaults to `/`. |
-    | `depth` | No | `1` (default) for immediate children; `0` to return only the path's own info (akin to a stat). |
+    | `path` | No | Directory to list. Defaults to `/`. Replaced by the configured allowed path when one is set. |
+    | `depth` | No | `1` (default) for immediate children, or `0` for the path's own information only. No other value is accepted. |
 
-    ### `files` (action: `upload`)
+    ### `files` with action `upload`
 
     ```json
     {
       "name": "files",
       "arguments": {
         "action": "upload",
-        "path": "/Generated/2026-05-26-summary.md",
-        "content": "# Daily summary\n\n…",
+        "path": "/Generated/summary.md",
+        "content": "# Daily summary\n\nFirst line.",
         "contentType": "text/markdown"
       }
     }
     ```
 
     | Parameter | Required | Description |
-    |-----------|----------|-------------|
+    |---|---|---|
     | `action` | Yes | Must be `upload`. |
-    | `path` | Yes | Target file path. Existing files at the same path are overwritten. |
-    | `content` | Yes | The file content (text). For binary uploads, prefer copying from an existing file via `copy` after staging the content elsewhere. |
-    | `contentType` | No | MIME type of the content. Defaults to `text/plain`. Common values: `text/markdown`, `application/json`, `text/csv`. |
+    | `path` | Yes, unless a chat attachment supplies the file name | Target file path. An existing file at that path is overwritten. |
+    | `content` | Yes, unless a chat attachment supplies the bytes | Text content of the file. |
+    | `contentType` | No | MIME type. Defaults to `text/plain`. Common values: `text/markdown`, `application/json`, `text/csv`. |
 
-    ### `files` (action: `move`)
+    <Note>
+      When the capability scope includes `attachment_urls` and the user attached a file in the chat, the connector fetches the first attachment and uploads its bytes instead of asking the model for `content`. It derives the file name from the attachment URL when `path` is absent, and the MIME type from the attachment response when `contentType` is absent. Explicit `content` always wins over the attachment.
+    </Note>
+
+    ### `files` with action `move` or `copy`
 
     ```json
     {
       "name": "files",
       "arguments": {
         "action": "move",
-        "sourcePath": "/Exports/2026-05-25.csv",
-        "destinationPath": "/Archive/2026-05-25.csv",
+        "sourcePath": "/Exports/report.csv",
+        "destinationPath": "/Archive/report.csv",
         "overwrite": false
       }
     }
     ```
 
     | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `action` | Yes | Must be `move`. |
+    |---|---|---|
+    | `action` | Yes | `move` or `copy`. |
     | `sourcePath` | Yes | Current path of the file or directory. |
-    | `destinationPath` | Yes | New path (must be inside `allowedPath` if configured). |
-    | `overwrite` | No | Whether to overwrite if the destination exists. Defaults to `true`. |
+    | `destinationPath` | Yes | Target path. Both paths must sit inside the allowed path when one is configured. |
+    | `overwrite` | No | Overwrite the destination if it exists. Defaults to `true`. |
 
-    ### `files` (action: `search`)
+    ### `files` with action `search`
 
     ```json
     {
@@ -240,17 +252,19 @@ This connector is used by three different roles. Jump to the section that matche
     ```
 
     | Parameter | Required | Description |
-    |-----------|----------|-------------|
+    |---|---|---|
     | `action` | Yes | Must be `search`. |
-    | `path` | No | Search root (defaults to `/`). The search is always recursive. |
-    | `query` | No | Case-insensitive substring match on file names. |
-    | `dateFrom` | No | ISO 8601: only files modified on or after this date. |
-    | `dateTo` | No | ISO 8601: only files modified on or before this date. |
+    | `path` | No | Search root. Defaults to `/`, and is replaced by the configured allowed path when one is set. The search is always recursive. |
+    | `query` | No | Case-insensitive substring match on the file name. |
+    | `dateFrom` | No | ISO 8601 date. Only files modified on or after this date. |
+    | `dateTo` | No | ISO 8601 date. Only files modified on or before this date. |
     | `sortOrder` | No | `desc` (default, newest first) or `asc`. |
-    | `page` | No | Page number, 1-indexed. Default `1`. |
-    | `pageSize` | No | Items per page. Default `50`. |
+    | `page` | No | Page number, 1-indexed. Defaults to `1`. |
+    | `pageSize` | No | Items per page. Defaults to `50`. |
 
-    ### `files` (action: `getTree`)
+    Results contain files only; directories are excluded from the matches. Filtering, sorting and pagination are applied by the connector after it has walked the tree, so a large subtree costs the same server round trip whatever the page size.
+
+    ### `files` with action `getTree`
 
     ```json
     {
@@ -263,73 +277,97 @@ This connector is used by three different roles. Jump to the section that matche
     ```
 
     | Parameter | Required | Description |
-    |-----------|----------|-------------|
+    |---|---|---|
     | `action` | Yes | Must be `getTree`. |
-    | `path` | Yes | Root of the tree to walk. |
+    | `path` | No | Root of the tree. Defaults to `/`, and is replaced by the configured allowed path when one is set. |
+
+    The returned tree contains directories only, not files.
 
     <Warning>
-      `getTree` can return very large responses on deep directories. When the tree is large, prefer `list` with `depth: 1` and recurse client-side, or call `search` with a path filter.
+      `getTree` and `search` both issue a single `PROPFIND` with `Depth: infinity`. Many WebDAV servers, Nextcloud among them, refuse that header, and the call then fails with `Error: PROPFIND with Depth: infinity failed. The server may not support infinite depth requests.` Every WebDAV request also has a 15 second deadline. Prefer `list` with `depth: 1` and walk one level at a time when a server refuses infinite depth or a subtree is large.
     </Warning>
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
-    ## Workspace builder
+    ## Workspace builder path
 
-    **Goal:** install the connector in a workspace, configure the WebDAV credential, and call WebDAV operations from your automations.
+    **Goal:** install the connector in a workspace, store the WebDAV credential, allow the agents that may use it, and call WebDAV operations from your automations.
 
-    ## Installation
+    ## Install and configure
 
-    1. Go to **Apps** in your workspace
-    2. Search for **WebDAV** and install it
-    3. Open the app instance configuration and fill in the base URL, authentication type and Basic / Bearer credentials
+    WebDAV follows the standard App + MCP installation flow: install **WebDAV** from **Builder > Apps**, open the **Configuration app** link on the app instance, save the credential, then allowlist the agents. Each step, with the roles it requires, is documented in [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace#install-the-app). What follows is only what is specific to WebDAV.
 
-    ## Configuration
+    **What the install provisions.** The connector computes the **MCP Endpoint** for this workspace, generates the **Configuration app** link, and creates three empty workspace secrets ready to be filled: `webdavPassword`, `webdavToken` and `webdavAuthorizedAgents`. See [What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions).
 
-    | Field | Description |
-    |-------|-------------|
-    | **WebDAV Base URL** | WebDAV server base URL, e.g. `https://cloud.example.com/remote.php/dav/files/user`. All paths in tool calls are resolved relative to this URL. |
-    | **Authentication Type** | `basic` for username/password, `token` for Bearer token. |
-    | **Username** | Username for Basic Auth (ignored in token mode). |
-    | **Password** | Password (or app password) for Basic Auth (stored as a workspace secret). |
-    | **Bearer Token** | Bearer token for token mode (stored as a workspace secret). |
-    | **Allowed path (optional)** | If set, every file operation is rejected when the resolved path falls outside this subtree. Leave empty to expose the full base URL. |
-    | **MCP Endpoint** | Auto-populated on install: URL of the MCP endpoint for this instance. |
+    ### Credential fields
 
-    Pick one of the two authentication modes:
+    Under **WebDAV credentials** in the [configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app), fill in:
 
-    | Auth mode | What you provide | Best for |
-    |-----------|------------------|----------|
-    | `basic` | A **username** + **password** (or app password) | Nextcloud / ownCloud / generic `mod_dav` with HTTP Basic auth |
-    | `token` | A **Bearer token** issued by the provider | Providers that issue API tokens instead of passwords |
+    | Field | What to enter |
+    |---|---|
+    | **Base URL** | The folder the account lands in, for example `https://cloud.example.com/remote.php/dav/files/alice` |
+    | **Authentication** | **Username + password**, or **Bearer token** |
+    | **Username** and **Password** | The account and its password or app password, in Basic mode |
+    | **Bearer token** | The token issued by your provider, in token mode |
+    | **Allowed path (optional)** | A subtree such as `/Documents`. Everything outside it is refused: browsing, reading and knowledge sync alike. Leave empty for the whole account. |
 
-    <Note>
-      The Basic / Bearer credentials are stored as workspace secrets and resolved server-side. The **MCP Endpoint** is generated automatically by the `onInstall` flow.
-    </Note>
+    Select **Save credentials**. The password and the token go to your workspace's secret store; the base URL, the authentication type, the username and the allowed path go to the app instance configuration, which is what the connector reads at runtime. WebDAV has no OAuth mode, so there is no callback URL to register and no per-user account to connect.
 
-    ## Available Instructions
+    Then select **Test connection**. The configuration app saves first, then asks the connector itself to reach the server with the values the runtime will read. It probes the allowed path when one is set, and the account root otherwise.
 
-    Every instruction resolves credentials from the workspace configuration. All paths are interpreted relative to the `baseUrl`; a leading `/` is allowed but optional.
+    ### Authorized agents
 
-    ### Files & Directories
+    Under **Authorized agents**, tick each agent allowed to call this connector's MCP endpoint. Each change is saved immediately. For a ticked agent, **Install capability** also attaches the MCP tool to that agent with the correct scope, replacing any previous instance of it. See [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector).
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listFiles` | List a directory by `path` (default `/`); `depth` = `1` for immediate children (default) or `0` for path info only. | `{ files: [{ name, path, isDirectory, size, lastModified, contentType }] }` |
-    | `getFile` | Download file content by `path`. | `{ path, content, size, contentType }` |
-    | `getFileProperties` | Fetch metadata of a file or directory by `path` without its content. | `{ path, isDirectory, size, lastModified, contentType, etag }` |
-    | `uploadFile` | Create or overwrite a file at `path` with `content`; optional `contentType` (default `text/plain`). | `{ path, size }` |
-    | `deleteFile` | Delete a file or directory by `path` (directories are deleted recursively). | Empty (HTTP 204) |
-    | `moveFile` | Move/rename from `sourcePath` to `destinationPath`; `overwrite` (default `true`) controls overwrite-on-target. | `{ sourcePath, destinationPath }` |
-    | `copyFile` | Copy from `sourcePath` to `destinationPath`; `overwrite` (default `true`) controls overwrite-on-target. | `{ sourcePath, destinationPath }` |
-    | `getDirectoryTree` | Walk the full nested directory tree under `path`. | `{ path, tree: [{ name, path, isDirectory, children }] }` |
-    | `searchFiles` | Recursive search under `path` filtered by `query` (name substring), `dateFrom`/`dateTo`, with `page`/`pageSize`/`sortOrder`. | `{ matches: [{ name, path, lastModified, size }], page, pageSize, total }` |
-    | `createDirectory` | Create a directory at `path` (parent must exist). | `{ path }` |
+    To disable the per-agent gate entirely, select **Allow all agents (disables selection + verification)**. The app then displays a standing warning that any agent can call this connector.
 
-    <Note>
-      `Returns` shows the shape of the operation output. `depth` accepts `0` (path info only) or `1` (immediate children, default). `deleteFile` deletes directories recursively.
-    </Note>
+    <Warning>
+      With a shared WebDAV service credential, **Allow all agents** means any agent in the workspace can read and write everything the account can reach inside the allowed path. Keep it for a private test workspace only. See [The allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard).
+    </Warning>
 
-    ## DSUL Examples
+    ## Configuration reference
+
+    | Field | Stored in | Description |
+    |---|---|---|
+    | **WebDAV Base URL** (`baseUrl`) | App instance config | WebDAV server base URL. Every path in a call is resolved relative to it. |
+    | **Authentication Type** (`type`) | App instance config | `basic` for username and password, `token` for a Bearer token. |
+    | **Username** (`username`) | App instance config | Username for Basic authentication. Ignored in token mode. |
+    | **Password** (`password`) | Workspace secret `webdavPassword` | Password or app password for Basic authentication. |
+    | **Bearer Token** (`token`) | Workspace secret `webdavToken` | Bearer token for token mode. |
+    | **Allowed path (optional)** (`allowedPath`) | App instance config | Restricts MCP tool calls and Resource calls to this subtree. Leave empty for no restriction. |
+    | **Max inlined file size (bytes)** (`connectorInlineMaxBytes`) | App instance config | Files larger than this are reported as unfetchable by the Knowledge Resource reader instead of being inlined. Defaults to `1400000`. |
+    | **Configuration app** (`configAppUrl`) | App instance config, read-only | Generated on install. Opens the configuration app for this instance. |
+    | **Authorized agents** (`authorizedAgents`) | Workspace secret `webdavAuthorizedAgents` | Comma-separated agent ids allowed to call the MCP endpoint. `*` allows every agent. Managed by the configuration app. |
+    | **MCP Endpoint** (`mcpEndpoint`) | App instance config, read-only | Generated on install. The URL an agent or a Knowledge connection is given. |
+
+    <Warning>
+      Do not edit the `password`, `token` or `authorizedAgents` fields by hand in the raw app configuration. They hold generated binding literals that resolve to the workspace secrets; overwriting them breaks credential resolution. Use the configuration app, or Builder's **Secrets** panel, instead.
+    </Warning>
+
+    ## App instructions
+
+    App instructions resolve the credential from the workspace configuration through the same code path as the MCP tools. Paths are interpreted relative to `baseUrl`.
+
+    | Instruction | Arguments | Returns |
+    |---|---|---|
+    | `listFiles` | `path` (default `/`), `depth` (`1` default, or `0`) | `{ path, depth, totalItems, items: [{ href, url, name, isDirectory, size, contentType, lastModified, etag }] }` |
+    | `getFile` | `path` (required) | `{ path, content, contentType, size }` |
+    | `getFileProperties` | `path` (required) | `{ path, name, isDirectory, size, contentType, lastModified, etag }` |
+    | `uploadFile` | `path` (required), `content` (required), `contentType` (default `text/plain`) | `{ success, path, status, created, contentType }` |
+    | `deleteFile` | `path` (required) | `{ success, path, status }` |
+    | `moveFile` | `sourcePath` (required), `destinationPath` (required), `overwrite` (default `true`) | `{ success, sourcePath, destinationPath, status }` |
+    | `copyFile` | `sourcePath` (required), `destinationPath` (required), `overwrite` (default `true`) | `{ success, sourcePath, destinationPath, status }` |
+    | `getDirectoryTree` | `path` (default `/`) | `{ rootPath, tree: { name, path, url, children: [...] } }` |
+    | `searchFiles` | `path` (default `/`), `query`, `dateFrom`, `dateTo`, `page` (default `1`), `pageSize` (default `50`), `sortOrder` (default `desc`) | `{ searchPath, dateFrom, dateTo, query, sortOrder, totalItems, page, pageSize, totalPages, items }` |
+    | `createDirectory` | `path` (required) | `{ success, path, status }` |
+
+    Any failure is returned as `{ error: "<message>" }` rather than raised, so test for `error` before using the result.
+
+    <Warning>
+      **Allowed path is not enforced on App instructions.** The subtree restriction is applied by the MCP endpoint only. A DSUL automation calling `WebDAV.getFile` can reach any path the credential can reach. Treat the allowed path as a restriction on agents and Knowledge sync, and control automation scope through your workspace's own access rules.
+    </Warning>
+
+    ## DSUL examples
 
     ### List the contents of a folder
 
@@ -363,9 +401,10 @@ This connector is used by three different roles. Jump to the section that matche
 
           {{summary.body}}
         contentType: 'text/markdown'
+        output: uploaded
     ```
 
-    ### Move yesterday's exports to an archive folder
+    ### Move an export to an archive folder
 
     ```yaml
     - WebDAV.moveFile:
@@ -374,7 +413,7 @@ This connector is used by three different roles. Jump to the section that matche
         overwrite: false
     ```
 
-    ### Search for recent reports by name
+    ### Search for reports by name and date
 
     ```yaml
     - WebDAV.searchFiles:
@@ -391,49 +430,142 @@ This connector is used by three different roles. Jump to the section that matche
 
 ---
 
-## Error Handling
+## Use WebDAV as a Knowledge connector
 
-WebDAV uses standard HTTP status codes plus a handful of WebDAV-specific ones (RFC 4918).
+Beyond tool calls, the MCP endpoint implements the Resource methods that a knowledge base uses to browse, read and re-check documents. The end-to-end procedure for attaching a WebDAV account to a knowledge base is documented in [Knowledges connectors](/products/ai-knowledge/connectors); this section states what the connector itself guarantees.
 
-| HTTP Status | Meaning | Typical Cause |
-|-------------|---------|----------------|
-| `400` | Bad Request | Malformed path, invalid `depth`, missing required parameter. |
-| `401` | Unauthorized | Wrong username / password, expired or revoked Bearer token. |
-| `403` | Forbidden | The configured user lacks the WebDAV permission for the operation, or the path falls outside `allowedPath`. |
-| `404` | Not Found | The path does not exist on the server. |
-| `405` | Method Not Allowed | Calling a method (e.g. `MKCOL`) on a path that already exists. |
-| `409` | Conflict | `createDirectory` called on a path whose parent does not exist (`MKCOL` parent missing). |
-| `412` | Precondition Failed | `move`/`copy` with `overwrite: false` but the destination already exists. |
-| `423` | Locked | Another client holds a WebDAV lock on the resource; retry later. |
-| `429` | Rate Limited | Provider throttling (Nextcloud rate limits, reverse-proxy WAF). |
-| `507` | Insufficient Storage | The user is over quota on the provider. |
-| `500` / `502` / `503` | Server Error | Transient error from the upstream server or proxy. Retry with exponential backoff. |
+- **Addressing.** A file or folder is addressed as `webdav://files/{path}`, where each path segment is percent-encoded and the path is relative to the configured base URL. Resource URIs therefore survive a change of base URL host.
+- **Discovery.** `webdav://profile/knowledge` is a fixed public descriptor served anonymously, along with `resources/templates/list` and `initialize`. Nothing in them touches the WebDAV server or its credential.
+- **Authorization.** `resources/list` and `resources/read` are authorized against the workspace that holds the configuration: the caller must be able to read that workspace. The agent allowlist does not apply to them. An anonymous caller, or one presenting only an API key, is refused with `This connector answers Resource calls to its workspace members, or to the trusted Knowledge Sync workspace.`
+- **Listing.** `resources/list` with no parent URI starts at the allowed path when one is set, and at `/` otherwise. The page size defaults to `200` and is capped at `1000`. The cursor is opaque and carries the parent path and the active query, so paging without resending the same query is not possible. Delta listing is not supported: each pass lists and compares.
+- **Reading.** A folder returns identity only. A file returns its metadata plus its bytes inlined as a data URL, because WebDAV has no anonymous pre-signed URL. Files above `connectorInlineMaxBytes` (default `1400000`) are returned marked unfetchable rather than truncated, as are files whose size the server does not report.
+- **Freshness.** The revision compared between syncs is the WebDAV `getetag` property, falling back to `getlastmodified`.
+- **Access re-check.** Knowledge sync calls the `files` tool with `action: "checkAccess"` and a list of Resource URIs, and receives the subset that is still inside the allowed path and still present on the server. At most `200` URIs are accepted per call; a longer batch is refused with `Too many resource URIs in one access check (<n>); this connector answers at most 200 per call.` The check covers freshness and perimeter, never identity: the connector holds one credential, so the verdict is the same for every reader.
 
-### Common Issues
+<Warning>
+  Per-user access control is not available for WebDAV. Every reader of a knowledge base fed by this connector can retrieve any document the service credential can read, within the allowed path. Scope the account and the allowed path accordingly before syncing.
+</Warning>
 
-**"WebDAV not configured"**: The app instance is missing either `baseUrl` or the credentials for the chosen `type` (Basic or token). Open the app configuration and fill in the base URL, authentication type and credentials.
+## Verify the setup
 
-**"Basic Auth requires username and password"**: `type` is `basic` but the username or password is empty. Provide both in the app config (use an app password on 2FA-enabled accounts).
+Run these checks in order. Each has an observable result. They are the WebDAV form of the generic checks in [Verify the installation](/apps-store/marketplace/connectors/install-in-workspace#verify-the-installation); WebDAV has no "who am I" operation, because every call uses the same service credential.
 
-**"Token auth requires a Bearer token"**: `type` is `token` but no Bearer token is set. Paste a valid token in the app config.
+<Steps>
+  <Step title="Verify the credential reaches the server">
+    In the configuration app, select **Test connection**. Success reports that the server answered, naming the path that was probed: the allowed path when one is set, the account root otherwise. A refusal reports the HTTP status: `401` means wrong credentials, and `404` means a wrong base URL or a nonexistent allowed path.
+  </Step>
+  <Step title="Verify a read-only tool call from the agent">
+    In the agent's playground, ask for a plain directory listing, for example `List the files at the top level of the WebDAV share`. The agent should call `files` with `action: "list"` and return the entries. Do this before any write test.
+  </Step>
+  <Step title="Verify the perimeter is enforced">
+    With an **Allowed path** configured, ask the agent to read a path outside it. The call must fail with `Access denied - path outside allowed scope`. A success here means the allowed path was not saved.
+  </Step>
+  <Step title="Verify the allowlist blocks an unlisted agent">
+    From an agent that is not ticked under **Authorized agents**, trigger any tool. The call must be refused with `This agent is not authorized to use this connector.` If it succeeds, check that **Allow all agents** is not enabled.
+  </Step>
+  <Step title="Verify a controlled write">
+    Ask the agent to upload a small text file to a disposable path, then confirm it in the WebDAV interface, then delete it. Confirm that the agent asked you before deleting, per its system prompt.
+  </Step>
+</Steps>
 
-**Nextcloud / ownCloud 401 with the right password**: Two-factor authentication on the account requires an **app password**. Create one in *Security → Devices & sessions* and use it as the `password`.
+## Error handling
 
-**"Access denied - path outside allowed scope" (403)**: The resolved path is not under the configured `allowedPath`. Either widen the allowed path or rewrite the call to a path within it.
+### Configuration errors
 
-**`getTree` times out on a large folder**: Prefer `listFiles` with `depth: 1` and recurse from the client, or use `searchFiles` with `dateFrom`/`dateTo` to scope the request.
+These are returned by the connector before any request reaches the WebDAV server.
 
-**`upload` with binary content fails**: The `content` parameter is a string. For binary payloads, stage the file elsewhere (a previously uploaded file in WebDAV, a public URL, etc.) and use `copy` or an out-of-band upload. The connector does not currently accept base64-encoded `content`.
+| Message | Cause | Fix |
+|---|---|---|
+| `WebDAV not configured. Please set baseUrl, type, and credentials in the app configuration.` | `baseUrl` is empty on the app instance. | Enter the **Base URL** in the configuration app and save. |
+| `Basic Auth requires username and password.` | `type` is `basic` but the username or the password is empty. | Fill both. On a two-factor account, use an app password. |
+| `Token auth requires a Bearer token.` | `type` is `token` but no token is stored. | Paste the token under **Bearer token** and save. |
+| `Unknown auth type: <value>. Expected "basic" or "token".` | `type` holds an unsupported value. | Set **Authentication** through the configuration app rather than editing the raw config. |
 
-**Trailing slashes**: Some WebDAV servers are strict about trailing slashes on directories. If a directory listing returns 404, retry with a trailing `/`.
+### Authorization errors
 
-## External Resources
+These are JSON-RPC errors returned by the MCP endpoint.
+
+| Code | Message | Cause | Owner |
+|---|---|---|---|
+| `-32003` | `This agent is not authorized to use this connector.` followed by the agent id and the remediation | The calling agent is not on the tenant allowlist. | Workspace admin, in the configuration app |
+| `-32003` | ``No agent id reached this connector. Add `agent_id` to the MCP capability scope so agent-factory injects it.`` | The capability was declared without `agent_id` in its **Scope**. | Agent builder or Governance admin, on the capability |
+| `-32001` | `Access denied - path outside allowed scope` | A tool call names a path outside the configured allowed path. The error carries the allowed path in its `data`. | Caller, or workspace admin if the perimeter is wrong |
+| `-32602` | `This path is outside the configured allowed path.` | Same perimeter check on a Resource read or list. | Caller, or workspace admin |
+| `-32003` | `This connector answers Resource calls to its workspace members, or to the trusted Knowledge Sync workspace.` | A Resource call arrived with no identity and from no trusted caller. An API key is refused here too. | Caller |
+| `-32003` | `You do not have the rights to read this connector on the workspace that holds its configuration.` | The caller is identified but cannot read the workspace holding the credential. | Workspace admin, by granting read on that workspace |
+| `-32001` | `This connector could not authenticate the call, so membership of the workspace holding its configuration could not be established. This is not a missing role.` | The platform declined to authenticate the call, for example an organization enforcing multi-factor authentication. | Organization admin |
+
+### Argument errors
+
+| Message | Cause |
+|---|---|
+| ``Missing required argument `action` for files. Available: copy, createDir, delete, get, getProperties, getTree, list, move, search, upload`` | The tool call omitted `action`. |
+| ``Unknown action `<value>` for files. Available: …`` | The `action` value is not one of the supported operations. |
+| `Tool not found: <name>` | The tool name is not `files` and does not match a known operation. |
+| `Method not found: <method>` | The JSON-RPC method is not implemented by this endpoint. |
+| `Invalid dateFrom: <value>` or `Invalid dateTo: <value>` | A `search` filter is not a parsable date. Use ISO 8601, for example `2026-04-01T00:00:00Z`. |
+
+### Server errors
+
+The connector surfaces the WebDAV server's own status in messages of the form `Error listing files: HTTP <status> <statusText> - <body>`, `Error downloading file (HTTP <status>)`, `Error uploading file (HTTP <status>)`, `Error deleting file (HTTP <status>)`, `Error moving file (HTTP <status>)` and `Error creating directory (HTTP <status>)`. Interpret the status with the [WebDAV specification](https://datatracker.ietf.org/doc/html/rfc4918#section-11): `401` for authentication, `403` for a permission the account lacks, `404` for a missing path, `405` when the target already exists, `409` when the parent of a new directory does not exist, `412` when `overwrite` is `false` and the destination exists, `423` when another client holds a lock, and `507` when the account is over quota.
+
+A request that the server never answers is reported with status `0` and `timeout after 15s`.
+
+### Common issues
+
+**Nextcloud or ownCloud returns `401` with a password you know is right.** The account has two-factor authentication enabled, which rejects the main password over WebDAV. Create an app password and use it instead.
+
+**`Error: PROPFIND with Depth: infinity failed.`** The server refuses infinite-depth listings, which `getTree` and `search` both need. Use `list` with `depth: 1` and walk one level at a time.
+
+**Every tool call is refused although the credential tests fine.** The calling agent is not allowlisted, or the capability scope is missing `agent_id`. Check **Authorized agents** in the configuration app, and the capability's **Scope** field.
+
+**An agent uploads invented text instead of the file the user attached.** The capability scope is missing `attachment_urls`, so the connector never receives the attachment URL and the model fills `content` itself. Add `attachment_urls` to the scope and reinstall the capability.
+
+**`Failed to fetch the uploaded attachment (HTTP <status>).`** The attachment URL injected by Agent Creator could not be retrieved. Ask the user to re-attach the file, then retry.
+
+**A knowledge base returns fewer documents than the folder holds.** Files larger than `connectorInlineMaxBytes`, and files whose size the WebDAV server does not report, are marked unfetchable and skipped. Raising `connectorInlineMaxBytes` above roughly 1.4 MB does not help: the bytes travel as a base64 data URL whose content field is capped at 2,000,000 characters downstream.
+
+**A directory listing returns `404`.** Some WebDAV servers are strict about trailing slashes on collections. Retry the path with a trailing `/`.
+
+## Revoke, rotate and remove
+
+These are the WebDAV specifics of [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall).
+
+- **Rotate the credential.** Change the password or token at the provider, then enter the new value in the configuration app and select **Save credentials**, then **Test connection**. No agent or automation needs to be reconfigured: they never hold the credential.
+- **Revoke one agent.** Untick it under **Authorized agents**. The change takes effect on the next call; the agent then receives the `-32003` refusal. Removing the MCP capability from the agent itself is a separate action, done in Agent Creator.
+- **Revoke every agent at once.** Clear the allowlist, or if **Allow all agents** is enabled, turn it off first. An empty allowlist refuses every agent.
+- **Narrow the perimeter.** Set or tighten **Allowed path** and save. It applies immediately to MCP tool calls and Resource calls, including knowledge syncs already attached.
+- **Offboard the account.** Disable or delete the WebDAV service account at the provider. Every path through the connector fails at once, which is the intended fail-closed behavior.
+- **Remove the connector.** Uninstall the WebDAV app from the workspace, then delete the `webdavPassword`, `webdavToken` and `webdavAuthorizedAgents` secrets from the workspace's **Secrets** panel, since uninstalling the app does not clear them. Detach any knowledge base connection that pointed at the endpoint, and delete the Governance capability if one was declared for it, as described in [Remove or update a capability](/apps-store/marketplace/connectors/declare-capability#remove-or-update-a-capability).
+
+<Warning>
+  Treat the MCP endpoint URL as sensitive and share it only with the people who administer the connector. The **Authorized agents** list matches the agent id presented in the call, so it routes and filters traffic rather than cryptographically authenticating the caller. The Resource methods do not rely on it: they authorize each caller against membership of the workspace that holds the credential.
+</Warning>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Install a connector in your workspace" icon="puzzle-piece" href="/apps-store/marketplace/connectors/install-in-workspace">
+    The standard install, credential and allowlist flow this connector follows.
+  </Card>
+  <Card title="Declare a connector capability" icon="plug" href="/apps-store/marketplace/connectors/declare-capability">
+    Wire the MCP endpoint onto an agent, or publish it to your organization's catalog.
+  </Card>
+  <Card title="Agent capabilities" icon="robot" href="/products/agent-factory/capabilities">
+    How Agent Creator agents consume MCP tools in Prisme.ai.
+  </Card>
+  <Card title="Knowledges connectors" icon="database" href="/products/ai-knowledge/connectors">
+    Attach a WebDAV account to a knowledge base and keep it in sync.
+  </Card>
+</CardGroup>
+
+## External resources
 
 <CardGroup cols={2}>
   <Card title="WebDAV (RFC 4918)" icon="book" href="https://datatracker.ietf.org/doc/html/rfc4918">
-    Official WebDAV protocol specification.
+    The WebDAV protocol specification, including its status codes and the `PROPFIND` method.
   </Card>
-  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
-    Learn how Agent Creator agents consume MCP tools in Prisme.ai.
+  <Card title="Nextcloud app passwords" icon="key" href="https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices">
+    Create a revocable app password for an account with two-factor authentication.
   </Card>
 </CardGroup>
