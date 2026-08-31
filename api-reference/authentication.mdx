@@ -247,6 +247,49 @@ Authentication is part of what makes the platform governed by design: the same i
       The endpoint is rate-limited per source IP (default **60 exchanges/min**, configurable via `RATE_LIMIT_TOKEN_EXCHANGE`). When brokering exchanges server-side, all users share one IP; exceeding the limit returns `429 Too Many Requests`. Self-hosters can raise it; see [Environment Variables](/self-hosting/kubernetes/environment-variables).
     </Note>
   </Tab>
+  <Tab title="Web Session Ticket">
+    A native client authenticates with a bearer token, and that token must never reach a browser: there is no API to seed a cookie inside a system web view, and putting the token in a URL would leak it through the `Referer` header, proxy logs and history. Flows that need a real web session, connector OAuth in particular, were therefore unreachable from a mobile app.
+
+    The **web session ticket** solves this the way [RFC 9126](https://datatracker.ietf.org/doc/html/rfc9126) treats `request_uri`: the app states its intent through an authenticated back channel and receives an opaque single-use reference, and that reference is the only thing that ever travels through the browser.
+
+    <Steps>
+      <Step title="Mint a ticket">
+        Call the endpoint with the API token the app already holds:
+
+        ```bash
+        curl -X POST "https://api.studio.prisme.ai/v2/user/webSessionTicket" \
+             -H "Authorization: Bearer <your token>" \
+             -H "Content-Type: application/json" \
+             -d '{
+                   "redirect": "https://studio.prisme.ai/workspaces",
+                   "expiresIn": 60
+                 }'
+        ```
+
+        ```json
+        {
+          "ticket": "<opaque single-use ticket>",
+          "url": "https://api.studio.prisme.ai/v2/user/webSession?ticket=...",
+          "expiresIn": 60,
+          "expires": "2026-08-31T10:00:00.000Z"
+        }
+        ```
+
+        The ticket carries 256 bits of randomness and no information of its own. It is bound to the caller and to its session, lives 60 seconds by default and 300 at most (`WEB_SESSION_TICKET_TTL` and `WEB_SESSION_TICKET_MAX_TTL`), and is forbidden to access tokens and service accounts.
+      </Step>
+      <Step title="Open the returned URL in the system browser">
+        `GET /v2/user/webSession` burns the ticket, sets the `access-token` cookie under `Referrer-Policy: no-referrer` and `Cache-Control: no-store`, then redirects to your `redirect` target. The window now holds an ordinary Prisme.ai session, so anything that works on web, connector OAuth included, works from there.
+      </Step>
+    </Steps>
+
+    <Warning>
+      `redirect` must point at this platform (its API, consoles or workspace pages), or be a root-relative path. It is validated when the ticket is minted and again when it is exchanged. Self-hosters can allow extra hostnames with `WEB_SESSION_ALLOWED_REDIRECT_HOSTS`.
+    </Warning>
+
+    <Note>
+      The cookie reuses the caller's `prismeaiSessionId`, so the app and the browser share one session: same MFA state, same lifetime, and nothing extra to revoke. The exchange endpoint is rate-limited per source IP (default **30/min**, `RATE_LIMIT_WEB_SESSION`). Never log a ticket. The SDK exposes the first call as `api.webSessionTicket()`.
+    </Note>
+  </Tab>
 </Tabs>
 
 ## JWT Token Details
