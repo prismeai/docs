@@ -1,0 +1,603 @@
+---
+title: 'Teams'
+description: 'Microsoft Teams meetings, transcripts and attendance through Microsoft Graph, plus Bot Framework messaging, from agents and Builder automations'
+---
+
+<img
+  src="/images/connectors/teams.png"
+  alt="Teams"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The Teams connector gives agents and automations access to Microsoft Teams **meetings**: listing the meetings on a calendar, resolving a meeting from its join URL, reading its **transcript** as structured speaker segments, and reading its **attendance report**. It also embeds a **Bot Framework connector** that turns a Teams bot into the user-facing channel of a Prisme.ai agent, so a conversation started in Teams is answered by the platform.
+
+It ships as two workspaces: the **MicrosoftTeams** app, which holds the business logic (Microsoft Graph calls, authentication, VTT parsing, Bot Framework activities), and the **Microsoft Teams MCP** workspace, a protocol-only JSON-RPC wrapper that exposes the meeting operations as MCP tools and delegates everything else to the app. Install the app to call it from Builder, install the MCP workspace to let agents call it as tools.
+
+<CardGroup cols={3}>
+  <Card title="Meetings & calendar" icon="calendar-days">
+    List the Teams meetings on a user's calendar with join URLs, organizer and attendee counts, and resolve a meeting id from a join URL
+  </Card>
+  <Card title="Transcripts & attendance" icon="file-lines">
+    List and fetch meeting transcripts, parsed from WebVTT into speaker segments with timestamps, and read who attended and for how long
+  </Card>
+  <Card title="Teams bot messaging" icon="comments">
+    Receive Teams activities on a webhook and reply into the same conversation, including streamed agent answers
+  </Card>
+</CardGroup>
+
+## Choose your authentication mode
+
+The connector supports two **mutually exclusive** authentication modes, selected by the **Auth Mode** configuration field. Pick the one that matches your use case before configuring anything.
+
+<CardGroup cols={2}>
+  <Card title="Application mode (app-only)" icon="building">
+    A single Microsoft Entra application acts for the workspace, with no end-user login. Calendar calls target `/users/{userId}`, meeting artifacts go through the tenant-wide `/communications` endpoints. Best for back-office automations and meeting-analysis pipelines.
+  </Card>
+  <Card title="Delegated mode (OAuth per-user)" icon="user-check">
+    Each end user signs into Microsoft once through a connect page. Every call runs against `/me`, so the reach is exactly what that user can see in Teams. Best for agents acting on behalf of the logged-in user.
+  </Card>
+</CardGroup>
+
+| Aspect | Application mode | Delegated (OAuth) mode |
+|---|---|---|
+| `authMode` value | `application` (default) | `oauth` |
+| Entra permission type | Application | Delegated |
+| Admin consent | Required | Optional (user consent if the tenant allows it) |
+| Graph base URL | `/users/{userId}` and `/communications` | `/me` |
+| Meeting reach | Any meeting the app is allowed to read in the tenant | Meetings of the connected user only |
+| `userId` argument | Required (calendar operations) | Ignored, all calls run against `/me` |
+| Token acquisition | Client credentials per request, cached per user | Authorization code + PKCE, refresh token stored |
+| Extra tenant setup | Teams **application access policy** for meeting artifacts | None |
+| Best for | Back-office / service automations | User-facing agents, per-user data |
+
+---
+
+## Prerequisites
+
+<Tabs>
+  <Tab title="Application mode">
+    ## Application mode
+
+    - A **Microsoft Entra application** registered in your tenant, with a **client secret**
+    - **Application permissions** granted with admin consent (Microsoft Graph):
+      - `Calendars.Read`: list the Teams meetings on a user's calendar
+      - `OnlineMeetings.Read.All`: resolve an online meeting from its join URL
+      - `OnlineMeetingTranscript.Read.All`: list and download meeting transcripts
+      - `OnlineMeetingArtifact.Read.All`: read attendance reports
+    - Your **Directory (tenant) ID**, **Application (client) ID** and secret value
+    - A **Default User ID** (user principal name or object id) for calendar operations, unless every call passes `userId`
+
+    <Warning>
+      **A Teams application access policy is required.** Application permissions alone do not grant app-only access to online meetings, transcripts and attendance reports: Microsoft additionally requires a Teams application access policy that authorizes your application id for the organizers whose meetings you read. Create it once with the Teams PowerShell module:
+
+      ```powershell
+      # 1. Connect to Microsoft Teams
+      Connect-MicrosoftTeams
+
+      # 2. Create a policy for the connector's application id
+      New-CsApplicationAccessPolicy -Identity "Teams-Connector-Policy" `
+        -AppIds "<your-azure-client-id>" `
+        -Description "Prisme.ai Teams connector"
+
+      # 3. Grant it to the meeting organizers it may read (or tenant-wide with -Global)
+      Grant-CsApplicationAccessPolicy -PolicyName "Teams-Connector-Policy" -Identity "organizer@yourdomain.com"
+      ```
+
+      Granting the policy to a limited set of organizers instead of `-Global` is the way to keep app-only mode least-privilege. Policy changes can take up to 30 minutes to propagate. Always check the [official Microsoft documentation](https://learn.microsoft.com/en-us/graph/cloud-communication-online-meeting-application-access-policy) for the current syntax.
+    </Warning>
+
+    <Note>
+      **Transcription must have been enabled during the meeting.** Graph only exposes a transcript for meetings that were actually transcribed; otherwise the transcript tools return `No transcripts available for this meeting.`
+    </Note>
+  </Tab>
+
+  <Tab title="Delegated (OAuth) mode">
+    ## Delegated (OAuth) mode
+
+    - A **Microsoft Entra application** registered in your tenant with a **Web** platform configured
+    - A **Redirect URI** added to the app registration, pointing at the connector's callback webhook:
+
+      ```
+      {platformApiUrl}/workspaces/{workspaceId}/webhooks/oauthCallback
+      ```
+
+      Example (production, workspace `tg2XT9I`):
+
+      ```
+      https://api.studio.prisme.ai/v2/workspaces/tg2XT9I/webhooks/oauthCallback
+      ```
+
+    - **Delegated permissions** granted (Microsoft Graph). The default scope list is:
+
+      ```text
+      openid profile email offline_access Calendars.ReadWrite OnlineMeetings.ReadWrite OnlineMeetingArtifact.Read.All OnlineMeetingTranscript.Read.All User.Read
+      ```
+
+    - A **client secret**: the connector runs the authorization code flow with PKCE as a **confidential client**, so "Allow public client flows" must stay **No**
+    - Either the tenant allows end-user consent, or an admin grants consent once to the scopes above
+
+    <Note>
+      You can reuse the same Entra app registration for both modes, but the **permission types differ**: Application permissions for app-only mode, Delegated permissions for OAuth mode. The connector keeps them in separate configuration fields (`clientId` / `clientSecret` versus `oauthClientId` / `oauthClientSecret`), so both can coexist.
+    </Note>
+  </Tab>
+
+  <Tab title="Bot Framework (optional)">
+    ## Bot Framework messaging
+
+    Only needed if you use the connector as a **Teams chatbot channel**; the meeting tools work without it.
+
+    - An **Azure Bot** resource with the **Microsoft Teams** channel enabled
+    - The bot's **Microsoft App ID** and **client secret** (used as *Bot ID* and *Bot Secret* in the configuration)
+    - The bot's **messaging endpoint** set to the connector webhook:
+
+      ```
+      {platformApiUrl}/workspaces/{workspaceId}/webhooks/{appInstanceSlug}/messagesEndpoint
+      ```
+
+    - A **Teams app manifest** referencing the bot, sideloaded or published to your organization's Teams catalog
+
+    <Note>
+      Bot Framework tokens are acquired against the `botframework.com` tenant, independently of the Microsoft Graph credentials above, and cached in the workspace global scope until they expire.
+    </Note>
+  </Tab>
+</Tabs>
+
+---
+
+## OAuth flow (Delegated mode)
+
+When `authMode` is `oauth`, end users connect their Microsoft account through a built-in flow implemented by the `teams-mcp` workspace.
+
+<Steps>
+  <Step title="User opens the connect page">
+    The user visits `{pagesUrl}/connect-teams`. The page shows a **Connect** button when OAuth is configured (`oauthClientId` is set) and the user has no active connection; otherwise it shows the current connection state or a "not configured" message.
+  </Step>
+  <Step title="Initiate">
+    The page generates a PKCE **code verifier / code challenge (S256)** and a CSRF **state**, stores them in the user scope as `user.teams.oauthPending`, and builds the Microsoft authorize URL so the button links straight to Microsoft.
+  </Step>
+  <Step title="Microsoft login & consent">
+    The user is redirected to `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize` and consents to the delegated scopes.
+  </Step>
+  <Step title="Callback & token exchange">
+    Microsoft redirects back to `/webhooks/oauthCallback?code=...&state=...`. The webhook requires an authenticated session, validates the `state`, exchanges the code (with the PKCE `code_verifier`) at `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`, and stores:
+
+    - `teams_delegated_token`: platform secret, user scope, TTL = `expires_in`
+    - `teams_refresh_token`: platform secret, user scope, TTL = **90 days** (`7776000` s)
+    - `user.teams.oauth`: metadata only (`expiresAt`, `scope`, `authMethod: delegated`)
+  </Step>
+  <Step title="Automatic refresh">
+    When the access token is expired or its secret can no longer be read, `refreshOAuthToken` silently exchanges the refresh token for a new access token and rotates the refresh token when Microsoft returns a new one. If the refresh fails, the tool response asks the user to reconnect.
+  </Step>
+  <Step title="Status & disconnect">
+    The `checkAuthStatus` webhook returns `{ connected, authMethod }` for the current user. The `disconnectOAuth` webhook (or the `disconnectOAuth` event) deletes both platform secrets and `user.teams.oauth`, then sends the user back to the connect page.
+  </Step>
+</Steps>
+
+<Note>
+  **Security properties:**
+  - PKCE (S256) protects the authorization code, and the connector stays a confidential client
+  - The CSRF `state` is validated against the value stored for that user on callback
+  - Tokens are stored as **platform secrets** (opaque references), never as plain user metadata
+  - Client-credentials tokens are cached per user as the `teams_cc_token` secret with the token's own TTL, and refreshed 5 minutes before expiry
+</Note>
+
+---
+
+<Tabs>
+  <Tab title="Usage as App">
+    ## Usage as App
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **MicrosoftTeams** and install it
+    3. Open the app instance configuration and fill in the fields for your chosen mode
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Auth Mode** (`authMode`) | `application` (client credentials, default) or `oauth` (delegated) |
+    | **Azure Client ID** (`clientId`) | Entra application (client) ID for the client-credentials flow |
+    | **Azure Client Secret** (`clientSecret`) | Entra application client secret, stored as a workspace secret |
+    | **Azure Tenant ID** (`tenant`) | Entra directory (tenant) ID |
+    | **Default User ID** (`defaultUserId`) | Default mailbox/calendar owner (UPN or object id) for application mode |
+    | **OAuth Client ID** (`oauthClientId`) | Entra application (client) ID for the delegated flow; can be the same app registration |
+    | **OAuth Client Secret** (`oauthClientSecret`) | Client secret used for the authorization code exchange |
+    | **OAuth Scopes** (`oauthScopes`) | Space-separated delegated scopes; defaults to the list in *Prerequisites* |
+    | **Bot ID** (`botFramework.appId`) | Azure Bot Microsoft App ID, for the messaging channel |
+    | **Bot Secret** (`botFramework.appPassword`) | Azure Bot client secret |
+    | **Bot Framework Tenant** (`botFramework.tenant`) | Tenant used to acquire Bot Framework tokens; defaults to `botframework.com` |
+
+    Credential values resolve from workspace secrets (`azureClientId`, `azureClientSecret`, `azureTenant`, `defaultUserId`, `oauthClientId`, `oauthClientSecret`, `botAppId`, `botAppPassword`), so secrets never appear in the app instance configuration itself.
+
+    ## Meeting identifiers
+
+    Transcript and attendance operations take a Teams **online meeting id**, which is not the calendar event id returned by `listMeetingEvents`. The normal sequence is:
+
+    1. `listMeetingEvents` → calendar events, each with `eventId`, `subject` and `joinUrl`
+    2. `getMeeting` with that `joinUrl` → the online `meetingId`
+    3. `listTranscripts` / `getTranscript` / `getAttendanceReport` with that `meetingId`
+
+    ## Available Instructions
+
+    Every instruction resolves credentials from the workspace configuration and follows the configured auth mode. Arguments marked `*` are required.
+
+    ### Meetings & calendar
+
+    | Instruction | Arguments | Returns |
+    |-------------|-----------|---------|
+    | `listMeetingEvents` | `userId`, `from`, `to`, `top` | `{ structuredData: { meetings: [{ eventId, subject, start, end, organizer, organizerEmail, joinUrl, attendeeCount, webLink }], count } }`. Calendar events are filtered to online meetings only. |
+    | `getMeeting` | `joinUrl`*, `userId` | `{ structuredData: { meeting: { meetingId, subject, startDateTime, endDateTime, joinUrl, meetingType } } }` |
+
+    ### Transcripts
+
+    | Instruction | Arguments | Returns |
+    |-------------|-----------|---------|
+    | `listTranscripts` | `meetingId`* | `{ structuredData: { transcripts: [{ transcriptId, createdDateTime, meetingId }], count, meetingId } }` |
+    | `getTranscriptContent` | `meetingId`*, `transcriptId`* | `{ structuredData: { meetingId, transcriptId, content } }` where `content` is raw WebVTT |
+    | `getTranscript` | `meetingId`* | Lists transcripts, downloads the **first** one, parses the VTT and returns `{ structuredData: { transcriptId, speakerCount, segmentCount, transcript, segments: [{ speaker, text, start, end }] } }` |
+    | `parseTranscript` | `text`* | Parses raw VTT into `{ segments, speaker_count }` without any Graph call |
+
+    ### Attendance
+
+    | Instruction | Arguments | Returns |
+    |-------------|-----------|---------|
+    | `getAttendanceReport` | `meetingId`* | Most recent attendance report, expanded: `{ structuredData: { meetingId, totalParticipantCount, attendees: [{ displayName, email, role, totalAttendanceInSeconds, joinedAt, leftAt }] } }` |
+
+    ### Bot messaging
+
+    | Instruction | Arguments | Description |
+    |-------------|-----------|-------------|
+    | `sendTextMessage` | `text`*, `originalActivity`* | Reply into the conversation the activity came from; Markdown is supported |
+    | `sendActivity` | `body`*, `originalActivity`*, `dontUseActivityId` | Send one raw Bot Framework activity; set `dontUseActivityId` to post to the conversation instead of replying to a specific activity |
+    | `sendStreamResponse` | `stream`*, `originalActivity`*, `delay` | Convert a Prisme.ai stream into activities and send them sequentially, with an optional delay in seconds between each |
+    | `invalidateBotToken` | — | Drop the cached Bot Framework token, for example after rotating the bot secret |
+
+    `messagesEndpoint` is a webhook, not an instruction: Teams posts incoming activities to it and it emits them as `teams.bot.messageReceived`. Subscribe an automation to that event, call your agent, then answer with `sendTextMessage` or `sendStreamResponse` passing the received activity as `originalActivity`.
+
+    ### Setup & diagnostics
+
+    | Instruction | Arguments | Description |
+    |-------------|-----------|-------------|
+    | `configureTeams` | `clientId`*, `clientSecret`*, `tenant`*, `userId`* | Store Entra credentials in the **user** scope (`user.teams.credentials`), taking precedence over the workspace configuration for that user |
+    | `getAppPermissions` | — | List the Graph application role assignments granted to the configured `clientId`, to check consent |
+    | `clearTokenCache` | — | Delete the cached `teams_cc_token` secret so the next call acquires a fresh token, for example after granting new permissions |
+
+    ## Events emitted
+
+    | Event | Emitted when |
+    |-------|--------------|
+    | `teams.meetings.listed` | `listMeetingEvents` returns, with `meetingCount` |
+    | `teams.meeting.retrieved` | `getMeeting` resolves a join URL |
+    | `teams.transcripts.listed` / `teams.transcript.retrieved` / `Teams.transcript.parsed` | Transcript operations complete |
+    | `teams.attendance.retrieved` | `getAttendanceReport` returns, with `attendeeCount` |
+    | `teams.credentials.configured` / `teams.oauth.disconnected` / `teams.authentication.failed` | Authentication lifecycle |
+    | `teams.bot.messageReceived` / `teams.connector.activity.received` / `teams.connector.stream.sent` | Bot Framework traffic |
+
+    ## DSUL Examples
+
+    ### List this week's Teams meetings
+
+    ```yaml
+    - MicrosoftTeams.listMeetingEvents:
+        userId: user@company.com   # Application mode only; ignored in Delegated mode
+        from: '2026-09-01T00:00:00Z'
+        to: '2026-09-07T23:59:59Z'
+        top: 25
+      output: meetings
+    ```
+
+    ### Resolve a meeting and read its transcript
+
+    ```yaml
+    - MicrosoftTeams.getMeeting:
+        joinUrl: '{{meetings.structuredData.meetings[0].joinUrl}}'
+      output: meeting
+    - MicrosoftTeams.getTranscript:
+        meetingId: '{{meeting.structuredData.meeting.meetingId}}'
+      output: transcript
+    - set:
+        name: fullText
+        value: '{{transcript.structuredData.transcript}}'
+    ```
+
+    ### Read the attendance report
+
+    ```yaml
+    - MicrosoftTeams.getAttendanceReport:
+        meetingId: '{{meeting.structuredData.meeting.meetingId}}'
+      output: attendance
+    ```
+
+    ### Answer a Teams message with an agent
+
+    ```yaml
+    when:
+      events:
+        - teams.bot.messageReceived
+    do:
+      - AI Knowledge.chat:
+          query: '{{payload.text}}'
+        output: answer
+      - MicrosoftTeams.sendTextMessage:
+          text: '{{answer.output}}'
+          originalActivity: '{{payload}}'
+    ```
+  </Tab>
+
+  <Tab title="Usage as MCP">
+    ## Usage as MCP
+
+    The **Microsoft Teams MCP** workspace exposes the meeting operations as JSON-RPC 2.0 tools. It is protocol-only: the endpoint validates the `mcp-api-key` header through MCP Core, routes `tools/call` through `routeToolCall`, and delegates every operation to the MicrosoftTeams app, where authentication, Graph URL construction and VTT parsing happen. Tool output is normalized by a single formatter, so every tool honours the same `outputFormat` argument.
+
+    ## MCP Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **MCP API Key** (`mcpApiKey`) | Configured on the Microsoft Teams MCP workspace and sent in the `mcp-api-key` header on every MCP call |
+
+    The MCP workspace carries its own copy of the Teams credentials (`teams.*`) and OAuth settings (`oauth.*`), which it passes to the imported app.
+
+    ## Plug into an Agent Creator capability
+
+    <Steps>
+      <Step title="Create or open a workspace">
+        From the Prisme.ai console, create a new workspace or open the one that will host the connector.
+      </Step>
+      <Step title="Install and configure the connector">
+        Install **MicrosoftTeams** and configure the credentials for your auth mode, as described in the *Usage as App* tab.
+      </Step>
+      <Step title="Copy the MCP endpoint and API key">
+        Open the Microsoft Teams MCP app instance configuration and copy the **MCP Endpoint** and **MCP API Key** values.
+      </Step>
+      <Step title="Add the MCP capability">
+        In Agent Creator, open the agent and add a capability. Select a dedicated Teams capability if one exists in your catalog; otherwise use the generic `custom_mcp` capability, paste the MCP endpoint as the server URL, then add this header:
+
+        ```json
+        {
+          "mcp-api-key": "your-mcp-api-key"
+        }
+        ```
+      </Step>
+      <Step title="Connect a Microsoft account (Delegated mode)">
+        In `oauth` mode, the user must have connected once at `{pagesUrl}/connect-teams`. Until then, tool calls return an authentication error carrying the connect URL.
+      </Step>
+      <Step title="Brief the agent">
+        Tell the agent that transcripts and attendance need an online `meetingId`, that `listMeetings` returns calendar events with join URLs, and that meeting content is confidential: it should not repeat a transcript to someone who was not in the meeting.
+      </Step>
+    </Steps>
+
+    ## Legacy MCP install (Advanced > Tools)
+
+    Use this flow for an AI Knowledge agent that does not yet support the native Agent Creator capability picker.
+
+    <Steps>
+      <Step title="Install the connector">
+        Install and configure the Teams app and its MCP workspace alongside your agent.
+      </Step>
+      <Step title="Open your AI Knowledge project">
+        Navigate to **Advanced > Tools**.
+      </Step>
+      <Step title="Add an MCP tool">
+        Click **Add**, select the **MCP** tab, and paste the MCP endpoint URL.
+      </Step>
+      <Step title="Add the auth headers">
+        Add the API key, plus the Azure credentials if you drive authentication from the client rather than the workspace configuration:
+
+        ```json
+        {
+          "mcp-api-key": "your-mcp-api-key",
+          "azure-client-id": "your-client-id",
+          "azure-client-secret": "your-client-secret",
+          "azure-tenant": "your-tenant-id"
+        }
+        ```
+      </Step>
+    </Steps>
+
+    ## Authentication
+
+    The connector resolves Microsoft Graph credentials in this order:
+
+    1. **`authMode: oauth`** in the configuration → the stored delegated token for the calling user, refreshed automatically; if there is none, the call fails with a message pointing at the connect page
+    2. `Authorization: Bearer <token>` header, used as a pre-resolved Graph access token
+    3. `azure-client-id` / `azure-client-secret` / `azure-tenant` headers (client credentials supplied by the caller)
+    4. Per-user credentials stored by `configureTeams` (`user.teams.credentials`)
+    5. Workspace configuration and secrets (`clientId`, `clientSecret`, `tenant`)
+
+    Tokens obtained from options 3 to 5 are cached per user as the `teams_cc_token` platform secret. Credentials are never returned in tool schemas or tool results.
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` argument:
+
+    - **`verbose`** (default): human-readable text, optimized for LLM consumption
+    - **`structured`**: machine-readable JSON in `structuredContent`
+    - **`both`**: the structured payload with its JSON also rendered as text
+
+    ## Available Tools
+
+    | Tool | Description | Scope |
+    |------|-------------|-------|
+    | `listMeetings` | List the Teams meetings on a user's calendar, with join URLs, subjects, dates and attendee counts | User-scoped, needs `userId` in application mode |
+    | `listTranscripts` | List the transcripts available for a meeting, with their ids and creation dates | Communications-scoped, no `userId` |
+    | `getTranscript` | Fetch the meeting's first transcript, parse the VTT, return speaker segments with timestamps | Communications-scoped, no `userId` |
+    | `getAttendance` | Return the participant list with roles, join/leave times and total attendance duration | Communications-scoped, no `userId` |
+    | `configureTeams` | Store Entra credentials for the calling user, so later tool calls authenticate with them | Setup |
+
+    <Note>
+      Two diagnostic operations, `getAppPermissions` and `clearTokenCache`, are routed by the endpoint but are not advertised in `tools/list`. They are meant for troubleshooting from the app side rather than for agents.
+
+      `getMeeting` is **not** exposed as an MCP tool: an agent that only has the MCP surface receives join URLs from `listMeetings` but cannot convert one into the `meetingId` that the transcript and attendance tools expect. Resolve it in a Builder automation with the app instruction `getMeeting`, or pass the agent a `meetingId` you already hold.
+    </Note>
+
+    ## Tool Details
+
+    ### `listMeetings`
+
+    ```json
+    {
+      "name": "listMeetings",
+      "arguments": {
+        "userId": "user@company.com",
+        "from": "2026-09-01T00:00:00Z",
+        "to": "2026-09-07T23:59:59Z",
+        "top": 25,
+        "outputFormat": "structured"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `userId` | Yes in application mode | Calendar owner (UPN or object id). Falls back to the per-user credentials, then to **Default User ID**; ignored in delegated mode, where the calendar is always `/me`. |
+    | `from` / `to` | No | ISO 8601 bounds applied to the event start date. |
+    | `top` | No | Number of events to fetch, up to 100; the connector requests 50 when omitted. |
+    | `outputFormat` | No | `verbose`, `structured` or `both`. |
+
+    Results are sorted by start date descending and filtered to online meetings, so non-Teams calendar entries are dropped.
+
+    ### `listTranscripts`
+
+    ```json
+    {
+      "name": "listTranscripts",
+      "arguments": {
+        "meetingId": "MSpkYzE3Njc0Yy04MWQ5..."
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `meetingId` | Yes | Teams online meeting id, as returned by the app's `getMeeting`. |
+    | `outputFormat` | No | `verbose`, `structured` or `both`. |
+
+    ### `getTranscript`
+
+    ```json
+    {
+      "name": "getTranscript",
+      "arguments": {
+        "meetingId": "MSpkYzE3Njc0Yy04MWQ5...",
+        "outputFormat": "structured"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `meetingId` | Yes | Teams online meeting id. |
+    | `outputFormat` | No | `verbose`, `structured` or `both`. |
+
+    Returns `speakerCount`, `segmentCount`, the `segments` array (`speaker`, `text`, `start`, `end`) and a flattened `transcript` string formatted as `[start] Speaker: text` lines. When several transcripts exist, only the first one is fetched; call `listTranscripts` first to pick another.
+
+    ### `getAttendance`
+
+    ```json
+    {
+      "name": "getAttendance",
+      "arguments": {
+        "meetingId": "MSpkYzE3Njc0Yy04MWQ5...",
+        "outputFormat": "both"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `meetingId` | Yes | Teams online meeting id. |
+    | `outputFormat` | No | `verbose`, `structured` or `both`. |
+
+    The most recent attendance report of the meeting is expanded; recurring or rejoined sessions may produce several reports, and only the latest is returned.
+
+    ### `configureTeams`
+
+    ```json
+    {
+      "name": "configureTeams",
+      "arguments": {
+        "clientId": "00000000-0000-0000-0000-000000000000",
+        "clientSecret": "your-client-secret",
+        "tenant": "00000000-0000-0000-0000-000000000000",
+        "userId": "user@company.com"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `clientId` | Yes | Entra application (client) ID. |
+    | `clientSecret` | Yes | Entra application client secret. |
+    | `tenant` | Yes | Entra directory (tenant) ID. |
+    | `userId` | Yes | Default calendar owner for the stored credentials. |
+
+    <Warning>
+      `configureTeams` accepts a client secret as a tool argument, so the value transits through the agent conversation. Prefer configuring credentials on the workspace, and keep this tool for interactive setup or per-user tenants.
+    </Warning>
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+| HTTP Status | Error | Solution |
+|-------------|-------|----------|
+| `400` | Invalid parameters, malformed filter or meeting id | Check the ISO 8601 date format on `from` / `to`, and that `meetingId` is an online meeting id and not a calendar event id |
+| `401` | Token missing, expired or revoked | Application mode: verify `clientId`, `clientSecret` and `tenant`. Delegated mode: the user reconnects at `/connect-teams` |
+| `403` | Insufficient permissions | Grant admin consent for the application permissions, and check the Teams application access policy covers the meeting organizer |
+| `404` | Meeting, transcript or attendance report not found | Verify the meeting id, that the meeting has ended, and that transcription was enabled |
+| `429` | Microsoft Graph throttling | Back off and retry, honouring `Retry-After` |
+| `500` / `503` | Microsoft Graph or connector runtime error | Transient; retry shortly and inspect the workspace execution logs |
+
+### Common Issues
+
+**"Teams credentials not configured"**: no credential source resolved. Configure the workspace credentials, call `configureTeams`, pass the `azure-*` headers, or connect through OAuth.
+
+**"OAuth authentication required" with a `connectUrl`**: the connector is in `oauth` mode and the calling user has no valid delegated token. The user opens the returned URL, or `{pagesUrl}/connect-teams`, and signs in.
+
+**"userId is required for application auth mode"**: a calendar operation ran in application mode with no `userId` argument, no per-user credentials and no **Default User ID** in the configuration.
+
+**"No transcripts available for this meeting. Ensure transcription was enabled."**: Graph returned an empty transcript list. Transcription must have been started during the meeting, and the recording policy must allow the app to read it.
+
+**`403 Forbidden` on transcripts or attendance while permissions look correct**: the Teams application access policy is missing, or does not cover the meeting's organizer. Grant it to that organizer and allow up to 30 minutes for propagation.
+
+**`AADSTS700016`**: the application was not found in the directory. Check that the tenant id matches the app registration.
+
+**`AADSTS65001`**: the user has not consented to the delegated scopes. Enable user consent in the tenant, or have an admin consent once.
+
+**`invalid_client`**: the client secret is wrong or has expired. Rotate it in Microsoft Entra ID and update the workspace secret.
+
+**`invalid_grant` on refresh**: the refresh token expired (over 90 days) or was revoked. The user reconnects at `/connect-teams`.
+
+**A new permission has no effect**: the previous access token is still cached. Call `clearTokenCache` (or the `clearTokenCache` app instruction) so the next call acquires a fresh token.
+
+**The Teams bot does not answer**: check that the Azure Bot messaging endpoint points at `.../webhooks/{appInstanceSlug}/messagesEndpoint`, that the Teams channel is enabled, and that an automation subscribes to `teams.bot.messageReceived`. After rotating the bot secret, call `invalidateBotToken`.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="Microsoft Graph online meetings" icon="microsoft" href="https://learn.microsoft.com/en-us/graph/api/resources/onlinemeeting">
+    Reference for online meetings, transcripts and attendance reports
+  </Card>
+  <Card title="Application access policies" icon="shield" href="https://learn.microsoft.com/en-us/graph/cloud-communication-online-meeting-application-access-policy">
+    Authorize an application for app-only access to online meetings
+  </Card>
+  <Card title="OAuth 2.0 authorization code flow" icon="key" href="https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow">
+    Microsoft identity platform: delegated auth code + PKCE
+  </Card>
+  <Card title="Bot Framework: Teams bots" icon="comments" href="https://learn.microsoft.com/en-us/microsoftteams/platform/bots/what-are-bots">
+    Build and register a bot for the Microsoft Teams channel
+  </Card>
+  <Card title="Connector Architecture" icon="sitemap" href="/apps-store/marketplace/connectors/architecture">
+    Reference architecture and security model for App + MCP connectors
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
+    How Agent Creator agents consume MCP tools in Prisme.ai
+  </Card>
+</CardGroup>
