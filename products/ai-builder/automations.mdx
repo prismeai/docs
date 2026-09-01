@@ -159,6 +159,30 @@ Anywhere a value is expected, you can interpolate an expression.
 
 The full expression and condition grammar is documented in [Condition and Expression syntax](#condition-and-expression-syntax); it covers comparison and logical operators, regular expressions, MongoDB-style matches, deep-merge, and the built-in helpers for dates, math, strings, and URL parsing.
 
+#### Producing a literal `{{ … }}`
+
+Interpolation is **single-pass**: it never re-scans what it just produced. A `{{`
+with no matching `}}` is therefore left alone, and a value that *contains*
+`{{something}}` is never resolved a second time.
+
+That is what lets you build a binding meant to be **stored rather than
+resolved** — the reference an app instance writes into its configuration, for
+instance, which only resolves later, in another context:
+
+```yaml
+- set:
+    name: openBrace
+    value: '{{'                                    # left as-is
+- set:
+    name: secretBinding
+    value: '{{openBrace}}secret.myKey}}'           # → the string "{{secret.myKey}}"
+```
+
+The result survives every later interpolation, nested object values included,
+and a workspace export/import round-trip. Conversely, to detect a binding that
+was *not* resolved, compare a slice of it: `'{% slice({{value}}, 0, 2) %}'`
+against `{{openBrace}}`, variable to variable.
+
 ### Variable scopes
 
 Variables live in different scopes with different lifetimes. Each scope is exposed as a top-level object in expressions.
@@ -640,7 +664,20 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
           - set:
               name: counter
               value: '{% {{$index}} + 1 %}'
+
+    # Iterate through an OBJECT: each item is a { key, value } pair
+    - repeat:
+        on: '{{queryParams}}'
+        do:
+          - set:
+              name: pairs[]
+              value: '{{item.key}}={{item.value}}'
     ```
+
+    `on` accepts an array, an object, or a stream. Given an object, the loop
+    walks its entries and exposes each one as `{{item.key}}` / `{{item.value}}`
+    — which is how you iterate over the keys of an object without a helper
+    function.
 
     You can also process batches in parallel:
 
@@ -1425,7 +1462,9 @@ Conditions allow you to execute different instructions based on contextual infor
 {{someAge}} !== 18
 {{someAge}} != 18
 
-# String matching
+# String matching — a bare pattern is a SUBSTRING test, not a regex.
+# `matches "^hel"` looks for the literal characters `^hel` and finds nothing.
+# Use regex(...) below when you need anchors, classes or quantifiers.
 "hello" matches "hel"
 "hello" matches {{someArray}}
 
@@ -1470,7 +1509,17 @@ isNumber({{someVariable}})
 ```yaml
 "luke.skywalker@gmail.com" matches regex("luke|skywalker")
 "luke.skywalker@gmail.com" matches regex(/luke|skywalker/)
+
+# Anchors work, so you can require a shape rather than merely find one:
+{{callbackUrl}} matches regex("/webhooks/[A-Za-z0-9_.-]*oauthCallback$")
 ```
+
+The pattern is **not interpolated** — a `{{variable}}` written inside it is
+matched as those literal characters. Interpolating one would be a trap
+anyway: a value carrying `.` or `/` turns into wildcards, which is how a host
+check quietly becomes an open redirect. To test a value against another
+variable, compare the two directly (`'{{a}} == {{b}}'`), slicing first when
+you need a prefix.
 
 ### MongoDB-like Conditional Matches
 
