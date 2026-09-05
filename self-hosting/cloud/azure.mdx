@@ -54,88 +54,339 @@ A certificate covering both is the easiest path. Manage it in Key Vault and refe
 
 Entra ID lets you replace static passwords for Redis and PostgreSQL with short-lived tokens, using [system-assigned or user-assigned managed identities](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/overview).
 
-### Common setup
+Two modes are available. They differ in **how the token reaches the pod**, and that difference decides what you have to configure:
 
-1. Create a managed identity:
+| | Option A — `azureSystemIdentity` | Option B — `azureManagedIdentityClientId` |
+|---|---|---|
+| Identity is bound to | the AKS cluster (kubelet identity) | a Kubernetes ServiceAccount, via a federated credential |
+| Token arrives via | IMDS (`169.254.169.254`) | a projected token, injected by the AKS workload identity webhook |
+| Requires a pod label | no | **yes** |
+| Isolation | every pod on the node shares the identity | per ServiceAccount |
 
-   ```bash
-   az identity create --name PrismeaiIdentity --resource-group RESOURCE_GROUP
-   ```
+Option B (recommended) is the better choice for a shared cluster. It is also the one with more moving parts, so work through the checklist at the end of this section before concluding it does not work.
 
-2. Wire the identity to AKS. Pick one:
+### 1. Create the managed identity
 
-   **Option A: bind to the cluster** (simpler, applies to all workloads):
+```bash
+az identity create --name PrismeaiIdentity --resource-group RESOURCE_GROUP
 
-   ```bash
-   az aks update --resource-group RESOURCE_GROUP --name CLUSTER_NAME \
-     --enable-managed-identity \
-     --assign-identity IDENTITY_ID --assign-kubelet-identity IDENTITY_ID
-   ```
+az identity show --name PrismeaiIdentity --resource-group RESOURCE_GROUP \
+  --query "{clientId:clientId, objectId:principalId}" -o table
+```
 
-   Then set every `azureSystemIdentity: true` in your Helm values.
+Keep both GUIDs. They are **not** interchangeable and you will need each in a different place:
 
-   **Option B: federated credentials** (per service account, recommended):
+- **`clientId`** goes in your Helm values (`azureManagedIdentityClientId`) and in the ServiceAccount annotation.
+- **`objectId`** (also called `principalId`) is what you grant on Redis and register in PostgreSQL.
 
-   ```bash
-   az identity federated-credential create --name prismeai-core-fic \
-     --identity-name PrismeaiIdentity --resource-group RESOURCE_GROUP \
-     --issuer <aks_oidc_issuer> \
-     --subject system:serviceaccount:CORE_NAMESPACE:prismeai-backends-sa \
-     --audiences api://AzureADTokenExchange
+### 2. Wire the identity to AKS
 
-   az identity federated-credential create --name prismeai-apps-fic \
-     --identity-name PrismeaiIdentity --resource-group RESOURCE_GROUP \
-     --issuer <aks_oidc_issuer> \
-     --subject system:serviceaccount:APPS_NAMESPACE:prismeai-backends-sa \
-     --audiences api://AzureADTokenExchange
-   ```
+#### Option A (simplest): bind to the cluster
 
-   <Note>
-   All backend services (everything except `prismeai-console`) need `serviceAccount.name: prismeai-backends-sa` in your Helm values. Replace `CORE_NAMESPACE` and `APPS_NAMESPACE` with your namespace names.
-   </Note>
+Simplest, and applies to every workload on the node.
 
-   Then set every `azureManagedIdentityClientId` in your Helm values to the managed identity's **clientId**.
+```bash
+az aks update --resource-group RESOURCE_GROUP --name CLUSTER_NAME \
+  --enable-managed-identity \
+  --assign-identity IDENTITY_ID --assign-kubelet-identity IDENTITY_ID
+```
 
-### Redis
+Then set every `azureSystemIdentity: true` in your Helm values (see the table in step 3 for the full list). No ServiceAccount and no pod label are needed: IMDS answers regardless.
 
-1. Open your Azure Managed Redis instance.
-2. Go to **Settings → Authentication**.
-3. Enable Microsoft Entra ID authentication and select the managed identity.
+#### Option B (recommended): federated credentials, per ServiceAccount
 
-### PostgreSQL
+First, make sure the cluster can do it at all:
 
-1. Connect with your Entra admin user:
+```bash
+az aks update --resource-group RESOURCE_GROUP --name CLUSTER_NAME \
+  --enable-oidc-issuer --enable-workload-identity
 
-   ```bash
-   export AZ_DATABASE_SERVER_NAME=prismeai
-   export AZ_DATABASE_NAME=<db>
-   export CURRENT_USERNAME=$(az ad signed-in-user show --query userPrincipalName --output tsv)
-   psql "host=$AZ_DATABASE_SERVER_NAME.postgres.database.azure.com \
-         user=$CURRENT_USERNAME dbname=$AZ_DATABASE_NAME port=5432 \
-         password=$(az account get-access-token --resource-type oss-rdbms --output tsv --query accessToken) \
-         sslmode=require"
-   ```
+AKS_OIDC_ISSUER=$(az aks show --resource-group RESOURCE_GROUP --name CLUSTER_NAME \
+  --query oidcIssuerProfile.issuerUrl -o tsv)
+```
 
-2. Create a Postgres user attached to the managed identity (same name):
+Then create one federated credential **per namespace** — the subject contains the namespace, so `core` and `apps` need separate credentials:
 
-   ```sql
-   select * from pgaadauth_create_principal('PrismeaiIdentity', false, false);
-   ```
+```bash
+az identity federated-credential create --name prismeai-core-fic \
+  --identity-name PrismeaiIdentity --resource-group RESOURCE_GROUP \
+  --issuer "$AKS_OIDC_ISSUER" \
+  --subject system:serviceaccount:CORE_NAMESPACE:prismeai-backends-sa \
+  --audiences api://AzureADTokenExchange
 
-3. Grant permissions:
+az identity federated-credential create --name prismeai-apps-fic \
+  --identity-name PrismeaiIdentity --resource-group RESOURCE_GROUP \
+  --issuer "$AKS_OIDC_ISSUER" \
+  --subject system:serviceaccount:APPS_NAMESPACE:prismeai-backends-sa \
+  --audiences api://AzureADTokenExchange
+```
 
-   ```sql
-   GRANT CREATE, USAGE ON SCHEMA public TO "PrismeaiIdentity";
-   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "PrismeaiIdentity";
-   ALTER DEFAULT PRIVILEGES IN SCHEMA public
-     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "PrismeaiIdentity";
-   ```
+Workload Identity then needs **three** things on every backend workload. Missing any one of them silently disables federation:
 
-4. In your Helm values, set the managed identity name as the user for all three PostgreSQL clients:
+| # | What | Where |
+|---|---|---|
+| 1 | `serviceAccount.name: prismeai-backends-sa` | Helm values, on every backend chart |
+| 2 | annotation `azure.workload.identity/client-id: <clientId>` | on that ServiceAccount |
+| 3 | **label `azure.workload.identity/use: "true"`** | on the **pod template** |
 
-   - `global.storage.permissions.user`
-   - `prismeai-api-gateway.storage.users.user`
-   - `prismeai-runtime.storage.collections.user`
+<Warning>
+**The Helm charts before prismeai-core 1.12.1 and prismeai-apps 0.7.1 cannot set item 3.** No backend chart exposes a `podLabels` hook, so the pod label cannot be applied from values. When using old charts, Option B needs a post-install patch — see [Applying the pod label](#applying-the-pod-label) below. Without the label the AKS webhook injects nothing and the Azure SDK falls back to IMDS, which only works if the identity happens to be attached to your node pool. It does not report an error.
+</Warning>
+
+In your values, for every backend chart (everything except `prismeai-console` and `prismeai-pages`):
+
+```yaml
+serviceAccount:
+  create: true
+  name: prismeai-backends-sa
+  annotations:
+    azure.workload.identity/client-id: "<clientId>"
+```
+
+<Warning>
+Set `serviceAccount.annotations` on **every** backend subchart, not just one. Each subchart renders its own ServiceAccount object; when they share a name, the last one applied wins, so a single annotated definition is overwritten by the unannotated ones that follow it.
+</Warning>
+
+#### If your chart exposes `global.podLabels`
+
+Newer charts (prismeai-core >= 1.12.1 and prismeai-apps >= 0.7.1)
+add two hooks that replace both the repetition above and the
+post-install patch below. Check with `helm show values <chart> | grep podLabels`; if
+it is there, the whole Workload Identity configuration is four lines, set once per
+release:
+
+```yaml
+global:
+  podLabels:
+    azure.workload.identity/use: "true"
+  serviceAccount:
+    annotations:
+      azure.workload.identity/client-id: "<clientId>"
+```
+
+You still set `serviceAccount.name: prismeai-backends-sa` on each backend. The
+global annotations are merged into every ServiceAccount the release creates, so the
+last-one-wins problem disappears, and **[Applying the pod label](#applying-the-pod-label) becomes unnecessary**.
+
+### 3. Set the identity on every client
+
+Each backing-service client is configured independently. Setting only some of them leaves the rest on username/password authentication, which fails or silently keeps using an old secret.
+
+There are **seven**, across **two Helm releases**:
+
+| Values key | Backing service | Release |
+|---|---|---|
+| `global.broker.azureManagedIdentityClientId` | Redis — event bus | core |
+| `global.storage.permissions.azureManagedIdentityClientId` | PostgreSQL — permissions | core |
+| `prismeai-api-gateway.storage.users.azureManagedIdentityClientId` | PostgreSQL — users | core |
+| `prismeai-api-gateway.storage.sessions.azureManagedIdentityClientId` | **Redis** — sessions | core |
+| `prismeai-runtime.storage.collections.azureManagedIdentityClientId` | PostgreSQL — collections | core |
+| `prismeai-runtime.cache.contexts.azureManagedIdentityClientId` | **Redis** — contexts cache | core |
+| `global.storage.searchengines.azureManagedIdentityClientId` | **Redis** — crawler / searchengine | **apps** |
+
+For Option A, set `azureSystemIdentity: true` at those same seven paths instead.
+
+<Note>
+**Four of the seven are Redis.** Configuring "the PostgreSQL ones" plus the broker still leaves **sessions**, **contexts** and the crawler/searchengine cache authenticating with a password.
+
+Watch `global.storage.searchengines` in particular: the key says *searchengines*, but its value is a Redis URL (`redis://user:password@host:6379/4`) and it configures a Redis client. It is in the `apps` release, not `core`.
+</Note>
+
+<Warning>
+Managed identity covers **Redis and PostgreSQL only**. Elasticsearch is configured separately with `ELASTIC_USER` / `ELASTIC_PASSWORD` and has no identity option, and Blob storage uses `UPLOADS_STORAGE_AZURE_BLOB_CONNECTION_STRING` — an account key. Both remain credential-based no matter what you set above, so "passwordless" applies to two of the four backing services.
+</Warning>
+
+### 4. Remove static passwords
+
+```yaml
+# for each of the seven clients above
+password: ''
+```
+
+<Warning>
+A static password **takes precedence and silently disables managed identity**. The service starts, connects and works normally, using the password — nothing reports that the identity is unused. Check your `existingSecret` contents too: a leftover `password` key has the same effect.
+</Warning>
+
+### 5. Redis
+
+1. Open your Azure Cache for Redis / Azure Managed Redis instance.
+2. **Settings → Authentication → Microsoft Entra Authentication** — enable it.
+3. Add a data access policy for the identity's **objectId**, not its clientId:
+
+```bash
+az redis access-policy-assignment create \
+  --resource-group RESOURCE_GROUP --name CACHE_NAME \
+  --access-policy-name "Data Owner" \
+  --object-id <objectId> --object-id-alias PrismeaiIdentity \
+  --policy-assignment-name prismeai-identity
+```
+
+<Note>
+The client sends the token's `oid` claim as the Redis username, which is the **objectId**. Assigning the policy to the `clientId` by mistake produces `WRONGPASS` with a perfectly valid token.
+</Note>
+
+### 6. PostgreSQL
+
+Connect as your Entra administrator, to the **`postgres`** maintenance database:
+
+```bash
+export AZ_DATABASE_SERVER_NAME=prismeai
+export CURRENT_USERNAME=$(az ad signed-in-user show --query userPrincipalName --output tsv)
+
+psql "host=$AZ_DATABASE_SERVER_NAME.postgres.database.azure.com \
+      user=$CURRENT_USERNAME dbname=postgres port=5432 \
+      password=$(az account get-access-token --resource-type oss-rdbms --output tsv --query accessToken) \
+      sslmode=require"
+```
+
+<Warning>
+Connect to **`postgres`**, not to your application database. Azure installs the `pgaadauth_*` functions only in the maintenance database; any database created afterwards is cloned from `template1` and does not have them. Running the next command in your application database fails with `function pgaadauth_create_principal(...) does not exist`, whose hint about type casts is misleading — the function is simply not there.
+</Warning>
+
+Register the managed identity as a Postgres role, passing its **objectId** explicitly:
+
+```sql
+select * from pgaadauth_create_principal_with_oid(
+  'PrismeaiIdentity', '<objectId>', 'service', false, false);
+```
+
+<Note>
+`pgaadauth_create_principal('PrismeaiIdentity', false, false)` also exists and asks the server to resolve the name against Entra. For a **user-assigned managed identity** prefer the `_with_oid` form: it needs no directory lookup, so it works regardless of tenant restrictions. Keep the name-resolving form for human users and groups.
+</Note>
+
+Roles are cluster-wide, so the principal now exists for every database. Grants are not — reconnect to your **application** database and run:
+
+```sql
+GRANT CONNECT ON DATABASE "<your-database>" TO "PrismeaiIdentity";
+GRANT CREATE, USAGE ON SCHEMA public TO "PrismeaiIdentity";
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "PrismeaiIdentity";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "PrismeaiIdentity";
+```
+
+Verify the mapping before moving on:
+
+```sql
+select * from pgaadauth_list_principals(false);
+```
+
+`PrismeaiIdentity` should appear with `principaltype = service` and an `objectid` equal to the identity's objectId.
+
+### 7. Put the Postgres principal in the connection URL
+
+Under Entra authentication the Azure token supplies the **password**; the **username** must come from the connection URL:
+
+```
+postgres://PrismeaiIdentity@<server>.postgres.database.azure.com:5432/<database>?sslmode=require
+```
+
+Use that URL for the `url` key of each PostgreSQL `existingSecret` — `global.storage.permissions`, `prismeai-api-gateway.storage.users` and `prismeai-runtime.storage.collections`.
+
+<Warning>
+The separate `.user` value has **no effect** under Entra authentication: the chart omits `*_STORAGE_USER` whenever `azureManagedIdentityClientId` or `azureSystemIdentity` is set. If the principal is in neither the URL nor that variable, the driver sends an empty username and PostgreSQL answers `no PostgreSQL user name specified in startup packet`, which points nowhere near the real cause.
+</Warning>
+
+### Applying the pod label
+
+**Skip this section if your chart exposes `global.podLabels`** (see above) — it exists only for charts that do not.
+
+Otherwise, patch the deployments after every `helm install` or `helm upgrade` — the upgrade rewrites the pod template and drops the label:
+
+```bash
+NS=CORE_NAMESPACE
+for d in $(kubectl -n $NS get deploy -o name | grep -vE 'console|pages'); do
+  kubectl -n $NS patch "$d" --type=strategic \
+    -p '{"spec":{"template":{"metadata":{"labels":{"azure.workload.identity/use":"true"}}}}}'
+done
+```
+
+Repeat for your apps namespace.
+
+<Warning>
+If your deployment pipeline rebuilds the Helm package from source on every run — a common GitOps arrangement — this patch is reverted on the next deploy and is not a durable fix. On such a pipeline, Option B needs a chart that exposes `global.podLabels`, or use Option A.
+</Warning>
+
+### Verify it actually worked
+
+This is the only reliable check, and it takes one command:
+
+```bash
+kubectl -n CORE_NAMESPACE exec deploy/prismeai-prismeai-events -- \
+  printenv AZURE_FEDERATED_TOKEN_FILE
+```
+
+- **Prints a path** → the webhook fired and the pod is authenticating through federation. Option B is working.
+- **Prints nothing** → the webhook did not fire. The pod is falling back to IMDS, whatever else appears to work. Re-check the pod label, the ServiceAccount annotation, and that `serviceAccount.name` is set on that chart.
+
+A pod can pass every functional test while printing nothing here — if the identity is also attached to your node pool, IMDS answers and the system behaves normally, sharing one identity across every pod on the node. Functional success is not evidence that Option B is configured.
+
+### Troubleshooting
+
+Every message below was produced on a real cluster by breaking one thing
+deliberately, so they are what you will actually see.
+
+<Warning>
+**Read a `ChainedTokenCredential` error to the end.** The Azure SDK tries each
+credential in turn and reports them all, so the first two lines are usually
+`EnvironmentCredential is unavailable` — which is noise. The real cause is last:
+
+```
+ChainedTokenCredential authentication failed.
+CredentialUnavailableError: EnvironmentCredential is unavailable...   ← noise
+AuthenticationRequiredError: invalid_client: Error(s): 700213
+  AADSTS700213: No matching federated identity record found ...       ← the cause
+```
+</Warning>
+
+#### The federated credential does not match
+
+```
+AADSTS700213: No matching federated identity record found for presented assertion
+subject 'system:serviceaccount:core:wrong-sa'. Check your federated identity
+credential Subject, Audience and Issuer against the presented assertion.
+```
+
+Azure quotes the subject it received. Compare it character by character with your
+`az identity federated-credential create --subject`. The subject is always
+`system:serviceaccount:<namespace>:<serviceaccountname>`, so a mismatch means the
+namespace is wrong, `serviceAccount.name` was not set on that chart, or the pod fell
+back to the `default` ServiceAccount.
+
+`AADSTS70021` is the same failure for the **issuer** rather than the subject — check
+`--issuer` against `az aks show --query oidcIssuerProfile.issuerUrl`.
+
+#### A leftover password, on a server expecting a token
+
+```
+28000  The access token has invalid format. Try again after making sure that the
+       token is passed exactly as returned by the authentication endpoint.
+```
+
+Nothing is wrong with the token — **none was requested**. A `password` is still set,
+so the driver short-circuits Azure authentication and sends that password where
+PostgreSQL expects a token. Remove it (step 4).
+
+#### Both PostgreSQL and Redis fail together
+
+They share exactly one thing: acquiring a token. Everything downstream — scopes,
+drivers, grants, servers — is separate. So a fault that takes out both is upstream of
+both: the pod label, the ServiceAccount annotation, or workload identity not enabled
+on the cluster. Do not start by looking at the databases.
+
+#### Symptom table
+
+| Symptom | Cause |
+|---|---|
+| Both PostgreSQL **and** Redis fail to authenticate | Token acquisition, not the databases. Missing pod label, missing ServiceAccount annotation, or workload identity not enabled on the cluster |
+| `AADSTS700213: No matching federated identity record found for presented assertion subject` | The federated credential subject does not match. The error quotes the subject it saw — compare it with your `--subject`. (`AADSTS70021` is the same problem for the *issuer* rather than the subject) |
+| `ManagedIdentityCredential authentication unavailable`, or a long hang | No federated token, and IMDS has no matching identity. Almost always the missing pod label |
+| Everything works, but you cannot prove the identity is used | Likely IMDS fallback, or a leftover static password. Run the verification command above |
+| PostgreSQL: `no PostgreSQL user name specified in startup packet` | The principal is not in the connection URL — see step 7 |
+| PostgreSQL: `password authentication failed` | The principal was never created, or was created in the wrong database — see step 6 |
+| PostgreSQL: `28000 The access token has invalid format` | A **static password is being sent instead of a token**. The message points at the token; the cause is a leftover `password` — see step 4 |
+| PostgreSQL: `function pgaadauth_create_principal(...) does not exist` | You are connected to the application database instead of `postgres` |
+| Redis: `WRONGPASS` or `NOPERM` with a valid token | No access policy assignment, or it was assigned to the clientId instead of the objectId |
+| Only some services authenticate | Not all seven values keys are set — see step 3 |
 
 ---
 
