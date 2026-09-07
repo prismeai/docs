@@ -37,13 +37,17 @@ Before deploying these microservices, ensure you have access to the following de
   </Card>
   <Card title="Redis" icon="server">
     Required for inter-service communication
-    
-    - Can use the same Redis instance as the core deployment
+
+    - May share an instance only if it uses `noeviction` and has enough capacity
     - Manages crawl queues and job scheduling
     - Facilitates communication between services
-    - Stores temporary processing data
+    - Must run with `maxmemory-policy=noeviction`
   </Card>
 </CardGroup>
+
+<Warning>
+  Redis stores engine definitions and crawl queues; it is not a cache. `prismeai-searchengine` checks the eviction policy at startup in every mode. `prismeai-crawler` also checks it in `durable-webhooks` and `full` modes. If Redis denies `CONFIG GET`, the services start with a warning and you must enforce the policy in your deployment. See [Redis configuration](/self-hosting/databases/redis).
+</Warning>
 
 ## Configuration
 
@@ -69,7 +73,7 @@ Configure the Crawler and SearchEngine microservices with the following environm
 <Accordion title="Crawler-Specific Environment Variables">
   | Variable Name | Description | Default Value | Affected Services |
   |---------------|-------------|---------------|-------------------|
-  | `MAX_CONTENT_LEN`                 | Maximum length (in characters) of documents crawled | `150000` | prismeai-crawler |
+  | `MAX_CONTENT_LEN`                 | Maximum length (in characters) of documents crawled | `1500000` | prismeai-crawler |
   | `CONCURRENT_REQUESTS`             | [The maximum number of concurrent (i.e. simultaneous) requests that will be performed by the Scrapy downloader](https://docs.scrapy.org/en/latest/topics/settings.html#concurrent-requests)          | `16` | prismeai-crawler |
   | `CONCURRENT_REQUESTS_PER_DOMAIN`  | The maximum number of concurrent (i.e. simultaneous) requests that will be performed to any single domain.          | `16` | prismeai-crawler |
   | `DOWNLOAD_DELAY`                  | [Minimum seconds to wait between 2 consecutive requests to the same domain.](https://docs.scrapy.org/en/latest/topics/settings.html#download-delay)          | `0` | prismeai-crawler |
@@ -78,16 +82,18 @@ Configure the Crawler and SearchEngine microservices with the following environm
   | `USER_AGENT`                      | Crawler HTTP user agent | `Prisme.ai (https://prisme.ai)` | prismeai-crawler
   | `ROBOTSTXT_OBEY`                  | Whether the crawler should respect the site's `robots.txt`. <br/><br/>- Recommended: **`True`** for all public websites. <br/>- For **internal portals (e.g. SharePoint, intranet)**, you may set **`False`** if robots.txt prevents access to content you are authorized to crawl. <br/><br/>⚠️ Disabling this option should only be done in controlled/internal environments. | `True` | prismeai-crawler |
   | `DEFAULT_ENGINE_WEBPAGES_LIMIT`   | Maximum pages that can be indexed per search engine before crawling stops | `30000` | prismeai-crawler |
-  | `MAX_SEARCHENGINES_NB`            | Maximum number of search engines to run concurrently. `-1` means unlimited. | `-1` | prismeai-crawler |
+  | `MAX_SEARCHENGINES_NB`            | Maximum number of search engines to run concurrently. `-1` means unlimited. Must stay `-1` when [`CRAWLER_RELIABILITY_MODE=full`](#reliability-mode). | `-1` | prismeai-crawler |
+  | `TARGET_SEARCHENGINES`            | Restrict a pod to a comma-separated list of search engine ids (e.g. `myworkspace/mycrawler`). Must be unset when [`CRAWLER_RELIABILITY_MODE=full`](#reliability-mode). |  | prismeai-crawler |
+  | `SEARCHENGINES_SYNC_METHOD`       | How engine configuration updates are propagated: `streams` (durably ordered) or `pubsub`. Must stay `streams` when [`CRAWLER_RELIABILITY_MODE=full`](#reliability-mode). | `streams` | Both |
 
 </Accordion>
 
 <Accordion title="ACK & Reliability Environment Variables">
-  These settings control the acknowledgment mechanism that ensures zero data loss when the crawler crashes during request processing.
+  These settings control how the crawler recovers work after a crash.
 
   | Variable Name | Description | Default Value | Affected Services |
   |---------------|-------------|---------------|-------------------|
-  | `ACK_ENABLED` | Enable/disable the request acknowledgment mechanism. When enabled, requests are tracked atomically in Redis and automatically reclaimed if the crawler crashes during processing. Disabling this reverts to the original behavior where crashed requests are lost. | `True` | prismeai-crawler |
+  | `ACK_ENABLED` | Enable/disable the request acknowledgment mechanism. When enabled, requests are tracked atomically in Redis and automatically reclaimed if the crawler crashes during processing. Disabling this reverts to the original behavior where crashed requests are lost. Must stay `True` when [`CRAWLER_RELIABILITY_MODE=full`](#reliability-mode). | `True` | prismeai-crawler |
   | `ACK_DUPEFILTER_DROPS` | When `True`, requests dropped by the deduplication filter are also ACKed (cleaned up from pending structures). | `True` | prismeai-crawler |
   | `SKIP_NON_RETRIABLE_ERRORS` | When `True`, HTTP 400/401/403/404/410 errors and certain exceptions (`UnsupportedFormat`, `CorruptedFile`, `AuthenticationFailed`) are moved to the DLQ immediately rather than retried. | `True` | prismeai-crawler |
   | `PENDING_VISIBILITY_TIMEOUT` | Time in seconds before a pending request is considered stale and eligible for reclaim. Set this to 2-3x your longest document processing time (e.g., large PDFs). If a request takes longer than this timeout, it will be retried. | `900` (15 minutes) | prismeai-crawler |
@@ -155,7 +161,7 @@ When planning your deployment, consider these resource recommendations:
   </Card>
   <Card title="Storage Needs" icon="hard-drive">
     - **ElasticSearch**: Plan for index growth based on content volume
-    - **Redis**: Minimal requirements for queue management
+    - **Redis**: Plan capacity for engine state, crawl queues, and the webhook outbox
     - Consider storage class with good I/O performance
   </Card>
   <Card title="Network Configuration" icon="network-wired">
@@ -164,6 +170,83 @@ When planning your deployment, consider these resource recommendations:
     - Consider bandwidth requirements for crawl activities
   </Card>
 </CardGroup>
+
+## Reliability mode
+
+Set `CRAWLER_RELIABILITY_MODE` on both services to choose the reliability level. The default is `legacy`, so upgrading does not enable the new delivery path automatically.
+
+| Mode | What it enables |
+|------|-----------------|
+| `legacy` *(default)* | Best-effort webhooks; crawler processes remain active while waiting for work. |
+| `durable-webhooks` | Adds a Redis-backed webhook outbox with retries and dead-lettering. Delivery is at least once. |
+| `full` | Adds atomic crawl admission and lets idle crawl workers stop and restart when work arrives. |
+
+<Warning>
+  Use the same mode on `prismeai-crawler` and `prismeai-searchengine`. During a rolling upgrade, update the crawler first and the searchengine second. Downgrade them in the reverse order.
+</Warning>
+
+### Prerequisites
+
+- Use a dedicated or correctly sized Redis instance with `maxmemory-policy=noeviction` in every mode. Do not use a cache-tuned LRU instance.
+- For `durable-webhooks` and `full`, enable Redis AOF persistence with `appendfsync everysec` or stronger so a Redis restart does not undermine the delivery guarantees.
+- Webhook consumers must be idempotent in `durable-webhooks` and `full`. Deduplicate events by the top-level `id` or `dedup_key`.
+- In `full`, any crawler pod can process any engine. Keep these required settings at their defaults:
+
+| Setting | Required value at `full` |
+|---------|--------------------------|
+| `ACK_ENABLED` | `True` |
+| `MAX_SEARCHENGINES_NB` | `-1` |
+| `TARGET_SEARCHENGINES` | unset |
+| `SEARCHENGINES_SYNC_METHOD` | `streams` on both services |
+
+### Enable full mode
+
+Set the variable on both services in your `values.yaml`, then deploy them together:
+
+```yaml
+prismeai-crawler:
+  env:
+    - name: CRAWLER_RELIABILITY_MODE
+      value: "full"
+
+prismeai-searchengine:
+  env:
+    - name: CRAWLER_RELIABILITY_MODE
+      value: "full"
+```
+
+Unknown values fall back to `legacy` and produce a warning.
+
+### Monitor durable webhooks
+
+In `durable-webhooks` and `full`, monitor the `outbox.stream.depth` and `outbox.dispatcher.pel.length` gauges. Alert well before the outbox reaches `WEBHOOK_OUTBOX_MAXLEN` (100,000 entries by default).
+
+<Warning>
+  At `WEBHOOK_OUTBOX_MAXLEN`, Redis may trim the oldest entries before delivery. Treat the limit as an emergency memory guard, not a normal operating level.
+</Warning>
+
+### API behaviour at `full`
+
+In `full`, `/index` admits each crawl batch atomically. Clients must handle the following responses:
+
+| Status | Meaning | Client action |
+|--------|---------|---------------|
+| `200` | All batches were accepted | — |
+| `400` | Invalid batch | Fix the request |
+| `404` | Unknown engine | — |
+| `503` + `Retry-After: 30` | The engine queue remained above its limit | Retry the same request after the delay |
+| `500` | Internal admission failure | Do not retry automatically; investigate the service |
+
+Below `full`, `/index` keeps its historical behaviour: a direct queue write with no backpressure refusal.
+
+<Note>
+  Large `/index` requests are split into batches. A `503` can therefore arrive after earlier batches were accepted; retrying the full request may create duplicates. Engine creation, update, and reset retry seed admission in the background instead of returning `503`.
+</Note>
+
+### Downgrading
+
+- Downgrade `prismeai-searchengine` first, then `prismeai-crawler`.
+- Before returning to `legacy`, stop webhook producers or wait for the outbox to drain. `legacy` does not consume entries left in the outbox.
 
 ## Deployment Process
 
