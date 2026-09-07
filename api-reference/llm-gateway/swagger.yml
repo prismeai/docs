@@ -34,6 +34,8 @@ tags:
     description: OpenAI-compatible chat completions (with optional SSE streaming).
   - name: Embeddings
     description: OpenAI-compatible text embeddings.
+  - name: Rerank
+    description: Rerank documents by relevance to a query (standard rerank contract, LLM-as-reranker backend).
   - name: Models
     description: Model catalogue (CRUD + bulk replace + governance-aware listing).
   - name: Defaults
@@ -183,6 +185,89 @@ paths:
                 $ref: '#/components/schemas/Error'
         '429':
           description: Governance quota exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/rerank:
+    post:
+      tags: [Rerank]
+      operationId: createRerank
+      summary: Rerank documents by relevance
+      description: |
+        Reranks a set of candidate documents by their relevance to a query,
+        following the de-facto standard rerank contract (compatible with
+        Cohere v2 / Jina / Voyage): a request of `{ model, query, documents }`
+        returns `{ results: [{ index, relevance_score }] }` sorted by
+        `relevance_score` descending, where `index` is the position of the
+        document in the input `documents` array.
+
+        **Backend.** LLM-as-reranker: relevance is scored via chat completions
+        (deterministic, `temperature: 0`, JSON output), then sorted server-side
+        so the ordering never relies on the model's own output order. The
+        request/response contract deliberately matches native rerankers, so the
+        backend can later be swapped to a native cross-encoder without changing
+        callers. Use `model: "mock"` for a deterministic, LLM-free response in
+        CI / load tests.
+
+        **Limits.** All documents are scored in a single prompt (no batching);
+        `documents` is capped at 200 items and `max_tokens_per_doc` is advisory.
+        Suited to a post-retrieval rerank window rather than large corpora.
+
+        **Rate limiting.** 100 requests per 60 seconds per consumer
+        (`auth.user_id` or `session.id`).
+
+        **Governance.** Reuses the `chat-completions` permission and the
+        organization governance overlay, so calls may be rejected with
+        `403 MODEL_NOT_ALLOWED` or `429` quota errors.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RerankRequest'
+      responses:
+        '200':
+          description: Successful rerank response (results sorted by relevance_score descending).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RerankResponse'
+        '400':
+          description: |
+            Validation error: missing `query`, empty `documents`, or more than
+            200 documents.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            Model not allowed for this caller (governance overlay).
+            `error.code` is typically `MODEL_NOT_ALLOWED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: |
+            Rate limit exceeded (`code: RATE_LIMITED`, 100 req / 60 s per
+            consumer) or governance quota exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: |
+            The reranker backend failed or returned no parseable results
+            (`code: RERANK_FAILED` or `RERANK_PARSE_FAILED`).
           content:
             application/json:
               schema:
@@ -986,6 +1071,82 @@ components:
           items:
             type: number
             format: float
+
+    RerankRequest:
+      type: object
+      required: [query, documents]
+      properties:
+        model:
+          type: string
+          maxLength: 256
+          description: |
+            Reranker model id. Defaults to the gateway's configured completions
+            default. Use `"mock"` for a deterministic, LLM-free response.
+        query:
+          type: string
+          maxLength: 8192
+          description: The search query to rank the documents against.
+        documents:
+          type: array
+          maxItems: 200
+          description: Candidate passages to rerank.
+          items:
+            type: string
+            maxLength: 8192
+        top_n:
+          type: integer
+          description: |
+            Limit the number of returned results. Defaults to all documents; a
+            value of 0 or less is ignored (returns all).
+        max_tokens_per_doc:
+          type: integer
+          description: |
+            Accepted for contract compatibility with native rerankers.
+            Currently advisory (not enforced).
+        analytics_context:
+          type: object
+          description: '**Prisme.ai extension.** Caller-supplied analytics context.'
+          additionalProperties: true
+
+    RerankResult:
+      type: object
+      required: [index, relevance_score]
+      properties:
+        index:
+          type: integer
+          description: Position of the document in the input `documents` array.
+        relevance_score:
+          type: number
+          format: float
+          description: Relevance of the document to the query, normalized to [0, 1].
+
+    RerankResponse:
+      type: object
+      required: [id, results]
+      properties:
+        id:
+          type: string
+          description: Unique identifier for this rerank request.
+        results:
+          type: array
+          description: Scored documents, sorted by `relevance_score` descending.
+          items:
+            $ref: '#/components/schemas/RerankResult'
+        meta:
+          type: object
+          properties:
+            model:
+              type: string
+            backend:
+              type: string
+              enum: [llm-as-reranker, mock]
+            billed_units:
+              type: object
+              properties:
+                input_tokens:
+                  type: integer
+                output_tokens:
+                  type: integer
 
     Model:
       type: object
