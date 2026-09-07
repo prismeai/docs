@@ -30,6 +30,8 @@ tags:
   description: Recurring web crawl seeds that discover and index pages into a knowledge base.
 - name: Search
   description: Semantic search over a knowledge base.
+- name: MCP
+  description: Per-knowledge-base Model Context Protocol endpoint for deterministic, filesystem-style access to content (kb_search, kb_ls, kb_find, kb_cat, kb_grep, kb_head, kb_tail, kb_sed, kb_source_url).
 - name: Access
   description: Per-knowledge-base access bindings (user, group, org, agent principals).
 - name: API Keys
@@ -1528,6 +1530,131 @@ paths:
           $ref: '#/components/responses/Error429'
         '502':
           $ref: '#/components/responses/Error502'
+  /v1/knowledge_bases/{knowledgeBaseId}/mcp:
+    parameters:
+    - name: knowledgeBaseId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: ^vs_[A-Za-z0-9-]+$
+        maxLength: 128
+      description: Knowledge base id. Legacy physical prefix `vs_` (the `kb_` rename is deferred).
+    post:
+      operationId: knowledgeBaseMcp
+      tags:
+      - MCP
+      summary: MCP endpoint (agentic filesystem access)
+      description: |
+        Per-knowledge-base Model Context Protocol endpoint (JSON-RPC 2.0, MCP spec
+        2025-06-18). Gives agents deterministic, filesystem-style access to this
+        base's content, complementary to semantic `/search`. The `knowledge_base_id`
+        is fixed by the URL and injected into every tool call, so an agent connected
+        here can only read THIS base and never passes the id itself. Access control
+        reuses the same middleware as the REST routes; content returned by the tools
+        is redacted from execution events.
+
+        Nine tools are exposed via `tools/list` and `tools/call`: `kb_search`
+        (semantic top-k), `kb_ls` (list documents), `kb_find` (find by name),
+        `kb_cat` (read a full document, chunks reassembled and de-duplicated),
+        `kb_grep` (pattern search with line numbers, literal by default), `kb_head`
+        and `kb_tail` (first and last N lines), `kb_sed` (output-only substitution,
+        never persisted) and `kb_source_url` (resolve a citation link).
+
+        Transport: POST only. A GET (SSE stream probe) returns 405; this endpoint
+        does not offer server-streaming.
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        description: A single JSON-RPC 2.0 request (`initialize`, `tools/list`, or `tools/call`).
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - jsonrpc
+              - method
+              properties:
+                jsonrpc:
+                  type: string
+                  enum:
+                  - '2.0'
+                id:
+                  description: Request id echoed back in the response. Omit for notifications.
+                  oneOf:
+                  - type: string
+                  - type: integer
+                method:
+                  type: string
+                  enum:
+                  - initialize
+                  - notifications/initialized
+                  - tools/list
+                  - tools/call
+                params:
+                  type: object
+                  description: |
+                    For `tools/call`: `{ name, arguments }` where `name` is one of the
+                    nine tools and `arguments` carries that tool's parameters. The
+                    `knowledge_base_id` is injected from the path and must not be sent.
+            examples:
+              toolsList:
+                summary: List the available tools
+                value:
+                  jsonrpc: '2.0'
+                  id: 1
+                  method: tools/list
+              grep:
+                summary: Grep a literal token across the base
+                value:
+                  jsonrpc: '2.0'
+                  id: 2
+                  method: tools/call
+                  params:
+                    name: kb_grep
+                    arguments:
+                      pattern: INV-42
+      responses:
+        '200':
+          description: |
+            JSON-RPC 2.0 response envelope. Tool results follow the MCP
+            `CallToolResult` shape (`content[]`, `structuredContent`, `isError`).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jsonrpc:
+                    type: string
+                    enum:
+                    - '2.0'
+                  id:
+                    nullable: true
+                    oneOf:
+                    - type: string
+                    - type: integer
+                  result:
+                    type: object
+                    description: Present on success (tool result, tools/list, or initialize).
+                  error:
+                    type: object
+                    description: Present on JSON-RPC errors (unknown method or tool, auth, rate limit).
+                    properties:
+                      code:
+                        type: integer
+                      message:
+                        type: string
+        '401':
+          $ref: '#/components/responses/Error401'
+        '403':
+          $ref: '#/components/responses/Error403'
+        '404':
+          $ref: '#/components/responses/Error404'
+        '405':
+          description: 'Method Not Allowed: the endpoint accepts POST only (a GET SSE stream is not offered).'
+        '429':
+          $ref: '#/components/responses/Error429'
   /v1/knowledge_bases/{knowledgeBaseId}/access:
     parameters:
     - name: knowledgeBaseId
