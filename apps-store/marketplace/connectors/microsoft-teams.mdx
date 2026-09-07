@@ -1,0 +1,713 @@
+---
+title: 'Microsoft Teams'
+description: 'Teams, channels, chats, messages and online meetings from Agent Factory agents and Builder workflows, plus an inbound Teams bot, via Microsoft Graph with per-user Microsoft Entra OAuth'
+---
+
+<img
+  src="/images/connectors/microsoft-teams.png"
+  alt="Microsoft Teams"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The Microsoft Teams app provides read/write access to Microsoft Teams through the [Microsoft Graph](https://learn.microsoft.com/en-us/graph/overview) REST API (v1.0): teams and channels, channel messages and their reply threads, one-to-one and group chats, and online meetings with their transcripts, recordings and attendance reports. It can be consumed three ways: as a remote MCP server that **Agent Factory** agents call as tools, as a Builder app whose instructions you call directly from DSUL, and as a **chat connector** — an inbound Teams bot that hands each incoming message to your own automation. The MCP surface groups every operation into **four entity tools** (`teams`, `channelMessages`, `chats`, `meetings`), each driven by an `action` argument, and runs in the **tenant app-instance context** (it resolves the installing workspace's own credentials). Authentication is per-user and supports several modes:
+
+- **Per-user OAuth2 (central client)** (`oauthCentral`, recommended): one Microsoft Entra OAuth Application is registered once by the platform maintainer; every end user signs in with their own Microsoft account. Nothing to register per tenant: each workspace just installs the app and clicks *Connect*.
+- **Per-user OAuth2 (tenant client)** (`oauth`): paste your own Entra application (client) ID/secret in the connector config app. Each user signs in with their own account against your client (PKCE authorization-code flow).
+- **Application (client credentials)** (`clientCredentials`): an Entra app with **application** Graph permissions and admin consent, acting without an interactive sign-in. Best for back-office / service automations and content indexing.
+- **Direct access token** (`accessToken`): a caller-managed Microsoft Graph access token, used as-is with no exchange.
+
+<CardGroup cols={3}>
+  <Card title="Conversations" icon="comments">
+    Browse joined teams and channels, read channel messages and their reply threads, read and post one-to-one and group chats, and inspect team, channel and chat rosters
+  </Card>
+  <Card title="Meetings & transcripts" icon="video">
+    Find meetings through the calendar, resolve a join URL into a meeting, schedule and update meetings, and read transcripts, recordings metadata and attendance reports
+  </Card>
+  <Card title="Chat connector" icon="robot">
+    Register a Teams bot whose messages are signature-verified and handed to your automation, so people can talk to an agent from a Teams conversation
+  </Card>
+</CardGroup>
+
+## Who is this for?
+
+This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
+
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot">
+    You build agents in **Agent Factory** and want them to read Teams conversations and meeting transcripts. → *Agent builder* tab.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved">
+    You run the platform and set up the shared Microsoft Entra OAuth client once for everyone. → *Platform admin setup* accordion below.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece">
+    You write Builder automations (DSUL) that call Teams operations, or run the inbound bot. → *Workspace builder* and *Chat connector* tabs.
+  </Card>
+</CardGroup>
+
+## Prerequisites (Microsoft side)
+
+- A **Microsoft 365** tenant with Teams, and an **Azure / Microsoft Entra ID** tenant where you can register an application (or a maintainer who already did).
+- An **app registration** in [Microsoft Entra ID](https://entra.microsoft.com) (Azure portal → **App registrations**), with a **client secret** created under **Certificates & secrets**.
+- **Microsoft Graph delegated permissions** granted on the app (for the per-user OAuth modes), covering the resources you intend to use:
+  - Teams & channels: `Team.ReadBasic.All`, `Channel.ReadBasic.All`, `TeamMember.Read.All`
+  - Channel messages: `ChannelMessage.Read.All` (add `ChannelMessage.Send` to post)
+  - Chats: `Chat.Read`, `ChatMessage.Read` (or `Chat.ReadWrite` + `ChatMessage.Send` to post)
+  - Meetings: `Calendars.Read` (meeting discovery goes through the calendar), `OnlineMeetings.Read` (or `OnlineMeetings.ReadWrite`), `OnlineMeetingTranscript.Read.All`, `OnlineMeetingArtifact.Read.All`
+  - Sign-in / identity: `openid`, `profile`, `offline_access`, `User.Read`
+- For the **application (client-credentials)** mode instead, grant the equivalent **application** permissions and have a Global Administrator grant admin consent. Reading channel messages with application permissions additionally requires Microsoft's [protected API approval](https://learn.microsoft.com/en-us/graph/teams-protected-apis).
+- For the **chat connector** only: an **Azure Bot** resource with the Microsoft Teams channel enabled (see the *Chat connector* tab).
+
+The OAuth scopes requested by the read-only preset are:
+
+```text
+offline_access
+https://graph.microsoft.com/User.Read
+https://graph.microsoft.com/Team.ReadBasic.All
+https://graph.microsoft.com/Channel.ReadBasic.All
+https://graph.microsoft.com/TeamMember.Read.All
+https://graph.microsoft.com/ChannelMessage.Read.All
+https://graph.microsoft.com/Chat.Read
+https://graph.microsoft.com/ChatMessage.Read
+https://graph.microsoft.com/Calendars.Read
+https://graph.microsoft.com/OnlineMeetings.Read
+https://graph.microsoft.com/OnlineMeetingTranscript.Read.All
+https://graph.microsoft.com/OnlineMeetingArtifact.Read.All
+```
+
+<Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
+  **Goal:** two one-time tasks: (1) configure the shared **central Microsoft Entra OAuth client** so every workspace lets its users sign in with their own Microsoft account, and (2) expose Microsoft Teams as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
+
+  ## 1. Configure the connector
+
+  <Steps>
+    <Step title="Register the OAuth Application in Microsoft Entra ID">
+      In [Microsoft Entra ID](https://entra.microsoft.com) → **App registrations > New registration**, register a **Web** application. Add a **Redirect URI** pointing at the core workspace callback:
+
+      ```text
+      <api-url>/workspaces/<workspace-id>/webhooks/oauthCallback
+      ```
+
+      <Warning>
+        Microsoft Entra rejects redirect URIs that contain a colon in the path, so use the **raw workspace id** of the core Microsoft Teams workspace, **not** the `slug:microsoft-teams-next` form used by other connectors. Copy the exact URI from the connector's configuration app, which renders it for you.
+      </Warning>
+
+      Add the Microsoft Graph **delegated** permissions listed in *Prerequisites*, create a **client secret** under **Certificates & secrets**, and note the **Application (client) ID**, the **secret value**, and the **Directory (tenant) ID** (or use `common` / `organizations` for multi-tenant).
+    </Step>
+    <Step title="Enter the credentials through the configuration app">
+      Open the central `microsoft-teams-next` workspace and launch its **Configuration app**: `<studio>/apps/microsoft-teams-next`, also linked as `Configuration app` on the installed instance. Switch to the maintainer view and follow the in-app instructions to paste the **Client ID**, **Client Secret**, **Tenant** and (optionally) scopes; the app stores them in the core workspace's secrets for you. Do not edit Studio's raw Secrets by hand. These credentials stay in the `microsoft-teams-next` workspace and are never exposed to tenants or end users; token exchange is proxied through the core `centralTokenExchange` webhook so the client secret never leaves the core workspace.
+    </Step>
+    <Step title="Tell workspaces to use the central client">
+      Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**.
+    </Step>
+  </Steps>
+
+  ## 2. Declare the capability in AI Governance
+
+  Generic connectors (broad tool surfaces meant to be shared across many agents, like Microsoft Teams) are best exposed as a named **capability** in AI Governance. Agent builders then enable that capability on their agents instead of pasting a raw MCP endpoint.
+
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) the **Microsoft Teams** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the connector's **MCP Endpoint**, and set its **Scope** to:
+
+      ```text
+      context_id,agent_id,user_id
+      ```
+
+      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
+    </Step>
+    <Step title="Make it available to agent builders">
+      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant.
+    </Step>
+    <Step title="Smoke-test">
+      From an agent that has the capability, in a workspace configured for `oauthCentral`, trigger any tool. The user is prompted to connect once (Microsoft sign-in); subsequent calls reuse the stored token transparently and refresh it automatically.
+    </Step>
+  </Steps>
+
+  <Note>
+    The connector's configuration app also offers a one-click **Add to catalog** button (workspace owner / admin only) that publishes the Microsoft Teams capability to the organization-wide Capabilities catalog for you, the easiest way to expose it to agent builders without hand-editing Governance.
+  </Note>
+
+  <Warning>
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model**: which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is also **no OAuth auth-config JSON** to attach in Governance: connect / status / disconnect are handled by the connector's own webhooks, wired automatically.
+  </Warning>
+</Accordion>
+
+---
+
+<Tabs>
+  <Tab title="Agent builder (Agent Factory)">
+    ## Agent builder
+
+    **Goal:** let an agent you build in Agent Factory read Teams conversations, post messages, and pull meeting transcripts through MCP tools.
+
+    <Note>
+      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Microsoft Teams app in a workspace (see the *Workspace builder* tab), and, for the central OAuth mode, a *Platform admin* must have provisioned the shared Microsoft Entra OAuth client (see the *Platform admin setup* accordion above).
+    </Note>
+
+    This connector runs in the **tenant app-instance context**: your agent is authorized two ways at once: it is identified by the `agent_id` that Agent Factory injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The Microsoft Graph access token itself is resolved server-side from the configured auth mode.
+
+    There are two ways to wire it up. Pick based on how much isolation you need.
+
+    ## Option A: Enable the shared capability from the catalog
+
+    The fastest path: a *Platform admin* has already published a **Microsoft Teams** capability (see the *Platform admin setup* accordion above, §2), so you just pick it from the catalog. A workspace owner can publish it in one click with the config app's **Add to catalog** button.
+
+    <Steps>
+      <Step title="Open your agent in Agent Factory">
+        Open the agent you want to extend and go to its capabilities / tools.
+      </Step>
+      <Step title="Add the Microsoft Teams capability">
+        Browse the capability catalog, select **Microsoft Teams**, and enable it. The MCP endpoint URL and the *Scope* (`context_id,agent_id,user_id`) are already wired by the admin: nothing to paste, and the shared instance accepts every agent, so there is no allowlist step on your side.
+      </Step>
+      <Step title="Connect a Microsoft account (OAuth modes)">
+        On the first tool call, an unconnected user is prompted to sign in; Agent Factory surfaces a `connect_url`. Application (`clientCredentials`) and `accessToken` modes need no per-user sign-in.
+      </Step>
+    </Steps>
+
+    <Note>
+      Convenient, but your agent runs against a **shared, platform-managed instance**: its Microsoft credentials are owned by someone else and the instance accepts every agent that is granted the capability. Prefer Option B for anything beyond quick experiments.
+    </Note>
+
+    ## Option B: Run it from your own workspace (recommended)
+
+    For production agents, install the connector in **your own workspace** and point the agent at *that* workspace's MCP endpoint.
+
+    <Warning>
+      **Prefer this mode for security.** Because the MCP runs in *your* app-instance context, the Microsoft credentials, the per-user OAuth tokens and the authorized-agents allowlist are all **scoped to your workspace**, not shared platform-wide. You decide exactly which agents may call it and which Microsoft account / auth mode backs them, and a misconfiguration elsewhere can never expose your Teams conversations. The shared catalog capability (Option A) is a broad surface many agents can reach; your own workspace is an isolated, least-privilege boundary.
+    </Warning>
+
+    <Steps>
+      <Step title="Install and configure the connector in your workspace">
+        Follow the *Workspace builder* tab: install **Microsoft Teams** in your workspace, open its **Configuration app**, choose the auth mode and connect a Microsoft account.
+      </Step>
+      <Step title="Allowlist your agent">
+        In that workspace's config app, open **Authorized agents** and tick your agent (the **Install capability** button does this for you).
+      </Step>
+      <Step title="Add the MCP capability to your agent">
+        In your agent, add a capability pointing at **your workspace's MCP Endpoint** URL, and set its **Scope** to:
+
+        ```text
+        context_id,agent_id,user_id
+        ```
+
+        The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "agent could not be identified" message. This *Scope* is separate from the Microsoft Graph OAuth scopes.
+      </Step>
+      <Step title="Connect a Microsoft account (OAuth modes)">
+        On the first tool call, the user is prompted to sign in (or uses **Connect** in the config app).
+      </Step>
+    </Steps>
+
+    ## Brief the agent in its system prompt
+
+    Whichever option you pick, wiring the capability is not enough: the agent must know the MCP exists and when to use it. Copy-pasteable starter:
+
+    ```text
+    You have access to the Microsoft Teams MCP server (tools: teams, channelMessages, chats, meetings). Each tool takes an `action` argument. Use it whenever the user asks about Teams teams or channels, channel discussions, chats, or meetings and their transcripts. Resolve ids before reading content: use `teams` (action list, then listChannels) to get teamId and channelId, then `channelMessages`. A channel conversation is two levels deep: `list` returns the thread starters and `listReplies` returns the body of a discussion, so read both before summarizing a thread. To reach a meeting transcript, call `meetings` action list (this reads the calendar, since Graph has no "list my meetings"), then `resolve` on the joinUrl to get a meetingId, then listTranscripts and getTranscript. Prefer calling a tool over guessing, and confirm with the user before posting anything (send, reply) or creating or updating a meeting.
+    ```
+
+    <Note>
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The agent still has to be allowlisted in the config app and its identity propagated so the connector can read its `agent_id`.
+    </Note>
+
+    <Note>
+      **Restricting to read-only (least privilege).** The Teams tools cover both reads and writes (posting a channel message, replying, sending a chat message, creating or updating a meeting). The connector requests exactly the scopes configured in the **Scopes** field of the configuration app, which offers a **read-only preset**; writes are only possible if you widen it. To keep the connector read-only, use the read preset listed in *Prerequisites* — in particular leave out `ChannelMessage.Send`, `Chat.ReadWrite`, `ChatMessage.Send` and `OnlineMeetings.ReadWrite`. Any write attempt is then rejected by Microsoft Graph with `403 Forbidden`, while the connection itself stays healthy because every connection check is a read.
+
+      With the central client (`oauthCentral`) you do not create your own Entra app: you keep `oauthCentral` and simply enter the read-only scopes, which override the central default — provided the platform's central app exposes those read permissions. The scope list is set at the workspace level (a workspace editor can widen it again); for a hard guarantee, back the connection with an Entra app limited to read permissions.
+    </Note>
+
+    ## Available Tools
+
+    Each tool takes an `action` argument selecting the concrete operation, plus the per-action parameters.
+
+    | Tool | Description |
+    |------|-------------|
+    | `teams` | Teams the user belongs to, their channels and their rosters. Actions: `list`, `get`, `listChannels`, `getChannel`, `listMembers`, `listChannelMembers`. |
+    | `channelMessages` | Messages posted in a channel and their replies. A channel conversation is two levels deep: `list` returns thread starters, `listReplies` the body of a discussion. Actions: `list`, `get`, `listReplies`, `getReply`, `send`, `reply`. |
+    | `chats` | One-to-one and group conversations, outside any channel. A chat is flat: there are no replies. Actions: `list`, `get`, `listMessages`, `getMessage`, `send`, `listMembers`. |
+    | `meetings` | Online meetings: discovery, scheduling, transcripts, recordings, attendance. Actions: `list`, `resolve`, `get`, `create`, `update`, `listTranscripts`, `getTranscript`, `listRecordings`, `listAttendanceReports`, `getAttendanceReport`. |
+
+    <Note>
+      **Two Graph behaviours worth knowing before you prompt an agent.** A meeting is discovered through the **calendar**: Graph has no "list my online meetings" collection, so `meetings` `list` reads calendar events and `resolve` turns a `joinUrl` into the `meetingId` every other action needs. And a **transcript is WebVTT text**, not JSON: `getTranscript` returns speaker-tagged plain text, truncated on a line boundary (`maxTranscriptCharacters`, 20000 by default) so a long meeting cannot exhaust the agent's context window.
+    </Note>
+
+    ## Output Formats
+
+    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
+
+    - **`verbose`** (default): a human-readable text view, optimized for LLM consumption.
+    - **`structured`**: concise machine-readable JSON in `structuredContent`.
+    - **`both`**: the structured payload, with its JSON also rendered as text.
+
+    ## Knowledge Resources
+
+    The connector also exposes Teams conversations as **MCP Resources**, so a knowledge base can index them. The tree is flattened to the discussion: a **team** and a **channel** are containers, and a **thread** — a root message plus its replies — is the document. Each thread's revision folds in the timestamp of the newest reply and the reply count, because the root message's own `lastModifiedDateTime` does not move when someone answers; without that, an answered question would never be re-indexed. Access is checked per reader, at that reader's own identity.
+
+    Channel **files** are not indexed here: they live in the team's SharePoint site and belong to the SharePoint connector.
+
+    ## Tool Details
+
+    ### teams
+
+    ```json
+    {
+      "name": "teams",
+      "arguments": {
+        "action": "listChannels",
+        "teamId": "19:abc...@thread.tacv2"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `list`, `get`, `listChannels`, `getChannel`, `listMembers`, `listChannelMembers`. |
+    | `teamId` | For every action except `list` | Team id. |
+    | `channelId` | For getChannel/listChannelMembers | Channel id. |
+    | `userId` | No (list only) | Target user; omit for the signed-in user. |
+    | `top` / `select` / `filter` / `skiptoken` | No | OData query options and pagination (`top` 1..100, default 20). |
+
+    <Note>
+      `list` accepts no OData query option: Microsoft Graph answers `400 Query option 'Top' is not allowed` on `joinedTeams` rather than ignoring it. It returns every team the identity belongs to in one response, so there is nothing to page.
+    </Note>
+
+    ### channelMessages
+
+    ```json
+    {
+      "name": "channelMessages",
+      "arguments": {
+        "action": "listReplies",
+        "teamId": "19:abc...@thread.tacv2",
+        "channelId": "19:def...@thread.tacv2",
+        "messageId": "1700000000000"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `list`, `get`, `listReplies`, `getReply`, `send`, `reply`. |
+    | `teamId` | Yes | Team id. |
+    | `channelId` | Yes | Channel id. |
+    | `messageId` | For get/listReplies/getReply/reply | Root message id. |
+    | `replyId` | For getReply | Reply id. |
+    | `top` / `select` / `expand` / `skiptoken` | No | OData query options; `top` is clamped to 1..50 by Graph on channel messages. `expand=replies` inlines a whole thread in one call. |
+    | `body` | For send/reply | A chatMessage resource, e.g. `{ body: { contentType: 'html', content: '...' } }`. |
+
+    ### chats
+
+    ```json
+    {
+      "name": "chats",
+      "arguments": {
+        "action": "listMessages",
+        "chatId": "19:abc...@unq.gbl.spaces",
+        "top": 20
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `list`, `get`, `listMessages`, `getMessage`, `send`, `listMembers`. |
+    | `chatId` | For every action except `list` | Chat id. |
+    | `messageId` | For getMessage | Message id. |
+    | `userId` | No (list only) | Target user; omit for the signed-in user. |
+    | `top` / `select` / `expand` / `filter` / `orderby` / `skiptoken` | No | OData query options; `top` is clamped to 1..50 by Graph on chat messages. |
+    | `body` | For send | A chatMessage resource, e.g. `{ body: { contentType: 'text', content: '...' } }`. |
+
+    <Note>
+      Chats are private conversations: everything here is read at the connected user's own identity, and a chat they have left is no longer readable.
+    </Note>
+
+    ### meetings
+
+    ```json
+    {
+      "name": "meetings",
+      "arguments": {
+        "action": "resolve",
+        "joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3ameeting_..."
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `action` | Yes | One of `list`, `resolve`, `get`, `create`, `update`, `listTranscripts`, `getTranscript`, `listRecordings`, `listAttendanceReports`, `getAttendanceReport`. |
+    | `meetingId` | For every action except list/resolve/create | Online meeting id; obtain it with `resolve`. |
+    | `joinUrl` | For resolve | The meeting join URL, as returned by `list`. |
+    | `transcriptId` | For getTranscript | Transcript id, from `listTranscripts`. |
+    | `reportId` | For getAttendanceReport | Attendance report id. |
+    | `from` / `to` | No (list only) | ISO 8601 window bounds, e.g. `2026-01-01T00:00:00Z`. |
+    | `userId` | No | Target user; omit for the signed-in user. Application-mode calls must set it, since there is no `me` without a signed-in user. |
+    | `maxTranscriptCharacters` | No (getTranscript only) | Truncate the WebVTT beyond this many characters; default 20000, clamped 2000..120000. |
+    | `body` | For create/update | An onlineMeeting resource, e.g. `{ startDateTime, endDateTime, subject }`. |
+
+    The usual chain is `list` → `resolve(joinUrl)` → `listTranscripts` → `getTranscript`.
+  </Tab>
+
+  <Tab title="Workspace builder (DSUL)">
+    ## Workspace builder
+
+    **Goal:** install the connector in a workspace, configure authentication and the agent allowlist, and call Teams operations from your automations.
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **Microsoft Teams** and install it
+    3. Open the **Configuration app** (the link auto-populated on install) to choose the auth mode, provide credentials, connect, and allow the agents that may call the connector
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Configuration app** | Auto-populated on install; open this link to configure authentication (mode + credentials), connect a Microsoft account (OAuth modes), manage the authorized-agents allowlist, and register the Teams bot. |
+    | **Microsoft Graph API version** | `v1.0` (default) or `beta`. |
+    | **Knowledge-sync** | Which workspaces may run a delegated Resource access check on behalf of a named reader. Defaults to the platform's knowledge-sync workspace. |
+
+    The configuration app drives everything; the app instance itself has no per-field credential form. It is organised in three tabs — **Authentication**, **Agents** (MCP endpoint, catalog entry and the authorized-agents allowlist) and **Teams bot** — and from the first one you pick one of:
+
+    | Auth mode | What you provide | Best for |
+    |-----------|------------------|----------|
+    | `oauthCentral` | Nothing; just click **Connect** | Workspaces on a platform where the admin set up the central client |
+    | `oauth` | Your own Entra **Application (client) ID + Secret** (+ tenant; redirect URI `<api-url>/workspaces/<your-workspace-id>/webhooks/oauthCallback`) | You manage your own Microsoft Entra OAuth app |
+    | `clientCredentials` | Entra **client ID + secret + tenant** with admin-consented **application** Graph permissions | Server-to-server / back-office, content indexing, no interactive sign-in |
+    | `accessToken` | A pre-minted Microsoft Graph **access token** | Short-lived / caller-managed tokens |
+
+    <Warning>
+      Microsoft Entra rejects a colon in the redirect URI path, so for the `oauth` mode use your workspace's **raw id** in the redirect URI, not the `slug:` form. The configuration app shows the exact URI to register.
+    </Warning>
+
+    <Note>
+      Credentials are provisioned into the workspace's Secrets by the `onInstall` flow and resolved server-side. Always set them through the configuration app rather than Studio's Secrets screen. The agent allowlist (**Authorized agents**) gates which Agent Factory agents may call the MCP endpoint; see the *Agent builder* tab.
+    </Note>
+
+    ## Available Instructions
+
+    Every instruction resolves credentials from the workspace configuration. Operations are grouped by Teams resource; the MCP server exposes the same operations behind the four entity tools (see the *Agent builder* tab). Instructions that read or write on behalf of a specific person accept an optional `userId`; omit it for the signed-in user.
+
+    ### Teams & channels
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listJoinedTeams` | List the teams the identity belongs to. Accepts no OData option. | `{ value: [{ id, displayName, description }] }` |
+    | `getTeam` | Get a team by `teamId`. | A team resource `{ id, displayName, visibility, … }`. |
+    | `listTeamMembers` | List the members of a `teamId`. | `{ value: [{ id, displayName, email, roles }] }` |
+    | `listChannels` | List the channels of a `teamId`. | `{ value: [{ id, displayName, membershipType, webUrl }] }` |
+    | `getChannel` | Get a channel by `teamId` + `channelId`. | A channel resource. |
+    | `listChannelMembers` | List the members of a channel. | `{ value: [ conversationMember ] }` |
+
+    ### Channel messages
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listChannelMessages` | Root messages of a channel, newest first (`teamId`, `channelId`). `expand=replies` inlines each thread. | `{ value: [ chatMessage ], "@odata.nextLink" }` |
+    | `getChannelMessage` | Get one root message by `messageId`. | A chatMessage `{ id, body, from, createdDateTime }`. |
+    | `listChannelMessageReplies` | Replies to a root message — where the body of a discussion lives. | `{ value: [ chatMessage ] }` |
+    | `getChannelMessageReply` | Get a single reply by `replyId`. | A chatMessage. |
+    | `sendChannelMessage` | Post a new root message; `body` = `{ body: { contentType, content }, subject? }`. | The created chatMessage. |
+    | `replyToChannelMessage` | Reply to a root message; `body` = `{ body: { contentType, content } }`. | The created chatMessage. |
+
+    ### Chats
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listChats` | Chats the identity takes part in, most recently updated first. | `{ value: [{ id, topic, chatType, lastUpdatedDateTime }] }` |
+    | `getChat` | Get a chat by `chatId`. | A chat resource. |
+    | `listChatMessages` | Messages of a chat, newest first. A chat is flat: no replies. | `{ value: [ chatMessage ] }` |
+    | `getChatMessage` | Get one message by `chatId` + `messageId`. | A chatMessage. |
+    | `sendChatMessage` | Post a message to a chat; `body` = `{ body: { contentType, content } }`. | The created chatMessage. |
+    | `listChatMembers` | List the participants of a chat. | `{ value: [ conversationMember ] }` |
+
+    ### Meetings
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listMeetingEvents` | Calendar events carrying a Teams meeting, within `from`/`to`. This is how you find a meeting. | `{ value: [{ id, subject, start, end, onlineMeeting: { joinUrl } }] }` |
+    | `resolveOnlineMeeting` | Turn a `joinUrl` into the online meeting every other operation needs. | `{ value: [ onlineMeeting ] }` |
+    | `getOnlineMeeting` | Get a meeting by `meetingId`. | An onlineMeeting resource. |
+    | `createOnlineMeeting` | Schedule a meeting; `body` = `{ startDateTime, endDateTime, subject }`. | The created onlineMeeting, with `joinWebUrl`. |
+    | `updateOnlineMeeting` | Change a meeting; `body` = the fields to update. | The updated onlineMeeting. |
+    | `listMeetingTranscripts` | Transcript ids and dates for a meeting — not the text. | `{ value: [{ id, createdDateTime }] }` |
+    | `getMeetingTranscriptContent` | The transcript itself, by `transcriptId`. | **WebVTT plain text** (speakers + timestamps), truncated on a line boundary — not JSON. |
+    | `listMeetingRecordings` | Recording metadata; the video is never returned inline. | `{ value: [{ id, createdDateTime, recordingContentUrl }] }` |
+    | `listMeetingAttendanceReports` | Attendance reports of a meeting. | `{ value: [{ id, totalParticipantCount, meetingStartDateTime }] }` |
+    | `getMeetingAttendanceReport` | One report with its records: who joined, when, for how long. | A report with `attendanceRecords`. |
+
+    ### Bot bridge
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `sendTextMessage` | Reply with plain text (Markdown supported) in the Teams conversation an inbound activity came from. `originalActivity` = the activity received on `teams.bot.messageReceived`. | The Bot Connector response `{ id }`. |
+
+    <Note>
+      `Returns` shows the shape of the operation output (the underlying Microsoft Graph resource). `getMeetingTranscriptContent` is the exception: it returns WebVTT text, because Graph serves transcripts as text rather than JSON.
+    </Note>
+
+    ## DSUL Examples
+
+    **List joined teams and their channels:**
+
+    ```yaml
+    - MicrosoftTeamsNext.listJoinedTeams:
+      output: teams
+    - MicrosoftTeamsNext.listChannels:
+        teamId: '{{teams.value[0].id}}'
+      output: channels
+    ```
+
+    **Read a channel discussion, thread starters then replies:**
+
+    ```yaml
+    - MicrosoftTeamsNext.listChannelMessages:
+        teamId: '{{teams.value[0].id}}'
+        channelId: '{{channels.value[0].id}}'
+        top: 20
+      output: messages
+    - MicrosoftTeamsNext.listChannelMessageReplies:
+        teamId: '{{teams.value[0].id}}'
+        channelId: '{{channels.value[0].id}}'
+        messageId: '{{messages.value[0].id}}'
+      output: replies
+    ```
+
+    **Post a message in a channel:**
+
+    ```yaml
+    - MicrosoftTeamsNext.sendChannelMessage:
+        teamId: '{{teams.value[0].id}}'
+        channelId: '{{channels.value[0].id}}'
+        body:
+          body:
+            contentType: html
+            content: '<p>Deployment finished.</p>'
+      output: posted
+    ```
+
+    **Find a meeting and read its transcript:**
+
+    ```yaml
+    - MicrosoftTeamsNext.listMeetingEvents:
+        from: '2026-01-01T00:00:00Z'
+        to: '2026-01-31T23:59:59Z'
+        top: 20
+      output: events
+    - MicrosoftTeamsNext.resolveOnlineMeeting:
+        joinUrl: '{{events.value[0].onlineMeeting.joinUrl}}'
+      output: meeting
+    - MicrosoftTeamsNext.listMeetingTranscripts:
+        meetingId: '{{meeting.value[0].id}}'
+      output: transcripts
+    - MicrosoftTeamsNext.getMeetingTranscriptContent:
+        meetingId: '{{meeting.value[0].id}}'
+        transcriptId: '{{transcripts.value[0].id}}'
+      output: transcript
+    ```
+
+    **Schedule a meeting:**
+
+    ```yaml
+    - MicrosoftTeamsNext.createOnlineMeeting:
+        body:
+          subject: 'Quarterly review'
+          startDateTime: '2026-02-10T09:00:00Z'
+          endDateTime: '2026-02-10T10:00:00Z'
+      output: created
+    ```
+  </Tab>
+
+  <Tab title="Chat connector (Teams bot)">
+    ## Chat connector
+
+    **Goal:** let people talk to one of your agents from inside Teams — a one-to-one chat with a bot, or a bot mentioned in a channel.
+
+    This is the connector's third surface, and it works the other way round from the other two. There, *you* call Microsoft. Here, **Microsoft calls you**: an Azure Bot forwards every message to the connector, which verifies it and hands it to an automation you write. Nothing is routed to an agent automatically — you decide what answers, which is what lets you put an approval step, a filter or a router in front of it.
+
+    ```mermaid
+    sequenceDiagram
+        participant P as Person in Teams
+        participant B as Azure Bot
+        participant C as Connector
+        participant A as Your automation
+        P->>B: sends a message
+        B->>C: POST messagesEndpoint
+        C->>C: verify signature, issuer,<br/>audience, validity, serviceUrl
+        C-->>B: 200, empty
+        C->>A: teams.bot.messageReceived
+        Note over A: you decide what answers
+        A->>C: MicrosoftTeamsNext.sendTextMessage
+        C->>B: POST the reply
+        B->>P: reply appears in the conversation
+    ```
+
+    <Note>
+      The bot is optional and independent from the rest: a workspace that only uses the tools and Knowledge Resources never needs one. Conversely, a bot needs no Microsoft Graph OAuth connection — it authenticates as the bot, not as a user.
+    </Note>
+
+    ## 1. Register an Azure Bot
+
+    <Steps>
+      <Step title="Create the Azure Bot resource">
+        In the [Azure portal](https://portal.azure.com), create an **Azure Bot** resource. Choose a **Multi Tenant** or **Single Tenant** app type and let Azure create the Microsoft App ID, or reuse an existing app registration. Note the **Microsoft App ID**, and create a **client secret** for it.
+      </Step>
+      <Step title="Enable the Microsoft Teams channel">
+        In the bot resource, open **Channels** and add **Microsoft Teams**. Without it, the bot exists but Teams will never deliver a message to it.
+      </Step>
+      <Step title="Point the messaging endpoint at the connector">
+        In **Configuration**, set the **Messaging endpoint** to the URL shown in the connector's configuration app:
+
+        ```text
+        <api-url>/workspaces/<your-workspace-id>/webhooks/<app-instance>.messagesEndpoint
+        ```
+
+        The configuration app renders the exact value with a copy button; `<app-instance>` is the slug of the installed app instance.
+      </Step>
+      <Step title="Enter the bot credentials in the configuration app">
+        Open the connector's **Configuration app** and go to its **Teams bot** tab, then paste the **Bot app ID** and **Bot app password** (the client secret). Leave *Bot tenant* empty for a multi-tenant bot; set your Entra tenant id for a single-tenant one. Save.
+
+        <Warning>
+          Enter these in the configuration app, never in Studio's **Secrets** screen. That screen serializes object values to strings, which would break not only the bot but the workspace's Microsoft Graph credentials with it.
+        </Warning>
+      </Step>
+      <Step title="Install the bot in Teams">
+        Package the bot as a Teams app (Developer Portal or an app manifest referencing the Microsoft App ID) and install it in the team or for the users who should be able to talk to it.
+      </Step>
+    </Steps>
+
+    ## 2. Answer incoming messages
+
+    Every verified activity is emitted as an event in your workspace. Write an automation that listens to it and replies.
+
+    | Event | Payload | When |
+    |-------|---------|------|
+    | `teams.bot.messageReceived` | The **full Bot Framework activity** — `type`, `text`, `from`, `conversation`, `serviceUrl`, `id`, … | Every inbound activity that passed verification. This is the one to listen to. |
+    | `teams.bot.activityReceived` | A summary: `activityType`, `conversationId`, `fromId`, `fromName` | Same trigger, lighter payload — convenient for logging or metrics. |
+    | `teams.bot.rejected` | `reason`, `activityType` | An activity failed verification and was answered `401`. Useful for alerting; the caller is never told which check failed. |
+
+    A minimal echo, to check the round trip end to end:
+
+    ```yaml
+    slug: replyInTeams
+    when:
+      events:
+        - teams.bot.messageReceived
+    do:
+      - conditions:
+          '{{payload.type}} != "message"':
+            - break: {}
+      - MicrosoftTeamsNext.sendTextMessage:
+          text: 'You said: {{payload.text}}'
+          originalActivity: '{{payload}}'
+    ```
+
+    Passing the whole activity back as `originalActivity` is what tells the connector where to answer: the conversation, the message being replied to and the `serviceUrl` are all read from it.
+
+    ## 3. Hand the message to an agent
+
+    To make the bot conversational, call your agent between the two steps and send its answer back:
+
+    ```yaml
+    slug: askAgentFromTeams
+    when:
+      events:
+        - teams.bot.messageReceived
+    do:
+      - conditions:
+          '{{payload.type}} != "message"':
+            - break: {}
+      - comment: Strip the @mention Teams prepends in a channel, so the agent sees the question only.
+      - set:
+          name: question
+          value: '{{payload.text}}'
+      - AI Knowledge.query:
+          projectId: '{{config.agentId}}'
+          question: '{{question}}'
+        output: answer
+      - MicrosoftTeamsNext.sendTextMessage:
+          text: '{{answer.output.text}}'
+          originalActivity: '{{payload}}'
+    ```
+
+    Replace the middle step with whatever should answer — an agent, a search, a routing table, or a human approval before replying. Teams renders Markdown in the reply, so lists and links come through.
+
+    <Note>
+      Bot Framework expects the webhook itself to answer immediately and empty; the reply travels back on a separate call. That is why the connector acknowledges Microsoft right away and your automation replies afterwards, and why a slow agent does not cause Teams to retry the message.
+    </Note>
+
+    ## What the connector guarantees
+
+    The messaging endpoint is **necessarily anonymous** — Microsoft calls it from outside and carries no Prisme.ai identity — so the signed token it sends is the only gate, and it is checked **before anything is emitted**. An event here makes a bot speak to a real person in a real conversation, so an unverified payload would be a way for anyone to put words in the bot's mouth. On each inbound activity the connector verifies:
+
+    - the **RS256 signature**, against Microsoft's published Bot Connector keys (cached, and re-fetched once if a key rotated);
+    - the **issuer** and the **audience** (your bot's app id);
+    - the token's **validity window**;
+    - the **`serviceUrl`** carried by the activity, which matters because the reply posts the bot token to that URL: without this check a replayed activity could aim it at a host of the attacker's choosing.
+
+    A failed check returns `401` **without saying which one failed** — telling an unauthenticated poster that would be free reconnaissance — and emits `teams.bot.rejected` so you can still see it. If Microsoft's key endpoint cannot be reached, the connector answers `503` rather than trusting the activity, and Microsoft retries.
+
+    <Note>
+      Message text is registered as sensitive before it can reach an event, so conversation content is redacted from the activity feed rather than logged in clear.
+    </Note>
+
+    ## Limits
+
+    - **Plain text and Markdown only.** Adaptive cards, typing indicators and attachments use the raw Bot Framework activity shape, which is not exposed as an instruction; `sendTextMessage` covers the conversational case.
+    - **No built-in agent routing.** The connector delivers the message and sends the reply; choosing what answers is the automation you write, as in the example above.
+    - **The reply targets the originating conversation.** Starting a conversation with a user who has never talked to the bot (proactive messaging) is not covered.
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+| HTTP code | Meaning |
+|-----------|---------|
+| `400` | Bad request: invalid parameters or malformed body. Note that some Teams endpoints **reject** OData options rather than ignoring them (`joinedTeams` refuses `$top`). |
+| `401` | Unauthorized: the Microsoft Graph access token is missing, expired or revoked. The user must reconnect (OAuth modes). On the bot endpoint: the activity's signature, issuer, audience, validity window or `serviceUrl` did not check out. |
+| `403` | Forbidden: insufficient Graph scope/permission, missing admin consent (application mode), or the account is not a member of the team or chat. |
+| `404` | Not found: the team, channel, chat, message or meeting id does not exist or is not visible to the account. |
+| `429` | Throttled: Microsoft Graph rate limit; back off and retry (honor `Retry-After`). |
+| `500` / `503` | Service error: transient; retry shortly. On the bot endpoint, `503` means Microsoft's signing keys could not be fetched — the activity was deliberately not trusted. |
+
+### Common Issues
+
+**"This agent is not authorized to use this connector"**: The calling agent is not in the allowlist. Open the configuration app → **Authorized agents** → tick this agent (or enable **Allow all agents**) and Save.
+
+**"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Factory never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allow the agent in the config app.
+
+**"Microsoft Teams is not connected for this user"**: No per-user OAuth token. Open the configuration app (OAuth mode) and click **Connect**, or use the agent's connect flow.
+
+**"token refresh failed … must reconnect"**: The stored refresh token was revoked or expired (Microsoft Entra invalidated it, or it aged past its limit). The connection is dropped automatically; the user must reconnect from the config app.
+
+**"OAuth is not configured"**: Neither a tenant OAuth client nor the central platform client is available. Set the client ID/secret/tenant in the config app, or ask the platform maintainer to provision the central Entra OAuth client.
+
+**"Bot Framework credentials are not configured"**: The bot app id or password is missing. Fill them in the configuration app's **Teams bot** tab; do not set them from Studio's Secrets screen.
+
+**The bot receives nothing**: Check three things in order — the **Microsoft Teams channel** is enabled on the Azure Bot resource, the **messaging endpoint** matches the URL shown in the config app exactly, and the bot app is actually installed in the team or chat. A `teams.bot.rejected` event means the message arrived but failed verification, which is a credential mismatch rather than a wiring problem.
+
+**"Query option 'Top' is not allowed"**: Some Teams collections reject OData options outright instead of ignoring them. `listJoinedTeams` returns every team in one response; do not pass `top` or a paging cursor to it.
+
+**A meeting cannot be found**: There is no "list my online meetings" endpoint in Graph. Discover meetings with `listMeetingEvents` (the calendar), then turn the event's `joinUrl` into a meeting with `resolveOnlineMeeting`.
+
+**Application mode cannot read channel messages**: Reading Teams messages with application permissions requires Microsoft's [protected API approval](https://learn.microsoft.com/en-us/graph/teams-protected-apis) on top of admin consent. Per-user OAuth is not subject to it.
+
+**Microsoft Entra redirect URI rejected**: Entra rejects a colon in the redirect URI path. Register the redirect URI with the workspace's **raw id** (`/workspaces/<workspace-id>/webhooks/oauthCallback`), not the `slug:` form; copy the exact value from the config app.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card title="Microsoft Graph API" icon="microsoft" href="https://learn.microsoft.com/en-us/graph/api/resources/teams-api-overview">
+    Official reference for the Teams, channels, chats, messages and online meetings REST APIs.
+  </Card>
+  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
+    Learn how Agent Factory agents consume MCP tools in Prisme.ai.
+  </Card>
+</CardGroup>
