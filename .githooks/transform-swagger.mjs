@@ -25,6 +25,14 @@
  *      buildInstructions.ts relies on the circular refs), so we cut the cycles in
  *      this docs-only copy by replacing each DFS back-edge with a shallow
  *      placeholder that mirrors the target's `type`.
+ *   8. Rename the `x-prismeai-api-key` security scheme from upstream's
+ *      `WorkspaceApiKeyAuth` to `OrgApiKeyAuth`, the name every other spec under
+ *      `api-reference/` uses since commit 518844a. Upstream keeps the legacy
+ *      name, so the rename lived as a hand-patch that each sync silently
+ *      reverted; doing it here makes it survive. Note the header itself serves
+ *      both workspace and organization keys (see `authentication.mdx`), so this
+ *      naming is worth revisiting with the API owners rather than treating as
+ *      settled.
  *
  * Usage:
  *   npm run swagger:transform                              # canonical entry point
@@ -65,6 +73,9 @@ const TAG_DESCRIPTIONS = [
 ];
 
 const TAG_CAPITALIZATIONS = { permissions: 'Permissions', monitoring: 'Monitoring' };
+
+// Upstream name -> documented name for the `x-prismeai-api-key` security scheme.
+const SECURITY_SCHEME_RENAMES = { WorkspaceApiKeyAuth: 'OrgApiKeyAuth' };
 
 const CANONICAL_SERVERS = [
   { url: 'https://api.studio.prisme.ai', description: 'Prisme.ai Cloud' },
@@ -184,13 +195,48 @@ function breakRecursiveRefs(doc) {
     if (type === 'array') {
       node.set('items', doc.createNode({ type: 'object' }));
     }
+    // No em dash: this repo's prose style bans them, and a generated description
+    // that reintroduced one would be rewritten by hand after every sync.
     node.set(
       'description',
-      `Recursive reference to \`${target}\` — nesting is truncated here to ` +
+      `Recursive reference to \`${target}\`; nesting is truncated here to ` +
         `avoid the infinite expansion that crashes the API reference renderer.`,
     );
   }
   return backEdges.length;
+}
+
+// Rename security schemes wherever OpenAPI can name one: the
+// `components.securitySchemes` definition, the root `security` list, and every
+// per-operation `security` list. Scoped to those three places on purpose, so a
+// schema property that happens to share the name is left alone. Idempotent (the
+// old name is gone after the first run).
+function renameSecuritySchemes(doc) {
+  let renamed = 0;
+
+  const renamePairKey = (pair) => {
+    const from = strVal(pair.key);
+    const to = SECURITY_SCHEME_RENAMES[from];
+    if (!to) return;
+    if (pair.key && typeof pair.key === 'object' && 'value' in pair.key) pair.key.value = to;
+    else pair.key = to;
+    renamed++;
+  };
+
+  const schemes = doc.getIn(['components', 'securitySchemes'], true);
+  if (isMap(schemes)) schemes.items.forEach(renamePairKey);
+
+  // Each `security` entry is a map of scheme name -> scopes.
+  const renameInSecurityList = (node) => {
+    if (!node || !node.items) return;
+    for (const requirement of node.items) {
+      if (isMap(requirement)) requirement.items.forEach(renamePairKey);
+    }
+  };
+  renameInSecurityList(doc.get('security', true));
+  for (const { op } of operations(doc)) renameInSecurityList(op.get('security', true));
+
+  return renamed;
 }
 
 function transform(filePath) {
@@ -199,7 +245,7 @@ function transform(filePath) {
     summariesAdded: 0, acronymsFixed: 0, tagsCapitalized: 0,
     duplicateIdsResolved: 0, opsDisambiguated: 0,
     rootTagsAdded: false, serversUpdated: false,
-    recursiveRefsBroken: 0,
+    recursiveRefsBroken: 0, securitySchemesRenamed: 0,
   };
 
   // 1. Add summaries from operationId where missing.
@@ -321,6 +367,9 @@ function transform(filePath) {
 
   // 7. Break recursive $ref cycles so the API playground can't expand forever.
   counters.recursiveRefsBroken = breakRecursiveRefs(doc);
+
+  // 8. Rename security schemes to the names the docs use.
+  counters.securitySchemesRenamed = renameSecuritySchemes(doc);
 
   // lineWidth defaults to 80: keeps long descriptions wrapped on multiple lines
   // rather than collapsing them. YAML 1.2 plain-scalar folding means we can't
