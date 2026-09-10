@@ -33,11 +33,14 @@ The SharePoint app provides read/write access to Microsoft SharePoint Online and
 
 ## Who is this for?
 
-This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
+This connector is used by four different roles. Jump to the section that matches yours; each one is self-contained.
 
-<CardGroup cols={3}>
+<CardGroup cols={2}>
   <Card title="Agent builder" icon="robot">
     You build agents in **Agent Creator** and want them to browse SharePoint sites, read files and query lists. → *Agent builder* tab.
+  </Card>
+  <Card title="Knowledge base owner" icon="database">
+    You want SharePoint documents indexed and searchable semantically, kept up to date. → *Knowledge base (sync)* tab.
   </Card>
   <Card title="Platform admin" icon="shield-halved">
     You run the platform and set up the shared Microsoft Entra OAuth client once for everyone. → *Platform admin setup* accordion below.
@@ -589,6 +592,123 @@ https://graph.microsoft.com/User.Read
             Status: 'Open'
       output: created
     ```
+  </Tab>
+
+  <Tab title="Knowledge base (sync)">
+    ## Knowledge base
+
+    **Goal:** index SharePoint documents into a knowledge base so an agent can search their **content**, and keep that base up to date.
+
+    <Note>
+      Before a base can be attached, a *Workspace builder* must have installed and configured the SharePoint app in a workspace and connected an account (see the *Workspace builder* tab). Nothing else is needed: the same app instance serves both the agent tools and the sync surface. The **Authorized agents** allowlist does **not** apply here — it gates the connector as an agent *tool*, and has no effect on synchronization.
+    </Note>
+
+    ## What can be synced
+
+    **Document libraries** and the files inside them. SharePoint **pages and lists are not synced**: they are agent tools, not indexable resources.
+
+    ## How it fits together
+
+    ```mermaid
+    flowchart LR
+      SP["SharePoint<br/>Microsoft Graph"]
+      Conn["SharePoint connector<br/>MCP resources"]
+      Sync["Knowledge Sync<br/>browse · diff · index"]
+      KB["Knowledge base<br/>vector store"]
+      Agent["Agent"]
+
+      Sync -->|"resources/list · resources/read"| Conn
+      Conn -->|"Graph API"| SP
+      Sync -->|"documents"| KB
+      Agent -->|"search"| KB
+      Agent -.->|"per-reader access check"| Sync
+    ```
+
+    The resource tree is three levels deep — a **site**, its **document libraries**, then any **item** inside them — and any container can be picked as a sync root:
+
+    ```text
+    sharepoint://site/{siteId}
+    sharepoint://site/{siteId}/drive/{driveId}
+    sharepoint://site/{siteId}/drive/{driveId}/item/{itemId}
+    ```
+
+    ## Attach the connector to a base
+
+    <Steps>
+      <Step title="Copy the MCP endpoint">
+        Open the connector's **Configuration app** in the workspace where it is installed; it displays and copies that workspace's MCP endpoint:
+
+        ```text
+        <api-url>/workspaces/<workspace-id>/webhooks/<app-instance>.mcp
+        ```
+      </Step>
+      <Step title="Create the connection in Knowledges">
+        Go to **Knowledges → Connectors → New Connection → Your own MCP server**, paste the endpoint and click **Check**.
+      </Step>
+      <Step title="Browse to the folder you want">
+        Pick a site, then a document library, then descend into folders and confirm with **Use this location**. Everything below the selected root is synced, nested folders included.
+      </Step>
+      <Step title="Pick the destination and sync">
+        Choose an existing knowledge base or create one from the same step, then click **Sync Now**. Large libraries are spread over several runs; the schedule (*Hourly* to *Daily*, under **Auto-sync**) finishes the job.
+      </Step>
+    </Steps>
+
+    The full wizard, the run history and the connection settings are documented once for every provider in [Knowledges → Connectors](/products/ai-knowledge/connectors). This tab covers only what is specific to SharePoint.
+
+    <Note>
+      SharePoint is normally also published as a **catalog connector**, which appears under **Available Providers** and asks each person to sign in with their own Microsoft account. Attaching this connector's own endpoint instead is what lets a base be fed by an **application identity** (`clientCredentials` mode) rather than by a person — the credential then belongs to the workspace, and no reader ever signs in for the sync.
+    </Note>
+
+    ## Who may sync, and who may read
+
+    | Moment | Acts as | Authorized by |
+    |--------|---------|---------------|
+    | Attaching the connection, browsing the tree | You | Your **role on the workspace** holding the connector's configuration — the right to read that workspace is the right to read this SharePoint through it |
+    | A scheduled sync run | No user at all | The calling workspace must be listed in `knowledgeSync.trustedCallers`; the Knowledge Sync workspace ships there by default |
+    | Answering a reader's question | The reader | A live per-reader access check (`items` / `checkAccess`) against Microsoft Graph |
+
+    <Note>
+      **Per-user access control is supported and worth keeping on.** The connector declares an access tool, so each reader's own rights are re-checked in SharePoint at query time: a file you lost access to stops appearing in answers without waiting for the next sync. Turning it off serves every synced document to anyone who can query the agent, whatever their SharePoint rights. Note that a connection backed by `clientCredentials` feeds the base with the **application's** reach — narrow it at the source (sites-selected permissions) rather than counting on the selection made in the wizard.
+    </Note>
+
+    ## What gets indexed
+
+    | Aspect | Behavior |
+    |--------|----------|
+    | Document unit | One **driveItem** (a file) = one document. Sites, libraries and folders are containers, never indexed themselves. |
+    | Content | Graph hands out a short-lived **pre-signed download URL**, so the bytes are fetched out of band — the format-aware path. Small text-like files (≤ 1 MB) are inlined directly instead, capped at 200 000 characters. |
+    | Revision marker | `cTag`, falling back to `eTag`. Unchanged files are never re-read and never re-indexed. |
+    | Identity | The **item id**. Renaming or moving a file inside the synced root therefore does *not* re-index it. |
+    | Deletions | Each run is a **full traversal**: a file absent from a complete listing is removed from the base. A listing that failed halfway deletes nothing. |
+
+    <Note>
+      **The Knowledge profile this connector declares** — the descriptor Knowledges probes at `sharepoint://profile/knowledge`:
+
+      | Field | Value |
+      |-------|-------|
+      | `provider` | `sharepoint-next` |
+      | `hierarchy` | `site` › `drive` › `item` |
+      | `canonical_uri` | `sharepoint://site/{siteId}/drive/{driveId}/item/{itemId}` |
+      | `revision` | `cTag`, fallback `eTag` |
+      | `read` | Pre-signed download URL for binaries; inline text ≤ 1 MB, 200 000 characters |
+      | `list` | 50 resources per page by default, 200 max; `delta_on_drive: false` |
+      | `access` | Tool `items`, action `checkAccess` |
+      | `authentication` | `oauth`, `oauthCentral`, `clientCredentials`, `accessToken` |
+    </Note>
+
+    ## Troubleshooting the sync
+
+    **The URL check says "You are not allowed to read it"**: you have no role on the workspace holding the connector's configuration. Ask its administrator for one — this is not about your SharePoint rights.
+
+    **The URL check says "It answered, but could not serve its content"**: the connector itself is not fully configured. Open its configuration app and connect an account.
+
+    **A site does not appear when browsing**: a site created moments ago is not searchable yet — `/sites?search=` is served by the SharePoint search index, which takes minutes to hours. It is reachable by path in the meantime.
+
+    **A whole library syncs slowly**: that is expected — runs are bounded and the schedule finishes the job. Prefer selecting a folder, or several narrow connections, over one library-wide root.
+
+    **A file is in the library but not in the base**: check its format is one the platform indexes, and that it is under the selected root. A file whose download failed is reported in the connection's synchronization errors rather than half-indexed.
+
+    **A scheduled sync keeps running after a right was revoked**: the role check runs on the interactive paths only. A scheduled run is authorized as the platform's synchronization workspace — delete the connection to stop it for certain.
   </Tab>
 </Tabs>
 

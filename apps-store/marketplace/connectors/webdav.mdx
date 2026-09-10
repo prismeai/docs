@@ -28,11 +28,14 @@ The WebDAV app provides read/write access to any [WebDAV](https://datatracker.ie
 
 ## Who is this for?
 
-This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
+This connector is used by four different roles. Jump to the section that matches yours; each one is self-contained.
 
-<CardGroup cols={3}>
+<CardGroup cols={2}>
   <Card title="Agent builder" icon="robot">
     You build agents in **Agent Creator** and want them to read and write files on a WebDAV server. → *Agent builder* tab.
+  </Card>
+  <Card title="Knowledge base owner" icon="database">
+    You want the files on a WebDAV server indexed and searchable semantically, kept up to date. → *Knowledge base (sync)* tab.
   </Card>
   <Card title="Platform admin" icon="shield-halved">
     You run the platform and want to publish WebDAV as a reusable capability. → *Platform admin setup* accordion below.
@@ -386,6 +389,115 @@ This connector is used by three different roles. Jump to the section that matche
         pageSize: 25
         output: matches
     ```
+  </Tab>
+
+  <Tab title="Knowledge base (sync)">
+    ## Knowledge base
+
+    **Goal:** index the files of a WebDAV server into a knowledge base so an agent can search their **content**, and keep that base up to date.
+
+    <Note>
+      Before a base can be attached, a *Workspace builder* must have installed the WebDAV app in a workspace and saved its credentials (see the *Workspace builder* tab). Nothing else is needed: the same app instance serves both the agent tools and the sync surface. The **Authorized agents** allowlist does **not** apply here — it gates the connector as an agent *tool*, and has no effect on synchronization.
+    </Note>
+
+    WebDAV is the reference case for a source nobody published for you: it is attached **by URL**, never from the catalog, and the base is fed by the workspace's own credential rather than by a person signing in. [Knowledges → Connectors](/products/ai-knowledge/connectors) carries the complete walkthrough — install the app, fill the credentials, test, copy the endpoint, attach it. This tab covers what is specific to the connector.
+
+    ## How it fits together
+
+    ```mermaid
+    flowchart LR
+      Server["WebDAV server<br/>Nextcloud · ownCloud · …"]
+      Conn["WebDAV connector<br/>MCP resources"]
+      Sync["Knowledge Sync<br/>browse · diff · index"]
+      KB["Knowledge base<br/>vector store"]
+      Agent["Agent"]
+
+      Sync -->|"resources/list · resources/read"| Conn
+      Conn -->|"PROPFIND · GET"| Server
+      Sync -->|"documents"| KB
+      Agent -->|"search"| KB
+      Agent -.->|"freshness · perimeter check"| Sync
+    ```
+
+    The resource tree is two levels deep — **folders**, then **files** — and any folder can be picked as a sync root:
+
+    ```text
+    webdav://files/{path}
+    ```
+
+    ## Attach the connector to a base
+
+    <Steps>
+      <Step title="Copy the MCP endpoint">
+        Open the connector's **Configuration app**; the **MCP endpoint** card holds the URL that identifies this workspace's connector:
+
+        ```text
+        <api-url>/workspaces/<workspace-id>/webhooks/<app-instance>.mcp
+        ```
+      </Step>
+      <Step title="Create the connection in Knowledges">
+        Go to **Knowledges → Connectors → New Connection → Your own MCP server**, paste the endpoint and click **Check**. On success the dialog reads *Compatible connector — webdav*, with the levels `folder › file`.
+      </Step>
+      <Step title="Browse to the folder you want">
+        Walk down from the account root — or from the allowed path, when one is set — and confirm with **Use this location**. Everything below the selected folder is synced, subfolders included.
+      </Step>
+      <Step title="Pick the destination and sync">
+        Choose an existing knowledge base or create one from the same step, then click **Sync Now**. The schedule (*Hourly* to *Daily*, under **Auto-sync**) keeps it current.
+      </Step>
+    </Steps>
+
+    ## Who may sync, and who may read
+
+    | Moment | Acts as | Authorized by |
+    |--------|---------|---------------|
+    | Attaching the connection, browsing the tree | You | Your **role on the workspace** holding the connector's configuration — the right to read that workspace is the right to read this server through it |
+    | A scheduled sync run | No user at all | The calling workspace must be listed in `knowledgeSync.trustedCallers`; the Knowledge Sync workspace ships there by default |
+    | Answering a reader's question | Everyone alike | The connector's single service credential — the verdict is the same for every reader |
+
+    <Warning>
+      **Per-user access control is offered, but it does not tell readers apart.** WebDAV exposes no portable per-user ACL, so the connector holds one account for the whole workspace. Keeping the setting on is still worth it — every query re-checks that the document is still there and still inside the allowed path, so a file deleted or moved out of scope stops appearing without waiting for the next sync. But what it protects is **freshness and perimeter, not identity**. If a folder should not be readable by everyone who can query the agent, do not sync it: narrow the **allowed path** instead, which the connector enforces on every single call.
+    </Warning>
+
+    ## What gets indexed
+
+    | Aspect | Behavior |
+    |--------|----------|
+    | Document unit | One **file** = one document. Folders are containers, never indexed themselves. |
+    | Content | Inlined as a bounded data URL — every byte needs an `Authorization` header, so there is no link a third party could fetch. Default ceiling about **1.4 MB** per file, adjustable in the workspace configuration; 200 000 characters of inline text. |
+    | Above the ceiling | Reported as unfetchable with a reason, and listed in the connection's synchronization errors. A file is never half-indexed. |
+    | File types | Inferred from the **extension**: many servers omit the content type or return `application/octet-stream` for everything, and the platform filters on the type. Give files their real extensions. |
+    | Revision marker | `getetag`, falling back to `getlastmodified`. Unchanged files are never re-read and never re-indexed. |
+    | Identity | The **path** on the server. Renaming or moving a file changes its identity: the old document leaves the base and the new one is ingested and re-embedded from scratch — on a folder, that applies to the whole subtree. |
+    | Deletions | Each run is a **full traversal**: a file absent from a complete listing is removed from the base. A listing that failed halfway deletes nothing. |
+
+    <Note>
+      **The Knowledge profile this connector declares** — the descriptor Knowledges probes at `webdav://profile/knowledge`:
+
+      | Field | Value |
+      |-------|-------|
+      | `provider` | `webdav` |
+      | `hierarchy` | `folder` › `file` |
+      | `canonical_uri` | `webdav://files/{path}` |
+      | `revision` | `getetag`, fallback `getlastmodified` |
+      | `read` | Inline data URL, ~1.4 MB by default; 200 000 characters of inline text |
+      | `list` | 200 resources per page by default, 1000 max; `delta_on_drive: false` |
+      | `access` | Tool `files`, action `checkAccess`, up to 200 URIs per call |
+      | `authentication` | `serviceAccount` — one credential held by the workspace, no per-user identity |
+    </Note>
+
+    ## Troubleshooting the sync
+
+    **The URL check says "You are not allowed to read it"**: you have no role on the workspace holding the connector's configuration. Ask its administrator for one — this is not about your rights on the WebDAV server.
+
+    **The URL check says "It answered, but could not serve its content"**: the credentials are missing or wrong. Open the configuration app and click **Test connection**, which reaches the server with the values actually saved.
+
+    **A browsing column says the source could not be listed**: that is a failure, not an empty folder — the server refused. Most often the credential is wrong, or the allowed path does not exist. Test the connection in the configuration app.
+
+    **A whole library is ignored**: check the extensions. The type is inferred from the file name, and a library of extension-less files is filtered out before indexing.
+
+    **Reorganizing folders re-indexes everything**: expected — the path *is* the document's identity. Plan reorganizations accordingly.
+
+    **A scheduled sync keeps running after a right was revoked**: the role check runs on the interactive paths only. A scheduled run is authorized as the platform's synchronization workspace — delete the connection to stop it for certain.
   </Tab>
 </Tabs>
 
