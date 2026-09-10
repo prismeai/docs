@@ -1,0 +1,139 @@
+---
+title: "Manage agent conversations via API"
+description: "List a user's conversations, load their history, and continue an existing thread with the Agent Creator API."
+---
+
+Use this flow to build conversation history into a mobile app, embedded chat,
+or other custom client. It takes three API calls:
+
+1. List the user's conversations.
+2. Load the selected conversation's history.
+3. Send the next message with the same `contextId`.
+
+For complete request and response schemas, use the linked API reference pages.
+
+## Prerequisites
+
+- An Agent Creator agent ID (`agent_<uuid>`). An administrator can provide it, or
+  you can copy it from the agent's URL.
+- A user-bound JWT or access token sent as `Authorization: Bearer <token>`.
+  See [Authentication](/api-reference/authentication).
+- Read access to the agent.
+
+<Note>
+  Examples use `api.studio.prisme.ai`. For sandbox, use
+  `api.sandbox.prisme.ai`. For self-hosted deployments, use your instance's API
+  host.
+</Note>
+
+```bash
+BASE="https://api.studio.prisme.ai/v2/workspaces/slug:agent-factory/webhooks"
+AGENT_ID="agent_<uuid>"
+TOKEN="YOUR_ACCESS_TOKEN"
+```
+
+## Step 1 - List conversations
+
+```bash
+curl -s \
+  -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/agents/$AGENT_ID/conversations?page=1&limit=20"
+```
+
+The response contains conversation metadata, not message content. Keep the
+`contextId` of the conversation the user selects.
+
+Conversations are scoped to the user represented by the token. If the same
+application calls this endpoint with another user's token, that user gets a
+different list.
+
+See [List conversations for an agent](/agent-factory/conversations/list-conversations-for-an-agent)
+for filters, pagination, and the response schema.
+
+## Step 2 - Load the history
+
+```bash
+CONTEXT_ID="ctx_..."
+
+curl -s \
+  -H "Authorization: Bearer $TOKEN" \
+  "$BASE/v1/agents/$AGENT_ID/conversations/$CONTEXT_ID?page=1&limit=100"
+```
+
+The response has two fields:
+
+- `conversation` contains the thread metadata.
+- `messages` contains the conversation turns as A2A task records.
+
+The API returns tasks from newest to oldest. To render a chronological chat:
+
+1. Reverse the `messages` array.
+2. Keep each task's `history` array in its existing order.
+3. Render history entries whose `role` is `user` or `agent`.
+4. Read text and files from each entry's `parts` array.
+5. If your client uses the OpenAI naming convention, map `agent` to
+   `assistant`.
+
+History entries without a `role` are execution activities, such as tool calls.
+You can omit them from a basic chat transcript.
+
+Page 2 contains older turns, so prepend those turns when implementing
+"load earlier messages."
+
+See [Get a conversation with its message history](/agent-factory/conversations/get-a-single-conversation-with-its-message-history)
+for the complete response schema.
+
+## Step 3 - Continue the conversation
+
+Send the next message with the selected conversation's `contextId`:
+
+```bash
+curl -N -s \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -X POST "$BASE/v1/agents/$AGENT_ID/messages/stream" \
+  -d "{\"message\":{\"contextId\":\"$CONTEXT_ID\",\"parts\":[{\"text\":\"Can you clarify?\"}]}}"
+```
+
+The server reloads the history associated with that `contextId` before running
+the agent. Omit `contextId` to start a new conversation, then store the
+`contextId` returned by the first `task.status` event.
+
+The stream follows this sequence:
+
+1. `task.status` starts the task.
+2. Zero or more `task.output.delta` events carry incremental output.
+3. `task.output.completed` ends the lifecycle sequence.
+
+On `task.output.completed`, inspect `data.status.state`. Treat `failed` as an
+error and `input-required` as a paused task that needs a user response or
+approval, not as an empty successful response.
+
+Each frame is a `data: <json>` line; the server emits no native SSE `event:`
+field. Lifecycle frames use `{"event": "<name>", "data": {...}}`. Frames
+without an `event` property are transport frames: discard only
+`{"keepAlive": true}`. The server closes the stream with a summary frame shaped
+as `{"error": ..., "task": {"status": {"state": ...}}}`. Inspect it: an early
+authorization failure is delivered there, with its code in `error.error` and
+HTTP 200 already committed. Never treat HTTP 200 alone as success.
+
+See [Stream an agent reply via SSE](/agent-factory/messages/stream-an-agent-reply-via-sse-a2a)
+for the request schema and stream contract.
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| `401 UNAUTHORIZED` | The Bearer token is present and has not expired. |
+| `403 FORBIDDEN` | The token's user can read the agent. For organization-scoped access, call `GET /v2/me` and verify that `orgSlugs` contains the agent's organization. |
+| The conversation list is empty | The conversations were created by the same user represented by the token. |
+| `404 CONVERSATION_NOT_FOUND` | The `agentId`, `contextId`, and authenticated user identify the same conversation. |
+| The history appears reversed | Reverse `messages`, but do not reverse each task's `history`. |
+| The streamed response appears empty | Inspect the summary frame: handle `error.error` when present; otherwise read `task.status.state`. |
+
+## Related API operations
+
+The [Conversations API reference](/agent-factory/conversations/list-conversations-for-an-agent)
+also documents creating, renaming, starring, archiving, and deleting
+conversations.
