@@ -1778,18 +1778,18 @@ paths:
           schema:
             type: string
             maxLength: 64
-        - name: messageLimit
+        - name: limit
           in: query
           required: false
           schema:
             type: string
-          description: Page size for the message history (default 100).
-        - name: messagePage
+          description: Page size for the task-message history (default 100).
+        - name: page
           in: query
           required: false
           schema:
             type: string
-          description: 1-indexed page number for the message history.
+          description: 1-indexed page number for the task-message history.
       responses:
         '200':
           description: Conversation + messages.
@@ -2024,19 +2024,28 @@ paths:
       description: |
         A2A-compliant streaming send. The request body uses the same
         `MessageSendParams` shape as `messages/send`. The response is
-        delivered as Server-Sent Events (`text/event-stream`): each
-        event is one of `task.status`, `task.message`, `task.artifact`,
-        `task.completed`, `task.failed`, `task.canceled`. Clients must
-        read until they see a terminal event.
+        delivered as Server-Sent Events (`text/event-stream`). Each frame is a
+        `data: <json>` line; the server emits no native SSE `event:` field.
+        Lifecycle frames use `{"event":"<name>","data":{...}}`.
+
+        The lifecycle sequence starts with `task.status`, emits zero or more
+        `task.output.delta` events, and reaches its terminal state with
+        `task.output.completed`. Clients must inspect `data.status.state` on
+        that event: `completed`, `failed`, or `input-required`.
+
+        Frames without an `event` property are transport frames. Discard only
+        the literal `{"keepAlive": true}` frame. The server closes the stream
+        with a summary frame shaped as
+        `{"error":...,"task":{"status":{"state":...}}}`. Inspect that frame:
+        an early authorization failure is delivered there, with its code in
+        `error.error` and HTTP 200 already committed. Never treat HTTP 200 alone
+        as success.
 
         The `x-draft-mode: true` header bypasses `published_config`
         resolution. The same HITL approval flow as `messages/send`
         applies - a streaming task may park in `input-required` until
         resolved.
 
-        This automation is also bound to the workspace event
-        `agents.messages.stream` for native event-bus fan-out
-        (WebSocket consumers); that path is out of scope for OpenAPI.
       parameters:
         - name: agentId
           in: path
@@ -2062,15 +2071,21 @@ paths:
         '200':
           description: |
             Server-Sent Events stream of A2A task lifecycle events.
-            Terminates after a `task.completed`, `task.failed`, or
-            `task.canceled` event.
+            `task.output.completed` is the terminal lifecycle event. Its
+            `data.status.state` reports whether the task completed, failed,
+            or requires user input. A transport summary frame follows; inspect
+            its `error` and `task.status.state` fields before closing the stream.
           content:
             text/event-stream:
               schema:
                 type: string
                 description: |
-                  Stream of `data: <json>` lines, each carrying an A2A
-                  task lifecycle event. See description for event types.
+                  Stream of `data: <json>` lines. Lifecycle frames use
+                  `{"event":"<name>","data":{...}}`; the server does not
+                  emit native SSE `event:` fields. Discard only the literal
+                  `{"keepAlive": true}` frame. The final summary frame has no
+                  `event`; inspect `error.error` for an early authorization
+                  failure and `task.status.state` for the final task state.
         '400':
           description: Validation error.
           content:
