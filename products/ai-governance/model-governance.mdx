@@ -357,13 +357,16 @@ A map of `name → value` HTTP header pairs attached to every upstream request. 
 | `{correlationId}` | The Prisme.ai correlation ID of the current request, which propagates trace context to the LLM provider's logs |
 | `{user.<path>}` | Any field of the calling user, at arbitrary depth. `{user.id}` for the Prisme.ai user ID, `{user.email}` for the email, `{user.authData.entraid.firstname}` for a nested provider-specific claim, etc. |
 | `{userId}` | Legacy alias of `{user.id}`, kept for backwards compatibility; prefer `{user.id}` in new configurations |
+| `{apiKeyId}` | The identifier of the organization API key that authenticated the call. API-key callers carry no user context, so this and `{orgSlug}` are the identity they have |
+| `{orgSlug}` | The slug of the calling organization |
+| `{sourceWorkspaceId}` | The workspace that issued the call, for workspace-to-workspace traffic |
 
 Resolution rules for `{user.<path>}`:
 - If the path doesn't exist on the user object, the header value resolves to an empty string.
 - If the resolved value is not a string (object, array, number), it is JSON-stringified before being sent.
 
 <Warning>
-Substitution is **full-string only**. The value must match the placeholder pattern exactly; composite values such as `prefix-{user.id}` or `req-{correlationId}-v2` are sent as-is, without substitution. Unknown placeholders that don't match any supported pattern (e.g. `{foo.bar}`) are also sent verbatim.
+Substitution is **full-string only**. The value must match the placeholder pattern exactly; composite values such as `prefix-{user.id}` or `req-{correlationId}-v2` are sent as-is, without substitution. Unknown placeholders that don't match any supported pattern (e.g. `{foo.bar}`) are also sent verbatim — so the provider receives the literal string `{foo.bar}`, which is non-empty and therefore looks like a populated header. `header_policy`, below, catches that — but only for the header names a policy actually requires.
 </Warning>
 
 **Examples**
@@ -405,6 +408,193 @@ anthropic:
 - Custom headers are **merged on top** of the provider's default headers (auth + content-type + provider-specific headers like `anthropic-version`). Reusing a default header name will override it, useful for `Authorization` on `openailike` when the upstream requires a non-Bearer scheme, or for `x-api-key` on `anthropic` when fronting Anthropic with an API Management gateway whose key differs from the upstream key.
 - For multipart endpoints (image edits, `openailike` only), the `Content-Type` is dropped automatically so the runtime can set the multipart boundary.
 - On Bedrock and Vertex, the standard provider auth (AWS Signature v4 / Google service account token) is **always added by the gateway**, regardless of `options.headers`; you cannot disable it through this option.
+
+#### Requiring identity headers — `header_policy`
+
+Configuring an identity header is not the same as receiving one. An unresolvable `{user.<path>}`
+resolves to an **empty string** rather than dropping the header, so a call whose user context lost
+its email reaches the provider with `x-user-email:` empty. A placeholder no version of the gateway
+recognises is worse: it is forwarded **literally**, so the provider receives the header with the
+value `{apiKeyId}` — non-empty, and therefore indistinguishable from a correct value. In both
+cases the call succeeds and nothing anywhere records that the identity was lost.
+
+`header_policy` turns that into a control. Per caller class, it either **refuses the call before
+the provider is contacted**, or lets it through and **records the finding**.
+
+**Where it is set.** On the organization, under `settings.llm`, next to `allowed_models`,
+`default_completion_model` and `quota_policy`. There is no dedicated panel in Agents Controls yet,
+so it is set with `PATCH /v2/orgs/{orgSlug}` on the `settings` object.
+
+<Warning>
+That PATCH **replaces `settings` wholesale** — it does not deep-merge. Read the organization first,
+merge your change into the `settings` you got back, and send the complete object. Sending only
+`{"settings": {"llm": {"header_policy": …}}}` wipes `settings.quotas` along with every other
+`settings.llm` key, including `allowed_models` and `quota_policy`.
+
+For the same reason, **importing a governance configuration from the Models tab deletes
+`header_policy`**: the import rebuilds `settings.llm` from a fixed list of known fields, and
+`header_policy` is not yet one of them. Editing fields in that tab normally is safe — only
+import/export drops it. Re-apply the policy after any import.
+</Warning>
+
+```yaml
+llm:
+  allowed_models: [gpt-5-chat-latest, claude-sonnet-5]
+  default_completion_model: gpt-5-chat-latest
+  header_policy:
+    user:
+      headers: [x-user-email]
+      mode: block
+    apikey:
+      headers: [x-api-key-issuer]
+      mode: report_only
+    workspace:
+      mode: disabled          # or simply omit the key
+```
+
+**Caller classes.** The policy is keyed by *who* is calling, because different callers carry
+different identities — requiring `x-user-email` of a machine-to-machine call would refuse every one
+of them:
+
+| Class | Who it is | Identity available |
+|---|---|---|
+| `user` | A real end-user session. Tested first, so it wins whenever a user is present | `{user.<path>}`, `{userId}` |
+| `apikey` | An organization API key with **no** user context at all | `{apiKeyId}`, `{orgSlug}` — `{user.*}` resolves to nothing here |
+| `workspace` | A trusted workspace-to-workspace call, no user | `{sourceWorkspaceId}` |
+
+<Note>
+`workspace` is the one class an **organization** policy may not reach. It is only selected when no
+user is in context at all, and on such a call the organization usually is not resolved either — the
+gateway then sees no organization settings and falls back to its own default, reporting
+`policySource: gateway`. Cover workspace-to-workspace traffic with the gateway-wide default rather
+than with a per-organization policy.
+</Note>
+
+**Modes.** `mode` is mandatory as soon as a class key exists:
+
+| Mode | Behavior |
+|---|---|
+| `block` | The call is refused with `403 HEADER_POLICY_VIOLATION`; the provider is never contacted |
+| `report_only` | The call proceeds normally and the finding is recorded. Use it to discover which provider entries are missing a header before you enforce |
+| `disabled` | Nothing is checked. Same as omitting the class entirely |
+
+An enforcing mode (`block`, `report_only`) must declare a non-empty `headers` array; `disabled` does
+not need one. A class that is not declared is disabled — so the policy above checks nothing for
+`workspace` callers.
+
+The organization value replaces the gateway-wide default **wholesale**, not merged key by key, so an
+organization's policy reads in one place — the same way `default_completion_model` overrides the
+gateway's `defaults.completions`. An organization opts out of a gateway default entirely with
+`header_policy: {}`.
+
+**What counts as a missing header.** Three situations, all of which mean the identity will not
+reach the provider:
+
+| | Situation |
+|---|---|
+| **Declared but empty** | The header **is** declared in `options.headers` on the provider entry serving the model, but its placeholder resolves empty for this call |
+| **Not declared** | The required header is absent from the final header set for that provider entry, so it would never be sent |
+| **Unresolved placeholder** | The configured value looks like a placeholder the gateway cannot resolve. It would reach the provider as the literal string `{apiKeyId}` — non-empty, and so invisible to any emptiness check |
+
+Header names are matched case-insensitively ([RFC 7230 §3.2](https://datatracker.ietf.org/doc/html/rfc7230#section-3.2)),
+and the check runs at the last point common to every provider family — so it behaves identically on
+OpenAI, Azure, OpenAI-like, Anthropic, Bedrock and Vertex. It covers chat completions, embeddings,
+images, image edits, rerank, and the gateway's own model-routing classifier. The one exception is
+`/v1/test`, the connectivity probe behind the Models tab's test button: it reaches the provider
+without going through the policy.
+
+In `block`, the caller receives:
+
+```json
+{
+  "error": "HEADER_POLICY_VIOLATION",
+  "message": "Call refused: required identity header(s) would reach the model provider empty.",
+  "status": 403,
+  "details": { "missing": ["x-user-email"], "model": "gpt-5-chat-latest" }
+}
+```
+
+`/v1/rerank` is the exception to that shape: it wraps any inner completion failure, so a refusal
+arrives as `error: "RERANK_FAILED"` with `code: "HEADER_POLICY_VIOLATION"`, still `403`, and without
+the `missing` list. Match on `code` as well as `error` if you handle refusals programmatically.
+
+**What is recorded.** Both modes emit a `governance.headers.missing` event, visible in the activity
+feed and available to AI Insights dashboards:
+
+| Field | Meaning |
+|---|---|
+| `blocked` | `true` when the call was refused, `false` in `report_only`. This is the field that separates the two |
+| `mode` | The mode that applied |
+| `missing` | The header names that would not have arrived |
+| `model`, `provider` | What the call was routed to |
+| `authType`, `policySource` | The caller class, and whether the gateway default or the organization policy applied |
+| `orgSlug`, `userId`, `sessionId`, `apiKeyId`, `correlationId`, `sourceWorkspaceId` | Call context |
+
+The user's email address is never included — only a `userEmailPresent` boolean, since the missing
+identity case is exactly the one where the value is untrusted.
+
+<Note>
+**Count requests, not events.** The check runs once per provider call, and one API request is not
+one provider call: a failover chain tries each candidate, `/v1/embeddings` splits large inputs into
+batches, and `model: auto` runs a routing classifier that can be refused on its own. Counting
+distinct `correlationId` gives you requests; a raw event count gives you attempts. `block` is
+tighter than `report_only` here — it stops at the first refusal on a batched embedding — but it is
+not guaranteed to be one event per request either.
+
+In `report_only` the finding also appears twice in the activity feed, under the app-prefixed name
+and under `governance.headers.missing`. Filter on the exact event type rather than a prefix.
+</Note>
+
+**A malformed policy is reported, never fatal.** An unknown class key, a missing or unrecognised
+`mode`, or an enforcing mode with no headers makes that entry invalid. The gateway then emits an
+`error` event with code `HeaderPolicyInvalid` naming each faulty key and its reason, **skips the
+faulty keys, applies whatever is still valid, and lets the call through**:
+
+| Reason | What is wrong |
+|---|---|
+| `UNKNOWN_CALLER_CLASS` | The key is not `user`, `apikey` or `workspace` |
+| `MODE_MISSING` | The class has no `mode` (including when the value is a bare string such as `user: block`) |
+| `MODE_UNKNOWN` | `mode` is not one of the three |
+| `HEADERS_MISSING` / `HEADERS_NOT_ARRAY` / `HEADERS_EMPTY` | An enforcing mode without a usable `headers` list |
+| `NOT_AN_OBJECT` | `header_policy` is not an object at all — nothing is salvageable, so the control is disabled entirely |
+
+So a typo in one class does not disable a correct one, and a mistyped policy never costs an
+organization its LLM traffic. The condition stays loud — the event repeats on every call until the
+policy is fixed — it is simply not fatal.
+
+**Gateway-wide lever.** Platform operators have `header_policy_enforcement` in the LLM Gateway
+config: `enabled` (default), `report_only` — which caps every declared mode at reporting, whatever
+the organizations configured — or `off`, which neutralises the control platform-wide. This is an
+operator control, not an organization one: an organization cannot re-enable a policy the platform
+turned off. An unrecognised value falls back to `enabled` and emits `HeaderPolicyEnforcementInvalid`,
+so a typo cannot silently switch a compliance control off.
+
+It lives in the LLM Gateway's runtime config, which is written only by
+`PATCH /v2/workspaces/{workspaceId}/config` — importing the workspace does not update it. That
+endpoint **replaces the whole config object**, so send the complete value, providers included, or
+you wipe the gateway's configuration.
+
+<Note>
+Roll it out on one organization first rather than gateway-wide. Start in `report_only`, watch
+`governance.headers.missing` to find which provider entries are missing the header, add the missing
+`options.headers` lines, then flip that organization to `block` and extend to the others.
+</Note>
+
+<Warning>
+`report_only` findings reach `governance.headers.missing` through an event listener bound to the
+OpenAI app instance by its slug. On a deployment where that instance was renamed from `OpenAI`, the
+relay stops silently and `report_only` produces no event at all — while `block` keeps working,
+since the gateway emits that one itself. Check the instance slug before trusting an empty
+`report_only` dashboard.
+</Warning>
+
+<Warning>
+The check itself runs inside the OpenAI app that fronts the providers, at the last point that sees
+the final header set. On a platform whose apps have not been updated to a version that supports it,
+the policy is accepted and stored but **silently not enforced** — no refusal, no
+`governance.headers.missing`. Confirm the app version before relying on a `block` policy for
+compliance.
+</Warning>
 
 ### Custom Endpoint (Anthropic)
 
