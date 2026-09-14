@@ -1,0 +1,176 @@
+---
+title: "Guardrails"
+description: "Enable and tune per-agent safety controls: PII, prompt injection, toxicity, off-topic, hallucination, and action approval"
+---
+
+Guardrails are safety checks that run **around** your agent, not inside its prompt. You add them to an agent as capabilities and tune each one to your use case. They run at three points:
+
+- **Input** (before the LLM sees the message): PII, prompt injection, off-topic.
+- **Output** (after the response is generated): toxicity, hallucination.
+- **Action** (before a tool runs): action approval.
+
+Central governance decides which guardrails are available; you enable and configure them per agent. This page is a practical guide: what each guardrail does, what to set, and how to adapt it.
+
+## The six guardrails at a glance
+
+| Guardrail | Phase | What it does | Typical action |
+|---|---|---|---|
+| **PII detection** | input | Finds emails, phones, SSNs, card numbers | mask, block, or warn |
+| **Prompt injection** | input | Detects jailbreak / instruction-override attempts | block |
+| **Off-topic (topic guard)** | input | Keeps the conversation on allowed subjects | redirect or block |
+| **Toxicity** | output | Scores the response for harmful content | flag, block, or regenerate |
+| **Hallucination** | output | Checks the response against your knowledge base | flag / regenerate |
+| **Action approval** | action | Flags sensitive tool calls for approval | see note below |
+
+<Note>
+**Detection mode.** PII runs on fast **deterministic regex** by default. The other four are **LLM classifiers**: they use the agent's own model, so their quality and language coverage follow the model you picked.
+</Note>
+
+## PII detection
+
+Redacts or blocks personal data in the **user's message** before it reaches the model.
+
+| Setting | Values | Default | Effect |
+|---|---|---|---|
+| `types` | `email`, `phone`, `ssn`, `credit_card` | `email`, `phone` | Which categories to look for |
+| `action` | `mask`, `block`, `warn` | `mask` | What to do on a match |
+| `mode` | `regex`, `llm` | `regex` | Detection engine |
+
+- **mask**: the value is replaced (for example `[EMAIL_MASKED]`, `[PHONE_MASKED]`) before the model sees it. The user still sees what they typed; only the model input is redacted.
+- **block**: the message is refused with a policy message; the model is not called.
+- **warn**: the message passes through, flagged.
+
+**How to adapt**
+- Handling health or financial data: add `ssn` and `credit_card` to `types`.
+- Zero tolerance (the model must never receive PII): set `action: block`.
+- Free text where regex misses context (names, addresses): switch `mode: llm` (slower, uses the agent model).
+
+## Prompt injection
+
+Detects attempts to override the agent's instructions ("ignore previous instructions", "you are now DAN", system-prompt extraction, role manipulation) in the **user's message**, and blocks them.
+
+| Setting | Values | Default | Effect |
+|---|---|---|---|
+| `sensitivity` | `low`, `medium`, `high` | `medium` | How aggressively to flag borderline phrasing |
+
+**How to adapt**
+- Public-facing or high-risk agent: `sensitivity: high`.
+- Internal agent where users paste large instruction-like prompts on purpose: `medium` or `low` to avoid false positives.
+
+<Note>
+Prompt injection is always a **blocking** guardrail: a detected attempt is refused, it has no pass-through mode.
+</Note>
+
+## Off-topic (topic guard)
+
+Keeps the conversation inside the subjects you allow, checked on the **user's message**.
+
+| Setting | Values | Default | Effect |
+|---|---|---|---|
+| `allowed_topics` | list of strings | (none) | The conversation must match one of these |
+| `blocked_topics` | list of strings | (none) | The conversation must not match any of these |
+| `action` | `redirect`, `block` | `redirect` | What to do when off-topic |
+
+- **redirect**: the user gets a friendly message steering them back to the allowed topics.
+- **block**: the message is refused.
+
+**How to adapt**
+- A banking assistant: `allowed_topics: ["banking", "accounts", "cards"]`, `action: redirect`.
+- A general agent that must avoid a few areas only: leave `allowed_topics` empty and set `blocked_topics: ["legal advice", "medical advice"]`.
+
+<Warning>
+If you leave both `allowed_topics` and `blocked_topics` empty, everything is on-topic and the guardrail is a no-op. Set at least one list.
+</Warning>
+
+## Toxicity
+
+Scores the **agent's response** for harmful content (hate speech, harassment, violence, sexual content, profanity, personal attacks).
+
+| Setting | Values | Default | Effect |
+|---|---|---|---|
+| `threshold` | `0.0` to `1.0` | `0.7` | Score above which the response is considered toxic |
+| `action` | `flag`, `block`, `regenerate` | `regenerate` | What to do above threshold |
+
+- **flag**: the response is tagged and passes through (best-effort monitoring).
+- **block**: the response is replaced with a policy message.
+- **regenerate**: the response is returned marked `moderated: true` (the runtime does not retry, see [Runtime Safeguards](./runtime-safeguards#post-loop-finalization-runs-once)).
+
+**How to adapt**
+- Strict customer-facing agent: `threshold: 0.3`, `action: block`.
+- Monitoring only (you want the signal, not enforcement): `action: flag`.
+
+<Warning>
+Toxicity is an **output** guardrail. If your agent streams its answer token by token, the text is shown live **before** the guardrail runs on the complete response. `block` replaces the final stored message, but a user watching the stream may briefly see the flagged content. To hide it entirely, turn off streaming for that agent or handle the blocked final message in your front end.
+</Warning>
+
+## Hallucination
+
+Compares the **agent's response** against the knowledge-base passages it retrieved, and flags claims that are not supported.
+
+| Setting | Values | Default | Effect |
+|---|---|---|---|
+| `require_sources` | `true`, `false` | `true` | Flag answers that cite no retrieved source |
+| `confidence_threshold` | `0.0` to `1.0` | `0.7` | Minimum support confidence before an answer is accepted |
+
+Flagged answers are returned marked `moderated: true` (no automatic retry).
+
+**How to adapt**
+- Only meaningful on an agent that **has a knowledge base**. On an agent with no sources and `require_sources: true`, every answer is flagged.
+- Reduce false flags on a well-sourced agent: lower `confidence_threshold` (for example `0.5`).
+
+## Action approval
+
+Marks a tool call as sensitive when the tool name matches a pattern (for example anything containing `delete`).
+
+<Warning>
+Today, tool-call approval is enforced through **[Tool Permissions](./tool-permissions)** (the human-in-the-loop `Always Ask` / `Ask First` / `Ask External` policies), which is the supported, working path. Configure approval there. The action-approval guardrail is defined in the catalog but is not yet the runtime enforcement point for tool calls.
+</Warning>
+
+## Behaviors that matter
+
+### Input blocks early, output cannot un-stream
+An input guardrail (PII, injection, topic) runs **before** the model, so a block or redirect stops the turn cleanly. An output guardrail (toxicity, hallucination) runs **after** generation: it sanitizes the final message but cannot recall tokens already streamed to the screen.
+
+### Fail-open vs fail-closed
+If a guardrail cannot reach a verdict (the classifier model is down, or returns an unusable answer), the platform does **not** silently pass a security guardrail:
+
+- **Deny-mode guardrails** (`block` / `redirect`, and prompt injection) **fail closed**: the request is blocked with an "unavailable" message.
+- **Best-effort guardrails** (`mask` / `flag`) **fail open** but the failure is always logged.
+- Override per guardrail with `on_error: open` or `on_error: closed`.
+
+### What you see afterwards
+Every guardrail that acts emits a `security.guardrail` event (Elastic Common Schema aligned) with the guardrail id, phase, and outcome (`blocked`, `redirected`, `masked`, `flagged`, or `error`). Find them in **Analytics** and in your SIEM. Sensitive values are never included, only the finding categories (for example `email`).
+
+## Adding a guardrail
+
+<Steps>
+  <Step title="Open Capabilities">
+    In Agent Creator, open your agent and go to **Capabilities**, then **Add Capability**.
+  </Step>
+  <Step title="Pick the guardrail">
+    Choose the guardrail from the catalog (PII, prompt injection, topic guard, toxicity, hallucination).
+  </Step>
+  <Step title="Configure it">
+    Set the fields from the tables above (`action`, `threshold`, `types`, `allowed_topics`, and so on). Defaults are safe starting points.
+  </Step>
+  <Step title="Test in the Playground">
+    Send a message that should trigger the guardrail and confirm the behavior. For output guardrails, check the streamed vs final message. For a blocking guardrail, verify a clean refusal.
+  </Step>
+</Steps>
+
+## Related
+
+<CardGroup cols="2">
+  <Card title="Agent Settings" icon="sliders" href="./settings">
+    Where safety controls live alongside retention and access
+  </Card>
+  <Card title="Tool Permissions" icon="shield-check" href="./tool-permissions">
+    Human-in-the-loop approval for tool calls
+  </Card>
+  <Card title="Runtime Safeguards" icon="gauge-high" href="./runtime-safeguards">
+    Budgets, loop caps, and why a rejected guardrail is not retried
+  </Card>
+  <Card title="Capabilities" icon="puzzle-piece" href="./capabilities">
+    How guardrails, tools, and skills are added to an agent
+  </Card>
+</CardGroup>
