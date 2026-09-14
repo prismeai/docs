@@ -28,7 +28,7 @@ flowchart LR
 4. The **canvas** renders the spec to a live HTML preview and offers **PPTX** (editable) and **PDF** exports; both run in the browser.
 
 <Note>
-Export is layout-agnostic. The PPTX is built from the **rendered DOM geometry** (`getBoundingClientRect` + `getComputedStyle`) mapped to native PowerPoint shapes/text, so any slide the renderer emits (including freeform HTML slides) exports to an editable `.pptx` with no per-layout code. The PDF rasterizes each rendered slide (landscape 16:9, one page per slide).
+**Typed layouts** export through **native PowerPoint emitters** (fixed 16:9 geometry with automatic text-fit) — deterministic and identical across PowerPoint (Windows/Mac), LibreOffice and Keynote. **Freeform** HTML slides export through a **best-effort mapping of the rendered DOM geometry** (`getBoundingClientRect` + `getComputedStyle`) to PowerPoint shapes/text. The **PDF** rasterizes each rendered slide (landscape 16:9, one page per slide) and is always pixel-perfect. See [Layouts: typed vs. freeform](#layouts-typed-vs-freeform).
 </Note>
 
 ## The three pieces
@@ -84,7 +84,7 @@ Both pieces are meant to be tailored to your brand and use cases.
 A new brand or style is a **new data entry**, with no code and no agent change:
 
 1. Open the `slides-mcp` workspace and edit `config.value.themes` (in `index.yml`).
-2. Add an entry with your palette and fonts. Colors are **bare hex** (no leading `#`; the renderer adds it). Use cross-platform fonts (Georgia / Helvetica / Arial / Trebuchet MS) so the browser preview and the exported PPTX render with matching metrics.
+2. Add an entry with your palette and fonts. Colors are **bare hex** (no leading `#`; the renderer adds it, and now tolerates a leading `#` too). Use **cross-platform fonts** — `Arial`, `Georgia`, `Times New Roman`, `Trebuchet MS`, `Verdana` — so the browser preview and the exported PPTX render with matching metrics. Office/Mac-only faces (Calibri, Cambria, Helvetica) are automatically substituted to keep the export consistent.
 
 ```yaml
 config:
@@ -106,6 +106,26 @@ config:
 
 `list_themes` exposes the new style automatically; the agent can offer it with no further change. You can also self-host your own copy of the MCP workspace and point your agent's MCP capability at it.
 
+#### Theme token reference
+
+Every theme entry under `config.value.themes` is a token set. These are **all** the fields you can configure:
+
+| Token | Role |
+|---|---|
+| `name` | Display name shown by `list_themes`. |
+| `dark` | Primary dark color — background of `title`, `section`, `quote`, `closing` and the data panels. |
+| `light` | Light background of content slides. |
+| `ink` | Default body text color on light slides. |
+| `muted` | Secondary text (labels, descriptions, footer). |
+| `accent` | The single sharp accent — numbers, CTA, eyebrow, the mark, bars. Use one, sparingly. |
+| `soft` | Soft tint — subtitles on dark slides, panel labels. |
+| `line` | Borders, card outlines, dividers. |
+| `fontHead` | Headline font. Use a **cross-platform** face (see above). |
+| `fontBody` | Body font. Cross-platform. |
+| `headWeight` | Headline weight (e.g. `600`–`800`). |
+
+Colors are **bare hex** (a leading `#` is tolerated). The MCP exposes two tools: **`list_themes()`** → `[{ name, label }]`, and **`get_theme(name)`** → the token set above (falls back to `executive` for an unknown name). Adding a theme = adding an entry here — **no code, no agent change**.
+
 ### Customize the skill instructions
 
 The `deck-designer` skill lives in the shared **capability Store** (the `capabilities` workspace catalog, exposed via the `v1/servers` API). A skill entry's instructions live in its `config_schema` defaults, so you can:
@@ -117,13 +137,128 @@ The `deck-designer` skill lives in the shared **capability Store** (the `capabil
 Keep the skill description sharp; it's the trigger the model sees, so it should clearly say *"decks / slides / presentation / pitch / .pptx"*. And prefer a capable model on the host agent: the design discipline is demanding and drives deck quality.
 </Tip>
 
+## Layouts: typed vs. freeform
+
+Deck Designer works from a set of **typed layouts** — hand-tuned, brand-aware building blocks: `title`, `section`, `agenda`, `bullets`, `twocolumn`, `stats`, `kpi`, `split`, `process`, `timeline`, `comparison`, `table`, `quote`, `closing`. When a point fits one of these, the agent fills its fields and the slide exports through a **native PowerPoint emitter**: fixed 16:9 geometry with automatic text-fitting, so the result is **deterministic and identical** across PowerPoint (Windows and Mac), LibreOffice and Keynote.
+
+When no typed layout fits, the agent authors a **freeform** slide as inline HTML. Freeform gives full design freedom, but it exports through a **best-effort DOM-to-PowerPoint mapping** (reading the rendered geometry) rather than a native emitter.
+
+<Warning>
+**A freeform slide's `.pptx` can occasionally need a small adjustment.** A freeform slide is arbitrary HTML **written by the language model**, and PowerPoint re-renders text with its own fonts and line-breaking. So a freeform slide can sometimes **reflow** in the exported `.pptx` — a title wrapping to an extra line, a block a few pixels off — even when the on-screen **preview and the PDF are perfect**. This is inherent to converting free HTML to editable PowerPoint (it is not a data-loss bug).
+
+If a freeform slide doesn't come out right, you have three options:
+1. Ask the agent to use a **typed layout** for that point — the reliable path for editable PPTX.
+2. Keep it freeform and **tweak the exported slide in PowerPoint** — it's fully editable.
+3. Use the **PDF**, which is always pixel-perfect, if you only need to present or share.
+</Warning>
+
+### Tips for clean freeform export
+
+- **Prefer typed layouts**; reach for freeform only when nothing fits.
+- Keep freeform slides **simple**: one piece of text per element, generous spacing, no overflow.
+- Use the theme's **cross-platform fonts** (see [Themes](#add-or-edit-a-theme-customize-the-mcp-server)) so the preview and the PPTX use matching metrics.
+
+### Typed layout reference
+
+Every slide is one object in `spec.slides`. This is the contract the **`deck-designer` skill** emits (and what you'd edit if you fork it). All fields are strings unless noted; `eyebrow` is the small uppercase kicker; empty/extra items beyond a layout's cap are dropped on export.
+
+<AccordionGroup>
+  <Accordion title="title — opener (dark)">
+    ```json
+    { "type": "title", "eyebrow?": "", "title": "", "subtitle?": "" }
+    ```
+  </Accordion>
+  <Accordion title="section — section divider (dark)">
+    ```json
+    { "type": "section", "number?": "01", "title": "", "subtitle?": "" }
+    ```
+  </Accordion>
+  <Accordion title="agenda — numbered contents (≤ 7 items)">
+    ```json
+    { "type": "agenda", "eyebrow?": "", "heading": "", "items": ["", ""] }
+    ```
+  </Accordion>
+  <Accordion title="bullets — key points (≤ 6, use sparingly)">
+    ```json
+    { "type": "bullets", "eyebrow?": "", "heading": "", "points": ["", ""] }
+    ```
+  </Accordion>
+  <Accordion title="twocolumn — takeaway + proof panel">
+    ```json
+    { "type": "twocolumn", "eyebrow?": "", "heading": "", "body?": "",
+      "points?": ["… (≤ 4, left column)"],
+      "panelTitle?": "", "panelPoints?": ["… (≤ 6, dark panel)"] }
+    ```
+  </Accordion>
+  <Accordion title="stats — three big numbers (exactly 3)">
+    ```json
+    { "type": "stats", "eyebrow?": "", "heading": "",
+      "stats": [ { "num": "600", "suffix?": "M", "label": "" } ] }
+    ```
+  </Accordion>
+  <Accordion title="kpi — metric grid (3–6)">
+    ```json
+    { "type": "kpi", "eyebrow?": "", "heading": "",
+      "metrics": [ { "num": "99.9", "suffix?": "%", "label": "" } ] }
+    ```
+  </Accordion>
+  <Accordion title="split — capabilities + data panel">
+    ```json
+    { "type": "split", "eyebrow?": "", "heading": "",
+      "features": [ { "icon": "tool|book|shield|chart", "title": "", "desc": "" } ],  // 3–4
+      "panelTitle": "", "bars": [ { "label": "", "value": 86 } ] }                    // 3–4, value 0–100
+    ```
+  </Accordion>
+  <Accordion title="process — numbered steps (3–5)">
+    ```json
+    { "type": "process", "eyebrow?": "", "heading": "",
+      "steps": [ { "title": "", "desc": "" } ] }
+    ```
+  </Accordion>
+  <Accordion title="timeline — roadmap (3–6 milestones, one highlight)">
+    ```json
+    { "type": "timeline", "eyebrow?": "", "heading": "",
+      "milestones": [ { "quarter": "Q1 2026", "title": "", "desc": "", "highlight?": false } ] }
+    ```
+  </Accordion>
+  <Accordion title="comparison — 2–3 columns, same rows (one highlight)">
+    ```json
+    { "type": "comparison", "eyebrow?": "", "heading": "",
+      "columns": [ { "title": "", "highlight?": false,
+        "rows": [ { "label": "", "value": "" } ] } ] }
+    ```
+  </Accordion>
+  <Accordion title="table — grid (≤ 6 columns, ≤ 7 rows)">
+    ```json
+    { "type": "table", "eyebrow?": "", "heading": "",
+      "columns": ["Col A", "Col B"], "rows": [ ["a1", "b1"], ["a2", "b2"] ] }
+    ```
+  </Accordion>
+  <Accordion title="quote — testimonial (dark, ≤ 25 words)">
+    ```json
+    { "type": "quote", "eyebrow?": "", "quote": "", "author": "", "role?": "", "company?": "" }
+    ```
+  </Accordion>
+  <Accordion title="closing — the ask / CTA (dark)">
+    ```json
+    { "type": "closing", "eyebrow?": "", "title": "", "cta?": "Get in touch →" }
+    ```
+  </Accordion>
+  <Accordion title="freeform — anything else (best-effort export)">
+    Fallback for layouts not covered above (matrix 2×2, case study, org chart, logo wall, pricing, code…). Author inline HTML using the theme CSS variables (`var(--dark|light|ink|muted|accent|soft|line|font-head|font-body)`); inline styles only, no external assets, one text per element, no overflow.
+    ```json
+    { "type": "freeform", "background": "light|dark|<hex>", "html": "<div style='…'>…</div>" }
+    ```
+  </Accordion>
+</AccordionGroup>
+
 ## Export formats
 
 Exports run entirely in the browser; what you see in the preview is exactly what exports.
 
 <CardGroup cols={2}>
   <Card title="PPTX (editable)" icon="file-powerpoint">
-    Native PowerPoint shapes and text boxes, mapped from the rendered geometry, fully editable in PowerPoint / Google Slides / Keynote.
+    Native PowerPoint shapes and text boxes, fully editable in PowerPoint / Google Slides / Keynote. Typed layouts use deterministic native emitters; freeform slides use a best-effort geometry mapping (see [Layouts](#layouts-typed-vs-freeform)).
   </Card>
   <Card title="PDF" icon="file-pdf">
     Pixel-perfect, landscape 16:9, one page per slide, faithful to the preview.
