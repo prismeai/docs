@@ -103,7 +103,7 @@ https://graph.microsoft.com/User.Read
       <api-url>/workspaces/<core-workspace-id>/webhooks/oauthCallback
       ```
 
-      For example, `https://api.studio.prisme.ai/v2/workspaces/08QVA1T/webhooks/oauthCallback` on production.
+      For example, `https://api.studio.prisme.ai/v2/workspaces/<core-workspace-id>/webhooks/oauthCallback` on production. The connector resolves this value in the core workspace context and never hardcodes the id, so read the exact URI from the configuration app.
 
       <Warning>
         Microsoft Entra rejects redirect URIs that contain a colon in the path, so use the **raw workspace id** of the core Outlook workspace, **not** the `slug:outlook-next` form shown as the central shape in [Callback URLs](/apps-store/marketplace/connectors/central-oauth#callback-urls). Copy the exact URI from the connector's configuration app, which renders the value resolved in the core workspace context.
@@ -249,14 +249,18 @@ https://graph.microsoft.com/User.Read
 
     | Tool | Description |
     |------|-------------|
-    | `mail` | Outlook mail messages. Actions: `list`, `get`, `create`, `update`, `delete`, `send`, `sendDraft`, `reply`, `replyAll`, `forward`, `move`, `listAttachments`, `getAttachment`. |
+    | `mail` | Outlook mail messages. Actions: `list`, `get`, `create`, `update`, `delete`, `send`, `sendDraft`, `reply`, `replyAll`, `forward`, `move`, `listAttachments`, `getAttachment`, `checkAccess`. |
     | `mailFolders` | Mail folders (well-known ids: `inbox`, `drafts`, `sentitems`, `deleteditems`). Actions: `list`, `get`, `create`, `delete`, `listMessages`, `listChildFolders`. |
     | `calendars` | Outlook calendars (the default calendar plus secondary ones). Actions: `list`, `get`, `create`, `delete`. |
     | `events` | Calendar events. Actions: `list`, `view`, `get`, `create`, `update`, `delete`, `accept`, `decline`, `tentativelyAccept`, `listForCalendar`. |
     | `contacts` | Personal contacts. Actions: `list`, `get`, `create`, `update`, `delete`. |
     | `contactFolders` | Contact folders. Actions: `list`, `get`, `create`, `listContacts`. There is no delete action. |
 
-    The MCP server advertises itself as `outlook-next-mcp` version `1.0.0`, and derives its `tools/list` manifest from the six tool automations. The tool automations refuse direct HTTP calls with `403` and the message `Direct calls are not allowed`, so every invocation must go through the MCP endpoint.
+    <Note>
+      `checkAccess` is advertised in the `mail` action enum, but it is **not** an operation for your agent. The MCP endpoint intercepts it before the agent allowlist and answers it only for the trusted Knowledge Sync caller; every other caller is refused with JSON-RPC `-32003` and `The delegated Resource access action is restricted to the trusted Knowledge Sync caller.` It exists for the per-reader access check of the sync surface, described in [Knowledge base (sync)](#knowledge-base-sync).
+    </Note>
+
+    The MCP server advertises itself as `outlook-next-mcp` version `1.0.0`, declares the `tools` and `resources` capabilities, and derives its `tools/list` manifest from the six tool automations. Each tool automation compares the calling workspace (`run.sourceWorkspaceId`) against its own and refuses anything else with HTTP `403` and `Direct calls are not allowed — use the MCP endpoint.`, so every invocation must go through the MCP endpoint.
 
     ## Response limits
 
@@ -403,7 +407,7 @@ https://graph.microsoft.com/User.Read
 
     Outlook follows the standard App + MCP installation flow: [install the app](/apps-store/marketplace/connectors/install-in-workspace#install-the-app) from **Apps** in your workspace, then [configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app), [authorize the agents that may call it](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector), and [copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint). Search the catalog for **Outlook**.
 
-    For Outlook specifically, installing the app provisions two workspace secrets, `outlookNextAuth` (the auth mode and its credentials) and `outlookNextAuthorizedAgents` (the agent allowlist), and wires them to the app instance configuration. Never edit these secrets by hand; the configuration app owns their shape.
+    For Outlook specifically, installing the app provisions two workspace secrets, `outlookNextAuth` (the auth mode and its credentials) and `outlookNextAuthorizedAgents` (the agent allowlist), and wires them to the app instance configuration. Never edit these secrets by hand; the configuration app owns their shape. The install also seeds `knowledgeSync.trustedCallers` with the `knowledge-sync` slug when the instance has none, so a scheduled synchronization is recognized without any configuration; a list you edited yourself is left alone on every reinstall.
 
     ## Configuration
 
@@ -411,7 +415,8 @@ https://graph.microsoft.com/User.Read
     |-------|-------------|
     | **Configuration app** | Auto-populated on install; open this link to configure authentication (mode and credentials), connect a Microsoft account (per-user OAuth modes), test the connection, and manage the authorized-agents allowlist. The URL has the form `<studio-url>/apps/outlook-next?workspaceId=<workspace-id>&workspaceSlug=<workspace-slug>&appInstance=<app-instance>`. |
     | **Microsoft Graph API version** | `v1.0` (default) or `beta`. It selects the Graph base URL `https://graph.microsoft.com/<version>`. |
-    | **Maximum MCP response characters** | Upper bound on the serialized MCP response before fair truncation. Defaults to `80000` and is clamped to the range `8000` to `100000` at runtime. |
+    | **Maximum MCP response characters** | Upper bound on the serialized MCP response before fair truncation. Defaults to `80000` and is clamped to the range `8000` to `100000` at runtime. The field's own help text quotes a wider range; the runtime clamp above is the one that applies. |
+    | **Knowledge-sync** (`knowledgeSync`) | Delegated MCP Resource access settings, used only by the sync surface. `trustedCallers` lists the workspace **slugs** allowed to browse and to run the delegated access check on a named user's behalf; each slug is resolved to this environment's workspace id through the platform registry at call time, so the same value works in sandbox and in production, and a slug that resolves to nothing fails closed. A raw workspace id written by an older install is still accepted. `mailbox` names the mailbox a scheduled sync reads when the instance ingests with an application identity; leave it empty for the ordinary per-user case. Non-secret: stored directly in the configuration value. |
 
     ## Authentication modes
 
@@ -581,7 +586,9 @@ https://graph.microsoft.com/User.Read
     **Goal:** index the messages of a mail folder into a knowledge base so an agent can search their **content**, and keep that base up to date.
 
     <Note>
-      Before a base can be attached, a workspace builder must have installed and configured the Outlook app in a workspace and connected a mailbox (see [Workspace builder](#workspace-builder-dsul)). Nothing else is needed: the same app instance serves both the agent tools and the sync surface. The **Authorized agents** allowlist does **not** apply here — it gates the connector as an agent *tool* ([Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector)), and has no effect on synchronization.
+      Before a base can be attached, a workspace builder must have installed and configured the Outlook app in a workspace and connected a mailbox (see [Workspace builder](#workspace-builder-dsul)). Nothing else is needed: the same app instance serves both the agent tools and the sync surface.
+
+      The **Authorized agents** allowlist does **not** apply here. `resources/list`, `resources/read` and the delegated `mail` / `checkAccess` action are authorized on a different axis, because nobody in those flows is an agent: a caller that is signed in must be able to **read the workspace that holds the connector's configuration**, and a synchronization run — scheduled or triggered by hand — carries no identity at all, so it is authorized as a workspace, by being listed in `knowledgeSync.trustedCallers`. The allowlist stays reserved for `tools/call` ([Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector)), so you never have to open the connector to every agent to make a knowledge base work.
     </Note>
 
     <Warning>
@@ -611,6 +618,8 @@ https://graph.microsoft.com/User.Read
     outlook://folder/{folderId}
     outlook://message/{messageId}
     ```
+
+    The connector publishes those two templates, plus `outlook://profile/knowledge`, through `resources/templates/list`. Both that method and a read of the profile URI answer **anonymously**, because catalog discovery probes them with no credentials; everything that touches the mailbox is behind the authorization described below.
 
     ## Attach the connector to a base
 
@@ -644,11 +653,15 @@ https://graph.microsoft.com/User.Read
     | Moment | Acts as | Authorized by |
     |--------|---------|---------------|
     | Attaching the connection, browsing the tree | You | Your **role on the workspace** holding the connector's configuration — the right to read that workspace is the right to read this mailbox through it |
-    | A scheduled sync run | No user at all | The calling workspace must be listed in `knowledgeSync.trustedCallers`; the Knowledge Sync workspace ships there by default |
-    | Answering a reader's question | The reader | A live per-reader access check (`mail` / `checkAccess`, batches of up to 100 URIs) against Microsoft Graph |
+    | A scheduled sync run | No user at all | The calling workspace must be listed by **slug** in `knowledgeSync.trustedCallers`; installing the app seeds `knowledge-sync` there, and the connector resolves that slug to the workspace id of the current environment |
+    | Answering a reader's question | The reader | A live per-reader access check (`mail` / `checkAccess`, batches of up to 100 distinct URIs), itself restricted to the same `knowledgeSync.trustedCallers` list, probing each message against Microsoft Graph |
 
     <Note>
-      **Per-user access control is supported — keep it on for a mailbox.** Each reader's own rights are re-checked in Outlook at query time, so a message they could not open in Outlook is not served to them either. Turning it off hands every synced message to anyone who can query the agent. On a shared mailbox fed by an application identity, be explicit about who is meant to read the base: the check can only reflect what Outlook itself grants each reader.
+      **Per-user access control is supported — keep it on for a mailbox.** Each reader's own rights are re-checked in Outlook at query time, so a message they could not open in Outlook is not served to them either. Turning it off hands every synced message to anyone who can query the agent.
+
+      The check always resolves the **reader's own Microsoft account** through the central OAuth client, even on an instance that ingests with `clientCredentials` or a stored access token — a check run on a shared identity would answer for that identity and clear correspondence the reader has no business seeing. A reader who has never connected Outlook therefore receives no documents: the check answers `requires_oauth` with a connect URL instead. On a shared mailbox fed by an application identity, be explicit about who is meant to read the base: the check can only reflect what Outlook itself grants each reader.
+
+      The check fails closed throughout. A malformed URI, a denial, an expired token and a Microsoft Graph outage all end with the document withheld, and a batch of more than 100 distinct URIs is refused rather than silently shortened.
     </Note>
 
     ## What gets indexed
@@ -657,7 +670,7 @@ https://graph.microsoft.com/User.Read
     |--------|----------|
     | Document unit | One **message** = one document, published as `text/plain` (subject, correspondents and body text). Folders are containers, never indexed themselves. |
     | Attachments | **Not ingested.** A message is a leaf, so the sync never descends into it; `hasAttachments` travels as metadata and the citation link opens the message. This matches the agent-tool surface, where binary fields such as `contentBytes` are stripped from every response (see [Response limits](#response-limits)). |
-    | Size ceiling | 200 000 characters of text per message; beyond it the document says it was truncated. |
+    | Size ceiling | 200 000 characters of text per message; beyond it the text is cut and the resource is flagged `truncated` in its metadata. |
     | Empty messages | A message with no extractable text — an empty body and no preview — is reported as unfetchable rather than indexed as a blank document. |
     | Revision marker | `changeKey`, falling back to `lastModifiedDateTime`. Unchanged messages are never re-read and never re-indexed. |
     | Deletions | Each run is a **full traversal**: a message absent from a complete listing is removed from the base — which also covers a message moved out of the synced folder. A listing that failed halfway deletes nothing. |
@@ -668,18 +681,26 @@ https://graph.microsoft.com/User.Read
       | Field | Value |
       |-------|-------|
       | `provider` | `outlook-next` |
+      | `tools` | `mail` |
       | `hierarchy` | `folder` › `message` |
       | `canonical_uri` | `outlook://message/{messageId}` |
       | `revision` | `changeKey`, fallback `lastModifiedDateTime` |
-      | `read` | Inline text only, 200 000 characters max; no binary |
+      | `read` | Inline text only, 200 000 characters max; binary `not_applicable` |
       | `list` | 50 resources per page by default, 100 max; `delta_on_drive: false` |
-      | `access` | Tool `mail`, action `checkAccess`, up to 100 URIs per call |
+      | `access` | Tool `mail`, action `checkAccess`, up to 100 distinct URIs per call |
       | `authentication` | `oauthCentral`, `oauth`, `clientCredentials`, `accessToken` |
+      | `resource_access` | Workspace role, or the trusted Knowledge Sync caller |
     </Note>
 
     ## Troubleshooting the sync
 
-    **The URL check says "You are not allowed to read it"**: you have no role on the workspace holding the connector's configuration. Ask its administrator for one — this is not about your mailbox rights.
+    **The URL check says "You are not allowed to read it"**, and the connector answers `You do not have the rights to read this connector on the workspace that holds its configuration.`: you have no role on the workspace holding the connector's configuration. Ask its administrator for one — this is not about your mailbox rights.
+
+    **`This connector answers Resource calls to its workspace members, or to the trusted Knowledge Sync workspace.`**: the call carries no identity and its workspace is not trusted. On a sync run, add the `knowledge-sync` slug to `knowledgeSync.trustedCallers` in the connector's **Knowledge-sync** configuration — installing the app normally seeds it.
+
+    **`Delegated Resource access is restricted to the trusted Knowledge Sync caller.`**: the run named a `targetUserId` from a workspace that is not in `knowledgeSync.trustedCallers`. Add that workspace's **slug** to the connector's **Knowledge-sync** configuration.
+
+    **`This connector could not authenticate the call, so membership of the workspace holding its configuration could not be established.`**: the platform declined to authenticate the call itself — a run carrying a user id but no session, or an organization enforcing MFA. This is not a missing role; sign in again rather than hunting for a permission.
 
     **The URL check says "It answered, but could not serve its content"**: the connector itself is not fully configured. Open its configuration app and connect a mailbox.
 
@@ -688,6 +709,8 @@ https://graph.microsoft.com/User.Read
     **An attachment's content is not searchable**: by design — attachments are not ingested. Index the documents themselves from where they live (SharePoint, Drive, WebDAV) if their content must be searchable.
 
     **Messages disappear from the base after being filed**: moving a message out of the synced folder removes it on the next complete traversal. Sync the folder the mail actually lands in, or a parent of it.
+
+    **A reader gets no documents at all, and the workspace activity feed shows `knowledge.access.delegation_unavailable`**: the access check was asked to act for another user from a run that already carries a signed-in user. The delegated token lives in a workspace-scoped secret that only a user-less run may read, so the check returns nothing rather than guessing. This is the sync path's own concern; it does not affect a reader querying the base normally.
 
     **A scheduled sync keeps running after a right was revoked**: the role check runs on the interactive paths only. A scheduled run is authorized as the platform's synchronization workspace — delete the connection to stop it for certain.
   </Tab>
@@ -736,7 +759,9 @@ Errors that every App + MCP connector shares are covered in [Install a connector
 
 **`Unknown action`** or **`Missing required argument`**: the `action` value is absent or not in the tool's enum. The error message lists the valid actions for that tool.
 
-**`Direct calls are not allowed`**: a tool automation was called over HTTP instead of through the MCP endpoint, and answered `403`. Point the capability at the connector's **MCP Endpoint**.
+**`Direct calls are not allowed — use the MCP endpoint.`**: a tool automation was called over HTTP instead of through the MCP endpoint, and answered `403`. The tool checks the provenance of the call — the workspace it came from must be the workspace that owns the automation — so no header or key can stand in for the endpoint. Point the capability at the connector's **MCP Endpoint**.
+
+**`The delegated Resource access action is restricted to the trusted Knowledge Sync caller.`** (JSON-RPC `-32003`): something called the `mail` tool with `action: "checkAccess"` from a workspace that is not in `knowledgeSync.trustedCallers`. This action belongs to the sync surface, not to agents; remove it from the agent's instructions, or add the calling workspace's slug to the connector's **Knowledge-sync** configuration if it really is a synchronization caller.
 
 **`Microsoft Graph is not connected for this user`**: no per-user OAuth token exists. Open the configuration app in a per-user OAuth mode and select **Connexion**, or use the agent's connect flow. In a scheduled automation with no user session, switch the workspace to `clientCredentials` or `accessToken`.
 
@@ -744,7 +769,7 @@ Errors that every App + MCP connector shares are covered in [Install a connector
 
 **`Microsoft Graph token endpoint temporarily unavailable`**: Microsoft returned a `5xx` on the token exchange. This is flagged as transient, the connection is preserved, and the call succeeds on retry.
 
-**`No stored Microsoft Graph token for this user`**: a non-interactive resolution found no workspace-scoped refresh token for the target user. That token is only stored when the user connects while holding the workspace editor or owner role.
+**`No stored Microsoft Graph token for this user`**: a non-interactive resolution — a scheduled run, or the sync surface's delegated access check — found no workspace-scoped refresh token for the target user. That copy is deposited when the user connects once from the configuration app, and the connector grants every workspace **member** the right to write their own `olnRefresh_<user-id>` secret, so no editor role is needed despite what the message says. Ask the target user to connect; on the sync surface the same condition surfaces as `requires_oauth` with a connect URL rather than as an error.
 
 **`Microsoft Graph OAuth is not configured`**: neither a tenant OAuth client nor the central platform client is available. Set the client ID, secret and tenant in the config app, or ask the platform maintainer to provision the central Entra OAuth client from the core workspace.
 

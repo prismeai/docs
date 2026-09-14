@@ -53,6 +53,10 @@ The MCP server runs in the **tenant app-instance context**: it resolves the inst
 
 Every call goes through the same chain: the MCP endpoint identifies the calling agent, checks the workspace allowlist, resolves a Figma access token for the invoking user, then dispatches to the entity tool, which calls `https://api.figma.com`.
 
+<Note>
+  Figma content is kept out of the workspace activity feed. Every entity tool declares its `content` and `structuredContent` output as redacted, and the arguments that carry payloads — the `variables` change objects, and the body and query string of the underlying API call — are redacted too, so document JSON, comment text and rendered image links appear masked instead of in clear. Every credential-handling webhook redacts its whole output: the OAuth connect, callback, status and disconnect endpoints, the central token exchange, `testAuth`, `setOAuthClient` and the MCP endpoint itself. What stays visible is the call itself: which tool ran, with which action, and whether it failed.
+</Note>
+
 ### Runtime identity
 
 In all three authentication modes, Figma sees a **single Figma account**, and Figma enforces that account's own file and team permissions. Prisme.ai never widens what the account can reach.
@@ -549,8 +553,9 @@ Figma names the missing scope in the body of its `403` response, and the connect
 
     - Access tokens are cached in user scope with an expiry. The connector refreshes proactively when fewer than 120 seconds remain, and assumes a 3300 second lifetime when Figma omits `expires_in`.
     - Figma does not reissue the refresh token on refresh, so the stored one is kept.
-    - When Figma permanently rejects the refresh token (any `4xx`), the connector deletes the stored connection so the user is prompted to reconnect instead of hitting repeated failures. A `5xx` is treated as transient and the connection is kept.
-    - The refresh token is additionally written to the workspace secret `figRefresh_<userId>` so scheduled automations can resolve that user without an interactive session. That write requires the connecting user to be a workspace editor or owner; for anyone else it is skipped silently and only the interactive path works.
+    - When Figma permanently rejects the refresh token (any `4xx`), the connector deletes the stored connection so the user is prompted to reconnect instead of hitting repeated failures. An interactive run drops the user-scope connection; a scheduled run deletes that user's `figRefresh_<userId>` workspace secret, so the schedule stops replaying a token Figma will keep rejecting. A `5xx` is treated as transient and the connection is kept.
+    - The refresh token is additionally written to the workspace secret `figRefresh_<userId>` so scheduled automations can resolve that user without an interactive session. The connector's `security.yml` carries an unroled rule letting every member `create` and `update` `figRefresh_<their own user id>` and nobody else's, so connecting deposits the token whatever the member's workspace role — see [Reading a workspace secret with no user](/products/ai-builder/module-secrets#reading-a-workspace-secret-with-no-user).
+    - A scheduled run reads, and when the token is dead deletes, `figRefresh_<userId>` under a dedicated `tokenResolver` role that the connector assumes for that single call. The role is never granted to a person and cannot be assumed from anywhere but the connector's own token-resolution automation, so a workspace member cannot use it to read another member's refresh token.
 
     ## Available instructions
 
@@ -748,7 +753,7 @@ The connector normalizes every Figma failure into a message naming the operation
 
 **`Figma is not authenticated`**: no auth mode resolved at all, usually an instance installed but never configured. Open the configuration app, choose the mode, and store its credentials. Owner: workspace builder.
 
-**`No stored Figma token for this user`**: a scheduled or otherwise non-interactive run tried to act on behalf of a user who has no `figRefresh_<userId>` secret. That secret is only written when the user connects while holding the workspace editor or owner role. Have them connect once from the configuration app with that role. Owner: workspace builder.
+**`No stored Figma token for this user`**: a scheduled or otherwise non-interactive run tried to act on behalf of a user who has no `figRefresh_<userId>` secret. Have that user connect once from the configuration app in an OAuth mode; the deposit is theirs to make and needs no particular workspace role. The message ends with `as a workspace editor`, which is a leftover from an earlier permission model and no longer describes what the connector requires. Owner: the user themselves.
 
 **`Direct calls are not allowed`**, returned as `403`: an entity automation was called directly instead of through the MCP endpoint. Point the caller at the MCP endpoint URL, or use the `Figma.<instruction>` App instructions from DSUL. Owner: agent builder or workspace builder.
 

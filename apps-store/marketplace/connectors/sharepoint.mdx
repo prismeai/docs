@@ -148,7 +148,7 @@ offline_access https://graph.microsoft.com/Sites.ReadWrite.All https://graph.mic
   The `agent_id` in that scope is what lets the connector identify and authorize the calling agent, as explained in [What the Scope means](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means). It is unrelated to the Microsoft Graph OAuth scopes.
 
   <Warning>
-    Publishing the capability makes the connector **available**; it does not by itself authorize a specific agent, as explained in [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization). This connector follows the **tenant-context model**: which agents may call a workspace's endpoint is gated by that workspace's **Authorized agents** allowlist (see [Workspace builder (DSUL)](#workspace-builder-dsul)). The shared core endpoint is the exception — when the central OAuth client is configured, it accepts every agent and per-user OAuth is the only gate, as described in [Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint).
+    Publishing the capability makes the connector **available**; it does not by itself authorize a specific agent, as explained in [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization). This connector follows the **tenant-context model**: which agents may call a workspace's **tools** is gated by that workspace's **Authorized agents** allowlist (see [Workspace builder (DSUL)](#workspace-builder-dsul)). The shared core endpoint is the exception — when the central OAuth client is configured, it accepts every agent and per-user OAuth is the only gate, as described in [Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint). The MCP Resource methods are on a different axis entirely: they answer to read access on the workspace holding the configuration, so the catalog entry and the agent allowlist are independent of what a knowledge base may sync.
   </Warning>
 </Accordion>
 
@@ -256,6 +256,10 @@ offline_access https://graph.microsoft.com/Sites.ReadWrite.All https://graph.mic
     - **`verbose`** (default): a human-readable text view, optimized for LLM consumption.
     - **`structured`**: concise machine-readable JSON in `structuredContent`.
     - **`both`**: the structured payload, with its JSON also rendered as text.
+
+    <Note>
+      **SharePoint content stays out of the workspace activity feed.** Every entity tool declares its `content` and `structuredContent` output as redacted, the `body` arguments that carry payloads are redacted too, and so are the Resource automations and every credential-handling webhook — the OAuth connect, callback, status and disconnect endpoints, the central token exchange, `testAuth`, `setOAuthClient` and the MCP endpoint itself. What stays visible is the call itself: which tool ran, with which action, and whether it failed. Redaction applies to the emitted events only; agents and automations still receive the real values.
+    </Note>
 
     ## Tool details
 
@@ -485,7 +489,15 @@ offline_access https://graph.microsoft.com/Sites.ReadWrite.All https://graph.mic
 
     Listings page at 50 resources by default and 200 at most. A read inlines the text of a text-like file up to 1,000,000 bytes, capped at 200,000 characters; every other item comes back as metadata carrying its short-lived pre-signed download URL, so the bytes are fetched out of band. Item revisions are tracked by `cTag`, falling back to `eTag`. A drive URI also accepts an opt-in delta listing, but the published profile advertises `delta_on_drive: false`, so a knowledge-base sync re-lists in full rather than following the delta feed.
 
-    Resource requests are authorized by the same agent allowlist as tool calls: `resources/list` and `resources/read` run the same check as a tool call, and an unauthorized or unidentified caller is refused with `This agent is not authorized to access SharePoint Resources.` A scheduled sync that runs without a user session may name the connection owner through `targetUserId`, but only from a workspace listed in the connector's `knowledgeSync.trustedCallers` configuration; any other caller is refused with `Delegated Resource access is restricted to the trusted Knowledge Sync caller.`
+    Resource requests are **not** gated by the **Authorized agents** allowlist — that allowlist governs `tools/call`. `resources/list` and `resources/read` are authorized by the caller's **read access to the workspace that holds the connector's configuration**, checked by reading that workspace as the caller; an `agent_id` riding along on the request changes nothing. Refusals are JSON-RPC errors:
+
+    - `-32003` `You do not have the rights to read this connector on the workspace that holds its configuration.` — an identified caller who cannot read that workspace.
+    - `-32003` `This connector answers Resource calls to its workspace members, or to the trusted Knowledge Sync workspace.` — a caller carrying no identity at all and not recognized as the trusted sync workspace.
+    - `-32001` `This connector could not authenticate the call, so membership of the workspace holding its configuration could not be established. This is not a missing role.` — the platform declined to authenticate the call; the role is not what is missing.
+
+    `resources/templates/list` and the `sharepoint://profile/knowledge` read answer before this check, so discovery works unauthenticated.
+
+    A scheduled sync runs without a user session and names the connection owner through `targetUserId`. That is honored only for a workspace listed in the connector's `knowledgeSync.trustedCallers` configuration; any other caller is refused with `-32003` `Delegated Resource access is restricted to the trusted Knowledge Sync caller.` The same guard, under the message `The delegated Resource access action is restricted to the trusted Knowledge Sync caller.`, protects the `items` `checkAccess` action.
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
@@ -497,7 +509,7 @@ offline_access https://graph.microsoft.com/Sites.ReadWrite.All https://graph.mic
 
     The installation flow is the standard one: [Install the app](/apps-store/marketplace/connectors/install-in-workspace#install-the-app), then [Configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app). Search for **SharePoint** in **Apps**, install it, then open the **Configuration app** link that installation writes into the instance configuration, choose the auth mode, provide credentials, connect, and allow the agents that may call the connector. You need the `owner`, `editor` or `admin` role on the workspace ([Before you begin](/apps-store/marketplace/connectors/install-in-workspace#before-you-begin)).
 
-    For SharePoint, installation provisions two workspace secrets, `sharepointNextAuth` (auth mode and credentials) and `sharepointNextAuthorizedAgents` (the agent allowlist), and binds them so the connector resolves them at runtime ([What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions)). Manage both through the configuration app rather than by editing Secrets directly.
+    For SharePoint, installation provisions two workspace secrets, `sharepointNextAuth` (auth mode and credentials) and `sharepointNextAuthorizedAgents` (the agent allowlist), and binds them so the connector resolves them at runtime ([What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions)). Manage both through the configuration app rather than by editing Secrets directly. Installation also seeds `knowledgeSync.trustedCallers` with `knowledge-sync` when the instance has no list of its own, so a scheduled knowledge-base sync is recognized without any extra configuration; an install that already carries its own list keeps it untouched.
 
     ## Configuration
 
@@ -505,7 +517,7 @@ offline_access https://graph.microsoft.com/Sites.ReadWrite.All https://graph.mic
     |-------|-------------|
     | **Configuration app** | Auto-populated on install; open this link to configure authentication, connect a Microsoft account (OAuth modes), publish the capability, and manage the authorized-agents allowlist. |
     | **Microsoft Graph API version** | `v1.0` (default) or `beta`. |
-    | **Knowledge-sync** | Delegated MCP Resource access settings. `trustedCallers` lists the workspace ids allowed to pass a server-verified `targetUserId`. |
+    | **Knowledge-sync** | Delegated MCP Resource access settings. `trustedCallers` lists the workspace **slugs** allowed to pass a server-verified `targetUserId`, resolved to ids through the platform registry so the same value works in every environment. Installation seeds it with `knowledge-sync`; a raw workspace id written by an earlier install is still accepted. |
 
     The configuration app drives everything else; the app instance itself has no per-field credential form. From it you pick one of:
 
@@ -527,7 +539,7 @@ offline_access https://graph.microsoft.com/Sites.ReadWrite.All https://graph.mic
     </Warning>
 
     <Note>
-      **Authorized agents** gates which Agent Creator agents may call this workspace's MCP endpoint; the flow is described in [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector). Tick each agent, or turn on **Allow all agents (disables selection + verification)** — which, as the app warns, lets any agent call the connector ([The allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard)). The allowlist does not apply to the shared core endpoint when a central OAuth client is configured.
+      **Authorized agents** gates which Agent Creator agents may call this workspace's MCP **tools**; the flow is described in [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector). Tick each agent, or turn on **Allow all agents (disables selection + verification)** — which, as the app warns, lets any agent call the connector ([The allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard)). The allowlist does not apply to the shared core endpoint when a central OAuth client is configured, and it does not apply to the MCP Resource methods at all: those are governed by read access to this workspace (see [MCP Resources](#mcp-resources)), so feeding a knowledge base never requires widening the agent list.
     </Note>
 
     Copy the endpoint agents will call from the configuration app, as described in [Copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint), and hand it to the agent builder together with the **Scope** `context_id,agent_id,user_id`.
@@ -748,12 +760,12 @@ offline_access https://graph.microsoft.com/Sites.ReadWrite.All https://graph.mic
     | Moment | Acts as | Authorized by |
     |--------|---------|---------------|
     | Attaching the connection, browsing the tree | You | Your **role on the workspace** holding the connector's configuration — the right to read that workspace is the right to read this SharePoint through it |
-    | A scheduled sync run | No user at all | The **Authorized agents** check first, then `knowledgeSync.trustedCallers`, which must list the calling workspace; the Knowledge Sync workspace ships there by default |
-    | Answering a reader's question | The reader | A live per-reader access check (`items` / `checkAccess`) against Microsoft Graph |
+    | A scheduled sync run | No user at all | `knowledgeSync.trustedCallers`, which must list the calling workspace by slug; installation seeds it with `knowledge-sync` |
+    | Answering a reader's question | The reader | A live per-reader access check (`items` / `checkAccess`) against Microsoft Graph, reserved to the trusted Knowledge Sync caller |
 
-    <Warning>
-      **Authorized agents gates the sync surface too, on this connector.** `resources/list` and `resources/read` run the same authorization check as a tool call, so a caller that is neither allowlisted nor identified is refused with `This agent is not authorized to access SharePoint Resources.` before `knowledgeSync.trustedCallers` is even consulted. Allow the sync caller under **Authorized agents**, or turn on **Allow all agents** ([The allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard)). The shared core endpoint is the exception: a resolved central OAuth client accepts every caller ([Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint)).
-    </Warning>
+    <Note>
+      **The Authorized agents allowlist does not gate the sync surface.** `resources/list` and `resources/read` are authorized by your **read access to the workspace holding the connector's configuration**, not by the agent allowlist — nobody in these flows is an agent, and presenting an `agent_id` does not change the answer. Feeding a knowledge base therefore never requires ticking agents or turning on **Allow all agents**, which would widen `tools/call` across the organization to grant one synchronization the right to read files. Keep the agent list as narrow as your tool calls need. The exact refusal messages are listed under [MCP Resources](#mcp-resources).
+    </Note>
 
     <Note>
       **Per-user access control is supported and worth keeping on.** The connector declares an access tool, so each reader's own rights are re-checked in SharePoint at query time: a file you lost access to stops appearing in answers without waiting for the next sync. Turning it off serves every synced document to anyone who can query the agent, whatever their SharePoint rights. Note that a connection backed by `clientCredentials` feeds the base with the **application's** reach — narrow it at the source (sites-selected permissions) rather than counting on the selection made in the wizard.
@@ -782,6 +794,7 @@ offline_access https://graph.microsoft.com/Sites.ReadWrite.All https://graph.mic
       | `list` | 50 resources per page by default, 200 max; `delta_on_drive: false` |
       | `access` | Tool `items`, action `checkAccess` |
       | `authentication` | `oauth`, `oauthCentral`, `clientCredentials`, `accessToken` |
+      | `resource_access` | `requireWorkspaceRole plus buildAppAuth` |
     </Note>
 
     ## Troubleshooting the sync
@@ -790,7 +803,11 @@ offline_access https://graph.microsoft.com/Sites.ReadWrite.All https://graph.mic
 
     **The URL check says "It answered, but could not serve its content"**: the connector itself is not fully configured. Open its configuration app and connect an account.
 
-    **"This agent is not authorized to access SharePoint Resources"**: the sync caller is not in **Authorized agents**. Tick it in the configuration app, or turn on **Allow all agents**.
+    **"You do not have the rights to read this connector on the workspace that holds its configuration"**: you are signed in, but you hold no role on the workspace where the SharePoint app is installed. Ask its administrator for one. This is not about **Authorized agents**, and not about your SharePoint rights.
+
+    **"This connector answers Resource calls to its workspace members, or to the trusted Knowledge Sync workspace"**: the call carried no identity and did not come from a workspace listed in `knowledgeSync.trustedCallers`. On a scheduled run, check that the list still contains `knowledge-sync` in the instance configuration.
+
+    **"This connector could not authenticate the call, so membership of the workspace holding its configuration could not be established"**: the platform declined to authenticate the call itself — a run carrying a user id but no session, or an organization enforcing MFA. Do not go looking for a missing role; sign in again from the surface making the call.
 
     **A site does not appear when browsing**: a site created moments ago is not searchable yet — `/sites?search=` is served by the SharePoint search index, which takes minutes to hours. It is reachable by path in the meantime.
 

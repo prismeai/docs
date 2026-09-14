@@ -1,6 +1,6 @@
 ---
 title: 'Jira'
-description: 'Search, create and manage Atlassian Jira Cloud and Jira Data Center issues, projects, users, metadata and agile boards from Agent Creator agents and Builder workflows, with per-user Atlassian OAuth, API tokens or OAuth1'
+description: 'Search, create and manage Atlassian Jira Cloud and Jira Data Center issues, projects, users, metadata and agile boards from Agent Creator agents and Builder workflows, with per-user Atlassian OAuth, API tokens, Data Center personal access tokens or OAuth1'
 ---
 
 <img
@@ -21,11 +21,12 @@ Pick the authentication mode from the outcome you need, not from what is easiest
 | `oauthCentral` | The invoking end user | Recommended. A platform maintainer registers one Atlassian 3LO app for the whole platform; each workspace installs the connector and each user signs in with their own Atlassian account. Nothing to register per workspace. |
 | `oauth` | The invoking end user | You must keep the Atlassian OAuth app under your own tenant's control. You paste your own Client ID and Secret in the configuration app; users sign in against your client (authorization code with PKCE, 3LO). |
 | `apiToken` | One shared Atlassian account | Unattended automations with no interactive sign-in. HTTP Basic with an Atlassian account email plus an API token. Every call is attributed to that single account. |
-| `accessToken` | Whoever owns the token | A caller-managed token is already available and is used as-is with no exchange. On Data Center this is where a Personal Access Token goes (sent as `Bearer`). |
+| `accessToken` | Whoever owns the token | A caller-managed token is already available and is used as-is with no exchange (sent as `Bearer`). One shared token for the whole workspace; for *per-user* Data Center tokens use `personalAccessToken` instead. |
+| `personalAccessToken` | The invoking end user | Data Center only. Each user pastes their own Jira **Personal Access Token** once; it is validated against `GET /rest/api/2/myself` and stored in that user's own secret store. No OAuth client to register anywhere. |
 | `oauth1` | The invoking end user | Data Center only, where OAuth2 is unavailable. A Jira Application Link signs each request with a shared consumer key and RSA private key, plus an access token each user obtains from that Application Link. |
 
 <Warning>
-  `apiToken` and `accessToken` are **shared service identities**: every agent and every user of the workspace acts as that one Atlassian account, Jira audit logs attribute all writes to it, and its project permissions become the blast radius of the whole connector. Prefer `oauthCentral` or `oauth` whenever a human triggers the action. Selecting `oauth1` on a Cloud deployment fails with `oauth1 is supported only with deployment=dataCenter.`
+  `apiToken` and `accessToken` are **shared service identities**: every agent and every user of the workspace acts as that one Atlassian account, Jira audit logs attribute all writes to it, and its project permissions become the blast radius of the whole connector. Prefer `oauthCentral`, `oauth` or `personalAccessToken` whenever a human triggers the action. Selecting a Data Center-only mode on a Cloud deployment fails with `oauth1 is supported only with deployment=dataCenter.` or `personalAccessToken is supported only with deployment=dataCenter.`
 </Warning>
 
 <CardGroup cols={3}>
@@ -36,7 +37,7 @@ Pick the authentication mode from the outcome you need, not from what is easiest
     List projects, components, versions and statuses; discover fields, issue types, priorities and create-screen metadata before writing.
   </Card>
   <Card title="Per-user Atlassian OAuth" icon="key">
-    Per-user 3LO OAuth (central or tenant client), an HTTP Basic API token, a direct access token, or Data Center OAuth1, all resolved server-side.
+    Per-user 3LO OAuth (central or tenant client), an HTTP Basic API token, a direct access token, or Data Center personal access tokens and OAuth1, all resolved server-side.
   </Card>
 </CardGroup>
 
@@ -63,10 +64,13 @@ Jira is an App + MCP connector, so it follows the three standard connector flows
 - An **Atlassian Jira Cloud** site (`https://yoursite.atlassian.net`) or a **Jira Data Center 10.3** base URL (an absolute HTTP or HTTPS URL, optionally with a context path such as `/jira`, and without credentials, query string or fragment), plus an account with permission on the projects you intend to use.
 - For the OAuth2 modes: an **OAuth 2.0 (3LO) app** registered in the [Atlassian Developer Console](https://developer.atlassian.com/console/myapps/), with the **Jira platform REST API** added and the scopes below granted.
 - For the `apiToken` mode: an **Atlassian account email** plus an **API token** generated at [Atlassian API Tokens](https://id.atlassian.com/manage-profile/security/api-tokens). On Cloud you also supply the **site** (`yoursite.atlassian.net`); on Data Center the configured base URL is used instead.
+- For the `personalAccessToken` mode (Data Center only): nothing to register on the Jira side beyond the base URL. Each user issues themselves a **Personal Access Token** from their own Jira Data Center account and pastes it once into the connection form.
 - For the `oauth1` mode (Data Center only): a **Jira Application Link** configured with a consumer key and an RSA public key, so each user can issue themselves an access token.
-- The base URL is resolved automatically: the OAuth2 and `accessToken` modes call `https://api.atlassian.com/ex/jira/{cloudId}` on Cloud (the `cloudId` is discovered from the granted site through `GET https://api.atlassian.com/oauth/token/accessible-resources`); the `apiToken` mode calls `https://{site}.atlassian.net` directly. On Data Center every mode calls the configured base URL.
+- The base URL is resolved automatically: the OAuth2 and `accessToken` modes call `https://api.atlassian.com/ex/jira/{cloudId}` on Cloud (the `cloudId` is discovered from the granted site through `GET https://api.atlassian.com/oauth/token/accessible-resources`); the `apiToken` mode calls `https://{site}.atlassian.net` directly. On Data Center every mode calls the configured base URL, which is normalized and validated first and then takes precedence over any Cloud-style base the mode would otherwise build.
 
 ### OAuth scopes
+
+Cloud and Data Center expose **disjoint scope vocabularies**, and the connector resolves the **Scopes** field against the vocabulary of the selected `deployment` before it builds the authorize URL: a scope is case-corrected (`read write` becomes `READ WRITE` on Data Center), a scope belonging to the other deployment is dropped, and an empty field falls back to that deployment's default.
 
 On Cloud, the scopes requested by default are the **classic** Jira platform scopes, which cover every platform operation (issues, search, projects, users, metadata, attachments):
 
@@ -79,11 +83,13 @@ manage:jira-configuration
 offline_access
 ```
 
-On a Data Center OAuth2 client the default scope list is instead:
+A Data Center OAuth2 client accepts only these coarse scopes, and the default is `READ WRITE`:
 
 ```text
-READ WRITE
+READ  WRITE  READ_ALL  MANAGE_SUBSCRIPTIONS  JSM_KB  ADMIN  SYSTEM_ADMIN
 ```
+
+`offline_access` is **not** a Data Center scope: Data Center returns a refresh token unconditionally, and sending `offline_access` fails the authorize call with an unknown-scope error. Saving a central profile with `deployment=dataCenter` and Cloud scopes (or the reverse) is rejected with `These scopes are not valid for deployment=<deployment>: <scopes>.`
 
 The connector requests exactly the scopes stored in the **Scopes** field of the configuration app, so that field is the effective grant: it can narrow what the Atlassian app exposes, never widen it.
 
@@ -109,14 +115,22 @@ Body adaptations applied on Data Center:
 - Atlassian Document Format (ADF) values are flattened to plain text for `createIssue` and `updateIssue` descriptions and for `addComment` bodies, because REST API v2 expects wiki-markup strings.
 - `assignIssue` sends `name` instead of `accountId`.
 
-Data Center OAuth2 uses the instance endpoints `{baseUrl}/rest/oauth2/latest/authorize` and `{baseUrl}/rest/oauth2/latest/token`, with a form-encoded token request. Cloud uses `https://auth.atlassian.com/authorize` and `https://auth.atlassian.com/oauth/token` with a JSON token request.
+Data Center OAuth2 uses the instance endpoints `{baseUrl}/rest/oauth2/latest/authorize` and `{baseUrl}/rest/oauth2/latest/token`, with a form-encoded token request. Cloud uses `https://auth.atlassian.com/authorize` and `https://auth.atlassian.com/oauth/token` with a JSON token request. Data Center also ignores the `audience` and `prompt` parameters Cloud requires, so the connector omits them on a `dataCenter` profile.
+
+#### Connecting a Data Center personal access token
+
+In `personalAccessToken` mode there is no redirect to Jira. Starting the connection opens a form in the configuration app; the token you paste is checked with `GET {baseUrl}/rest/api/2/myself` before anything is stored, so an invalid value is rejected (`invalid_token`) and any token already connected is left untouched. An empty submission returns `token_required`, and a malformed base URL on the profile returns `invalid_base_url`. Accepted tokens are written to the connecting user's **own** secret store under `jiraNextPat`, never to the shared workspace configuration. If Jira later answers `401` to a normal call, the connector deletes the stored token so the user is prompted to reconnect rather than retrying a dead credential.
 
 <Note>
-  A **central** (platform-wide) client can only be an OAuth2 client, as described in [When to use a central client](/apps-store/marketplace/connectors/central-oauth#when-to-use-a-central-client). If the platform maintainer stores a Data Center OAuth1 profile as the central profile, workspaces that select `oauthCentral` cannot resolve it: the connection status reports `unsupported_central_auth_mode`. Data Center OAuth1 must be configured per workspace with the `oauth1` mode.
+  The central profile accepts three modes (`oauth`, `personalAccessToken`, `oauth1`; anything else is rejected with `Central mode must be oauth, personalAccessToken, or oauth1.`), but only an **OAuth2** central profile can be shared with installed workspaces, as described in [When to use a central client](/apps-store/marketplace/connectors/central-oauth#when-to-use-a-central-client). If the platform maintainer stores a Data Center OAuth1 or `personalAccessToken` profile as the central profile, workspaces that select `oauthCentral` cannot resolve it: the connection status reports `unsupported_central_auth_mode`. Those two modes serve the core `jira-next` endpoint itself (where each user still connects their own token), and must otherwise be configured per workspace with the `oauth1` or `personalAccessToken` mode.
 </Note>
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
   **Goal:** two one-time tasks: (1) configure the shared **central Atlassian OAuth client** so every workspace lets its users sign in with their own Atlassian account, and (2) expose Jira as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
+
+  <Note>
+    **Data Center without OAuth2.** If your platform serves a single Jira Data Center instance that has no OAuth2 application, store the central profile in `personalAccessToken` mode instead: it saves only the deployment and base URL (no client id, no secret, no scopes), and every user of the core endpoint connects by pasting their own Personal Access Token. Saving it with anything other than `deployment=dataCenter` and a base URL is rejected with `Personal Access Token mode requires deployment=dataCenter and baseUrl.` Such a profile serves the core endpoint only: workspaces that select `oauthCentral` still report `unsupported_central_auth_mode` and must select `personalAccessToken` themselves.
+  </Note>
 
   ## 1. Configure the connector
 
@@ -265,7 +279,7 @@ Data Center OAuth2 uses the instance endpoints `{baseUrl}/rest/oauth2/latest/aut
       read:jira-work read:jira-user offline_access
       ```
 
-      (Drop `write:jira-work`, `manage:jira-project` and `manage:jira-configuration`.) With central OAuth (`oauthCentral`) you do **not** create your own Atlassian client: keep `oauthCentral` and just enter the read-only scopes; your tenant scope overrides the platform default (the central app must expose those read scopes). Write calls are then rejected by Atlassian with `403`. Note this is set at the workspace level; a workspace editor can widen it again, and a provider-side restriction (a read-only Atlassian account or permission scheme) is the only hard guarantee. For the `apiToken`, `accessToken` and `oauth1` modes, restrict at the provider instead by backing the connection with a Jira account that has read-only project permissions.
+      (Drop `write:jira-work`, `manage:jira-project` and `manage:jira-configuration`.) With central OAuth (`oauthCentral`) you do **not** create your own Atlassian client: keep `oauthCentral` and just enter the read-only scopes; your tenant scope overrides the platform default (the central app must expose those read scopes). Write calls are then rejected by Atlassian with `403`. Note this is set at the workspace level; a workspace editor can widen it again, and a provider-side restriction (a read-only Atlassian account or permission scheme) is the only hard guarantee. For the `apiToken`, `accessToken`, `personalAccessToken` and `oauth1` modes, restrict at the provider instead by backing the connection with a Jira account that has read-only project permissions.
     </Note>
 
     ## Available Tools
@@ -440,6 +454,7 @@ Data Center OAuth2 uses the instance endpoints `{baseUrl}/rest/oauth2/latest/aut
     | Workspace secret holding the auth profile | `jiraNextAuth` |
     | Workspace secret holding the agent allowlist | `jiraNextAuthorizedAgents` |
     | Per-user OAuth refresh token secret | `jrnRefresh_<userId>` |
+    | Per-user Data Center personal access token secret | `jiraNextPat` (user-scoped) |
     | Capability **Scope** | `context_id,agent_id,user_id` |
 
     Installing the app provisions those secrets, binds them to the instance configuration, and stores both the configuration app URL and this instance's own OAuth callback URL, as described in [What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions). The flow is idempotent and re-runs on every reconfiguration.
@@ -457,7 +472,8 @@ Data Center OAuth2 uses the instance endpoints `{baseUrl}/rest/oauth2/latest/aut
     | `oauthCentral` | Nothing but the **Scopes** you want to narrow to; then start the connection ([Select the central client in a workspace](/apps-store/marketplace/connectors/central-oauth#select-the-central-client-in-a-workspace)) | Workspaces on a platform where a maintainer set up the central Atlassian client. Cloud or Data Center OAuth2. |
     | `oauth` | Your own Atlassian **Client ID + Secret** and **Scopes**, registered against this instance's own callback URI, given after this table | You manage your own Atlassian OAuth app |
     | `apiToken` | Atlassian **account email** + **API token**, plus the **site** (`yoursite.atlassian.net`) on Cloud | A single shared service identity, no interactive sign-in |
-    | `accessToken` | A pre-minted Atlassian **access token** (a Data Center Personal Access Token goes here) | Short-lived or caller-managed tokens |
+    | `accessToken` | A pre-minted Atlassian **access token**, shared by the whole workspace | Short-lived or caller-managed tokens |
+    | `personalAccessToken` | Data Center **base URL** only; each user then pastes their own **Personal Access Token** | Data Center instances without OAuth2, when each user must act as themselves |
     | `oauth1` | Data Center **base URL**, Application Link **consumer key** and **RSA private key**; each user then submits their own Application Link access token | Data Center instances without OAuth2 |
 
     In `oauth` mode, the redirect URI to register at Atlassian is this instance's own callback, not the core one:
@@ -467,6 +483,10 @@ Data Center OAuth2 uses the instance endpoints `{baseUrl}/rest/oauth2/latest/aut
     ```
 
     The configuration app renders the exact value for your instance; copy it from there rather than assembling it by hand. Do not register the core `jira-next` URI here: that one belongs to the central client only, and mixing the two breaks sign-in on both sides ([Callback URLs](/apps-store/marketplace/connectors/central-oauth#callback-urls)).
+
+    <Note>
+      **Jira content is redacted from the activity feed.** Tool arguments, request bodies, query parameters and Jira response payloads are marked for redaction before the connector emits its execution events, and client secrets, OAuth1 private keys and personal access tokens are registered as interaction secrets, so issue content and credentials do not appear in the workspace activity feed. Troubleshoot from the operation name and status code rather than expecting the payload to be logged.
+    </Note>
 
     <Note>
       Credentials are provisioned into the workspace's Secrets by the install flow and resolved server-side, so no automation ever receives a raw token. The agent allowlist (**Authorized agents**) gates which Agent Creator agents may call the MCP endpoint; enabling the allow-all option stores `*` in the allowlist and disables the per-agent gate entirely, with the consequences described in [The allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard). The OAuth **Scopes** field is what the connector actually requests (see [OAuth scopes](#oauth-scopes)); set a read-only list there to restrict writes.
@@ -633,7 +653,7 @@ Run these checks after configuring the connector and before letting an agent wri
 
 <Steps>
   <Step title="Confirm the runtime identity">
-    Call the `users` tool with `action: myself` from the agent, or run `JiraNext.getMyself: {}` from an automation. The response returns the `accountId`, `displayName` and `emailAddress` of the account Jira actually sees. In the OAuth modes this must be the signed-in user; in `apiToken` and `accessToken` modes it is the shared service account, and every write in the workspace will be attributed to it.
+    Call the `users` tool with `action: myself` from the agent, or run `JiraNext.getMyself: {}` from an automation. The response returns the `accountId`, `displayName` and `emailAddress` of the account Jira actually sees. In the per-user modes (`oauthCentral`, `oauth`, `personalAccessToken`, `oauth1`) this must be the signed-in user; in `apiToken` and `accessToken` modes it is the shared service account, and every write in the workspace will be attributed to it.
   </Step>
   <Step title="Run a read-only query">
     Call `search` with `action: jql` and a narrow query such as `project = DEV ORDER BY updated DESC`, passing `fields` to limit the payload. Issues are returned only for projects the resolved identity can browse.
@@ -650,12 +670,13 @@ Run these checks after configuring the connector and before letting an agent wri
 
 The generic procedures are in [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall), and, for the platform-wide client, [Rotate and revoke the central client](/apps-store/marketplace/connectors/central-oauth#rotate-and-revoke-the-central-client). What is specific to Jira:
 
-- **Disconnect one user.** The connector deletes that user's stored OAuth2 **and OAuth1** tokens and the workspace-scoped copy of their refresh token. To also revoke the grant at Atlassian, the user must remove the app's access from their Atlassian account settings; that is the only provider-side guarantee.
-- **Offboard a user.** Disconnect them before their Prisme.ai account is removed. Their refresh token is stored under a workspace secret named `jrnRefresh_<userId>`, which the disconnect flow deletes.
+- **Disconnect one user.** The connector deletes that user's stored OAuth2 token, their Data Center **personal access token** (`jiraNextPat`), their **OAuth1** token, and the workspace-scoped copy of their refresh token. To also revoke the grant at Atlassian, the user must remove the app's access from their Atlassian account settings (or revoke the personal access token in Jira Data Center); that is the only provider-side guarantee.
+- **Offboard a user.** Disconnect them before their Prisme.ai account is removed. Their refresh token is stored under a secret named `jrnRefresh_<userId>`, in **two** scopes: a user-scoped copy (the source of truth used on every refresh) and a workspace-scoped copy (used by non-interactive runs). The disconnect flow deletes only the workspace-scoped copy, so delete the user-scoped one as well when offboarding, otherwise a still-valid refresh token survives the disconnect.
 - **Rotate the central client secret.** Generate a new secret in the [Atlassian Developer Console](https://developer.atlassian.com/console/myapps/), then re-enter the Client ID and Secret in the maintainer view. Refreshes fail until the stored value matches the one Atlassian expects; users reconnect once if Atlassian invalidated their grants.
 - **Rotate an API token or access token.** Replace the value in the configuration app. No user re-consent is required because the `apiToken` and `accessToken` modes have no per-user connection.
+- **Rotate a personal access token.** The user reconnects from the configuration app and pastes the new token; the replacement is only stored once Jira accepts it, so a failed rotation leaves the working token in place. Revoke the old token in Jira Data Center to make the rotation effective on the provider side.
 - **Revoke an agent's access.** Untick the agent in **Authorized agents**, or clear the allow-all option. The next call is rejected with `This agent is not authorized to use this connector.`
-- **Uninstall.** Uninstalling does not delete the workspace secrets the install flow provisioned (`jiraNextAuth`, `jiraNextAuthorizedAgents`) or the per-user `jrnRefresh_<userId>` secrets; delete them from the workspace **Secrets** to purge the stored credentials, and remove any **Jira** entry from the Capabilities catalog ([Remove or update a capability](/apps-store/marketplace/connectors/declare-capability#remove-or-update-a-capability)).
+- **Uninstall.** Uninstalling does not delete the workspace secrets the install flow provisioned (`jiraNextAuth`, `jiraNextAuthorizedAgents`) or the per-user `jrnRefresh_<userId>` and `jiraNextPat` secrets; delete them from the workspace **Secrets** to purge the stored credentials, and remove any **Jira** entry from the Capabilities catalog ([Remove or update a capability](/apps-store/marketplace/connectors/declare-capability#remove-or-update-a-capability)).
 
 ## Error Handling
 
@@ -689,11 +710,21 @@ Atlassian responses are normalized into one message per status, with the failing
 
 **"oauth1 is supported only with deployment=dataCenter."**: OAuth1 was selected on a Cloud deployment. Switch the deployment to `dataCenter`, or choose an OAuth2 mode.
 
+**"personalAccessToken is supported only with deployment=dataCenter."**: The per-user personal access token mode was selected on a Cloud deployment. Switch the deployment to `dataCenter`, or use `oauthCentral`, `oauth` or `apiToken` on Cloud.
+
+**"Jira Data Center is not connected for this user. Open the connection popup and enter a Personal Access Token."**: No personal access token is stored for this user in `personalAccessToken` mode, or the stored one was deleted after Jira rejected it with `401`. Reconnect from the configuration app and paste a valid token.
+
+**The connection form rejects the token (`invalid_token`, `token_required`, `invalid_base_url`)**: `token_required` means the form was submitted empty; `invalid_base_url` means the profile's Data Center base URL is not an absolute HTTP or HTTPS URL without credentials, query string or fragment; `invalid_token` means Jira refused the token on `GET {baseUrl}/rest/api/2/myself`. In all three cases nothing is stored and any previously connected token is kept.
+
+**"These scopes are not valid for deployment=…"**: The central profile mixes the two scope vocabularies. Data Center accepts only `READ`, `WRITE`, `READ_ALL`, `MANAGE_SUBSCRIPTIONS`, `JSM_KB`, `ADMIN` and `SYSTEM_ADMIN`; Cloud uses the `read:*` / `write:*` scopes plus `offline_access`. See [OAuth scopes](#oauth-scopes).
+
+**"Central mode must be oauth, personalAccessToken, or oauth1."**: The maintainer view was asked to store a central profile in a mode it does not support. Pick one of the three; `apiToken` and `accessToken` are per-workspace modes only.
+
 **"Jira OAuth1 is not connected for this user."**: The Application Link access token is missing for this user. Open the connection popup and paste the token issued by the Jira Application Link; it is validated with a signed request before being stored, and the previous token is kept if validation fails.
 
 **"Invalid Jira Data Center baseUrl (…)"**: The base URL is not an absolute HTTP or HTTPS URL, or it carries credentials, a query string or a fragment. Enter the bare instance URL, optionally with a context path such as `/jira`.
 
-**Connection status reports `unsupported_central_auth_mode`**: The central profile is a Data Center OAuth1 profile, which installed workspaces cannot resolve. Configure `oauth1` directly in the workspace instead of `oauthCentral`.
+**Connection status reports `unsupported_central_auth_mode`**: The central profile is a Data Center `oauth1` or `personalAccessToken` profile, which installed workspaces cannot resolve. Configure that mode directly in the workspace instead of `oauthCentral`.
 
 **Agile calls fail with an Atlassian scope error**: The `agile` tool needs a fully-granular Jira Software OAuth app; it cannot run on a token that carries classic scopes. Either migrate the Atlassian app (and the connector **Scopes** field) to the fully-granular set, or avoid the `agile` operations. This is an Atlassian platform limitation. See [OAuth scopes](#oauth-scopes).
 

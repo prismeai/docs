@@ -22,7 +22,7 @@ The Knowledges app exposes the **Prisme.ai Knowledges API** (`/v1/knowledge_base
     Attach files and URLs, follow indexing status, inspect chunks, reindex, resolve download links.
   </Card>
   <Card title="Search & crawl" icon="magnifying-glass">
-    Semantic search with tag filters, plus web crawl seeds with per-seed metrics and recrawl.
+    Semantic search with tag filters, plus web crawl seeds with per-seed metrics and scheduling.
   </Card>
 </CardGroup>
 
@@ -56,6 +56,10 @@ This connector is used by three different roles. Jump to the section that matche
 
 <Note>
   Knowledges replaces the deprecated [Storage connector](/apps-store/marketplace/connectors/storage-client), which exposed the same knowledge bases under the older `vectorStores` naming. Two things live only on that older connector: per-knowledge-base **API keys** and **RBAC access bindings**, and **agent skills** plus admin diagnostics. Keep it installed if you need those; use Knowledges for everything else.
+</Note>
+
+<Note>
+  Knowledge-base content is redacted from the workspace activity feed. Every tool and instruction declares its output as redacted, and the inbound fields that carry content are redacted too — search `query` strings, request bodies and query strings, and API error bodies — so document text, chunks and search hits appear masked instead of in clear. What stays visible is the call itself: which tool or instruction ran, and whether it failed.
 </Note>
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
@@ -131,7 +135,7 @@ This connector is used by three different roles. Jump to the section that matche
     </Steps>
 
     <Note>
-      **Restricting to read-only (least privilege).** The connector never forces write permissions: it acts as the caller, so what an agent may do is exactly what its user may do on each knowledge base. To make an agent read-only, share the target knowledge bases with the calling users in a **read** role rather than as owners — write calls then fail with `403` while search keeps working (the connection itself stays healthy, since every check is a read). When the workspace uses the **credential override** mode instead, back the credential with an account that only holds read bindings. This is enforced by the Knowledges backend on every call, not by the connector, so it is a hard boundary rather than a declarative hint.
+      **Restricting to read-only (least privilege).** The connector never forces write permissions: it acts as the caller, so what an agent may do is exactly what its user may do on each knowledge base. To make an agent read-only, share the target knowledge bases with the calling users in the `reader` role rather than as owners — the roles a share can grant are `reader` (read), `editor` (read, write) and `admin` (read, write, share), and only the owner may delete. Write calls then fail with `403` while search keeps working (the connection itself stays healthy, since every check is a read). When the workspace uses the **credential override** mode instead, back the credential with an account that only holds read bindings. This is enforced by the Knowledges backend on every call, not by the connector, so it is a hard boundary rather than a declarative hint.
     </Note>
 
     <Note>
@@ -175,7 +179,7 @@ This connector is used by three different roles. Jump to the section that matche
     | `get` | Get a seed's configuration and metrics by `seed_id` (`seed_<uuid>`). |
     | `update` | Update a seed's `crawler_options`. The URL is immutable. |
     | `delete` | Delete a seed. Only pages attributed solely to it are removed. |
-    | `recrawl` | Trigger an immediate crawl of the seed. Returns `409` if a crawl is already running for the knowledge base. |
+    | `recrawl` | Legacy action, kept on the tool but no longer backed: the Knowledges API removed the per-seed recrawl endpoint, so the call returns `404`. Crawls run on the schedule set by `crawl_settings.periodicity`; to re-process pages already ingested, use `documents` action `reindex`. |
 
     <Warning>
       Direct binary upload is not available over MCP. Upload the file to the platform first, then pass its `native_file_id` to `documents` action `add`. When the capability declares `attachment_urls`, files the user drops in the conversation are reachable as URLs and can be passed as `source_url`.
@@ -191,6 +195,10 @@ This connector is used by three different roles. Jump to the section that matche
 
     <Note>
       Tool arguments accept an `agent_id` field, but on the MCP path it is only a transport-identity fallback for capabilities that do not inject the `agent-id` header. It is consumed for authorization and then stripped before the call reaches the Knowledges backend, so an agent cannot use it to bind a knowledge base or a document to another agent.
+    </Note>
+
+    <Note>
+      If your agent reads one knowledge base rather than managing many, the Knowledges product also publishes a per-knowledge-base MCP endpoint of its own, with nine read-only filesystem-style tools (`kb_search`, `kb_ls`, `kb_find`, `kb_cat`, `kb_grep`, `kb_head`, `kb_tail`, `kb_sed`, `kb_source_url`). It is a different endpoint from this connector, fixed to a single base, and it needs no app install. See [Agentic RAG with the Filesystem MCP](/products/ai-knowledge/advanced-rag#agentic-rag-with-the-filesystem-mcp).
     </Note>
 
     ## Output Formats
@@ -224,13 +232,17 @@ This connector is used by three different roles. Jump to the section that matche
     | `description` | No | Free-text description. |
     | `embedding` | No | Object `{ model, dimensions }`. Defaults to the platform's embedding settings. |
     | `dimensions` | No | Shorthand for `embedding.dimensions`. |
-    | `chunking_strategy` | No | Chunking configuration, passed through to the Knowledges API. |
+    | `chunking_strategy` | No | Chunking configuration. `type` is `auto` (default), `static` or `semantic`. `auto` and `static` take `max_chunk_size_tokens` and `chunk_overlap_tokens`; `semantic` takes `min_tokens` and `max_tokens`. |
     | `parser` | No | Parsing backend override: `tika`, `tika-ocr`, `unstructured`, `unstructured-ocr`, `llm`. |
     | `file_parsing` | No | Per-modality model overrides: `{ image, audio, document }`. |
     | `provider` | No | Vector index backend. Defaults to the platform setting. |
     | `expires_after` | No | TTL configuration for the knowledge base. |
 
     Returns the created knowledge base with HTTP `201` and `status: active` — provisioning is synchronous.
+
+    <Note>
+      The size keys of `chunking_strategy` are accepted either flat on the object or nested under the type key (`{ "type": "static", "static": { "max_chunk_size_tokens": 400 } }`); the nested form wins when both are present. The pre-canonical pair `chunk_size` / `chunk_overlap` is still read, and an explicit `chunk_overlap_tokens: 0` is honored rather than replaced by the default.
+    </Note>
 
     ### `knowledges` (action: `search`)
 
@@ -392,18 +404,22 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `listKnowledges` | List knowledge bases; `scope` = `owned,shared,all,agents` (default `owned,shared`), plus `name`, `status`, `agent_id`, `limit`, `page`. | `{ data: [KnowledgeBase], total, page, limit }` |
+    | `listKnowledges` | List knowledge bases; `scope` = `owned,shared,all,agents` (default `owned,shared`), plus `name`, `status`, `agent_id`, `limit`, `page`. | `{ data: [KnowledgeBase], total, page, limit, has_more }` |
     | `createKnowledge` | Create a knowledge base by `name`; optional `description`, `provider`, `embedding`, `dimensions`, `chunking_strategy`, `parser`, `file_parsing`, `expires_after`, `agent_id`. | `KnowledgeBase` (HTTP 201, `status: active`) |
     | `getKnowledge` | Get one by `knowledge_id`; `include: "processing"` probes live crawler status and metrics. | `KnowledgeBase` |
     | `updateKnowledge` | Update `name`, `description`, `chunking_strategy`, `parser`, `file_parsing` and `crawl_settings`. | `KnowledgeBase` |
     | `deleteKnowledge` | Delete by `knowledge_id`; cascades documents, vectors and bindings (native files preserved). | `{ status: "deleting" }` (HTTP 202, completes synchronously) |
     | `searchKnowledge` | Semantic search by `query`; optional `limit`, `min_score`, `filter` AST, `scope`, `conversation_id`, `agent_id`. | Search results; every hit carries a `document_id` |
 
+    <Note>
+      Every `KnowledgeBase` returned carries the caller's resolved `role` on that base and a `permissions` array listing what that role actually grants — `owner` gives `read, write, share, delete`, `admin` gives `read, write, share`, `editor` gives `read, write`, `reader` gives `read`. Branch on `permissions` rather than rebuilding the role table in your automation: an unrecognized role yields an empty array, so it grants nothing.
+    </Note>
+
     ### Documents
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `listDocuments` | List a knowledge base's documents; filters `status`, `source_type`, `origin`, `web_source_id`, `search`, `scope`, `conversation_id`. | `{ data: [Document], total, page, limit }` |
+    | `listDocuments` | List a knowledge base's documents; filters `status`, `source_type`, `origin`, `web_source_id`, `search`, `scope`, `conversation_id`. | `{ data: [Document], total, page, limit, has_more }` |
     | `addDocument` | Attach `source_url` and/or `native_file_id`; optional `source_type`, `fetch_url`, `filename`, `mime_type`, `bytes`, `tags`, `metadata`, `expires_at`, `chunking_strategy`, `agent_id`. | `Document` (201 new, 200 refreshed) |
     | `getDocument` | Get a document by `document_id`, with `status`, `last_error`, `indexed_at`. | `Document` |
     | `updateDocument` | Edit `tags`, `metadata`, `expires_at`, `filename`. | `Document` |
@@ -416,12 +432,12 @@ This connector is used by three different roles. Jump to the section that matche
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `listWebSources` | List crawl seeds with per-seed metrics, plus a knowledge-base-wide `summary` (web-page total and unattributed residual). | `{ data: [WebSource], summary, total, page, limit }` |
+    | `listWebSources` | List crawl seeds with per-seed metrics, plus a knowledge-base-wide `summary` (web-page total and unattributed residual). | `{ data: [WebSource], summary, total, page, limit, has_more }` |
     | `addWebSource` | Register a crawl start `url` (SSRF-validated, idempotent); optional `crawler_options`. | `WebSource` (200 when the URL is already registered) |
     | `getWebSource` | Get a seed by `seed_id`, with its configuration and metrics. | `WebSource` |
     | `updateWebSource` | Update `crawler_options`. The `url` is immutable. | `WebSource` |
     | `deleteWebSource` | Delete a seed; only pages attributed solely to it are removed. | Empty (HTTP 204) |
-    | `recrawlWebSource` | Trigger an immediate crawl of the seed. | `WebSource` (HTTP 202, `metrics.last_run_status: running`) |
+    | `recrawlWebSource` | Legacy instruction, kept on the app but no longer backed: the Knowledges API removed the per-seed recrawl endpoint. Schedule crawls with `updateKnowledge` and `crawl_settings.periodicity`; re-process ingested pages with `reindexDocument`. | `{ error }` (HTTP 404) |
 
     <Note>
       App-mode instructions never throw on an API failure: they return `{ error: { isError: true, content: [{ type: "text", text: "…" }] } }`. Test `{{result.error}}` in your automation before consuming the payload.
@@ -550,8 +566,7 @@ The Knowledges API uses standard HTTP status codes. The connector normalizes the
 | `400` | Bad Request | Missing `action`, unknown action for the entity, malformed `filter` AST, `tags` sent as an array instead of an object. |
 | `401` | Unauthorized | The backend rejected the forwarded identity, or the credential override. Anonymous and cron callers have no identity to forward. |
 | `403` | Forbidden | The caller has no access to this knowledge base or document, or only a read binding on a write call. |
-| `404` | Not Found | Unknown `knowledge_id`, `document_id` or `seed_id` — or a `native_file_id` that does not exist. |
-| `409` | Conflict | `webSources` action `recrawl` while a crawl is already running for this knowledge base. |
+| `404` | Not Found | Unknown `knowledge_id`, `document_id` or `seed_id` — a `native_file_id` that does not exist — or `webSources` action `recrawl`, whose backend endpoint no longer exists. |
 | `413` | Payload Too Large | The ingested source exceeds the platform's document size limit. |
 | `429` | Rate Limited | Too many indexing or search calls in a short window. Wait and retry. |
 | `500` | Server Error | Transient Knowledges backend error. Retry with exponential backoff. |

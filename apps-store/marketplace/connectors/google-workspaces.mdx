@@ -91,7 +91,9 @@ The authentication mode decides which Google identity the provider sees, and the
 
 In the OAuth modes, each user's access token is cached in their own user scope and refreshed automatically shortly before expiry. The refresh token is additionally deposited as a workspace secret named `gwsRefresh_<usageKey>_<userId>`, so a scheduled run with no signed-in user can replay it for a named `targetUserId`. That secret can never be read back by a browser: only the runtime resolves it.
 
-The same person may hold **several separate connections**, one per usage: `connection:<id>` for a knowledge base's ingestion and `agent:<id>` for a reader consulting an agent, even when both point at the same Google account. Disconnecting one leaves the others intact.
+The same person may hold **several separate connections**, one per usage: `connection:<id>` for a knowledge base's ingestion and `agent:<id>` for a reader consulting an agent, even when both point at the same Google account. Each usage is asked about and disconnected on its own, so a reader dropping an agent's connection never takes a knowledge base's nightly sync down with it; the configuration app's single disconnect button, which names no usage, still drops every connection that person holds.
+
+Google content itself — file names and contents, mail bodies, event details — is **redacted from the Activity Feed**. The events a run emits record that an operation happened, not what it carried, so a workspace's execution history can be read without exposing the third-party data that passed through it.
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
   **Goal:** two one-time tasks: (1) configure the shared **central OAuth client** so every workspace lets its users sign in with their own Google account, and (2) expose Google Workspaces as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs.
@@ -255,7 +257,7 @@ The same person may hold **several separate connections**, one per usage: `conne
     </Note>
 
     <Note>
-      The five tool webhooks refuse direct HTTP calls with `403` and the message `Direct calls are not allowed — use the MCP endpoint.` Always go through the `mcp` endpoint.
+      The five tool webhooks accept only a call whose provenance is the connector's own workspace, which is what the `mcp` endpoint's in-process dispatch produces. Anything else — a direct HTTP call, a call relayed from another workspace — is refused with `403` and the message `Direct calls are not allowed — use the MCP endpoint.` Always go through the `mcp` endpoint.
     </Note>
 
     ## Output formats
@@ -353,11 +355,24 @@ The same person may hold **several separate connections**, one per usage: `conne
     | `labelIds` | No | Restrict messagesList to these label ids. |
     | `maxResults` | No | Page size for messagesList. |
     | `format` | No | `minimal`, `full`, `raw` or `metadata` for messagesGet and threadsGet. |
-    | `body` | For messagesSend/draftsCreate/messagesModify | Send or draft: `{to,subject,text\|html,cc,bcc,replyTo,inReplyTo,threadId}` as plain strings (the server builds the MIME message and base64-encodes it; never encode it yourself). Modify: `{addLabelIds,removeLabelIds}`. |
+    | `body` | For messagesSend/draftsCreate/messagesModify | Send or draft: `{to,subject,text\|html,cc,bcc,replyTo,inReplyTo,threadId}` as plain strings (the server builds the MIME message and base64-encodes it; never encode it yourself). `inReplyTo` takes the **RFC 822 `Message-ID`** of the mail being answered, angle brackets included, read from `messagesGet` — never a Gmail message id, which belongs in `threadId`. Modify: `{addLabelIds,removeLabelIds}`. |
     | `outputFormat` | No | `verbose` (default) or `compact`. |
 
     <Note>
       Resolve "me" or "my email" with a single `getProfile` call; it returns the connected account's `emailAddress` and mailbox counters. Never list messages to discover the connected address.
+    </Note>
+
+    <Note>
+      **How the message is built.** Gmail accepts nothing but a full RFC 2822 message base64url-encoded under `raw`, so the connector assembles it server-side from the plain fields. Two consequences worth knowing:
+
+      - Every header value is folded back onto a single line before it is written, so a recipient or subject smuggled in from a mail, a web page or an indexed document cannot inject a `Bcc:` header of its own.
+      - The subject is emitted as one RFC 2047 encoded word, which keeps accents and non-Latin scripts intact but is not split at the 75-character limit the RFC asks for. A very long non-ASCII subject may render oddly in strict clients; shorten it, or pass a pre-encoded `raw`.
+
+      A call the builder cannot encode is refused with its own reason rather than reaching Google and coming back as an opaque `400`:
+
+      ```text
+      buildGmailRaw: no plain fields (to/subject/text/html) and no pre-encoded `raw` — nothing to send.
+      ```
     </Note>
 
     ### calendar
@@ -407,15 +422,16 @@ The same person may hold **several separate connections**, one per usage: `conne
     | Agent allowlist secret | `googleWorkspacesAuthorizedAgents` (comma-separated agent ids, or `*`) |
     | Configuration app link | `configAppUrl` on the app instance |
     | OAuth callback URL | `oauthCallbackUrl` on the app instance, `<api-url>/workspaces/slug:<your-workspace>/webhooks/<app-instance>.oauthCallback`. Register it at Google only in the `oauth` mode; `oauthCentral` uses the core callback instead. |
+    | Trusted knowledge-sync callers | `knowledgeSync.trustedCallers`, seeded with the `knowledge-sync` slug when the instance has none, so a scheduled synchronization is recognized without anyone configuring anything |
 
-    The operation is idempotent, so reinstalling never overwrites credentials you already entered.
+    The operation is idempotent, so reinstalling never overwrites credentials you already entered, and a `trustedCallers` list you edited yourself is left alone on every reinstall.
 
     ## Configuration
 
     | Field | Description |
     |-------|-------------|
     | **Configuration app** (`configAppUrl`) | Auto-populated on install; open this link to configure authentication (mode and credentials), connect a Google account in the OAuth modes, and manage the authorized-agents allowlist. Read-only on the instance. |
-    | **Knowledge-sync** (`knowledgeSync`) | Delegated MCP Resource access settings. `trustedCallers` lists the workspace ids allowed to invoke the delegated access check with a server-verified `targetUserId`. Non-secret, stored directly in the configuration value. |
+    | **Knowledge-sync** (`knowledgeSync`) | Delegated MCP Resource access settings. `trustedCallers` lists the workspace **slugs** allowed to invoke the delegated access check with a server-verified `targetUserId`, and to reach Drive Resources on the paths that carry no signed-in caller. Each slug is resolved to this environment's workspace id through the platform registry, so the same value works in sandbox and in production; a raw workspace id written by an install that predates this form is still accepted. Non-secret, stored directly in the configuration value. |
 
     The configuration app drives authentication; the app instance itself has no per-field credential form. From it you pick one of:
 
@@ -427,7 +443,7 @@ The same person may hold **several separate connections**, one per usage: `conne
     | `accessToken` | A pre-minted Google **access token** | Whichever account minted the token | Short-lived, caller-managed tokens |
 
     <Note>
-      Credentials are provisioned into the workspace's Secrets by the install flow and resolved server-side; they are never sent to the browser or to an agent. Enter them only through the configuration app, never by hand in Studio **Secrets** ([Configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app)). The **Authorized agents** allowlist gates which Agent Creator agents may call this instance's MCP endpoint **and its Drive Resources**; manage it as described in [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector), and hand the endpoint to the agent builder as in [Copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint).
+      Credentials are provisioned into the workspace's Secrets by the install flow and resolved server-side; they are never sent to the browser or to an agent. Enter them only through the configuration app, never by hand in Studio **Secrets** ([Configure credentials in the configuration app](/apps-store/marketplace/connectors/install-in-workspace#configure-credentials-in-the-configuration-app)). The **Authorized agents** allowlist gates which Agent Creator agents may call this instance's `tools/call`; manage it as described in [Authorize the agents that may call the connector](/apps-store/marketplace/connectors/install-in-workspace#authorize-the-agents-that-may-call-the-connector), and hand the endpoint to the agent builder as in [Copy the MCP endpoint](/apps-store/marketplace/connectors/install-in-workspace#copy-the-mcp-endpoint). It does **not** gate the Drive Resources, which are authorized on a different axis (see [Google Drive MCP Resources](#google-drive-mcp-resources)).
     </Note>
 
     ## Available instructions
@@ -476,10 +492,10 @@ The same person may hold **several separate connections**, one per usage: `conne
     | `gmailGetProfile` | Resolve the connected account ("me" or "my email") in one call. | `{ emailAddress, messagesTotal, threadsTotal, historyId }` |
     | `gmailMessagesList` | List or search message ids; filter with `q` (Gmail search syntax), `labelIds`, `includeSpamTrash`. | `{ messages: [{ id, threadId }], nextPageToken, resultSizeEstimate }` |
     | `gmailMessagesGet` | Fetch one message by `id`; `format` controls verbosity (`minimal`, `full`, `metadata`, `raw`). | A Message resource `{ id, threadId, labelIds, snippet, payload, … }`. |
-    | `gmailMessagesSend` | Send an email; `body` = `{ to, subject, text\|html, cc, bcc, replyTo, inReplyTo, threadId }` as plain strings (the server builds the MIME message). A pre-encoded `{ raw }` is also accepted. | The sent Message `{ id, threadId, labelIds }`. |
+    | `gmailMessagesSend` | Send an email; `body` = `{ to, subject, text\|html, cc, bcc, replyTo, inReplyTo, threadId }` as plain strings (the server builds the MIME message). `inReplyTo` is the RFC 822 `Message-ID` of the mail being answered, not a Gmail id. A pre-encoded `{ raw }` is also accepted and passed through untouched. | The sent Message `{ id, threadId, labelIds }`. |
     | `gmailMessagesModify` | Add or remove labels on a message; `body` = `{ addLabelIds, removeLabelIds }`. | The updated Message `{ id, threadId, labelIds }`. |
     | `gmailMessagesTrash` | Move a message to Trash by `id`. | The trashed Message `{ id, threadId, labelIds }`. |
-    | `gmailDraftsCreate` | Create a draft; `body` follows `gmailMessagesSend`. | `{ id, message: { id, threadId } }` |
+    | `gmailDraftsCreate` | Create a draft; `body` follows `gmailMessagesSend`. A pre-encoded `{ message: { raw } }` is also accepted. | `{ id, message: { id, threadId } }` |
     | `gmailLabelsList` | List all labels in the mailbox. | `{ labels: [{ id, name, type }] }` |
     | `gmailThreadsGet` | Fetch a full conversation thread by `id`. | `{ id, historyId, messages: [ Message ] }` |
     | `gmailHistoryList` | List mailbox history since `startHistoryId`, for push consumers discovering new messages. Not exposed to agents. | `{ history: [...], historyId, nextPageToken }` |
@@ -574,9 +590,9 @@ The same person may hold **several separate connections**, one per usage: `conne
       Before a base can be attached, a workspace builder must have installed and configured the Google Workspaces app in a workspace and connected a Google account or a service account (see [Workspace builder (DSUL)](#workspace-builder-dsul)). Nothing else is needed: the same app instance serves both the agent tools and the sync surface.
     </Note>
 
-    <Warning>
-      Unlike most connectors, the **Authorized agents** allowlist **does** apply to the sync surface on this one: `resources/list` and `resources/read` run the same agent check as `tools/call`, and so does the `drive` / `checkAccess` action. A synchronization run carries no `agent_id`, so on a tenant instance the allowlist must be set to **Allow all agents** (the `*` wildcard, see [The allow-all wildcard](/apps-store/marketplace/connectors/install-in-workspace#the-allow-all-wildcard)) or every run is refused with `This agent is not authorized to access Google Drive Resources.` The shared core endpoint is the exception: with the central client configured it accepts every caller ([Agent authorization on the core endpoint](/apps-store/marketplace/connectors/central-oauth#agent-authorization-on-the-core-endpoint)).
-    </Warning>
+    <Note>
+      The **Authorized agents** allowlist does **not** apply to the sync surface. `resources/list`, `resources/read` and the `drive` / `checkAccess` action are authorized on a different axis, because nobody in those flows is an agent: a caller who is signed in must be able to **read the workspace that holds the connector's configuration**, and a synchronization run — scheduled or triggered by hand — carries no identity at all, so it is authorized as a workspace, by being listed in `knowledgeSync.trustedCallers`. There is therefore no allowlist step for a knowledge base, and you never have to open the connector to every agent to make one work.
+    </Note>
 
     ## What can be synced
 
@@ -640,7 +656,7 @@ The same person may hold **several separate connections**, one per usage: `conne
     | Moment | Acts as | Authorized by |
     |--------|---------|---------------|
     | Attaching the connection, browsing the tree | You | Your **role on the workspace** holding the connector's configuration — the right to read that workspace is the right to read this Drive through it |
-    | A scheduled sync run | No user at all | The calling workspace must be listed in `knowledgeSync.trustedCallers`; the Knowledge Sync workspace ships there by default |
+    | A scheduled sync run | No user at all | The calling workspace must be listed in `knowledgeSync.trustedCallers`, which the install seeds with the `knowledge-sync` slug |
     | Answering a reader's question | The reader | A live per-reader access check (`drive` / `checkAccess`) against the Drive API, itself restricted to the same `knowledgeSync.trustedCallers` list |
 
     <Note>
@@ -672,6 +688,7 @@ The same person may hold **several separate connections**, one per usage: `conne
       | `list` | 50 resources per page by default, 200 max; `delta_on_drive: false` |
       | `access` | Tool `drive`, action `checkAccess` |
       | `authentication` | `oauth`, `oauthCentral`, `serviceAccount`, `accessToken` |
+      | `resource_access` | `requireWorkspaceRole plus buildAppAuth` — read access to the workspace holding the configuration, then Google auth resolved for the caller |
 
       This resource is served **without authentication**, so a catalog can probe compatibility on a connector that is not configured yet ([Compatibility probing](/products/ai-knowledge/connectors#compatibility-probing)).
     </Note>
@@ -682,9 +699,13 @@ The same person may hold **several separate connections**, one per usage: `conne
 
     **The URL check says "It answered, but could not serve its content"**: the connector itself is not fully configured. Open its configuration app and connect an account.
 
-    **`This agent is not authorized to access Google Drive Resources.`**: the sync run carries no agent id, and this instance's allowlist names specific agents. Open the configuration app, go to **Authorized agents** and enable **Allow all agents**.
+    **`You do not have the rights to read this connector on the workspace that holds its configuration.`**: you are signed in, but you have no read access to the workspace where the connector is installed. Ask that workspace's administrator for a role; your Drive rights have nothing to do with it.
 
-    **`Delegated Resource access is restricted to the trusted Knowledge Sync caller.`**: the run named a `targetUserId` from a workspace that is not in `knowledgeSync.trustedCallers`. Add that workspace id to the connector's **Knowledge-sync** configuration.
+    **`This connector answers Resource calls to its workspace members, or to the trusted Knowledge Sync workspace.`**: the call carries no identity and its workspace is not trusted. On a sync run, add the `knowledge-sync` slug to `knowledgeSync.trustedCallers` in the connector's **Knowledge-sync** configuration — the install normally seeds it.
+
+    **`This connector could not authenticate the call, so membership of the workspace holding its configuration could not be established. This is not a missing role.`**: the platform declined to authenticate the call itself, for example a run carrying a user id but no session, or an organization enforcing MFA. Granting a role fixes nothing here; sign in again from the workspace.
+
+    **`Delegated Resource access is restricted to the trusted Knowledge Sync caller.`**: the run named a `targetUserId` from a workspace that is not in `knowledgeSync.trustedCallers`. Add that workspace's **slug** to the connector's **Knowledge-sync** configuration.
 
     **A shared drive does not appear**: the connected account (or the service account) is not a member of it. Drive membership is the only thing browsing can see.
 
@@ -713,13 +734,13 @@ Behavior and limits, all fixed by the connector:
 - **Listing.** `resources/list` with no parent URI enumerates My Drive first, then every shared drive the caller can see. Pages are bounded: the page size defaults to `50` and is capped at `200`, and the cursor is Drive's own `nextPageToken`. Drive delta listing is not supported.
 - **Reading.** Google-native documents (Docs, Sheets, Slides) are exported to `text/plain` and inlined. Other files are downloaded with the caller's token and inlined as a data URL, because Drive offers no anonymous pre-signed download URL. The inline ceiling is 4194304 bytes (4 MiB) and can be lowered or raised with the `connector_inline_max_bytes` configuration value. A file above the ceiling, or one that cannot be downloaded, comes back as metadata only, marked `unfetchable` with a reason.
 - **Revision.** A file's revision is its Drive `version`, falling back to `modifiedTime`.
-- **Authorization.** `resources/list` and `resources/read` apply the same agent allowlist as `tools/call`, then resolve Google auth for the caller. An unauthorized agent gets JSON-RPC error `-32003`.
+- **Authorization.** Resources are **not** gated by the authorized-agents allowlist, which stays reserved for `tools/call`. `resources/list` and `resources/read` ask a different question: the right to read this Drive through the connector is the right to read the workspace that holds its credentials. A caller carrying an identity must be able to read that workspace; a caller carrying none — the synchronization paths — is accepted only when its workspace is listed in `knowledgeSync.trustedCallers`. Google auth is resolved for the caller only once that passes. A refusal is JSON-RPC `-32003` (`You do not have the rights to read this connector on the workspace that holds its configuration.`, or `This connector answers Resource calls to its workspace members, or to the trusted Knowledge Sync workspace.`), `-32001` when the platform declines to authenticate the call at all, and `-32002` when the connector cannot establish which workspace holds its configuration.
 
 ### Delegated access checks for knowledge bases
 
 A knowledge base indexed from Drive must still refuse a document to a reader who cannot open it in Drive. The connector answers that question through a delegated access check: a batch of canonical resource URIs is probed with the reader's own token, and only files that answer successfully are returned as allowed. The check **fails closed**: a malformed URI, a Drive denial or a provider outage all leave the document out.
 
-This check is not a general-purpose tool. It is restricted to the workspace ids listed in `knowledgeSync.trustedCallers`, because an unguarded `targetUserId` would let any MCP caller ask about another user's Drive. Any other caller receives `The delegated Resource access action is restricted to the trusted Knowledge Sync caller.`
+This check is not a general-purpose tool. Although it is reached as a `drive` tool call, it is gated **before** the authorized-agents allowlist rather than by it, and restricted instead to the workspace slugs listed in `knowledgeSync.trustedCallers` — because an unguarded `targetUserId` would let any MCP caller ask about another user's Drive. Any other caller receives `The delegated Resource access action is restricted to the trusted Knowledge Sync caller.`
 
 Resolving *another* user's token reads a workspace-scoped secret, which the runtime grants only to a run that has no user of its own, such as a scheduled synchronization. A delegated check triggered from an interactive conversation therefore reports `delegation_unavailable` rather than asking the reader to reconnect an account that is already connected. When the `targetUserId` names the very user carrying the request, no delegation is involved: the connector reads that reader's own stored token, so an interactive check about oneself — the query-time case — works normally.
 
@@ -758,7 +779,7 @@ The generic lifecycle is documented in [Rotate credentials and uninstall](/apps-
 | Rotate the central client secret | Platform admin | Re-enter the client id and secret in the maintainer view of the configuration app | New token exchanges use the new secret immediately. Rotating at Google without updating the connector makes every refresh fail with `invalid_grant`, which drops the stored refresh tokens and prompts users to reconnect. |
 | Rotate a tenant client secret or a service-account key | Workspace builder | Re-enter the credentials in the configuration app | Applies to the whole workspace on the next call. |
 | Offboard a departing user | Organization administrator | Have the user disconnect, or revoke the grant from the Google account's third-party access page | The stored refresh token stops working; the connector deletes it on the first rejected refresh, so scheduled runs that named that user fail with an explicit reconnection message instead of silently continuing. |
-| Stop an agent from calling the connector | Workspace builder | Remove the agent from **Authorized agents** in the configuration app and save | The next tool call is refused with the authorization message, on both tools and Drive Resources. |
+| Stop an agent from calling the connector | Workspace builder | Remove the agent from **Authorized agents** in the configuration app and save | The next tool call is refused with the authorization message. Drive Resources are unaffected: they answer to workspace members and to the trusted knowledge-sync caller, so revoke the reader's role on the workspace, or remove the slug from `knowledgeSync.trustedCallers`, to close that path. |
 | Remove the connector | Workspace builder | Uninstall the app from the workspace | The MCP endpoint and the OAuth webhooks disappear. Delete the `googleWorkspacesAuth` and `googleWorkspacesAuthorizedAgents` secrets, and any remaining `gwsRefresh_*` secrets, to purge stored credentials. |
 
 ## Error handling
@@ -791,7 +812,7 @@ Problems that are not Google-specific (an empty **Configuration app** field, a s
 
 **`Google is not connected for this user.`**: No per-user OAuth token exists. Open the configuration app in an OAuth mode and select **Connect**, or use the agent's connect flow.
 
-**`No stored Google token for this user.`**: A non-interactive run named a `targetUserId` who never connected. That user must connect once from the configuration app as a workspace editor.
+**`No stored Google token for this user.`**: A non-interactive run named a `targetUserId` who never connected. Have that user connect once from the configuration app in an OAuth mode; the deposit is theirs to make and needs no particular workspace role. The message ends with `as a workspace editor`, which is a leftover from an earlier permission model and no longer describes what the connector requires.
 
 **`Google token refresh failed …`**: The stored refresh token was revoked or expired, so Google rejected it permanently. The connector drops the stored token automatically and reports the connection as disconnected; the user must reconnect.
 
@@ -803,9 +824,9 @@ Problems that are not Google-specific (an empty **Configuration app** field, a s
 
 **`Google service-account token exchange failed …`**: The `jwt` mode could not obtain a token. Check the service-account key, the scopes enabled for it, and, for domain-wide delegation, that `saSubject` is authorized for those scopes in the Google Workspace admin console.
 
-**`Direct calls are not allowed — use the MCP endpoint.`**: Something called a tool webhook directly. Route the call through the connector's `mcp` endpoint.
+**`Direct calls are not allowed — use the MCP endpoint.`**: Something called a tool webhook from outside the connector's own workspace. The five tool webhooks compare the calling workspace against the one they run in, so only the `mcp` endpoint's own dispatch gets through. Route the call through that endpoint.
 
-**Gmail send fails or arrives garbled**: Pass `to`, `subject` and `text` or `html` as plain strings in `body`. The server builds and base64-encodes the MIME message itself; never encode the content yourself.
+**Gmail send fails or arrives garbled**: Pass `to`, `subject` and `text` or `html` as plain strings in `body`. The server builds and base64-encodes the MIME message itself; never encode the content yourself. If a reply lands as a new conversation, check that `inReplyTo` carries the RFC 822 `Message-ID` of the answered mail (from `messagesGet`) and that the Gmail thread id is in `threadId` instead.
 
 **A Drive Resource returns metadata but no content**: The file exceeded the 4 MiB inline ceiling, or the download failed. The response is marked `unfetchable` with the reason; lower the file size, export the document, or fetch it through the `drive` tool instead.
 

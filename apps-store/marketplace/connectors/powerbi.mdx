@@ -73,7 +73,7 @@ The connector supports a single credential model, and it is deliberate: **per-us
 | Consent | Granted once per user, on first connect |
 | Credential scope | Personal to the user; never shared across the workspace |
 | Configured by | A workspace administrator, once per workspace, in the configuration app |
-| Default requested scopes | `https://analysis.windows.net/powerbi/api/.default offline_access openid profile` |
+| Default requested scopes | `https://analysis.windows.net/powerbi/api/.default offline_access openid profile`, narrowable per workspace in the configuration app ([Choose the OAuth scopes](#choose-the-oauth-scopes)) |
 
 There is no shared service account and no client-credentials mode, so a user can never see Power BI content they could not open in Power BI themselves, and Power BI audit logs attribute every action to the real person. The trade-off is that every user must connect once, and that **App-mode instructions resolve the token of the Prisme.ai user running the automation**. An unattended run with no connected user resolves no token and fails with `Power BI is not connected for this user`.
 
@@ -111,9 +111,9 @@ Tokens are stored per user. The access token is cached with its expiry and reuse
       In the [Microsoft Entra admin center](https://entra.microsoft.com), open **Identity > Applications > App registrations > New registration**. Add a **Web** platform and paste the callback URL you copied as the single redirect URI. Under **API permissions**, add the delegated **Power BI Service** permissions your users need, then under **Certificates & secrets** create a **client secret**. Record the **Application (client) ID**, the secret value and the **Directory (tenant) ID**.
     </Step>
     <Step title="Enter the credentials in the configuration app">
-      Back in the configuration app, fill in the **tenant**, **oauthClientId** and **oauthClientSecret** fields, leave **scopes** at the default value unless Microsoft requires a narrower set, and save. The app writes them into the workspace secret `powerbiAuth`. Do not edit that secret by hand in Builder.
+      Back in the configuration app, fill in the **Directory (tenant) ID**, **Application (client) ID** and **Client secret** fields, pick the permissions your users need in the **Scopes** field (see [Choose the OAuth scopes](#choose-the-oauth-scopes)), and save. The app writes them into the workspace secret `powerbiAuth` as `tenant`, `oauthClientId`, `oauthClientSecret` and `scopes`. Do not edit that secret by hand in Builder.
 
-      Leaving **tenant** empty falls back to `organizations`, which accepts any work or school account. Set the directory (tenant) ID explicitly to restrict sign-in to your own tenant.
+      Leaving **Directory (tenant) ID** empty falls back to `organizations`, which accepts any work or school account. Set the directory (tenant) ID explicitly to restrict sign-in to your own tenant.
     </Step>
     <Step title="Connect a Microsoft account">
       Select the connect action. The configuration app saves the credentials, then opens the Microsoft sign-in page in a popup. After consent, the popup returns to the configuration app and the connection state switches to connected.
@@ -123,6 +123,33 @@ Tokens are stored per user. The access token is cached with its expiry and reuse
   <Warning>
     The client secret is stored in the workspace secret `powerbiAuth` and is never sent to an agent or returned by any tool. Never paste it into an agent prompt, an automation body, or a chat message.
   </Warning>
+
+  ## Choose the OAuth scopes
+
+  The **Scopes** field of the configuration app is a picker over the Power BI delegated permissions, with three presets. Every Power BI scope carries the resource prefix `https://analysis.windows.net/powerbi/api/`, omitted below for readability:
+
+  ```text
+  Read-only preset
+  Workspace.Read.All Dataset.Read.All Report.Read.All Dashboard.Read.All
+  Dataflow.Read.All Gateway.Read.All Capacity.Read.All App.Read.All
+  offline_access openid profile
+
+  Read + write preset
+  Workspace.ReadWrite.All Dataset.ReadWrite.All Report.ReadWrite.All Dashboard.ReadWrite.All
+  Dataflow.ReadWrite.All Gateway.ReadWrite.All Capacity.ReadWrite.All Content.Create
+  offline_access openid profile
+
+  App registration (.default)
+  .default offline_access openid profile
+  ```
+
+  Leaving the field empty falls back to the **App registration (.default)** preset, which requests exactly the delegated permissions already granted on the Entra ID app registration. The picker also accepts scopes typed by hand, so you can add anything outside the catalog.
+
+  <Warning>
+    **`.default` cannot be combined with granular Power BI scopes.** Microsoft Entra ID rejects a sign-in that mixes `https://analysis.windows.net/powerbi/api/.default` with individual scopes of the same resource and answers `invalid_scope`. The picker swaps one for the other and warns if a conflict is left; when you paste a scope string by hand, keep either `.default` or an explicit list, never both.
+  </Warning>
+
+  Neither preset includes the tenant-wide admin scopes `Tenant.Read.All` and `Tenant.ReadWrite.All`. Add one explicitly, alongside the **Fabric administrator** or **Power BI administrator** role, if your users run the `admin` tool or the `admin*` instructions.
 
   ## Declare the capability in AI Governance (optional)
 
@@ -230,7 +257,7 @@ Tokens are stored per user. The access token is cached with its expiry and reuse
     ```
 
     <Note>
-      **Restricting to read-only (least privilege).** The tools cover both reads and writes. The connector requests the `.default` scope, so the issued token inherits exactly the delegated permissions granted to the Microsoft Entra application; it never forces write access. To allow only reads, grant the application read-level **Power BI Service** delegated permissions such as `Dataset.Read.All`, `Report.Read.All`, `Dashboard.Read.All` and `Workspace.Read.All` instead of their `ReadWrite` variants. Connecting still succeeds, and any write call is then rejected by Power BI with `403`, surfaced to the agent as an error. This restriction lives on the Entra application, outside any workspace's reach.
+      **Restricting to read-only (least privilege).** The tools cover both reads and writes, and the scope set is what draws the line. The quickest lever is the configuration app's **Scopes** field: select the **Read-only preset** ([Choose the OAuth scopes](#choose-the-oauth-scopes)) and the issued token carries only `Read.All` permissions, so Power BI rejects every write with `403`, surfaced to the agent as an error. That field is workspace-level, so a workspace editor can widen it again. For a guarantee no workspace can undo, grant the Microsoft Entra application read-level **Power BI Service** delegated permissions such as `Dataset.Read.All`, `Report.Read.All`, `Dashboard.Read.All` and `Workspace.Read.All` instead of their `ReadWrite` variants, and leave the scopes on the `.default` preset so the token inherits exactly what the application holds. Connecting still succeeds either way.
     </Note>
 
     ## Available tools
@@ -502,7 +529,7 @@ Tokens are stored per user. The access token is cached with its expiry and reuse
 
     | Auth mode | What you provide | Runtime identity |
     |-----------|------------------|------------------|
-    | Per-user OAuth2 with PKCE (Microsoft Entra ID) | `tenant`, `oauthClientId`, `oauthClientSecret` and optionally `scopes`, entered once in the configuration app, then each user connects their own Microsoft account | The signed-in Prisme.ai user, acting with their own Power BI permissions |
+    | Per-user OAuth2 with PKCE (Microsoft Entra ID) | `tenant`, `oauthClientId`, `oauthClientSecret` and optionally `scopes` (see [Choose the OAuth scopes](#choose-the-oauth-scopes)), entered once in the configuration app, then each user connects their own Microsoft account | The signed-in Prisme.ai user, acting with their own Power BI permissions |
 
     <Note>
       Install provisions two workspace secrets, `powerbiAuth` and `powerbiAuthorizedAgents`, and binds them to the app instance configuration, as described in [What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions). The configuration app writes to them; do not edit them by hand. The allowlist gates which Agent Creator agents may call the MCP endpoint and has no effect on DSUL instructions.
@@ -539,7 +566,7 @@ Tokens are stored per user. The access token is cached with its expiry and reuse
     | `listDatasets` | `groupId` | List datasets in a workspace. |
     | `getDataset` | `groupId`, `datasetId` | Fetch one dataset. |
     | `deleteDataset` | `groupId`, `datasetId` | Delete a dataset. |
-    | `getDatasetSchema` | `groupId`, `datasetId` | Return the model's column schema through the DMV query `EVALUATE INFO.VIEW.COLUMNS()`. |
+    | `getDatasetSchema` | `groupId`, `datasetId` | Return the model's column schema through the DMV query `EVALUATE INFO.VIEW.COLUMNS()`. Use `executeQueries` instead in App mode, see the note below. |
     | `getDatasetTables` | `groupId`, `datasetId` | List the tables of a **Push API** dataset only. |
     | `getDatasetDatasources` | `groupId`, `datasetId` | List the dataset's datasources. |
     | `updateDatasetDatasources` | `groupId`, `datasetId`, `updateDetails` | Remap datasources. |
@@ -549,8 +576,12 @@ Tokens are stored per user. The access token is cached with its expiry and reuse
     | `bindDatasetToGateway` | `groupId`, `datasetId`, `gatewayObjectId`, `datasourceObjectIds` | Bind a dataset to a gateway. |
 
     <Note>
-      `getDatasetTables` works **only** for Push API datasets; on a regular import or DirectQuery semantic model it fails with `not Push API dataset`. Use `getDatasetSchema` instead, which posts `EVALUATE INFO.VIEW.COLUMNS()` to `executeQueries` and therefore needs the **Dataset Execute Queries REST API** tenant setting enabled. `executeQueries` with `EVALUATE INFO.VIEW.TABLES()` returns the table list.
+      `getDatasetTables` works **only** for Push API datasets; on a regular import or DirectQuery semantic model it fails with `not Push API dataset`. To inspect a regular model, run `executeQueries` with `EVALUATE INFO.VIEW.COLUMNS()` for columns and `EVALUATE INFO.VIEW.TABLES()` for tables. Both need the **Dataset Execute Queries REST API** tenant setting enabled.
     </Note>
+
+    <Warning>
+      **The App-mode `getDatasetSchema` instruction fails.** It posts to the `executeQueries` endpoint without attaching its DAX query, so Power BI answers `400` and the instruction returns `Bad request while getDatasetSchema`. Call `executeQueries` with `EVALUATE INFO.VIEW.COLUMNS()` instead, as in the [DSUL examples](#dsul-examples). The MCP `datasets` tool with `action: getSchema` is unaffected: it carries the query in its own request spec and works normally.
+    </Warning>
 
     ### DAX queries
 
@@ -734,6 +765,10 @@ Run these three checks in order. Each one is independent of the previous role's 
 2. **Builder path.** From an automation, call `listWorkspaces` and check that the response carries a `value` array and that `{{result.error}}` is empty. This is a read-only call and needs no Power BI write permission.
 3. **Agent path.** In the agent preview, ask the agent to list your Power BI workspaces. It calls the `workspaces` tool with `action: list` and answers from the result. A refused call returns the allowlist or identity message instead, both listed under [Common issues](#common-issues).
 
+<Note>
+  Power BI response bodies, tool arguments and tool outputs are registered as redaction secrets before the connector emits its execution events, so query results, report metadata and DAX payloads do not appear in the workspace activity feed. Error messages stay visible, which is what you read when a call fails.
+</Note>
+
 ## Rotate, revoke, and remove
 
 The generic rotation and uninstall rules are in [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall), including the fact that uninstalling leaves the workspace secrets behind. These are the Power BI specifics:
@@ -776,6 +811,7 @@ Two failures happen before Power BI is reached:
 - **`Unknown action`** or **`Missing required argument`**: the agent passed an unsupported `action`, or omitted it. Both messages end with `Available:` followed by the valid actions for that tool.
 - **`Direct calls are not allowed`** (HTTP `403`): something called a tool webhook such as `query` or `datasets` directly. Tools are reachable only through the MCP endpoint. From Builder, call the matching App-mode instruction instead, for example `executeQueries` or `listDatasets`.
 - **`getTables` fails on a regular dataset**: `getTables` only works on Push API datasets. To inspect an import or DirectQuery semantic model use the `datasets` tool with `action: getSchema`, or run `EVALUATE INFO.VIEW.TABLES()` and `EVALUATE INFO.VIEW.COLUMNS()` through the `query` tool.
+- **The Microsoft sign-in page returns `invalid_scope`**: the **Scopes** field mixes `https://analysis.windows.net/powerbi/api/.default` with granular Power BI scopes, which Entra ID refuses. Open the configuration app, keep either `.default` or the explicit list, and save before connecting again. See [Choose the OAuth scopes](#choose-the-oauth-scopes).
 - **The OAuth popup returns with an `invalid_state` message**: the callback did not match the pending authorization request, typically after the flow was left open too long or was started in another browser session. Start the connect flow again from the configuration app.
 - **Entra ID rejects the redirect URI**: the redirect URI registered on the app registration must match the connector's **Callback URL** byte for byte, including the **raw workspace id** and the `<app-instance-slug>.oauthCallback` suffix. **A `slug:` form is not accepted by Entra ID**, because the colon makes the URI invalid for Microsoft. Copy the value the configuration app renders; see [Register the Microsoft Entra ID application](#register-the-microsoft-entra-id-application).
 - **A failed call is a value, not an exception**: after a DSUL call, always branch on `{{result.error}}`. A missing check silently passes the error object downstream.

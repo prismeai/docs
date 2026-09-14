@@ -557,7 +557,11 @@ To smoke-test the result: from an agent that has the capability, in a workspace 
     | `accessToken` | A monday.com **API token (v2)** | Builder automations and shared service accounts where one identity acts for the whole workspace |
 
     <Note>
-      Install runs the connector's `onInstall` automation, described in [What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions). For monday.com it provisions two workspace secrets: `mondayAuth` holds the auth mode and its credentials, and `mondayAuthorizedAgents` holds the comma-separated agent ids allowed to call the MCP endpoint (or `*` for all agents). The central client lives in the core workspace secret `mondayCentralOAuth` and is never copied into tenant workspaces. Per-user OAuth refresh tokens are additionally stored, best effort, as a workspace secret named `monRefresh_<userId>`, which is what lets scheduled automations resolve a specific user's token. That write only succeeds when the connecting user is a workspace editor or owner; interactive use works for everyone regardless.
+      Install runs the connector's `onInstall` automation, described in [What installing provisions](/apps-store/marketplace/connectors/install-in-workspace#what-installing-provisions). For monday.com it provisions two workspace secrets: `mondayAuth` holds the auth mode and its credentials, and `mondayAuthorizedAgents` holds the comma-separated agent ids allowed to call the MCP endpoint (or `*` for all agents). The central client lives in the core workspace secret `mondayCentralOAuth` and is never copied into tenant workspaces. Per-user OAuth refresh tokens are additionally stored as a workspace secret named `monRefresh_<userId>`, which is what lets scheduled automations resolve a specific user's token.
+    </Note>
+
+    <Note>
+      **Who may deposit and replay a per-user token.** The connector declares both halves in its own `security.yml`, following the pattern documented in [Reading a workspace secret with no user](/products/ai-builder/module-secrets#reading-a-workspace-secret-with-no-user). A rule carrying no role lets every member `create` and `update` `monRefresh_<their own user id>` and nobody else's, so connecting deposits the token whatever the member's workspace role. A run with no user, such as a scheduled automation, cannot bind to that rule, so the connector declares a `tokenResolver` role holding `read`, `create`, `update` and `delete` over the whole `monRefresh_` family: `buildAppAuth` takes it on with `assumeRole` for the single `secrets` call that touches the token, and for nothing else. The role is never granted to a person and carries no API key.
     </Note>
 
     <Note>
@@ -811,6 +815,10 @@ Run these checks in order after installing and configuring the connector. Each o
 | Write control | Ask the agent to create an item on a test board | The item appears in monday.com and its creation is attributed to the identity checked above |
 | Least privilege | With read-only scopes configured, ask the agent to create an item | monday.com rejects the mutation with a permission error |
 
+<Note>
+  monday.com content is declared as redacted before the connector emits its execution events, so it appears masked in the workspace activity feed rather than in clear. This covers the GraphQL `query` and `variables` sent to monday.com, the tool arguments and update or doc-block bodies that carry text, the third-party error body, and the output of every tool, instruction and MCP response. What stays visible is the call itself: which operation ran, for which agent and user, and whether it failed.
+</Note>
+
 ## Disconnect, rotate and remove
 
 The generic lifecycle is documented in [Rotate credentials and uninstall](/apps-store/marketplace/connectors/install-in-workspace#rotate-credentials-and-uninstall) and, for the central client, [Rotate and revoke the central client](/apps-store/marketplace/connectors/central-oauth#rotate-and-revoke-the-central-client). The table below is the monday.com-specific form, including the secret names to delete.
@@ -851,7 +859,7 @@ The connector normalizes monday.com responses into MCP errors. A GraphQL failure
 
 **`Monday token endpoint temporarily unavailable`**: monday.com's token endpoint returned a 5xx. This is transient and the connection is preserved, so retry shortly. No reconnection is needed.
 
-**`No stored Monday token for this user`**: a non-interactive run, such as a scheduled automation, tried to act on behalf of a user with no `monRefresh_<userId>` secret. That secret is written only when the connecting user is a workspace editor or owner, so have such a user connect once from the configuration app.
+**`No stored Monday token for this user`**: a non-interactive run, such as a scheduled automation, tried to act on behalf of a user for whom no `monRefresh_<userId>` secret exists. Have that user connect once from the configuration app in an OAuth mode; the deposit is theirs to make and needs no particular workspace role. The message ends with `as a workspace editor`, which is a leftover from an earlier permission model and no longer describes what the connector requires.
 
 **`Monday OAuth is not configured`**: neither a tenant OAuth client nor the central platform client is available. Enter the client ID and secret in the configuration app for the tenant mode, or ask the platform maintainer to provision the central OAuth client from the core `monday` workspace. For central-client failures such as `central_client_not_configured` or a rejected redirect URI, see [Troubleshooting](/apps-store/marketplace/connectors/central-oauth#troubleshooting).
 

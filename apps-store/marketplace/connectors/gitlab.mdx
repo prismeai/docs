@@ -220,6 +220,10 @@ Each role's section keeps the GitLab-specific values it needs. The generic, conn
     |------|-------------|
     | `issues` | Issues and their notes. Actions: `list` (one project), `listAll` (across all accessible projects; use for "my issues" with `scope:assigned_to_me`/`created_by_me`), `listGroup`, `get`, `create`, `update`, `close`, `reopen`, `delete`, `listNotes`, `getNote`, `createNote`, `updateNote`, `deleteNote`. |
 
+    <Note>
+      **Internal notes.** On `createNote`, pass `internal: true` to post the note as an **internal note**, invisible to the issue reporter (the Service Desk customer). GitLab offers no way to turn a published note internal afterwards, so the choice has to be made on `createNote`; read `internal` back from the response to confirm. The `confidential` argument is deprecated by GitLab and ignored on notes, so it hides nothing: on `create` and `update` it still marks the **issue** itself as confidential.
+    </Note>
+
     ### Merge Requests
 
     | Tool | Description |
@@ -266,7 +270,7 @@ Each role's section keeps the GitLab-specific values it needs. The generic, conn
     | `uploads` | Project uploads. Action: `create` only. Uploads the files attached to the current chat message to a project and returns one `{ ok, markdown, url, filename }` entry per file, to embed in an issue description or a note body. |
 
     <Note>
-      `uploads` requires the capability *Scope* to declare [`attachment_urls`](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means), which is how Agent Creator passes the URLs of the files the user dropped in the conversation. Pass the project in `id` as a **raw** namespaced path (`group/subgroup/repo`) or a numeric project ID; do not URL-encode it. Files larger than 25 MB are rejected, and each filename is transliterated to ASCII before upload.
+      `uploads` requires the capability *Scope* to declare [`attachment_urls`](/apps-store/marketplace/connectors/declare-capability#what-the-scope-means), which is how Agent Creator passes the URLs of the files the user dropped in the conversation. Pass the project in `id` as a **raw** namespaced path (`group/subgroup/repo`) or a numeric project ID; do not URL-encode it. Each filename is transliterated to ASCII before upload (accents and ligatures folded, every other character collapsed to `_`, the extension kept), because GitLab stores and references an upload under different Unicode normalizations. A file the connector cannot download is reported on its own entry as `{ "ok": false, "error": "Could not download the file to upload." }`; the other files in the same call still upload.
     </Note>
 
     ## Output Formats
@@ -448,10 +452,12 @@ Each role's section keeps the GitLab-specific values it needs. The generic, conn
     | OAuth callback: `<api-url>/workspaces/slug:<workspace-slug>/webhooks/<app-instance>.oauthCallback` | Computed on install. Register it as the redirect URI on your own GitLab application in `oauth` mode. In `oauthCentral` mode you register nothing: the core workspace callback is used and proxies the authorization code back here. The two shapes are compared in [Callback URLs](/apps-store/marketplace/connectors/central-oauth#callback-urls). |
     | MCP endpoint: `<api-url>/workspaces/slug:<workspace-slug>/webhooks/<app-instance>.mcp` | The app instance's own `mcp` webhook. This is the URL an Agent Creator capability points at. |
 
-    | Workspace secret | Description |
+    | Secret | Description |
     |-------|-------------|
-    | `gitlabAuth` | Object holding the auth mode and its credentials: `mode` (`oauthCentral`, `oauth` or `accessToken`), `oauthClientId`, `oauthClientSecret`, `scopes`, `accessToken`. Written by the configuration app. |
-    | `gitlabAuthorizedAgents` | Comma-separated agent IDs allowed to call the MCP endpoint, or `*` for all. Written by the configuration app. |
+    | `gitlabAuth` | Workspace scope. Object holding the auth mode and its credentials: `mode` (`oauthCentral`, `oauth` or `accessToken`), `oauthClientId`, `oauthClientSecret`, `scopes`, `accessToken`. Written by the configuration app. |
+    | `gitlabAuthorizedAgents` | Workspace scope. Comma-separated agent IDs allowed to call the MCP endpoint, or `*` for all. Written by the configuration app. |
+    | `glabRefresh_<userId>` | Written in the OAuth modes when a user connects. The **user**-scoped copy holds that user's refresh token, and its presence is what `oauthStatus` reports the connection on. A **workspace**-scoped copy is written too, for the non-interactive path described below. The connector's `security.yml` carries an unroled rule letting every member `create` and `update` `glabRefresh_<their own user id>` and nobody else's, so connecting deposits the token whatever the member's workspace role — see [Reading a workspace secret with no user](/products/ai-builder/module-secrets#reading-a-workspace-secret-with-no-user). |
+    | `glabAccess_<userId>` | User scope. Cache of the current access token. GitLab revokes the previous access token on every refresh-token rotation, so no expiry is tracked: a `401` from GitLab triggers one automatic refresh-and-retry instead. |
 
     The configuration app drives everything; the app instance itself has no per-field credential form. From it you pick one of:
 
@@ -469,6 +475,8 @@ Each role's section keeps the GitLab-specific values it needs. The generic, conn
 
     <Note>
       **Running OAuth-backed automations without a user (cron and background runs).** In the OAuth modes, a per-user token normally comes from the caller's own session. For scheduled or event-driven automations that have no interactive user, the connector can replay a stored refresh token instead: pass a server-controlled user ID as `targetUserId`, and it reads the workspace secret `glabRefresh_<userId>` and exchanges it for a fresh access token. That secret is only written when the person who connects is a workspace **editor** or **owner**; for anyone else the write is denied and only the interactive path works. Never build that user ID from a tool argument or from user input: whoever it names is the account every scheduled call will run as.
+
+      GitLab rotates refresh tokens on every exchange, so the connector stores the newly issued one back before returning. That read and write run under an internal `tokenResolver` role that the connector assumes for the single call and that is never granted to a person. When GitLab rejects a stored refresh token for good (any `4xx`), the same role deletes the secret, so the schedule stops replaying a dead token and that user has to reconnect from the configuration app.
     </Note>
 
     ## Available Instructions
@@ -502,7 +510,7 @@ Each role's section keeps the GitLab-specific values it needs. The generic, conn
     | `closeIssue` | Close issue `iid` (state_event=close) | `{ iid, state: "closed" }` |
     | `reopenIssue` | Reopen issue `iid` (state_event=reopen) | `{ iid, state: "opened" }` |
     | `listIssueNotes` | List notes of issue `iid` (`sort`, `order_by`, `per_page`) | `[ { id, body, author, ... } ]` |
-    | `createIssueNote` | Add a note (`body`) on issue `iid` (+ `confidential`) | `{ id, body, ... }` |
+    | `createIssueNote` | Add a note (`body`) on issue `iid`. Pass `internal: true` for an **internal note**, invisible to the issue reporter (Service Desk customer); GitLab cannot turn a published note internal afterwards. `confidential` is deprecated by GitLab and ignored on notes | `{ id, body, internal, ... }` |
     | `getIssueNote` | Get note `note_id` of issue `iid` | `{ id, body, ... }` |
     | `updateIssueNote` | Update note `note_id` body of issue `iid` | `{ id, body, ... }` |
     | `deleteIssueNote` | Delete note `note_id` of issue `iid` | Empty (HTTP 204) |
@@ -755,11 +763,11 @@ The generic rules, including the fact that uninstalling never deletes the worksp
 
 | Goal | Who does it | How |
 |------|-------------|-----|
-| Disconnect one user | The user | Select **Disconnect** in the configuration app, or use the agent's disconnect action. The connector attempts a revocation at `https://gitlab.com/oauth/revoke`, then deletes the stored per-user token and that user's `glabRefresh_<userId>` workspace secret. The configuration app returns with `status=disconnected`. |
-| Offboard a user | Workspace editor and GitLab admin | Have the user disconnect, then remove the account from the GitLab group. If the account is already gone, delete the `glabRefresh_<userId>` workspace secret so no scheduled run can replay it. |
+| Disconnect one user | The user | Select **Disconnect** in the configuration app, or use the agent's disconnect action. The connector attempts a revocation at `https://gitlab.com/oauth/revoke` (skipped in `oauthCentral` mode, which holds no client secret locally), then deletes the stored per-user token and that user's `glabRefresh_<userId>` **workspace** secret. The configuration app returns with `status=disconnected`. |
+| Offboard a user | Workspace editor and GitLab admin | Have the user disconnect, then remove the account from the GitLab group. Disconnect clears the workspace-scoped copy but not the user-scoped `glabRefresh_<userId>` and `glabAccess_<userId>` secrets, so delete those as well; deleting `glabRefresh_<userId>` at workspace scope is what stops any scheduled run from replaying the account. |
 | Stop one agent | Workspace editor | Untick the agent in **Authorized agents** and Save. The next call is rejected immediately. |
 | Rotate a workspace credential | Workspace editor | Reopen the configuration app, paste the new Application ID and Secret (or the new access token), and Save. In the OAuth modes, users whose refresh token was minted against the old client must reconnect. |
-| Remove the connector | Workspace editor | Uninstall the GitLab app from the workspace, then delete the `gitlabAuth`, `gitlabAuthorizedAgents` and any remaining `glabRefresh_<userId>` secrets. Finally delete or revoke the GitLab OAuth application or personal access token on the GitLab side, because uninstalling does not revoke it. |
+| Remove the connector | Workspace editor | Uninstall the GitLab app from the workspace, then delete the `gitlabAuth`, `gitlabAuthorizedAgents` and any remaining `glabRefresh_<userId>` and `glabAccess_<userId>` secrets. Finally delete or revoke the GitLab OAuth application or personal access token on the GitLab side, because uninstalling does not revoke it. |
 
 <Warning>
   In `oauthCentral` mode the connector holds no client secret locally, so it cannot call GitLab's revocation endpoint: disconnecting deletes the stored tokens on the Prisme.ai side only. To invalidate an already issued token immediately, revoke the authorization from GitLab, under **User Settings > Applications**.
@@ -772,7 +780,7 @@ The connector normalizes GitLab API failures into a single message per status co
 | HTTP status | Message the connector returns | Resolution |
 |-------------|-------------------------------|------------|
 | 400 | Bad request while the operation | Check argument shapes: IDs, dates, enum values |
-| 401 | Authentication failed, check GitLab credentials or OAuth connection | Reconnect (OAuth modes), or verify the access token is valid and carries the `api` scope |
+| 401 | Authentication failed, check GitLab credentials or OAuth connection | The connector already replays the call once with a freshly minted token, so a `401` that surfaces means the refresh failed too. Reconnect (OAuth modes), or verify the access token is valid and carries the `api` scope |
 | 403 | Forbidden, check the user's GitLab permissions or OAuth scopes | The connected account lacks the access level on this project or group, or the granted scope is `read_api` on a write call |
 | 404 | Resource not found | Verify the project `id` (numeric or URL-encoded path) and the resource `iid` |
 | 429 | Rate limit or org limit exceeded, wait and retry | Back off and retry; see the [GitLab rate limits reference](https://docs.gitlab.com/security/rate_limits/) for the limits that apply to your plan |
@@ -794,7 +802,7 @@ Failures that are not specific to GitLab are covered by the shared troubleshooti
 
 **"GitLab token endpoint temporarily unavailable"**: GitLab returned a server error on the token endpoint. This is transient, the stored connection is kept, and no reconnection is needed. Retry the call.
 
-**"No stored GitLab token for this user"**: A background or scheduled run tried to resolve a user who never deposited a refresh token. That user must connect once from the configuration app **as a workspace editor or owner**, which is the only case where the `glabRefresh_<userId>` secret can be written.
+**"No stored GitLab token for this user"**: A background or scheduled run tried to resolve a user who never deposited a refresh token. Have that user connect once from the configuration app in an OAuth mode; the deposit is theirs to make and needs no particular workspace role. The message ends with `as a workspace editor`, which is a leftover from an earlier permission model and no longer describes what the connector requires.
 
 **"GitLab is not authenticated"**: The workspace has no usable auth configuration. Choose a mode and enter its credentials in the configuration app.
 
