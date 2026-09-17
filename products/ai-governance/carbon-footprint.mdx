@@ -1,0 +1,121 @@
+---
+title: 'Carbon Footprint'
+description: 'How the LLM Gateway estimates the energy and CO₂eq impact of every model call'
+---
+
+Every completion served through the LLM Gateway is scored for its environmental impact: the energy it consumed (kWh) and the greenhouse-gas emissions it produced (kg CO₂eq). The estimate is attached to each call and aggregated in [Observability](./observability) (the **Carbon** headline card).
+
+The method is **inspired by the [EcoLogits](https://ecologits.ai) methodology**: a per-token energy model, scaled by datacenter efficiency (PUE) and converted to CO₂ with a region-specific grid emission factor, reported with an uncertainty range. It is a **parametric estimate, not a measurement** — its accuracy depends entirely on the metrics declared on each model.
+
+## Where the inputs come from
+
+The estimate is driven by three fields you declare per model, in the **Metrics** section of the model declaration form (Governe → Models → Add/Edit model → Advanced):
+
+<Frame>
+  <img src="/images/ai-governance-model-metrics.png" alt="Model declaration — Metrics section (Energy/Token, PUE Profile, Eco Score)" />
+</Frame>
+
+| Field | Feeds | Meaning |
+|---|---|---|
+| **Energy/Token** (`energy_per_token`) | GPU energy | Energy drawn per output token, in **kWh/token**. Required — without it, no carbon estimate is produced (only pricing). |
+| **PUE Profile** (`pue_profile`) | Datacenter overhead | `efficient`, `average` (default) or `inefficient`. |
+| **Region** (`region`) | Emission factor | Grid carbon intensity of where the model runs. Defaults to `world`. |
+| **Eco Score**, **Cost Tier**, **Training Date** | Display only | Not used in the calculation. |
+
+<Warning>
+**Unit matters.** `Energy/Token` is expressed in **kWh per token** (e.g. `0.0000103` kWh/token ≈ 10.3 mWh/token). Entering a value in Wh/token would make the reported footprint 1000× too high. The field is not unit-suffixed in the UI, so declare it in kWh/token.
+</Warning>
+
+## Calculation
+
+For a call with `in` input tokens and `out` output tokens, and a model whose declared energy per token is `ept`:
+
+### 1. GPU energy
+
+Input tokens (encoding) are counted at ~33% of an output token's energy:
+
+```
+gpu_energy = (in × ept × 0.33) + (out × ept)        [kWh]
+```
+
+### 2. Server overhead
+
+A fixed server draw of 0.1 kW over an estimated 0.02 s of processing per token:
+
+```
+processing_time = (in + out) × 0.02                 [s]
+server_energy   = 0.1 kW × processing_time / 3600   [kWh]
+```
+
+### 3. Datacenter efficiency (PUE)
+
+The raw energy is scaled by the Power Usage Effectiveness of the datacenter:
+
+```
+total_energy = (gpu_energy + server_energy) × PUE   [kWh]
+```
+
+| PUE Profile | Multiplier |
+|---|---|
+| `efficient` | 1.1 |
+| `average` (default) | 1.58 |
+| `inefficient` | 2.0 |
+
+### 4. CO₂eq emissions
+
+The energy is converted with the grid emission factor of the model's region:
+
+```
+gwp = total_energy × emission_factor                [kg CO₂eq]
+```
+
+| Region | Emission factor (kg CO₂/kWh) |
+|---|---|
+| `world` (default) | 0.475 |
+| `eu-west` | 0.276 |
+| `eu-north` | 0.231 |
+| `us-east` | 0.389 |
+| `us-west` | 0.352 |
+| `asia` | 0.638 |
+
+### 5. Uncertainty range
+
+Both energy and emissions are reported with a **±20%** band (`min = value × 0.8`, `max = value × 1.2`).
+
+### Condensed formula
+
+```
+E   = [ (in·ept·0.33 + out·ept) + (0.1 · (in+out)·0.02 / 3600) ] × PUE
+CO₂ = E × emission_factor
+```
+
+## Worked example
+
+A short call of 51 input + 18 output tokens on a model declared at `ept = 0.0000103` kWh/token, `average` PUE, `us-west`:
+
+- `gpu_energy` = (51 × 0.0000103 × 0.33) + (18 × 0.0000103) ≈ **0.000359 kWh**
+- `server_energy` = 0.1 × (69 × 0.02) / 3600 ≈ **0.0000038 kWh**
+- `total_energy` = (0.000359 + 0.0000038) × 1.58 ≈ **0.000573 kWh**
+- `gwp` = 0.000573 × 0.352 ≈ **0.0002 kg CO₂eq** (~0.2 g CO₂eq)
+
+## Result shape
+
+Each call returns:
+
+```json
+{
+  "energy": { "value": 0.000573, "min": 0.000459, "max": 0.000688, "unit": "kWh" },
+  "gwp":    { "value": 0.000202, "min": 0.000161, "max": 0.000242, "unit": "kgCO2eq" },
+  "details": { "gpu_energy": 0.000359, "server_energy": 0.0000038, "pue": 1.58, "emission_factor": 0.352, "region": "us-west" }
+}
+```
+
+<Note>
+The constants (0.33 input factor, 0.1 kW server draw, 0.02 s/token, PUE multipliers and regional emission factors, ±20% band) are fixed in the gateway. Only `energy_per_token`, `pue_profile` and `region` are per-model. A model with no `energy_per_token` reports pricing only and no footprint.
+</Note>
+
+## Related
+
+- [Observability](./observability) — where the aggregated Carbon (kg CO₂eq) card is surfaced
+- [Available Models](./available-models) — the governed model catalog
+- [Model Governance](./model-governance) — access, routing and failover controls
