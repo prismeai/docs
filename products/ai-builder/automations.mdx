@@ -69,7 +69,7 @@ output: "{{greeting}}"
 | `do` | Ordered list of instructions to execute. |
 | `output` | Expression returned to the caller after `do` completes. |
 | `validateArguments` | When `true`, the runtime rejects calls whose inputs do not match the active `schemas` branch (or the branch derived from `arguments`). |
-| `private` | When `true`, the automation cannot be called from outside the workspace (only via `runWorkflow` from another automation). |
+| `private` | When `true`, the automation cannot be called from outside the workspace (only by calling it directly from another automation, using its slug as an instruction key). |
 | `disabled` | When `true`, the automation is registered but never executes. |
 | `labels` | Free-form tags used for organization. |
 
@@ -130,7 +130,6 @@ Inside `do:` and other instruction lists, these keys are interpreted by the runt
 | `all` | Execute child branches in parallel. |
 | `try` / `catch` | Catch errors raised by child instructions. |
 | `run` | Call a built-in runtime module function. |
-| `runWorkflow` | Call another automation in the workspace. |
 | `comment` | Free-form annotation, ignored at runtime. |
 | `rateLimit`, `auth`, `createUserTopic`, `joinUserTopic` | Specialized runtime instructions; see the table in [Visual Editor and YAML Mapping](#visual-editor-and-yaml-mapping). |
 
@@ -584,7 +583,6 @@ Each instruction node serializes to a single DSUL key. The table below lists eve
 | Parallel (All) | `all` | `do: [instructions]` | Execute branches concurrently and wait for all of them. |
 | Try / Catch | `try` | `do`, `catch` | Recover from errors raised by inner instructions. |
 | Run Module | `run` | `module`, `function`, `parameters`, `output` | Call a built-in runtime module (e.g. `secrets`, `collections`). |
-| Run Workflow | `runWorkflow` | `workflow`, `parameters`, `output` | Call another automation in the same workspace. |
 | Rate Limit | `rateLimit` | `name`, `limit`, `window`, `output` | Enforce a sliding-window rate limit. |
 | Auth Token | `auth` | `workspace` (bool), `output` | Issue a short-lived JWT for the current user or workspace. |
 | Create User Topic | `createUserTopic` | `topic`, `userIds` | Create a multi-user real-time topic. |
@@ -1261,7 +1259,7 @@ Publishes an event on the workspace event bus.
 | `target.currentSocket` | boolean | `false` | Deliver only on the socket that triggered this run (useful for SSE replies). |
 | `options.persist` | boolean | `true` | When `false`, the event is broadcast but not stored, so it is invisible in Activity. |
 
-**Output:** none. **Raises:** none. **Often chained with:** `wait`, `runWorkflow`.
+**Output:** none. **Raises:** none. **Often chained with:** `wait`.
 
 ### `fetch`
 
@@ -1380,18 +1378,25 @@ Calls a built-in runtime module.
 
 **Output:** the function's return value (varies). **Raises:** module-specific errors (`not_found`, `user_required`, …). See each module's reference page.
 
-### `runWorkflow`
+### Calling another automation
 
-Calls another automation in the same workspace.
+There is no dedicated instruction for calling another automation: **use the target automation's slug directly as the instruction key**, with its inputs as the value. This is the same mechanism used for imported app actions (see [App and workspace automation calls](#app-and-workspace-automation-calls)).
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `workflow` | string (required) | - | Slug of the target automation. |
-| `parameters` | object | `{}` | Inputs passed to the target automation (validated against its `schemas`, or the branch derived from `arguments`). |
-| `output` | string | - | Variable receiving the target's `output`. |
-| `wait` | boolean | `true` | When `false`, fire-and-forget; the parent continues without waiting. |
+```yaml
+- mySlackInstance.sendMessage:   # app action: <appInstanceSlug>.<action>
+    channel: "#general"
+    text: "Hello"
 
-**Output:** the target automation's `output`. **Raises:** propagates errors from the target (unless `wait: false`).
+- myAutomationSlug:              # workspace automation: slug used directly
+    someParam: value
+    output: result               # capture the target's output into `result`
+```
+
+The inputs are validated against the target automation's `schemas` (or the branch derived from its `arguments`). As with every other instruction, adding an `output` key stores the target automation's `output` into the named variable. Errors raised by the target propagate to the caller.
+
+<Warning>
+The slug is the raw YAML **key**, and instruction keys are **not** interpolated — only values are. So `{{ myVar }}` as a key does **not** resolve to a slug; the automation to call must be a static, hardcoded slug. To dispatch dynamically (slug from a variable), either branch with [`conditions`](#conditions) over known slugs, `emit` an event whose type is built from an expression (async), or `fetch` the target automation's webhook URL (the URL is a value, so it can be interpolated).
+</Warning>
 
 ### `rateLimit`
 
