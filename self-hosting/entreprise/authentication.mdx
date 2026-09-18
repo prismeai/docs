@@ -118,6 +118,7 @@ Prisme.ai supports the following authentication protocols:
           token_endpoint: "idp token_endpoint"
           jwks_uri: "idp public certificates endpoint"
           scopes: "openid email profile"
+          # userinfo_endpoint: "idp userinfo endpoint"  # only if the IdP omits profile claims from the id_token
           # issuer: "idp issuer URL"      # recommended; enforced during token exchange
           # allowTokenExchange: true      # opt-in: allow headless token exchange (see below)
         attributesMapping:
@@ -133,8 +134,52 @@ Prisme.ai supports the following authentication protocols:
     - The `scopes` field is optional and defaults to `openid email`
     - The minimum required scopes are `openid` and `email`
     - Add `profile` scope to retrieve additional user attributes like name
+    - `attributesMapping` maps **IdP claim names** to Prisme.ai user fields. The defaults above follow the OIDC standard claims (`given_name`, `family_name`); set them explicitly if your IdP uses different names
   </Step>
 </Steps>
+
+### Reading profile claims from the userinfo endpoint
+
+Prisme.ai reads user attributes from the **`id_token`**. Some identity providers keep the
+`id_token` minimal (only `sub`) and expose profile claims such as the first and last name
+on their OIDC `/userinfo` endpoint instead.
+
+Set `userinfo_endpoint` on the provider to cover that case. When present, Prisme.ai calls
+it with the access token right after the code exchange and uses its claims to **fill the
+gaps** left by the `id_token`:
+
+```yaml
+providers:
+  <ProviderName>:
+    type: oidc
+    config:
+      # ... other OIDC fields
+      userinfo_endpoint: "idp userinfo endpoint"
+    attributesMapping:
+      firstName: 'firstname'   # whatever claim names /userinfo actually returns
+      lastName: 'lastname'
+      email: 'email'
+```
+
+`userinfo_endpoint` must be an `https://` URL, otherwise the provider configuration is
+rejected. Loopback hosts (`localhost`, `127.0.0.1`, `[::1]`) are accepted, for pointing at
+a local IdP during development.
+
+<Note>
+  `id_token` claims always take precedence: only it is signature-verified, so `sub`, `iss`,
+  `aud` and `exp` can never be overridden by the `/userinfo` response. A response whose
+  `sub` does not match the `id_token` is discarded ([OIDC Core
+  5.3.2](https://openid.net/specs/openid-connect-core-1_0.html#UserInfoResponse)).
+
+  If the endpoint is unreachable, times out or errors, the login still succeeds using the
+  `id_token` claims alone: the user is simply created without the missing attributes.
+  The call timeout defaults to 5s (`OIDC_USERINFO_TIMEOUT`, in milliseconds).
+</Note>
+
+<Warning>
+  Leave `userinfo_endpoint` unset when your IdP already puts the profile claims in the
+  `id_token`: it adds one HTTP round-trip to every login for nothing.
+</Warning>
 
 ## Token Exchange (headless clients)
 
