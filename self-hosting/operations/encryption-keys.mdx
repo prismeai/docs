@@ -1,0 +1,196 @@
+---
+title: 'Recover a Lost Encryption Key'
+description: 'What to do when the secrets encryption master key is missing or was overwritten'
+---
+
+The `masterKeys` value in the `<release>-secrets-encryption` Secret is the only way to read encrypted data. This page is the procedure to follow when it is missing or no longer matches what encrypted your data. Back it up before you need it: see [Backup & Restore](/self-hosting/operations/backup#configuration-backup).
+
+## 1. Identify the failure
+
+<Tabs>
+  <Tab title="Unknown KEK kid">
+    ```
+    Unknown KEK kid: <kid>. Was this key removed before migration completed?
+    ```
+
+    The `kid` is no longer present in `masterKeys` — the key is **missing**. Every keyring carrying that `kid` is equally unreadable, so the impact can be scoped by `kid`.
+  </Tab>
+  <Tab title="decryption operation failed">
+    ```
+    decryption operation failed
+    ```
+
+    The `kid` is loaded but its bytes no longer match the ones that wrapped the stored data key — the key was **overwritten**, typically by a rotation that replaced an existing `kid` instead of appending a new one.
+
+    The same `kid` may then cover both broken and healthy keyrings. Do **not** scope any deletion by `kid` in this case: establish the exact list of keyrings that can no longer be unwrapped, and act only on that list.
+  </Tab>
+</Tabs>
+
+Both errors also break **writes**, not just reads: storing a secret first unwraps the existing keyring, so new secrets fail too.
+
+## 2. Try to recover the key
+
+As long as a copy exists, recovery is complete and lossless.
+
+<Steps>
+  <Step title="Read it from the running pods">
+    Environment variables are injected at pod start, so a pod that has not restarted since the loss still holds the key.
+
+    ```bash
+    for svc in runtime workspaces api-gateway; do
+      POD=$(kubectl get pod -n <NAMESPACE> -l app.kubernetes.io/instance=<RELEASE> \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep "$svc" | head -1)
+      [ -n "$POD" ] && kubectl exec -n <NAMESPACE> "$POD" -- \
+        sh -c "cat /proc/1/environ | tr '\0' '\n' | grep '^SECRETS_'"
+    done
+    ```
+
+    <Warning>
+      Do this **before** scaling anything down. Stopping the pods destroys this last copy.
+    </Warning>
+  </Step>
+
+  <Step title="Check the Helm release history">
+    ```bash
+    helm history <RELEASE> -n <NAMESPACE>
+    helm get values <RELEASE> -n <NAMESPACE> --revision <N>
+    ```
+  </Step>
+
+  <Step title="Check the vault, the GitOps repository and the cluster backups">
+    Sealed Secrets, External Secrets Operator and SOPS keep a reproducible copy, as does any backup taken before the loss.
+  </Step>
+</Steps>
+
+If you find the key, restore it and stop here:
+
+```yaml
+# secrets-encryption-values.yaml
+global:
+  secretsEncryption:
+    masterKeys: '<contents of masterKeys.json>'
+    refKeys: '<contents of refKeys.json>'
+```
+
+```bash
+helm upgrade <RELEASE> prismeai/prismeai-core \
+  -n <NAMESPACE> --reuse-values \
+  -f secrets-encryption-values.yaml
+```
+
+## 3. If the key is unrecoverable, purge the unusable rows
+
+<Warning>
+  Irreversible. The encrypted values are already lost; the purge only removes the rows that can no longer be read, so that users can create new secrets. A stale keyring left in place keeps blocking writes in that workspace or organization.
+</Warning>
+
+Four objects, spread over two databases:
+
+| Database | Collection / table | Content |
+|----------|--------------------|---------|
+| permissions (`PERMISSIONS_STORAGE_HOST`) | `secure_secrets` | Connector OAuth tokens, service-account client secrets |
+| permissions | `workspace_keyrings` | Wrapped data key, one per workspace |
+| users (`USERS_STORAGE_HOST`) | `org_sso_providers` | The `config` field of organization SSO providers |
+| users | `OrgKeyrings` | Wrapped data key, one per organization |
+
+<Info>
+  Leave the `secrets` table alone: it holds the plaintext `{{secret.*}}` values declared in a workspace's configuration, does not depend on any master key, and its name is one word away from `secure_secrets`.
+</Info>
+
+<Steps>
+  <Step title="Snapshot both databases">
+    The ciphertext is worthless today, but if the original key resurfaces in an older backup, it is the difference between restoring and having nothing.
+  </Step>
+
+  <Step title="Stop writes">
+    ```bash
+    kubectl scale deployment -n <NAMESPACE> \
+      -l app.kubernetes.io/instance=<RELEASE> --replicas=0
+    ```
+  </Step>
+
+  <Step title="Purge the permissions database">
+    <Tabs>
+      <Tab title="PostgreSQL">
+        ```sql
+        \set lost_kid '<LOST_KID>'
+
+        BEGIN;
+        CREATE TEMP TABLE lost_workspaces AS
+        SELECT workspace_id FROM workspace_keyrings WHERE kek_kid = :'lost_kid';
+
+        DELETE FROM secure_secrets     WHERE workspace_id IN (SELECT workspace_id FROM lost_workspaces);
+        DELETE FROM workspace_keyrings WHERE workspace_id IN (SELECT workspace_id FROM lost_workspaces);
+        COMMIT;
+
+        SELECT count(*) FROM workspace_keyrings WHERE workspace_id IN (SELECT workspace_id FROM lost_workspaces);
+        ```
+
+        If every master key is lost: `TRUNCATE TABLE secure_secrets, workspace_keyrings;`
+      </Tab>
+      <Tab title="MongoDB">
+        ```javascript
+        const lostKid = '<LOST_KID>';
+        const workspaceIds = db.workspace_keyrings.distinct('workspaceId', { kekKid: lostKid });
+
+        db.secure_secrets.deleteMany({ workspaceId: { $in: workspaceIds } });
+        db.workspace_keyrings.deleteMany({ workspaceId: { $in: workspaceIds } });
+
+        db.workspace_keyrings.countDocuments({ workspaceId: { $in: workspaceIds } });
+        ```
+
+        If every master key is lost, drop the filter and delete all documents in both collections.
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Purge the users database">
+    Required as soon as organization SSO providers exist: until the stale organization keyring is removed, the gateway fails on every SSO login **and rejects the re-entry of a new configuration**.
+
+    <Tabs>
+      <Tab title="PostgreSQL">
+        ```sql
+        BEGIN;
+        DELETE FROM "OrgKeyrings" WHERE kek_kid = :'lost_kid';
+        UPDATE org_sso_providers SET enabled = false WHERE config->>'v' = '1';
+        COMMIT;
+        ```
+
+        `OrgKeyrings` is the only mixed-case identifier in the schema: the double quotes are mandatory.
+      </Tab>
+      <Tab title="MongoDB">
+        ```javascript
+        db.OrgKeyrings.deleteMany({ kekKid: lostKid });
+        db.org_sso_providers.updateMany({ 'config.v': 1 }, { $set: { enabled: false } });
+        ```
+      </Tab>
+    </Tabs>
+
+    Only the `config` field is lost: `slug`, `type`, `domains` and `attributesMapping` survive, so re-entry is limited to the provider credentials.
+  </Step>
+
+  <Step title="Restart with a new key">
+    Generate a new pair, restore it as shown in [Install with Helm](/self-hosting/kubernetes/helm#secrets-encryption-keys), then bring the services back:
+
+    ```bash
+    helm upgrade <RELEASE> prismeai/prismeai-core -n <NAMESPACE> --reuse-values
+    ```
+
+    **All** pods of `prismeai-runtime`, `prismeai-workspaces` and `prismeai-api-gateway` must restart with the same values: a pod still holding the old key would wrap new data keys under a `kid` the others cannot resolve, and the in-memory caches have to be cleared. New keyrings are created automatically on the next secret write and on the first SSO configuration re-entered.
+  </Step>
+
+  <Step title="Verify">
+    - no `Unknown KEK kid` or `decryption operation failed` left in the logs of the three services;
+    - a throwaway automation chaining `secrets.set`, `secrets.get` and a `fetch` using the returned `$secret:` reference;
+    - a real SSO login on each organization whose configuration was re-entered.
+  </Step>
+</Steps>
+
+## 4. What users have to redo
+
+| Secret | Recovery |
+|--------|----------|
+| `scope: user` — connector OAuth tokens | **Manual.** Each user reconnects each connector — the only item needing an announcement |
+| `scope: workspace` — client-credentials tokens built from workspace configuration | Automatic, on the next run |
+| Service-account client secrets | Automatic, by rotation |
+| Organization SSO configurations | Manual, by an administrator |
