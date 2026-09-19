@@ -1,110 +1,416 @@
 ---
 title: 'Brave Search'
-description: 'Web search and LLM-ready grounding context for AI agents through the Brave Search API'
+description: 'Give agents live web results and LLM-ready grounding context through the Brave Search API, with a workspace-level subscription token and optional Brave Goggles filtering'
 ---
 
 <img
   src="/images/connectors/brave-search.svg"
-  alt="Brave Search"
+  alt="Brave Search connector logo"
   width="96"
   height="96"
   noZoom
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Brave Search connector exposes the **Brave Search API** as a remote MCP server for AI agents. It bundles two complementary tools (`brave_search` for raw web results and `brave_llm_context` for pre-structured grounding snippets) and returns them in the standard MCP `content` response format.
+The Brave Search connector exposes the **Brave Search API** as a remote MCP server that **Agent Creator** agents call as a tool. It publishes two tools, `brave_search` for raw web results and `brave_llm_context` for pre-formatted grounding snippets, and returns both in the standard MCP `content` envelope. The connector runs on a **single workspace-level Brave subscription token**: Brave never sees the end user, only the token stored in the workspace, so every agent and every user shares the same Brave identity and the same quota.
 
-<CardGroup cols={2}>
-  <Card title="Current Web Search" icon="magnifying-glass">
-    Retrieve recent results from the open web with titles, URLs and snippets
+<CardGroup cols={3}>
+  <Card title="Live web results" icon="magnifying-glass">
+    `brave_search` returns the raw Brave web search payload (results, ranking signals, infoboxes) as JSON text.
   </Card>
-  <Card title="LLM Grounding" icon="brain">
-    Get token-budgeted, pre-formatted context ready to inject into an agent prompt
+  <Card title="Grounding context" icon="brain">
+    `brave_llm_context` returns token-budgeted markdown snippets with `url_citation` annotations, ready to cite in an answer.
   </Card>
   <Card title="Brave Goggles" icon="filter">
-    Apply site whitelist / re-ranking rules per call or workspace-wide
+    Restrict or re-rank results against a domain whitelist, set once for the workspace or overridden per call.
   </Card>
-  <Card title="MCP Native" icon="robot">
-    Exposes a JSON-RPC MCP endpoint that Agent Creator agents can call directly
+</CardGroup>
+
+## Who is this for?
+
+This connector is used by three roles. Go to the section that matches yours; each one is self-contained.
+
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to search the web.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and want to expose Brave Search once for every builder.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-builder">
+    You install and configure the connector in a workspace and hold the Brave token.
   </Card>
 </CardGroup>
 
 ## Prerequisites
 
-- A **Brave Search API account** with an active subscription token ([api-dashboard.search.brave.com](https://api-dashboard.search.brave.com/))
-- A plan that exposes both `/res/v1/web/search` **and** `/res/v1/llm/context` (the **Data for AI** plan is required for the LLM Context endpoint)
-- Your Brave subscription token
+- A **Brave Search API** account with an active subscription, created at [api-dashboard.search.brave.com](https://api-dashboard.search.brave.com/).
+- A **subscription token** from that account, sent by the connector as the `x-subscription-token` header.
+- A Brave subscription plan that covers both endpoints the connector calls: `https://api.search.brave.com/res/v1/web/search` for `brave_search` and `https://api.search.brave.com/res/v1/llm/context` for `brave_llm_context`. Endpoint coverage per plan is described in the [Brave Search API documentation](https://api-dashboard.search.brave.com/app/documentation).
+- A Prisme.ai workspace where you can edit **Secrets** and the connector configuration.
 
 <Note>
-  This connector targets agent web-search scenarios and exposes two MCP tools:
-  `brave_search` and `brave_llm_context`.
+  A plan that covers only one of the two endpoints still works: the tool backed by
+  the missing endpoint returns an `isError` result with the message Brave sends back,
+  and the other tool keeps working.
 </Note>
 
-## Instance Configuration
+## Credential model
 
-The **Brave Search** connector is available in your Prisme.ai instance. Before using it from an agent:
+The connector uses one authentication mode. Read this before configuring anything, because it decides who is accountable for the traffic.
 
-1. Open the connector configuration
-2. Set the Brave API key in workspace secrets
-3. **Add your Brave Goggle in the `Default Goggles` field** (see the "Brave Goggles" section below); this is required if you want every Brave Search call to be scoped to your whitelist
-4. Adjust the other default search options if needed (count, market, token budget…)
+| Auth mode | What you provide | Identity Brave sees | Best for |
+|---|---|---|---|
+| **Static subscription token (workspace level)** | One Brave subscription token, stored in the workspace secret `BRAVE_API_KEY` and referenced by the **Brave API Key:** configuration field | The Brave account that owns the token, never the invoking end user | All deployments. Brave Search exposes public web data and has no per-user resource to delegate. |
 
-## Connector Configuration
+<Warning>
+  This is a **shared service credential**. Every agent and every end user that can reach
+  the MCP endpoint spends the same Brave quota, and Brave's own logs attribute all traffic
+  to the token owner, not to individual users. Prisme.ai attribution stays available in the
+  workspace activity feed. Give the token its own Brave subscription rather than reusing a
+  personal one, and treat quota exhaustion as a shared blast radius: one runaway agent can
+  starve every other agent on the same workspace.
+</Warning>
 
-Set these values in the connector configuration. They define the provider and the default search options used when the agent omits them.
+Access to the MCP endpoint itself is gated by Prisme.ai, not by Brave. The endpoint accepts three principals and rejects everything else:
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| **Provider** | `brave` | Search provider identifier |
-| **Default Count** | `5` | Number of web search results when `num_results` is omitted (`brave_search`) |
-| **Default Market** | `US` | Country code when `market` is omitted (`brave_search`) |
-| **Default LLM Context Count** | `20` | Number of grounding entries when `count` is omitted (`brave_llm_context`) |
-| **Default LLM Context Market** | `us` | Country code when `country` is omitted (`brave_llm_context`) |
-| **Default Max Tokens** | `8192` | Token budget for the LLM context response when `max_tokens` is omitted |
-| **Default Context Threshold Mode** | `balanced` | Relevance filter for `brave_llm_context` (`strict`, `balanced`, `lenient`, `disabled`) |
-| **Default Goggles** | _(empty)_ | **Primary place to configure a Brave Goggle.** Paste a raw Goggle definition or a hosted URL; it is applied to every call from this workspace. Leave empty only if you intentionally want unfiltered Brave Search. |
+| Principal | Resolved from | Typical caller |
+|---|---|---|
+| User session | the caller's user JWT | An agent call made on behalf of a signed-in user |
+| Workspace | the calling workspace's JWT | Another workspace calling the connector in process |
+| Organization API key | the organization on the API key session | Server-to-server integrations |
 
-The **Default Goggles** field is where you configure the Goggle that applies to every Brave Search call from this workspace. Most deployments will set this once at install time and leave the `goggles` tool argument unused.
+An unauthenticated request gets HTTP `401` and the JSON-RPC error `-32000` with the message `Authentication required`.
 
-## Workspace Secrets
+<Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
+  **Goal:** Brave Search is a **per-workspace** connector. The Brave subscription token lives in the workspace that runs the connector, so there is no platform-wide credential to provision and no central OAuth client to register.
 
-Set this value in the workspace secrets panel. It is referenced by the connector configuration and sent as the `x-subscription-token` header on every call to the Brave API.
+  The only optional platform task is to publish Brave Search as a reusable **capability** in AI Governance, so that agent builders enable it from the catalog instead of pasting an MCP endpoint URL by hand.
 
-| Secret | Description |
-|--------|-------------|
-| `BRAVE_API_KEY` | Brave Search API subscription token |
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) the **Brave Search** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the **MCP Endpoint** of the workspace running the connector. For the connector workspace itself, that URL is:
 
-<Note>
-  Keep the Brave API key in workspace secrets. Do not paste the token into the
-  visible connector configuration fields.
-</Note>
+      ```text
+      https://api.<your-instance>/v2/workspaces/slug:tools-search-brave/webhooks/brave-search/mcp
+      ```
+    </Step>
+    <Step title="Make it available to agent builders">
+      Select **Save**. The capability then appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
+    </Step>
+  </Steps>
+
+  <Warning>
+    Declaring the capability makes the connector **available** to agent builders; it does not
+    provision any Brave credential and it does not restrict which tools an agent may call.
+    Because the connector holds a single shared token, every agent granted this capability
+    draws on the same Brave subscription. There is no OAuth auth-config JSON to attach here:
+    authentication is a server-side Brave subscription token, not a per-user OAuth flow.
+  </Warning>
+</Accordion>
+
+---
+
+<Tabs>
+  <Tab title="Agent builder (Agent Creator)">
+    ## Agent builder
+
+    **Goal:** let an agent you build in Agent Creator search the web through the `brave_search` and `brave_llm_context` MCP tools.
+
+    <Note>
+      Before an agent can call the connector, a workspace builder must have set the Brave
+      subscription token in a workspace ([Workspace builder](#workspace-builder-builder)), or a
+      platform admin must have published a Brave Search capability in AI Governance
+      ([Platform admin (Governance): one-time platform setup](#platform-admin-governance-one-time-platform-setup)).
+    </Note>
+
+    <Steps>
+      <Step title="Confirm the connector is configured">
+        Ask the workspace builder who owns the connector to confirm that the Brave subscription token is set and to hand you the workspace's **MCP Endpoint** URL.
+      </Step>
+      <Step title="Open your agent in Agent Creator">
+        Open the agent you want to extend and go to its capabilities.
+      </Step>
+      <Step title="Add the capability">
+        If an administrator published a **Brave Search** capability, select it from the catalog; the MCP server URL is already wired. Otherwise, add a capability pointing at the **MCP Endpoint** URL you received. The endpoint authenticates the caller's Prisme.ai principal, so no extra header and no per-user sign-in is required.
+      </Step>
+      <Step title="Brief the agent">
+        Add tool-use guidance to the agent's system prompt, as described in [Brief the agent in its system prompt](#brief-the-agent-in-its-system-prompt). Without it, the agent rarely reaches for the tools.
+      </Step>
+      <Step title="Save the agent">
+        Select **Save**. The agent now lists `brave_search` and `brave_llm_context` among its tools.
+      </Step>
+    </Steps>
+
+    <Note>
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under
+      **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. The connector still
+      resolves the Brave token from the workspace configuration.
+    </Note>
+
+    ## Brief the agent in its system prompt
+
+    Wiring the capability is not enough; the agent also needs to know when to reach for each tool. Copy this starter and adapt the trigger keywords to your domain:
+
+    ```text
+    You have access to the Brave Search MCP server (tools: brave_search, brave_llm_context).
+    Use it whenever the answer needs fresh public web sources: news, regulatory updates,
+    market data, factual lookups, competitor research.
+    - brave_search: use when you need raw web results (titles, URLs, snippets, infoboxes),
+      or when you want to inspect ranking. Recency filter values are Day, Week, Month.
+    - brave_llm_context: use when you only need factual grounding to cite in your answer.
+      It returns markdown snippets with their source URLs. Recency filter values are
+      pd (past day), pw (past week), pm (past month), py (past year).
+    Match the market or country to the user's language. Always cite the source URLs the
+    tool returns.
+    ```
+
+    ## Available tools
+
+    | Tool | Brave endpoint | Description |
+    |---|---|---|
+    | `brave_search` | `/res/v1/web/search` | Web search returning the raw Brave JSON payload, serialized as text. |
+    | `brave_llm_context` | `/res/v1/llm/context` | LLM-optimized grounding context, returned as markdown sections with `url_citation` annotations. |
+
+    Choose between them on response shape: `brave_search` when the agent needs the full Brave response (several result types, ranking signals, infobox), `brave_llm_context` when the agent only needs factual snippets to concatenate into its answer.
+
+    ## Tool details
+
+    ### brave_search
+
+    ```json
+    {
+      "name": "brave_search",
+      "arguments": {
+        "query": "actualites intelligence artificielle entreprise",
+        "num_results": 5,
+        "market": "fr-FR",
+        "freshness": "Day"
+      }
+    }
+    ```
+
+    | Argument | Type | Required | Description |
+    |---|---|---|---|
+    | `query` | string | Yes | Search query. Sent to Brave as `q`. |
+    | `num_results` | number | No | Number of results, 1 to 20. Sent to Brave as `count`. Falls back to the workspace default when omitted. |
+    | `market` | string | No | Market code such as `en-US` or `fr-FR`. The connector keeps a 2-letter value as is, and for a longer value splits on `-` and uppercases the second part, so `fr-FR` becomes `FR`. Sent to Brave as `country`. |
+    | `freshness` | string | No | Recency filter, one of `Day`, `Week`, `Month`. Forwarded verbatim; omitted from the request when not set. |
+    | `goggles` | string | No | Per-call override of the workspace **Default Goggles**. A hosted goggle URL or a raw goggle definition. See [Brave Goggles](#brave-goggles). |
+
+    The connector does not clamp `num_results` or validate `market`; Brave enforces its own bounds and returns an error the tool surfaces as an `isError` result.
+
+    ### brave_llm_context
+
+    ```json
+    {
+      "name": "brave_llm_context",
+      "arguments": {
+        "query": "European AI Act enforcement timeline",
+        "count": 15,
+        "country": "fr",
+        "search_lang": "en",
+        "freshness": "pm",
+        "max_tokens": 4096,
+        "context_threshold_mode": "strict"
+      }
+    }
+    ```
+
+    | Argument | Type | Required | Description |
+    |---|---|---|---|
+    | `query` | string | Yes | Search query, 1 to 400 characters and at most 50 words. Sent to Brave as `q`. |
+    | `count` | number | No | Number of grounding entries, 1 to 50. Falls back to the workspace default `20`. |
+    | `country` | string | No | 2-letter country code such as `us` or `fr`. Falls back to the workspace default `us`. |
+    | `search_lang` | string | No | Search language such as `en` or `fr`. Omitted from the request when not set. |
+    | `freshness` | string | No | Recency filter, one of `pd` (past day), `pw` (past week), `pm` (past month), `py` (past year). Omitted from the request when not set. |
+    | `max_tokens` | number | No | Maximum total tokens in the response, 1024 to 32768. Sent to Brave as `maximum_number_of_tokens`. Falls back to the workspace default `8192`. |
+    | `context_threshold_mode` | string | No | Relevance threshold, one of `strict`, `balanced`, `lenient`, `disabled`. Falls back to the workspace default `balanced`. |
+    | `goggles` | string | No | Per-call override of the workspace **Default Goggles**. See [Brave Goggles](#brave-goggles). |
+
+    Unlike `brave_search`, this tool forwards `search_lang` to Brave. The `brave_search` tool has no language argument; use `market` instead.
+
+    ## Response format
+
+    `brave_search` returns the Brave JSON payload serialized into a single text block:
+
+    ```json
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "{ \"type\": \"search\", \"web\": { \"results\": [ ... ] }, ... }"
+        }
+      ],
+      "isError": false
+    }
+    ```
+
+    `brave_llm_context` returns one markdown section per grounding entry, plus an `annotations` array that lets a client render clickable source cards:
+
+    ```json
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "## Result title\nSource: https://example.com/article\nFirst snippet\nSecond snippet\n\n## Other result\nSource: https://example.org/post\n",
+          "annotations": [
+            {
+              "type": "url_citation",
+              "url_citation": {
+                "url": "https://example.com/article",
+                "title": "Result title"
+              }
+            }
+          ]
+        }
+      ],
+      "isError": false
+    }
+    ```
+
+    When Brave returns no entry above the relevance threshold, the text block contains `No grounding context found for this query.` and `isError` stays `false`.
+  </Tab>
+
+  <Tab title="Workspace builder (Builder)">
+    ## Workspace builder
+
+    **Goal:** install the connector in a workspace, store the Brave subscription token, set the workspace-wide goggle, and hand the MCP endpoint to agent builders.
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace.
+    2. Search for **Brave Search** and install it.
+    3. Open **Secrets** and create `BRAVE_API_KEY` with your Brave subscription token.
+    4. Open the connector configuration and fill in the two fields listed under **Configuration fields**.
+    5. Select **Save**.
+
+    ## Configuration fields
+
+    The connector configuration form exposes two fields:
+
+    | Field | Stored as | Description |
+    |---|---|---|
+    | **Brave API Key:** | `USER_API_KEY` | Your Brave subscription token, sent as the `x-subscription-token` header on every call. Rendered as a password field. Reference the workspace secret rather than pasting the raw token: enter `{{secret.BRAVE_API_KEY}}`. |
+    | **Default Goggles (site whitelist / ranking rules)** | `default_goggles` | A hosted Brave Goggles URL or a raw goggle definition, applied to every call from this workspace. See [Brave Goggles](#brave-goggles). |
+
+    <Warning>
+      Store the token in the workspace secret `BRAVE_API_KEY` and point the **Brave API Key:**
+      field at it. Do not paste the raw token into the configuration, do not commit it to a
+      repository, and never place it in an agent's system prompt or in a chat message.
+    </Warning>
+
+    <Note>
+      The connector ships with a sample goggle definition already filled into **Default Goggles**.
+      Replace it with your own domain list or clear the field before going to production,
+      otherwise every search from this workspace is re-ranked against a whitelist you did not choose.
+    </Note>
+
+    ## Search defaults
+
+    Beyond the two form fields, the connector holds search defaults in its workspace configuration. They apply whenever the agent omits the matching tool argument. Changing them requires editing the connector configuration values, not the form.
+
+    | Configuration value | Default | Applies to |
+    |---|---|---|
+    | `default_count` | `5` | `brave_search` when `num_results` is omitted |
+    | `default_market` | `US` | `brave_search` when `market` is omitted |
+    | `default_llm_context_count` | `20` | `brave_llm_context` when `count` is omitted |
+    | `default_llm_context_market` | `us` | `brave_llm_context` when `country` is omitted |
+    | `default_max_tokens` | `8192` | `brave_llm_context` when `max_tokens` is omitted |
+    | `default_context_threshold_mode` | `balanced` | `brave_llm_context` when `context_threshold_mode` is omitted |
+    | `mcpTools` | two tool definitions | The catalog returned by the MCP `tools/list` method |
+
+    ## The MCP endpoint
+
+    The connector answers JSON-RPC 2.0 on a single webhook endpoint. For the connector workspace itself:
+
+    ```text
+    https://api.<your-instance>/v2/workspaces/slug:tools-search-brave/webhooks/brave-search/mcp
+    ```
+
+    Replace `<your-instance>` with your Prisme.ai instance host. When the connector runs from an app instance installed in your own workspace, use that workspace's slug and the **MCP Endpoint** value shown in the connector configuration. Hand this URL to agent builders, who wire it into an agent as described in [Agent builder (Agent Creator)](#agent-builder-agent-creator).
+
+    Supported JSON-RPC methods:
+
+    | Method | Result |
+    |---|---|
+    | `initialize` | `protocolVersion` `2025-06-18`, `capabilities.tools`, and `serverInfo` `{ "name": "brave-search", "version": "1.0.0" }` |
+    | `notifications/initialized` | HTTP `200` with an empty body |
+    | `tools/list` | The `brave_search` and `brave_llm_context` definitions |
+    | `tools/call` | The tool result for `brave_search` or `brave_llm_context` |
+
+    Any other method returns the JSON-RPC error `-32601` with the message `Method not found: <method>`.
+
+    ## Call the tools from DSUL
+
+    When the connector is installed as an app in your workspace, its two automations are available as instructions. Each takes a single `arguments` object holding the same fields as the matching MCP tool, and returns the same MCP result envelope. Replace `Brave Search` with the name your app instance was given at installation.
+
+    ```yaml
+    - Brave Search.web-search:
+        arguments:
+          query: '{{user_question}}'
+          num_results: 5
+          market: fr-FR
+          freshness: Week
+      output: search
+    - conditions:
+        '{{search.isError}}':
+          - emit:
+              event: brave.search.failed
+              payload: '{{search.content[0].text}}'
+    ```
+
+    ```yaml
+    - Brave Search.llm-context:
+        arguments:
+          query: '{{user_question}}'
+          count: 10
+          country: fr
+          max_tokens: 4096
+      output: grounding
+    # grounding.content[0].text holds the markdown sections
+    # grounding.content[0].annotations holds the url_citation entries
+    ```
+
+    <Note>
+      Both instructions return their failures as a normal value (`isError: true` with a text
+      message) instead of raising. Always branch on `{{result.isError}}`; a missing check
+      silently passes an error message downstream as if it were search results.
+    </Note>
+  </Tab>
+</Tabs>
+
+---
 
 ## Brave Goggles
 
-A **Brave Goggle** is a small text file that re-ranks or filters Brave Search results: whitelist a set of domains, boost some sites, discard the rest. The connector forwards any goggle you provide on every call to `brave_search` and `brave_llm_context`.
+A **Brave Goggle** is a small text file that re-ranks or filters Brave Search results: whitelist a set of domains, boost some sites, discard the rest. The connector applies a goggle to both tools.
 
-Reference syntax: [github.com/brave/goggles-quickstart](https://github.com/brave/goggles-quickstart).
+Where it comes from, in order of precedence:
 
-### Where to configure
+1. The `goggles` tool argument, when the agent passes one. It **replaces** the workspace default for that call; the two are never merged.
+2. The workspace **Default Goggles** configuration field.
+3. No goggle at all, when both are empty. Brave then runs an unfiltered search.
 
-**Goggles are configured in the workspace connector configuration**, in the `Default Goggles` field. This is the standard way to apply a Goggle to every Brave Search call from agents in this workspace. Once set, agents don't need to be aware of the goggle; it is applied transparently.
+Configure the goggle once in **Default Goggles** for the common case. The per-call argument is an advanced override for A/B testing, dynamic domain lists, or multi-tenant flows.
 
-A per-call `goggles` MCP argument also exists, but it is an **advanced override** for special cases (A/B testing, dynamic goggles, multi-tenant flows). Day-to-day deployments only need the workspace config.
+### Accepted formats
 
-### Format accepted by `Default Goggles`
-
-- **Hosted URL**: point to a publicly reachable goggle file (e.g. a GitHub raw URL).
-- **Inline raw definition**: paste the goggle content as a multi-line string.
+- **Hosted URL**: a publicly reachable goggle file, for example a raw file URL on a code host.
+- **Inline definition**: the goggle content pasted as a multi-line string.
 
 ### Syntax rules
 
-Every line that targets a site must include an action: `$discard`, `$boost,site=...`, or `$downrank,site=...`. A bare `$site=domain.com` line is **not** valid Goggles syntax and Brave will reject the call.
+Every line that targets a site must carry an action: `$discard`, `$boost,site=...`, or `$downrank,site=...`. A bare `$site=domain.com` line is not valid Goggles syntax and Brave rejects the request.
 
-A typical whitelist pattern is `$discard` (drop everything not boosted) followed by one `$boost,site=...` per allowed domain:
+A whitelist is `$discard` (drop everything not boosted) followed by one `$boost,site=...` per allowed domain:
 
 ```text
-! name: French finance whitelist
-! description: Restrict and boost results to French finance sources
+! name: Finance whitelist
+! description: Restrict and boost results to selected finance sources
 ! public: false
 ! author: Prisme.ai
 $discard
@@ -114,225 +420,119 @@ $boost,site=latribune.fr
 $boost,site=banque-france.fr
 ```
 
-### Precedence
-
-By default every Brave Search call uses the workspace `Default Goggles`. The `goggles` MCP tool argument is an **override**: when provided, it fully replaces the workspace default for that call (no merge). Leave both empty only to run a plain, unfiltered Brave Search.
+The full syntax reference is the [Brave Goggles quickstart](https://github.com/brave/goggles-quickstart).
 
 <Note>
-  To keep large inline goggle definitions safe from URL length limits, the
-  connector calls Brave with `POST` + JSON body (no GET query string). This is
-  transparent to agents; the MCP request/response format does not change.
+  The connector calls Brave with `POST` and a JSON body rather than a GET query string, so a
+  long inline goggle definition does not hit URL length limits. This is transparent to agents:
+  the MCP request and response format does not change.
 </Note>
 
-## Plug into an Agent Creator capability
+## Verify the setup
 
-Agents consume MCP servers directly through **Agent Creator** capabilities. This is the preferred way to expose Brave Search to an agent.
+Run these checks in order. Replace `<your-instance>` with your Prisme.ai host and `<token>` with your Prisme.ai access token. To test the organization API key principal instead, replace the `Authorization` header with `x-prismeai-api-key: <api-key>`.
 
 <Steps>
-  <Step title="Install the Brave Search connector">
-    From the Prisme.ai console, open the workspace that will host the connector and install **Brave Search** from the Imports panel.
-  </Step>
-  <Step title="Configure the connector">
-    Set `BRAVE_API_KEY` in workspace secrets, then open the connector configuration and fill in the defaults you need (most importantly **Default Goggles**; see the "Brave Goggles" section above).
-  </Step>
-  <Step title="Copy the MCP endpoint">
-    Still on the connector configuration page, copy the value of **MCP Endpoint**.
-  </Step>
-  <Step title="Open Agent Creator">
-    Switch to **Agent Creator** and open the agent you want to extend.
-  </Step>
-  <Step title="Add a capability">
-    Add a new capability to the agent:
-
-    - **If a dedicated Brave Search capability exists**: select it. The server URL is already wired; the connector resolves the Brave API key server-side from the workspace configuration.
-    - **Otherwise**: select the generic **`custom_mcp`** capability and paste the **MCP Endpoint** into the *Server URL* field. The endpoint is authenticated with the caller's Prisme.ai principal (user JWT, workspace JWT, or organization API key), so no extra header is required.
-  </Step>
-  <Step title="Save">
-    The agent now has access to `brave_search` and `brave_llm_context`.
-  </Step>
-  <Step title="Brief the agent in its system prompt">
-    Wiring the capability is not enough; the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
-
-    ```text
-    You have access to the Brave Search MCP server. Use it whenever the user asks for information that requires fresh, public web sources: news, regulatory updates, market data, factual lookups, competitor research. Call `brave_search` when you need raw web results (titles, URLs, snippets) and `brave_llm_context` when you only need pre-formatted grounding snippets to cite in your answer. Prefer recent results (`freshness: Day` / `pd` for breaking news) and a market matching the user's language. Always cite the source URLs returned by the tool.
+  <Step title="List the tools">
+    ```bash
+    curl -s -X POST \
+      "https://api.<your-instance>/v2/workspaces/slug:tools-search-brave/webhooks/brave-search/mcp" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer <token>" \
+      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
     ```
 
-    Refine the trigger keywords (regulatory areas, market codes, language) so the agent reliably picks up the right intent in your context.
+    Expected result: a `result.tools` array naming `brave_search` and `brave_llm_context`. An HTTP `401` with `Authentication required` means the credential was not accepted, and the connector configuration is not the problem.
+  </Step>
+  <Step title="Run one real search">
+    ```bash
+    curl -s -X POST \
+      "https://api.<your-instance>/v2/workspaces/slug:tools-search-brave/webhooks/brave-search/mcp" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer <token>" \
+      -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"brave_search","arguments":{"query":"Prisme.ai"}}}'
+    ```
+
+    Expected result: `result.isError` is `false` and `result.content[0].text` holds the Brave JSON payload. If `result.isError` is `true`, read the message and go to [Error handling](#error-handling).
+  </Step>
+  <Step title="Check it from the agent">
+    In Agent Creator, open the agent's playground and ask a question that needs the open web. The agent calls `brave_search` or `brave_llm_context` and grounds its answer on the returned source URLs.
   </Step>
 </Steps>
 
-## Available Tools
+## Rotate, revoke and remove
 
-| Tool | Description |
-|------|-------------|
-| `brave_search` | Search the web through Brave Search and return raw results (titles, URLs, snippets, infoboxes) |
-| `brave_llm_context` | Retrieve LLM-optimized grounding context as pre-formatted Markdown snippets with sources |
+| Task | Procedure | Effect |
+|---|---|---|
+| Rotate the subscription token | Generate a replacement token in the [Brave API dashboard](https://api-dashboard.search.brave.com/), update the `BRAVE_API_KEY` workspace secret, select **Save**, then revoke the old token at Brave. | The next call uses the new token. Calls in flight with the old token fail once it is revoked at Brave. |
+| Revoke access for one agent | In Agent Creator, remove the Brave Search capability from that agent and select **Save**. | The agent stops listing the two tools. Other agents are unaffected. |
+| Revoke access for everyone | Clear the **Brave API Key:** field and select **Save**, or revoke the token at Brave. | Both tools return an `isError` result carrying the Brave authentication failure. The MCP endpoint keeps answering `tools/list`. |
+| Remove the connector | Remove the capability from every agent that uses it, uninstall the app from the workspace, then delete the `BRAVE_API_KEY` secret and revoke the token at Brave. | The MCP endpoint stops answering, and the token is no longer usable anywhere. |
 
-### Choosing Between the Two Tools
+Deleting the secret without revoking the token at Brave leaves a live credential in circulation. Always revoke on the Brave side as the final step.
 
-| Tool | Brave endpoint | Response shape | When to use |
-|------|----------------|----------------|-------------|
-| `brave_search` | `/res/v1/web/search` | Stringified Brave JSON | The agent needs the full response (multiple result types, ranking signals, infobox) |
-| `brave_llm_context` | `/res/v1/llm/context` | Markdown text (`## title` / `Source: url` / snippets) | The agent only needs factual grounding ready to concatenate into its prompt |
+## Error handling
 
-### `brave_search` Arguments
+Both tools report failures as an MCP result with `isError: true` and a single text block, rather than raising. The MCP transport itself uses JSON-RPC error objects.
 
-| Argument | Type | Required | Description |
-|----------|------|----------|-------------|
-| `query` | string | Yes | Search query |
-| `num_results` | number | No | Number of results to request, from 1 to 20 |
-| `market` | string | No | Market code, for example `en-US` or `fr-FR` (the connector maps it to a 2-letter country code) |
-| `freshness` | string | No | Recency filter: `Day`, `Week`, or `Month` |
-| `goggles` | string | No | Advanced per-call override of the workspace `Default Goggles`. URL of a hosted Brave Goggle **or** raw inline goggle definition. Most deployments configure goggles once at the workspace level; see the "Brave Goggles" section. |
+| Message or code | Raised by | Meaning |
+|---|---|---|
+| `Error: query parameter is required` | either tool | The call carried no `query` argument. |
+| `Brave Search API error: <details>` | `brave_search` | Brave rejected the request, or the HTTP call failed. |
+| `Brave LLM Context API error: <details>` | `brave_llm_context` | Brave rejected the request, or the HTTP call failed. |
+| `No grounding context found for this query.` | `brave_llm_context` | The call succeeded but no entry passed the relevance threshold. `isError` stays `false`. |
+| JSON-RPC `-32000`, `Authentication required` | MCP endpoint, HTTP `401` | No user session, calling workspace, or organization API key could be resolved. |
+| JSON-RPC `-32601`, `Tool not found: <name>` | MCP endpoint | `tools/call` named a tool other than `brave_search` or `brave_llm_context`. |
+| JSON-RPC `-32601`, `Method not found: <method>` | MCP endpoint | The request used a JSON-RPC method the endpoint does not implement. |
 
-### `brave_llm_context` Arguments
+### Common issues
 
-| Argument | Type | Required | Description |
-|----------|------|----------|-------------|
-| `query` | string | Yes | Search query (1-400 characters, max 50 words) |
-| `count` | number | No | Number of grounding entries to request, from 1 to 50 (default 20) |
-| `country` | string | No | 2-letter country code, for example `us` or `fr` |
-| `search_lang` | string | No | Search language, for example `en` or `fr` |
-| `freshness` | string | No | Recency filter: `pd` (past day), `pw` (past week), `pm` (past month), `py` (past year) |
-| `max_tokens` | number | No | Maximum total tokens in the response, from 1024 to 32768 (default 8192) |
-| `context_threshold_mode` | string | No | Relevance threshold: `strict`, `balanced`, `lenient`, or `disabled` |
-| `goggles` | string | No | Advanced per-call override of the workspace `Default Goggles`. URL of a hosted Brave Goggle **or** raw inline goggle definition. Most deployments configure goggles once at the workspace level; see the "Brave Goggles" section. |
+- **`Error: query parameter is required`**: the MCP call did not include `params.arguments.query`. If an agent produces this repeatedly, its system prompt does not describe the tool arguments; add the prompt starter from [Agent builder (Agent Creator)](#agent-builder-agent-creator).
+- **`Brave Search API error` mentioning authentication or a subscription**: the token in **Brave API Key:** is missing, invalid, or revoked. Confirm that the field resolves the `BRAVE_API_KEY` secret and that the secret holds a current token from the Brave dashboard.
+- **`Brave LLM Context API error` while `brave_search` works**: the subscription plan does not cover `/res/v1/llm/context`. Upgrade the plan on the Brave side, or tell agents to use `brave_search` only.
+- **Either tool reporting a quota or rate limit**: the workspace token is shared by every agent and user reaching the endpoint. Check the usage page in the Brave dashboard, then either raise the plan limits or split high-volume agents onto a separate workspace with its own token.
+- **`No grounding context found for this query.`**: the relevance threshold filtered everything out. Pass a more permissive `context_threshold_mode` such as `lenient`, broaden the query, or check whether a restrictive goggle is discarding all candidates.
+- **An error mentioning the goggle, or empty results after setting one**: the goggle definition was rejected or discards everything. Confirm that every site line carries an action (`$boost,site=...`, not a bare `$site=...`), that a hosted goggle URL is publicly reachable, and that a `$discard` line is followed by at least one `$boost,site=...`.
+- **Results ignore the domain whitelist for one agent**: that agent passes its own `goggles` argument, which fully replaces the workspace **Default Goggles**. Remove the argument from the agent's instructions, or align it with the workspace goggle.
+- **`Authentication required` (HTTP `401`)**: the request reached the endpoint without an accepted principal. Call it with a user session, from another workspace, or with an organization API key.
+- **A `market` value that seems ignored on `brave_search`**: the connector converts a market code to a country code by taking the part after the `-` and uppercasing it, so `fr-FR` becomes `FR`. There is no language argument on `brave_search`; use `brave_llm_context` with `search_lang` when the language itself matters.
 
-## MCP Examples
+## Legacy Brave app
 
-### Web Search with Defaults
+An older **Brave** app exists in the Apps Marketplace, published from the `brave` workspace. It is a thin passthrough over the Brave REST API with a single `run` instruction and no MCP endpoint, so agents cannot discover its operations.
 
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "tools/call",
-  "params": {
-    "name": "brave_search",
-    "arguments": {
-      "query": "latest Brave Search API documentation"
-    }
-  }
-}
-```
+<Warning>
+  Use the Brave Search MCP connector described above for new work. The legacy app is
+  documented here only for workspaces that still depend on it. It has no goggles support,
+  no LLM grounding endpoint, and no MCP tool catalog.
+</Warning>
 
-### Web Search on a French Market with Fresh Results
+The legacy app is configured with a single field, **Your Brave API key:**, stored as `USER_API_KEY` and sent as the `x-subscription-token` header. Its `run` instruction issues a GET request to `https://api.search.brave.com/res/v1/<type>/search` and returns the raw Brave response.
 
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "method": "tools/call",
-  "params": {
-    "name": "brave_search",
-    "arguments": {
-      "query": "actualites intelligence artificielle entreprise",
-      "num_results": 5,
-      "market": "fr-FR",
-      "freshness": "Day"
-    }
-  }
-}
-```
+| Argument | Description |
+|---|---|
+| `type` | Brave endpoint family: `images`, `videos`, `news`, `search`, `places`, `reviews`, `scholar`, `patents`, `shopping`. Any value other than `images`, `videos` or `news` is sent as `web`. |
+| `q` | Search query. |
+| `country` | Country code, from a fixed list of 2-letter codes plus `ALL`. Empty means United States. |
+| `search_lang` | Search language code such as `fr` or `pt-br`. Empty means English. |
+| `count` | Number of results. |
+| `offset` | Result offset for paging. |
 
-### LLM Grounding Context with a Token Budget
+To migrate, install the Brave Search connector, move the token into `BRAVE_API_KEY`, and replace each `run` call with `web-search` (mapping `q` to `query`, `count` to `num_results`, and `country` to `market`), then uninstall the legacy app.
 
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 3,
-  "method": "tools/call",
-  "params": {
-    "name": "brave_llm_context",
-    "arguments": {
-      "query": "European AI Act enforcement timeline",
-      "count": 15,
-      "country": "fr",
-      "search_lang": "en",
-      "freshness": "pm",
-      "max_tokens": 4096,
-      "context_threshold_mode": "strict"
-    }
-  }
-}
-```
-
-### Web Search with a Per-Call Goggle Override (Advanced)
-
-Most workspaces will configure the Goggle once in the connector configuration (`Default Goggles`) and never pass `goggles` in the MCP call. The example below shows the advanced per-call override path.
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 4,
-  "method": "tools/call",
-  "params": {
-    "name": "brave_search",
-    "arguments": {
-      "query": "réglementation DORA banque",
-      "num_results": 10,
-      "market": "fr-FR",
-      "goggles": "! name: FR finance whitelist\n! public: false\n$discard\n\n$boost,site=acpr.banque-france.fr\n$boost,site=banque-france.fr\n$boost,site=lesechos.fr"
-    }
-  }
-}
-```
-
-## Response Format
-
-### `brave_search`
-
-Successful calls return the Brave JSON payload serialized as text:
-
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "{ \"type\": \"search\", \"web\": { \"results\": [ ... ] }, ... }"
-    }
-  ],
-  "isError": false
-}
-```
-
-### `brave_llm_context`
-
-Successful calls return Markdown sections, one per grounding entry, ready to inject into an agent prompt:
-
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "## Result title\nSource: https://example.com/article\nFirst snippet…\nSecond snippet…\n\n## Other result\nSource: https://example.org/post\n…\n"
-    }
-  ],
-  "isError": false
-}
-```
-
-If the Brave API rejects the call or the query is missing, the connector returns `isError: true` with a text error message.
-
-## Troubleshooting
-
-**`Error: query parameter is required`**: The MCP call did not include `params.arguments.query`.
-
-**`Brave Search API error: <details>`**: Returned by either tool when Brave rejects the call. Common causes: invalid or expired `BRAVE_API_KEY`, quota exceeded, plan that does not include the requested endpoint, or an unsupported parameter value.
-
-**`No grounding context found for this query.`**: `brave_llm_context` did not find any entry above the relevance threshold. Try a more permissive `context_threshold_mode` (for example `lenient`) or broaden the query.
-
-**`Brave Search API error: <goggles-related details>`**: The Goggle definition was rejected by Brave. Common causes: a `$site=...` line with no action (use `$boost,site=...` or `$discard` + `$boost,site=...`), an unreachable hosted URL, or unescaped characters. See [github.com/brave/goggles-quickstart](https://github.com/brave/goggles-quickstart) for the syntax reference.
-
-**`Authentication required`** (HTTP 401, JSON-RPC error `-32000`): The MCP endpoint requires an authenticated principal. Call it with a user JWT, a workspace JWT, or an organization API key.
-
-## Related
+## External resources
 
 <CardGroup cols={2}>
-  <Card title="Connectors Overview" icon="plug" href="/apps-store/marketplace/connectors">
-    Compare App and MCP connector usage modes
+  <Card title="Brave Search API" icon="book" href="https://api-dashboard.search.brave.com/app/documentation">
+    Official reference for the web search and LLM context endpoints, parameters and plans.
   </Card>
-  <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
-    Plug MCP servers into Knowledges agents
+  <Card title="Brave Goggles quickstart" icon="filter" href="https://github.com/brave/goggles-quickstart">
+    Goggles syntax reference: actions, site rules, and hosted goggle files.
+  </Card>
+  <Card title="Connectors overview" icon="plug" href="/apps-store/marketplace/connectors/overview">
+    Compare App and MCP connector operating models across the marketplace.
+  </Card>
+  <Card title="Agent capabilities" icon="robot" href="/products/agent-factory/capabilities">
+    How Agent Creator agents attach MCP servers and call their tools.
   </Card>
 </CardGroup>

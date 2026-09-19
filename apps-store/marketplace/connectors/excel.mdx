@@ -1,6 +1,6 @@
 ---
 title: 'Excel'
-description: 'Let Agent Creator agents and Builder workflows read, write, and reshape Excel workbooks stored in OneDrive or SharePoint via Microsoft Graph'
+description: 'Read, write, and reshape Excel workbooks stored in OneDrive or SharePoint from Agent Creator agents and Builder automations, through Microsoft Graph with Entra client credentials or per-user delegated OAuth'
 ---
 
 <img
@@ -12,17 +12,22 @@ description: 'Let Agent Creator agents and Builder workflows read, write, and re
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Excel connector exposes Microsoft Excel workbooks through the Microsoft Graph API. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. It runs in the installing workspace's own app-instance context and resolves its Microsoft credential server-side: either **Azure AD client credentials** (a service-account app accessing files across the tenant) or **delegated OAuth** (acting as a signed-in user). Agents read, write, and manipulate cells, ranges, tables, charts, named items, and pivot tables in spreadsheets hosted on OneDrive or SharePoint.
+The Excel connector exposes Microsoft Excel workbooks through the [Microsoft Graph](https://learn.microsoft.com/en-us/graph/api/resources/excel) workbook API. It ships as two pieces: the **Excel** app, installed from the Apps marketplace into a Builder workspace, which provides 56 deterministic DSUL instructions; and the **Excel MCP** connector workspace, which installs that app and republishes the same 56 operations as MCP tools over JSON-RPC 2.0 for **Agent Creator** agents. Both run in the app-instance context of the workspace that hosts them and resolve their Microsoft credential server-side. Agents and automations read, write, and manipulate cells, ranges, tables, charts, named items, and pivot tables in workbooks hosted on OneDrive or SharePoint.
+
+Authentication has two modes, selected by the **Authentication Mode** (`authMode`) configuration field:
+
+- **Client credentials** (`clientCredentials`, the mode used when `authMode` is empty): the connector requests a token from `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token` with `grant_type=client_credentials` and `scope=https://graph.microsoft.com/.default`. Microsoft sees the Entra application, not the end user. Best for unattended back-office automations over a shared document library.
+- **Per-user delegated OAuth** (`oauth`): each user signs in with their own Microsoft account through an authorization-code flow with PKCE, and Microsoft enforces that user's own file permissions. Best for interactive Chat experiences over user-owned workbooks.
 
 <CardGroup cols={3}>
-  <Card title="Read & write cells" icon="table">
-    Read and write cell values, formulas, and ranges with full formatting control, plus insert, clear, sort, and merge operations.
+  <Card title="Cells, ranges & formatting" icon="table">
+    Read and write cell values, formulas, and number formats, and control fonts, fill, borders, alignment, autofit, insert, delete, sort, merge, and clear operations.
   </Card>
   <Card title="Tables, charts & pivots" icon="chart-bar">
-    Create and manipulate Excel tables, charts, named ranges, and pivot tables, including exporting a chart as an image.
+    Create and manipulate Excel tables, charts, named items, and pivot tables, including exporting a chart as a base64 image.
   </Card>
   <Card title="Functions & recalculation" icon="calculator">
-    Run Excel worksheet functions and force a full workbook recalculation from an agent or automation.
+    Evaluate Excel workbook functions such as `SUM` or `PMT` and trigger a `Recalculate`, `Full`, or `FullRebuild` workbook calculation.
   </Card>
 </CardGroup>
 
@@ -31,55 +36,87 @@ The Excel connector exposes Microsoft Excel workbooks through the Microsoft Grap
 This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
 
 <CardGroup cols={3}>
-  <Card title="Agent builder" icon="robot">
-    You build agents in **Agent Creator** and want them to work with Excel workbooks. → *Agent builder* tab.
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to work with Excel workbooks. Go to Agent builder (Agent Creator).
   </Card>
-  <Card title="Platform admin" icon="shield-halved">
-    You run the platform and want to know what one-time setup Excel needs. → *Platform admin setup* accordion below.
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and want to know what one-time setup Excel needs. Go to Platform admin (Governance): one-time platform setup.
   </Card>
-  <Card title="Workspace builder" icon="puzzle-piece">
-    You write Builder automations (DSUL) that call Excel instructions directly. → *Workspace builder* tab.
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations (DSUL) that call Excel instructions directly. Go to Workspace builder (DSUL).
   </Card>
 </CardGroup>
 
-## Prerequisites
+## Prerequisites (Microsoft side)
 
-- A **Microsoft 365 / Azure AD** tenant with the workbooks you want to reach stored in **OneDrive** or **SharePoint** (`.xlsx` files only; legacy `.xls` is not supported).
-- An **Azure AD application** registered in that tenant (*Azure portal > App registrations*), with a **client secret** generated for it.
-- **Microsoft Graph permissions** granted to the app, with **admin consent**:
-  - `Files.Read.All`: read-only access to files.
-  - `Files.ReadWrite.All`: read/write access to files.
-  - `Sites.Read.All` or `Sites.ReadWrite.All`: for SharePoint-hosted files.
-- For **delegated OAuth** mode, the same app must have a redirect URI configured and the corresponding **delegated** permissions consented; for **client-credentials** mode, the matching **application** permissions are used.
-- Note the **Application (client) ID**, the **client secret value**, and the **Directory (tenant) ID**; these are pasted into the app configuration. For SharePoint files, also note the **site ID**.
+- A **Microsoft 365 / Microsoft Entra ID** tenant, with the workbooks you want to reach stored in **OneDrive** or **SharePoint**. The Graph workbook API operates on `.xlsx` files.
+- An **app registration** in [Microsoft Entra ID](https://entra.microsoft.com) (**App registrations > New registration**), with a **client secret** created under **Certificates & secrets**.
+- Note the **Application (client) ID**, the **client secret value**, and the **Directory (tenant) ID**. For SharePoint-hosted files, also note the **site ID**.
+
+For the **client credentials** mode, grant Microsoft Graph **application** permissions and have a Global Administrator grant admin consent. The connector's own `403` message names the permissions it expects:
+
+```text
+Files.ReadWrite.All
+Sites.ReadWrite.All
+```
+
+Read-only deployments can grant `Files.Read.All` and `Sites.Read.All` instead, at the cost of every write instruction failing with `Access denied`.
+
+For the **per-user delegated OAuth** mode, grant the equivalent **delegated** permissions and add a **Redirect URI** of type **Web**:
+
+```text
+<api-url>/workspaces/<workspace-id>/webhooks/OAuth Core/oauthCallback
+```
+
+<Warning>
+  The `OAuth Core` path segment is the slug of the imported OAuth Core app instance and contains a literal space. Register the redirect URI exactly as the connector builds it; a mismatch makes Microsoft reject the authorization request before the user ever reaches the consent screen.
+</Warning>
+
+The **Excel MCP** connector workspace requests this delegated scope string:
+
+```text
+openid profile email offline_access Files.ReadWrite.All Sites.ReadWrite.All User.Read
+```
+
+An **Excel** app instance used on its own in Builder requests `.default` instead, so the effective delegated permissions are whatever is consented on the app registration:
+
+```text
+openid profile email offline_access https://graph.microsoft.com/.default
+```
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
   <Note>
-    **No platform-level credential.** Excel follows the **static-credential** model: each workspace pastes its own Azure AD credentials into the app configuration, and the connector resolves them server-side. There is nothing to register centrally: no shared key, no Governance OAuth auth-config JSON.
+    **No platform-level credential.** Excel follows the **static-credential** model: each workspace stores its own Microsoft Entra credentials in its own workspace secrets, and the connector resolves them server-side. There is nothing to register centrally: no shared key, no Governance OAuth auth-config JSON.
   </Note>
 
-  Optionally, to let agent builders pick Excel from the capability catalog instead of pasting an MCP endpoint URL, declare it once as a named capability:
+  Optionally, to let agent builders pick Excel from the capability catalog instead of pasting an MCP endpoint URL, declare it once as a named capability. Excel ships no configuration app, so the **Install capability** and **Add to catalog** buttons described for newer connectors do not exist here: use the manual path, documented generically in [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance), with the Excel values below.
 
   <Steps>
     <Step title="Open AI Governance > Capabilities">
       Create (or edit) an **Excel** capability.
     </Step>
     <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint** (from the Excel app instance in the providing workspace), and set its **Scope** to:
+      Set the capability's MCP server URL to the connector workspace's MCP endpoint:
+
+      ```text
+      <api-url>/workspaces/<workspace-id>/webhooks/mcp
+      ```
+
+      Set its **Scope** to:
 
       ```text
       context_id,agent_id,user_id
       ```
 
-      The `agent_id` in the scope is what lets the connector identify the calling agent.
+      The `user_id` in the scope is what lets the connector resolve the calling user's delegated Microsoft token in `oauth` mode.
     </Step>
     <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
+      Select **Save**. The capability appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
     </Step>
   </Steps>
 
   <Warning>
-    Declaring the capability makes the connector **available** in the picker; it does not grant any Microsoft access by itself. The actual file access is governed by the Azure AD credentials and Graph permissions configured in the workspace that runs the Excel app.
+    Declaring the capability makes the connector **available** in the picker; it does not grant any Microsoft access by itself. File access is governed by the Entra credentials and Graph permissions configured in the workspace that runs the connector.
   </Warning>
 </Accordion>
 
@@ -92,152 +129,170 @@ This connector is used by three different roles. Jump to the section that matche
     **Goal:** let an agent you build in Agent Creator read and write Excel workbooks through Excel MCP tools.
 
     <Note>
-      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Excel app with Azure AD credentials (see the *Workspace builder* tab). A *Platform admin* may also have published an **Excel** capability in the catalog (see the *Platform admin setup* accordion above).
+      Before an agent can call the connector, a workspace builder must have configured the **Excel MCP** connector workspace with Microsoft Entra credentials and generated its MCP API key (see [Workspace builder (DSUL)](#workspace-builder-dsul)). A platform admin may also have published an **Excel** capability in the catalog (see [Platform admin (Governance): one-time platform setup](#platform-admin-governance-one-time-platform-setup)).
     </Note>
 
-    The connector resolves its Microsoft credential server-side; it is never exposed to the agent. Your agent is identified by the `agent_id` that Agent Creator injects through the capability *Scope*.
+    The connector resolves its Microsoft credential server-side; it is never exposed to the agent.
 
     <Steps>
       <Step title="Get the MCP endpoint">
-        From the workspace that runs the Excel app, copy the app instance's **MCP Endpoint** URL (or use the published **Excel** capability if a *Platform admin* declared one).
+        From the connector workspace, copy its MCP endpoint URL, or use the published **Excel** capability if a platform admin declared one in [Platform admin (Governance): one-time platform setup](#platform-admin-governance-one-time-platform-setup):
+
+        ```text
+        <api-url>/workspaces/<workspace-id>/webhooks/mcp
+        ```
       </Step>
       <Step title="Add the capability to your agent">
-        In your agent in Agent Creator, add a capability pointing at the **MCP Endpoint** URL, and set its **Scope** to:
+        In your agent in Agent Creator, add a capability pointing at the MCP endpoint URL, and set its **Scope** to:
 
         ```text
         context_id,agent_id,user_id
         ```
 
-        The `agent_id` is what lets the connector identify the calling agent.
+        The `user_id` is what lets the connector resolve the calling user's delegated token when the connector runs in `oauth` mode.
       </Step>
-      <Step title="Use it">
-        Ask the agent to work with a workbook (e.g. "read A1:C10 from this sheet" or "add a row to the Sales table"). It calls the matching Excel tool, passing the file's `itemId` and, for SharePoint, its `siteId`.
+      <Step title="Test a read before a write">
+        Ask the agent to list the worksheets of a workbook you can reach. It calls `listWorksheets` with the file's `itemId`. A successful call returns the worksheet names, which confirms credentials, permissions, and file addressing in one step.
+      </Step>
+      <Step title="Publish the agent">
+        Select **Publish**. Only the tools you enabled on the capability are exposed to end users.
       </Step>
     </Steps>
 
-    ## Brief the agent in its system prompt
+    ### First connection for an end user (delegated OAuth only)
+
+    When the connector workspace runs in `oauth` mode and the user has no valid token, the tool call fails with a message that carries the connect link:
+
+    ```text
+    OAuth authentication required. Connect your Microsoft account: <pages-url>/connect-excel
+    ```
+
+    The user opens that page, selects **Connect with Microsoft**, signs in, and returns to the connect page with a **Connected** banner. Retrying the request in Chat then succeeds. The same page offers **Disconnect** to revoke the stored tokens.
+
+    ### Brief the agent in its system prompt
 
     Wiring the capability is not enough: the agent must know the tools exist and how to address a file. Copy-pasteable starter:
 
     ```text
     You have access to the Excel MCP server (Microsoft Graph). Use it to read, write, and reshape Excel workbooks stored in OneDrive or SharePoint.
-    Always address a workbook by its `itemId` (the Graph drive item id). For SharePoint-hosted files, also pass `siteId` (and `driveId` if you know the specific document library). Use A1 notation for ranges (e.g. "A1:C10").
-    Read with getRange / getUsedRange before writing. Write values with updateRange. Use the table tools (createTable, addTableRow, applyTableFilter) for structured data, and executeExcelFunction to evaluate formulas. Recalculate with calculateWorkbook after bulk edits.
+    Always address a workbook by its itemId (the Graph drive item id). For SharePoint-hosted files, also pass siteId (and driveId to target a specific document library). Use A1 notation for ranges, for example A1:C10.
+    Call listWorksheets before reading a sheet: worksheet names are localised, so a French tenant uses "Feuil1" where an English one uses "Sheet1".
+    Read with getRange or getUsedRange before writing. Write values with updateRange. Use the table tools (createTable, addTableRow, applyTableFilter) for structured data, and executeExcelFunction to evaluate a workbook function. Call calculateWorkbook after bulk edits.
     ```
 
     <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL.
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the MCP endpoint URL.
     </Note>
 
-    ## Available Tools
+    ## Available tools
 
-    All instructions listed in the *Workspace builder* tab are exposed as MCP tools with the same names and parameters. They are grouped below.
+    The connector exposes 56 MCP tools. Tool names and argument names are identical to the App instructions documented in [Workspace builder (DSUL)](#workspace-builder-dsul), plus one extra `outputFormat` argument on every tool.
 
     ### Workbook
 
     | Tool | Description |
     |------|-------------|
-    | `createWorkbook` | Create a new Excel workbook. |
-    | `calculateWorkbook` | Recalculate all formulas in the workbook. |
+    | `createWorkbook` | Create a new empty Excel workbook in OneDrive or SharePoint. Returns the `itemId` needed for all other operations. |
+    | `calculateWorkbook` | Trigger workbook recalculation. |
 
     ### Worksheets
 
     | Tool | Description |
     |------|-------------|
-    | `listWorksheets` | List all worksheets in the workbook. |
-    | `getWorksheet` | Get worksheet details. |
-    | `addWorksheet` | Create a new worksheet. |
-    | `updateWorksheet` | Rename or reposition a worksheet. |
-    | `deleteWorksheet` | Delete a worksheet. |
-    | `getUsedRange` | Get the data-containing range of a worksheet. |
+    | `listWorksheets` | List all worksheets in a workbook. |
+    | `getWorksheet` | Get properties of a specific worksheet. |
+    | `addWorksheet` | Add a new worksheet. |
+    | `updateWorksheet` | Rename a worksheet, or change its position or visibility. |
+    | `deleteWorksheet` | Delete a worksheet. This cannot be undone. |
+    | `getUsedRange` | Get the smallest range encompassing any cells with data. |
 
     ### Ranges
 
     | Tool | Description |
     |------|-------------|
     | `getRange` | Read cell values, formulas, and formatting from a range. |
-    | `updateRange` | Write values to cells in a range. |
-    | `getCell` | Read a single cell by row/column. |
-    | `clearRange` | Clear contents and/or formatting of a range. |
-    | `insertRange` | Insert cells with a shift direction. |
-    | `deleteRange` | Delete cells with a shift direction. |
-    | `sortRange` | Sort range data. |
+    | `updateRange` | Write values and formulas to a range. |
+    | `getCell` | Read a single cell by row and column index (0-based). |
+    | `clearRange` | Clear contents and formatting from a range. |
+    | `insertRange` | Insert cells at a range, shifting existing cells. |
+    | `deleteRange` | Delete cells from a range, shifting remaining cells. |
+    | `sortRange` | Sort data in a range. |
     | `mergeRange` | Merge cells in a range. |
-    | `unmergeRange` | Unmerge cells in a range. |
+    | `unmergeRange` | Unmerge previously merged cells. |
 
     ### Formatting
 
     | Tool | Description |
     |------|-------------|
-    | `updateFormat` | Set alignment and text wrapping. |
-    | `updateFont` | Set font properties. |
-    | `updateFill` | Set background color. |
-    | `updateBorder` | Set border styles. |
-    | `autofitColumns` | Auto-fit column widths. |
-    | `autofitRows` | Auto-fit row heights. |
+    | `updateFormat` | Set alignment, column width, row height, and text wrapping. |
+    | `updateFont` | Set bold, italic, underline, color, font name, and size. |
+    | `updateFill` | Set the cell background fill color. |
+    | `updateBorder` | Set the color, style, and weight of one border side. |
+    | `autofitColumns` | Auto-fit column widths to content. |
+    | `autofitRows` | Auto-fit row heights to content. |
 
     ### Tables
 
     | Tool | Description |
     |------|-------------|
-    | `listTables` | List tables in the workbook. |
-    | `getTable` | Get table details. |
+    | `listTables` | List all tables in a workbook or worksheet. |
+    | `getTable` | Get details of a specific table. |
     | `createTable` | Create a table from a range. |
-    | `updateTable` | Update table properties. |
-    | `deleteTable` | Delete a table. |
+    | `updateTable` | Update table name, style, and header/total visibility. |
+    | `deleteTable` | Delete a table. The data remains, the table formatting is removed. |
     | `addTableRow` | Add a row to a table. |
-    | `updateTableRow` | Update row values. |
-    | `deleteTableRow` | Delete a row. |
-    | `addTableColumn` | Add a column. |
-    | `deleteTableColumn` | Delete a column. |
-    | `applyTableSort` | Sort a table. |
-    | `applyTableFilter` | Filter a table. |
-    | `clearTableFilter` | Clear table filters. |
-    | `convertTableToRange` | Convert a table to a normal range. |
+    | `updateTableRow` | Update an existing table row by index. |
+    | `deleteTableRow` | Delete a row from a table. |
+    | `addTableColumn` | Add a column to a table. |
+    | `deleteTableColumn` | Delete a column from a table. |
+    | `applyTableSort` | Sort table data by one or more columns. |
+    | `applyTableFilter` | Apply a filter to a table column. |
+    | `clearTableFilter` | Clear filters from a table. |
+    | `convertTableToRange` | Convert a table back to a normal range. |
 
     ### Charts
 
     | Tool | Description |
     |------|-------------|
-    | `listCharts` | List charts in a worksheet. |
-    | `getChart` | Get chart details. |
-    | `addChart` | Create a chart. |
-    | `updateChart` | Update chart properties. |
-    | `deleteChart` | Delete a chart. |
-    | `setChartData` | Change a chart's data source. |
-    | `setChartPosition` | Position a chart. |
-    | `getChartImage` | Export a chart as an image. |
-    | `updateChartTitle` | Set a chart title. |
-    | `updateChartLegend` | Configure a chart legend. |
+    | `listCharts` | List all charts in a worksheet. |
+    | `getChart` | Get details of a specific chart. |
+    | `addChart` | Create a new chart from a data range. |
+    | `updateChart` | Update chart name, position, and size. |
+    | `deleteChart` | Delete a chart from a worksheet. |
+    | `setChartData` | Change the data source for a chart. |
+    | `setChartPosition` | Position a chart using cell references. |
+    | `getChartImage` | Export a chart as a base64-encoded image. |
+    | `updateChartTitle` | Set or update the chart title. |
+    | `updateChartLegend` | Configure the chart legend. |
 
-    ### Named Items & Pivot Tables
+    ### Named items and pivot tables
 
     | Tool | Description |
     |------|-------------|
-    | `listNamedItems` | List named ranges. |
-    | `getNamedItem` | Get a named item's value. |
-    | `addNamedItem` | Create a named range. |
-    | `updateNamedItem` | Update a named item. |
-    | `listPivotTables` | List pivot tables. |
-    | `getPivotTable` | Get pivot table details. |
-    | `refreshPivotTable` | Refresh a pivot table. |
-    | `refreshAllPivotTables` | Refresh all pivot tables. |
+    | `listNamedItems` | List named ranges and constants in a workbook or worksheet. |
+    | `getNamedItem` | Get a specific named item by name. |
+    | `addNamedItem` | Add a named range or constant. |
+    | `updateNamedItem` | Update a named item's visibility or comment. The reference cannot be changed. |
+    | `listPivotTables` | List all pivot tables on a worksheet. |
+    | `getPivotTable` | Get details of a specific pivot table. |
+    | `refreshPivotTable` | Refresh a single pivot table. |
+    | `refreshAllPivotTables` | Refresh every pivot table in the workbook. |
 
     ### Functions
 
     | Tool | Description |
     |------|-------------|
-    | `executeExcelFunction` | Execute an Excel worksheet function and return its result. |
+    | `executeExcelFunction` | Evaluate an Excel workbook function such as `SUM`, `PMT`, or `AVERAGE`, and return its result. |
 
-    ## Output Formats
+    ## Output formats
 
-    Tools accept an `outputFormat` argument that controls the MCP response shape:
+    Every tool accepts an `outputFormat` argument that controls the MCP response shape:
 
-    - **`verbose`** (default): a human-readable text view of the operation, optimized for LLM consumption.
-    - **`structured`**: machine-readable JSON in `structuredContent`.
-    - **`both`**: the structured payload, with its JSON also rendered as text.
+    - `verbose` (the default when the argument is omitted): a human-readable text summary of the operation, optimized for LLM consumption.
+    - `structured`: the payload serialized as JSON in `content[0].text`, and the same object in `structuredContent`.
+    - `both`: the same response as `structured`.
 
-    ## Tool Details
+    ## Tool details
 
     ### getRange
 
@@ -245,7 +300,7 @@ This connector is used by three different roles. Jump to the section that matche
     {
       "name": "getRange",
       "arguments": {
-        "itemId": "01ABCDEF...",
+        "itemId": "01ABCDEF",
         "worksheetId": "Sheet1",
         "address": "A1:C10"
       }
@@ -256,9 +311,10 @@ This connector is used by three different roles. Jump to the section that matche
     |-----------|----------|-------------|
     | `itemId` | Yes | Graph drive item id of the workbook. |
     | `worksheetId` | Yes | Worksheet name or id. |
-    | `address` | Yes | Range in A1 notation (e.g. `A1:C10`). |
-    | `siteId` | No | SharePoint site id (for SharePoint-hosted files). |
-    | `driveId` | No | Specific document library / drive id. |
+    | `address` | Yes | Range in A1 notation, for example `A1:C10`. |
+    | `siteId` | No | SharePoint site id, for SharePoint-hosted files. |
+    | `driveId` | No | Specific document library or drive id. |
+    | `outputFormat` | No | `verbose`, `structured`, or `both`. |
 
     ### updateRange
 
@@ -266,12 +322,12 @@ This connector is used by three different roles. Jump to the section that matche
     {
       "name": "updateRange",
       "arguments": {
-        "itemId": "01ABCDEF...",
+        "itemId": "01ABCDEF",
         "worksheetId": "Sheet1",
         "address": "A1:C2",
         "values": [
           ["Name", "Age", "City"],
-          ["John", 30, "New York"]
+          ["Ada", 30, "Paris"]
         ]
       }
     }
@@ -281,9 +337,11 @@ This connector is used by three different roles. Jump to the section that matche
     |-----------|----------|-------------|
     | `itemId` | Yes | Graph drive item id of the workbook. |
     | `worksheetId` | Yes | Worksheet name or id. |
-    | `address` | Yes | Target range in A1 notation; must match the `values` dimensions. |
+    | `address` | Yes | Target range in A1 notation. Its dimensions must match `values`. |
     | `values` | Yes | 2D array of cell values to write. |
-    | `siteId` / `driveId` | No | SharePoint targeting. |
+    | `formulas` | No | 2D array of formulas to write. |
+    | `numberFormat` | No | 2D array of number-format strings. |
+    | `siteId`, `driveId` | No | SharePoint targeting. |
 
     ### createTable
 
@@ -291,7 +349,7 @@ This connector is used by three different roles. Jump to the section that matche
     {
       "name": "createTable",
       "arguments": {
-        "itemId": "01ABCDEF...",
+        "itemId": "01ABCDEF",
         "worksheetId": "Sheet1",
         "address": "A1:C10",
         "hasHeaders": true
@@ -312,7 +370,7 @@ This connector is used by three different roles. Jump to the section that matche
     {
       "name": "addChart",
       "arguments": {
-        "itemId": "01ABCDEF...",
+        "itemId": "01ABCDEF",
         "worksheetId": "Sheet1",
         "type": "ColumnClustered",
         "sourceData": "A1:C10",
@@ -325,19 +383,23 @@ This connector is used by three different roles. Jump to the section that matche
     |-----------|----------|-------------|
     | `itemId` | Yes | Graph drive item id of the workbook. |
     | `worksheetId` | Yes | Worksheet name or id. |
-    | `type` | Yes | Chart type (e.g. `ColumnClustered`, `Line`, `Pie`). |
+    | `type` | Yes | Chart type, for example `ColumnClustered`, `Pie`, or `LineMarkers`. |
     | `sourceData` | Yes | Range that supplies the chart data, in A1 notation. |
     | `seriesBy` | No | How series are grouped: `Auto`, `Columns`, or `Rows`. |
 
     ### executeExcelFunction
 
+    The function name is lowercased before the call, and `parameters` is sent as the request body, so its keys must match the Graph workbook function signature.
+
     ```json
     {
       "name": "executeExcelFunction",
       "arguments": {
-        "itemId": "01ABCDEF...",
-        "functionName": "VLOOKUP",
-        "values": ["lookupValue", "A1:C10", 2, false]
+        "itemId": "01ABCDEF",
+        "functionName": "SUM",
+        "parameters": {
+          "values": [1, 2, 3]
+        }
       }
     }
     ```
@@ -345,189 +407,235 @@ This connector is used by three different roles. Jump to the section that matche
     | Parameter | Required | Description |
     |-----------|----------|-------------|
     | `itemId` | Yes | Graph drive item id of the workbook. |
-    | `functionName` | Yes | Excel worksheet function name (e.g. `VLOOKUP`, `SUM`). |
-    | `values` | Yes | Ordered argument list passed to the function. |
+    | `functionName` | Yes | Excel workbook function name, for example `SUM`, `PMT`, or `AVERAGE`. |
+    | `parameters` | Yes | Function parameters as a JSON object. |
   </Tab>
 
   <Tab title="Workspace builder (DSUL)">
     ## Workspace builder
 
-    **Goal:** install the Excel app in a workspace, configure the Azure AD credential, and call Excel instructions from your automations.
+    **Goal:** configure the Excel connector with a Microsoft Entra credential and call Excel instructions from your automations, or expose them to agents over MCP.
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **Excel** and install it
-    3. Configure the app instance with your Azure AD credentials (see *Configuration* below)
+    1. Go to **Apps** in your workspace.
+    2. Search for **Excel** and install it.
+    3. Open the app instance configuration, fill in the Microsoft Entra values, and select **Save**.
+
+    <Note>
+      Excel predates the App + MCP configuration-app model used by newer connectors, so [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace) does not describe this connector. There is no **Configuration app** link on the instance and no configuration SPA: you type the credentials into the app instance configuration form itself, and they are stored in the workspace secrets listed below. There is also no **Authorized agents** allowlist. The **MCP API Key** is the only gate on the MCP endpoint, so any caller holding the endpoint URL and that key can invoke every tool.
+    </Note>
+
+    To expose the same operations as MCP tools instead, use the **Excel MCP** connector workspace: it installs the **Excel** app for you, stores the Entra values in its own workspace secrets, and publishes the MCP endpoint at `<api-url>/workspaces/<workspace-id>/webhooks/mcp`.
 
     ## Configuration
 
     | Field | Description |
     |-------|-------------|
-    | **Azure Client ID** | Azure AD Application (client) ID for Microsoft Graph. Stored as a workspace secret. |
-    | **Azure Client Secret** | Client secret value of the Azure AD app. Stored as a workspace secret. |
-    | **Azure Tenant ID** | Directory (tenant) ID (GUID). |
-    | **SharePoint Site ID** | Optional: default SharePoint site id for SharePoint-hosted files. |
-    | **Authentication Mode** | `clientCredentials` (service account, default) or `oauth` (delegated user auth). |
-    | **OAuth Client ID** / **OAuth Client Secret** | Azure AD OAuth app credentials, used only when **Authentication Mode** is `oauth`. |
-    | **MCP Endpoint** | Auto-populated on install: the URL Agent Creator agents point a capability at (see the *Agent builder* tab). |
+    | **Azure Client ID** (`clientId`) | Microsoft Entra application (client) ID used to call Microsoft Graph. Backed by the `azureClientId` workspace secret. |
+    | **Azure Client Secret** (`clientSecret`) | Client secret value of that application. Backed by the `azureClientSecret` workspace secret and masked in the form. |
+    | **Azure Tenant ID** (`tenant`) | Microsoft Entra directory (tenant) ID (GUID). Backed by the `azureTenant` workspace secret. |
+    | **SharePoint Site ID** (`siteId`) | Optional default SharePoint site ID for SharePoint-hosted files. Backed by the `azureSiteId` workspace secret. |
+    | **Authentication Mode** (`authMode`) | `clientCredentials` or `oauth`. Backed by the `authMode` workspace secret. |
+    | **OAuth Client ID** (`oauthClientId`) | Microsoft Entra application (client) ID used for the delegated flow. Read only when **Authentication Mode** is `oauth`. |
+    | **OAuth Client Secret** (`oauthClientSecret`) | Client secret for that delegated application. Masked in the form. |
 
-    The connector resolves its credential server-side based on the chosen mode:
+    The **Excel MCP** connector workspace adds one secret of its own, **MCP API Key** (`mcpApiKey`), and reuses `azureClientId` and `azureClientSecret` for the delegated flow. Generate the key from the MCP Core **API Key** page rather than typing a value: `tools/call` is refused outright when no key is configured.
 
-    | Auth mode | What you provide | Best for |
-    |-----------|------------------|----------|
-    | **Client credentials** (default) | Azure Client ID + Secret + Tenant ID | Service-account access to files across the tenant; server-to-server automations with no interactive sign-in. |
-    | **Delegated OAuth** | OAuth Client ID + Secret (plus a per-user connect flow) | Acting as a specific signed-in Microsoft user, scoped to that user's files. |
+    ## Authentication modes
+
+    | Mode | What you provide | Identity Microsoft sees | Best for |
+    |------|------------------|-------------------------|----------|
+    | `clientCredentials` (used when `authMode` is empty) | Azure Client ID, Client Secret, Tenant ID | The Entra application, with the application permissions consented on it | Unattended automations and shared document libraries |
+    | `oauth` | OAuth Client ID and Secret, plus a per-user connect flow | The signed-in Microsoft user, with that user's own file permissions | Interactive Chat over user-owned workbooks |
+
+    <Warning>
+      In `clientCredentials` mode every caller shares one Entra identity, so every workbook that identity can reach is reachable by any agent or automation bound to the instance, and Microsoft audit logs attribute the change to the application rather than to a person. Grant the narrowest Graph application permissions the workflow needs, and prefer `oauth` whenever a workbook belongs to a person.
+    </Warning>
+
+    <Warning>
+      When `siteId` and `driveId` are both absent, the connector targets `https://graph.microsoft.com/v1.0/me/drive`, which an application-permission token cannot resolve. In `clientCredentials` mode, set a **SharePoint Site ID** on the instance or pass `driveId` on every call.
+    </Warning>
+
+    Per request, an MCP tool call also forwards two HTTP headers to the underlying instruction: `accesstoken` supplies a caller-managed Microsoft Graph token that bypasses credential resolution, and `auth-mode` overrides the configured mode. Leave both unset unless a caller genuinely owns its own Graph token; a request that carries `accesstoken` runs with whatever permissions that token holds.
+
+    ### Delegated OAuth token lifecycle
+
+    Access tokens are stored as a user-scoped platform secret named `excel_delegated_token` with a time to live matching the provider's `expires_in`. Refresh tokens are stored as `excel_refresh_token` with a 90-day time to live and are rotated when Microsoft returns a new one. An expired access token is refreshed transparently; a failed refresh returns `OAuth session expired` with the action `reauthorize`, and the user has to connect again.
+
+    ## File addressing
+
+    **OneDrive** files need only an `itemId`. **SharePoint** files need `itemId` plus `siteId`, and optionally `driveId` to target a specific document library. A `siteId` passed on the call overrides the instance default; `driveId` has no instance default and must always come from the call.
 
     <Note>
-      File addressing: **OneDrive** files need only an `itemId`. **SharePoint** files need `itemId` + `siteId` (and optionally `driveId` to target a specific document library). The default `siteId` from the configuration is used when a call omits it.
+      Worksheet names are localised. A `404` on a worksheet path is most often a wrong sheet name (`Feuil1` on a French tenant, `Sheet1` on an English one). The connector adds that hint to its own `404` message and tells the caller to run `listWorksheets` first.
     </Note>
 
-    ## Available Instructions
+    ## Available instructions
 
-    Every instruction resolves credentials from the workspace configuration.
+    Arguments marked `*` are validated before the Graph call: omitting one returns `Missing required parameter: <name>`. Every instruction also accepts `siteId`, `driveId`, `accessToken`, and `authMode`.
 
     ### Workbook
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `createWorkbook` | Create a new Excel workbook in OneDrive/SharePoint. | `{ itemId, name, webUrl }` |
-    | `calculateWorkbook` | Force a full recalculation of all formulas in the workbook (`itemId`). | Empty (HTTP 204) |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `createWorkbook` | `name`*, `folderPath` |
+    | `calculateWorkbook` | `itemId`*, `calculationType` (`Recalculate`, `Full`, `FullRebuild`; defaults to `Full`) |
 
     ### Worksheets
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listWorksheets` | List all worksheets in a workbook (`itemId`). | `{ value: [{ id, name, position, visibility }] }` |
-    | `getWorksheet` | Get one worksheet's details by `worksheetId`. | `{ id, name, position, visibility }` |
-    | `addWorksheet` | Add a new worksheet; `name` optional. | `{ id, name, position }` |
-    | `updateWorksheet` | Rename or reposition a worksheet (`name`, `position`, `visibility`). | `{ id, name, position, visibility }` |
-    | `deleteWorksheet` | Delete a worksheet by `worksheetId`. | Empty (HTTP 204) |
-    | `getUsedRange` | Get the range that actually contains data on a worksheet. | `{ address, rowCount, columnCount, values, formulas }` |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listWorksheets` | `itemId`* |
+    | `getWorksheet` | `itemId`*, `worksheetId`* |
+    | `addWorksheet` | `itemId`*, `name`* |
+    | `updateWorksheet` | `itemId`*, `worksheetId`*, `name`, `position`, `visibility` (`Visible`, `Hidden`, `VeryHidden`) |
+    | `deleteWorksheet` | `itemId`*, `worksheetId`* |
+    | `getUsedRange` | `itemId`*, `worksheetId`*, `valuesOnly` |
 
     ### Ranges
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `getRange` | Read values, formulas and formatting from `address` (A1 notation). | `{ address, rowCount, columnCount, cellCount, values, formulas, numberFormat, text }` |
-    | `updateRange` | Write a 2D `values` array into `address`. | `{ address, rowCount, columnCount }` |
-    | `getCell` | Read a single cell by `row`/`column` index. | `{ address, value, formula, text }` |
-    | `clearRange` | Clear contents and/or formatting of `address` (`applyTo`). | Empty (HTTP 204) |
-    | `insertRange` | Insert cells at `address` with a `shift` direction. | `{ address }` |
-    | `deleteRange` | Delete cells at `address` with a `shift` direction. | Empty (HTTP 204) |
-    | `sortRange` | Sort `address` by one or more `fields`. | Empty (HTTP 204) |
-    | `mergeRange` | Merge the cells in `address` (`across` optional). | Empty (HTTP 204) |
-    | `unmergeRange` | Unmerge the cells in `address`. | Empty (HTTP 204) |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `getRange` | `itemId`*, `worksheetId`*, `address`* |
+    | `updateRange` | `itemId`*, `worksheetId`*, `address`*, `values`*, `formulas`, `numberFormat` |
+    | `getCell` | `itemId`*, `worksheetId`*, `row`*, `column`* (0-based indices) |
+    | `clearRange` | `itemId`*, `worksheetId`*, `address`*, `applyTo`* |
+    | `insertRange` | `itemId`*, `worksheetId`*, `address`*, `shift`* |
+    | `deleteRange` | `itemId`*, `worksheetId`*, `address`*, `shift`* |
+    | `sortRange` | `itemId`*, `worksheetId`*, `address`*, `fields`*, `hasHeaders` (defaults to `true`), `matchCase` (defaults to `false`) |
+    | `mergeRange` | `itemId`*, `worksheetId`*, `address`*, `across` |
+    | `unmergeRange` | `itemId`*, `worksheetId`*, `address`* |
 
     ### Formatting
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `updateFormat` | Set alignment and text wrapping on `address`. | `{ address }` |
-    | `updateFont` | Set font `name`/`size`/`bold`/`italic`/`color` on `address`. | `{ address }` |
-    | `updateFill` | Set the background `color` of `address`. | `{ address }` |
-    | `updateBorder` | Set border `style`/`color`/`weight` on `address`. | `{ address }` |
-    | `autofitColumns` | Auto-fit column widths over `address`. | Empty (HTTP 204) |
-    | `autofitRows` | Auto-fit row heights over `address`. | Empty (HTTP 204) |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `updateFormat` | `itemId`*, `worksheetId`*, `address`*, `columnWidth`, `rowHeight`, `horizontalAlignment`, `verticalAlignment`, `wrapText` |
+    | `updateFont` | `itemId`*, `worksheetId`*, `address`*, `bold`, `italic`, `underline`, `color`, `name`, `size` |
+    | `updateFill` | `itemId`*, `worksheetId`*, `address`*, `color`* (hex, for example `#FFFF00`) |
+    | `updateBorder` | `itemId`*, `worksheetId`*, `address`*, `sideIndex`*, `color`, `style`, `weight` |
+    | `autofitColumns` | `itemId`*, `worksheetId`*, `address`* |
+    | `autofitRows` | `itemId`*, `worksheetId`*, `address`* |
 
     ### Tables
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listTables` | List tables in the workbook (`itemId`). | `{ value: [{ id, name, range }] }` |
-    | `getTable` | Get a table's details by `tableId`. | `{ id, name, showHeaders, showTotals, style }` |
-    | `createTable` | Create a table from `address`; `hasHeaders` optional. | `{ id, name, range }` |
-    | `updateTable` | Update table properties (`name`, `showHeaders`, `style`, …). | `{ id, name, style }` |
-    | `deleteTable` | Delete a table by `tableId`. | Empty (HTTP 204) |
-    | `addTableRow` | Append a row of `values` to a table. | `{ index, values }` |
-    | `updateTableRow` | Update a row's `values` by `index`. | `{ index, values }` |
-    | `deleteTableRow` | Delete a row by `index`. | Empty (HTTP 204) |
-    | `addTableColumn` | Add a column (`name`, `values`) to a table. | `{ id, name, index }` |
-    | `deleteTableColumn` | Delete a column by id/index. | Empty (HTTP 204) |
-    | `applyTableSort` | Apply a sort to a table by `fields`. | Empty (HTTP 204) |
-    | `applyTableFilter` | Apply a column `filter` (`criterion`) to a table. | Empty (HTTP 204) |
-    | `clearTableFilter` | Clear the filter on a table column (or all). | Empty (HTTP 204) |
-    | `convertTableToRange` | Convert a table back into a normal range. | `{ address }` |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listTables` | `itemId`*, `worksheetId` |
+    | `getTable` | `itemId`*, `tableId`* |
+    | `createTable` | `itemId`*, `worksheetId`*, `address`*, `hasHeaders` |
+    | `updateTable` | `itemId`*, `tableId`*, `name`, `style`, `showHeaders`, `showTotals` |
+    | `deleteTable` | `itemId`*, `tableId`* |
+    | `addTableRow` | `itemId`*, `tableId`*, `values`* (2D array), `index` (appends at the end when omitted) |
+    | `updateTableRow` | `itemId`*, `tableId`*, `values`* (2D array), `index` (0-based, identifies the row) |
+    | `deleteTableRow` | `itemId`*, `tableId`*, `index` (0-based, identifies the row) |
+    | `addTableColumn` | `itemId`*, `tableId`*, `name`*, `index`, `values` |
+    | `deleteTableColumn` | `itemId`*, `tableId`*, `columnId`* |
+    | `applyTableSort` | `itemId`*, `tableId`*, `fields`* (`[{ key, ascending }]`), `matchCase` |
+    | `applyTableFilter` | `itemId`*, `tableId`*, `columnId`*, `criteria`* |
+    | `clearTableFilter` | `itemId`*, `tableId`*, `columnId` (clears every column when omitted) |
+    | `convertTableToRange` | `itemId`*, `tableId`* |
 
     ### Charts
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listCharts` | List charts on a worksheet. | `{ value: [{ id, name, type }] }` |
-    | `getChart` | Get a chart's details by `chartId`. | `{ id, name, type, height, width }` |
-    | `addChart` | Create a chart from `sourceData` (`type`, `seriesBy`). | `{ id, name, type }` |
-    | `updateChart` | Update chart properties (size, name, …). | `{ id, name }` |
-    | `deleteChart` | Delete a chart by `chartId`. | Empty (HTTP 204) |
-    | `setChartData` | Change a chart's data source (`sourceData`, `seriesBy`). | Empty (HTTP 204) |
-    | `setChartPosition` | Reposition a chart by anchor cells. | Empty (HTTP 204) |
-    | `getChartImage` | Export a chart as a base64 image (`width`/`height`). | `{ image }` (base64 PNG) |
-    | `updateChartTitle` | Set a chart's title text. | `{ id, title }` |
-    | `updateChartLegend` | Configure the chart legend (`position`, `visible`). | `{ id }` |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listCharts` | `itemId`*, `worksheetId`* |
+    | `getChart` | `itemId`*, `worksheetId`*, `chartId`* |
+    | `addChart` | `itemId`*, `worksheetId`*, `type`*, `sourceData`*, `seriesBy` (`Auto`, `Columns`, `Rows`) |
+    | `updateChart` | `itemId`*, `worksheetId`*, `chartId`*, `name`, `top`, `left`, `height`, `width` |
+    | `deleteChart` | `itemId`*, `worksheetId`*, `chartId`* |
+    | `setChartData` | `itemId`*, `worksheetId`*, `chartId`*, `sourceData`*, `seriesBy` |
+    | `setChartPosition` | `itemId`*, `worksheetId`*, `chartId`*, `startCell`*, `endCell`* |
+    | `getChartImage` | `itemId`*, `worksheetId`*, `chartId`*, `width`, `height`, `fittingMode` (`Fit`, `FitAndCenter`, `Fill`) |
+    | `updateChartTitle` | `itemId`*, `worksheetId`*, `chartId`*, `text`*, `visible`, `overlay` |
+    | `updateChartLegend` | `itemId`*, `worksheetId`*, `chartId`*, `visible`, `position` (`Bottom`, `Corner`, `Custom`, `Left`, `Right`, `Top`), `overlay` |
 
-    ### Named Items & Pivot Tables
+    ### Named items and pivot tables
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `listNamedItems` | List named ranges in the workbook. | `{ value: [{ name, value, scope }] }` |
-    | `getNamedItem` | Get a named item by `name`. | `{ name, value, type, scope }` |
-    | `addNamedItem` | Create a named range (`name`, `reference`). | `{ name, value, scope }` |
-    | `updateNamedItem` | Update a named item's reference/visibility. | `{ name, value }` |
-    | `listPivotTables` | List pivot tables on a worksheet. | `{ value: [{ id, name }] }` |
-    | `getPivotTable` | Get a pivot table's details by id. | `{ id, name }` |
-    | `refreshPivotTable` | Refresh one pivot table. | Empty (HTTP 204) |
-    | `refreshAllPivotTables` | Refresh every pivot table in the workbook. | Empty (HTTP 204) |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listNamedItems` | `itemId`*, `worksheetId` |
+    | `getNamedItem` | `itemId`*, `name`* |
+    | `addNamedItem` | `itemId`*, `name`* (no spaces), `reference`* (must start with `=`), `comment` |
+    | `updateNamedItem` | `itemId`*, `name`*, `visible`, `comment` |
+    | `listPivotTables` | `itemId`*, `worksheetId`* |
+    | `getPivotTable` | `itemId`*, `worksheetId`*, `pivotTableId`* |
+    | `refreshPivotTable` | `itemId`*, `worksheetId`*, `pivotTableId`* |
+    | `refreshAllPivotTables` | `itemId`* |
 
     ### Functions
 
-    | Instruction | Description | Returns |
-    |-------------|-------------|---------|
-    | `executeExcelFunction` | Evaluate an Excel worksheet function: `functionName` + ordered `values`. | `{ value, error }` |
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `executeExcelFunction` | `itemId`*, `functionName`*, `parameters`* |
 
-    <Note>
-      `Returns` shows the shape of the operation output. Mutating operations that the Graph API answers with `204 No Content` return an empty body.
-    </Note>
+    ## Response shape
 
-    ## DSUL Examples
+    Instructions do not return the raw Microsoft Graph payload. They return a presentation envelope, and the data lives under `structuredData`:
+
+    ```yaml
+    - Excel.getRange:
+        itemId: '{{workbookItemId}}'
+        worksheetId: Sheet1
+        address: "A1:C10"
+      output: range
+    # range.operation          -> read
+    # range.itemType           -> Range
+    # range.identifier         -> Sheet1!A1:C10
+    # range.structuredData     -> address, rowCount, columnCount, cellCount, values, formulas, numberFormat, text
+    ```
+
+    A failing call returns `{ error, status, details }` instead, so branch on `{{range.error}}` before reading `structuredData`.
+
+    ## DSUL examples
 
     ### Read a range
 
     ```yaml
     - Excel.getRange:
-        itemId: "01ABCDEF..."
+        itemId: '{{workbookItemId}}'
         worksheetId: Sheet1
         address: "A1:C10"
-      output: data
+      output: range
+    - conditions:
+        '{{range.error}}':
+          - break: {}
+    - set:
+        name: rows
+        value: '{{range.structuredData.values}}'
     ```
 
     ### Read a SharePoint-hosted range
 
     ```yaml
     - Excel.getRange:
-        itemId: "01ABCDEF..."
-        siteId: "contoso.sharepoint.com,abc-123,def-456"
+        itemId: '{{workbookItemId}}'
+        siteId: '{{sharePointSiteId}}'
         worksheetId: Sheet1
         address: "A1:C10"
-      output: data
+      output: range
     ```
 
     ### Write values
 
     ```yaml
     - Excel.updateRange:
-        itemId: "01ABCDEF..."
+        itemId: '{{workbookItemId}}'
         worksheetId: Sheet1
         address: "A1:C2"
         values:
           - ["Name", "Age", "City"]
-          - ["John", 30, "New York"]
-      output: result
+          - ["Ada", 30, "Paris"]
+      output: written
     ```
 
     ### Create a table from a range
 
     ```yaml
     - Excel.createTable:
-        itemId: "01ABCDEF..."
+        itemId: '{{workbookItemId}}'
         worksheetId: Sheet1
         address: "A1:C10"
         hasHeaders: true
@@ -538,48 +646,80 @@ This connector is used by three different roles. Jump to the section that matche
 
     ```yaml
     - Excel.addTableRow:
-        itemId: "01ABCDEF..."
-        tableId: "{{table.id}}"
+        itemId: '{{workbookItemId}}'
+        tableId: '{{table.structuredData.table.id}}'
         values:
-          - ["Jane", 28, "Paris"]
+          - ["Grace", 28, "Lyon"]
       output: row
     - Excel.calculateWorkbook:
-        itemId: "01ABCDEF..."
+        itemId: '{{workbookItemId}}'
+        calculationType: Full
       output: recalc
     ```
+
+    ## Verify the installation
+
+    1. In your workspace, run an automation containing a single `Excel.listWorksheets` call with the `itemId` of a workbook you can reach.
+    2. Confirm that `structuredData.worksheets` lists the sheet names and that `structuredData.count` is greater than zero.
+    3. Only then run a write instruction such as `Excel.updateRange` against a scratch workbook, and confirm the change in Excel.
+
+    If step 1 returns `Missing Azure credentials`, the instance configuration is incomplete. If it returns `Access denied`, the Graph permissions or the admin consent are missing.
   </Tab>
 </Tabs>
 
 ---
 
-## Error Handling
+## Error handling
 
-| HTTP Status | Error | Solution |
-|-------------|-------|----------|
-| 401 | Unauthorized | Azure credentials are missing, invalid, or expired; reconfigure the app and re-check the client secret. |
-| 403 | Forbidden | The Azure AD app lacks the required Microsoft Graph permissions, or admin consent was not granted. |
-| 404 | Not Found | Verify the `itemId` (and `siteId`/`driveId` for SharePoint); the workbook, worksheet, or range does not exist. |
-| 423 | Locked | The file is open in a desktop Office app; close it or wait for auto-save. |
-| 429 | Rate Limited | Microsoft Graph throttled the request; back off and retry, honoring the `Retry-After` header. |
-| 500 / 503 | Service error | Transient Microsoft Graph error; retry shortly. |
+The connector maps Microsoft Graph HTTP statuses to fixed messages and returns `{ error, status, details }`.
+
+| HTTP status | Message | Resolution |
+|-------------|---------|------------|
+| 400 | `Invalid request: <Graph message>`, or an operation-specific hint such as `Invalid range address. Use A1 notation like 'A1:C10'.` | Fix the argument named in the hint. |
+| 401 | `Authentication failed. Token may have expired or credentials are invalid.` | Re-check the client secret and tenant ID, or reconnect the Microsoft account in `oauth` mode. |
+| 403 | `Access denied. Check application permissions (Files.ReadWrite.All, Sites.ReadWrite.All).` | Grant the missing Graph permissions on the app registration and have an administrator grant admin consent. |
+| 404 | `Resource not found. Verify the ID is correct.`, or an operation-specific hint. On a worksheet path the message adds a localisation hint and asks you to call `listWorksheets`. | Verify `itemId`, plus `siteId` and `driveId` for SharePoint, and confirm the worksheet name. |
+| 409 | `Conflict. The resource may have been modified by another request.` | Re-read the resource and retry. |
+| 423 | `File is locked. Close it in the Office desktop app and try again.` | Close the workbook in the desktop app or wait for autosave to release the lock. |
+| 429 | `Rate limited by Microsoft Graph API. Please wait and try again.` | Back off and retry, honouring the `Retry-After` header returned by Microsoft Graph. |
+| Any other status at or above 400 | `API call failed with status <status>` | Inspect `details`, which carries the raw Graph error object. |
 
 ### Common Issues
 
-**"Missing Azure credentials"**: The app configuration has no `clientId` / `clientSecret` / `tenant`. Open the Excel app instance and paste your Azure AD application credentials, then re-run.
+**`Missing Azure credentials. Please configure clientId, clientSecret, and tenant in the app configuration.`**: the instance has no `clientId`, `clientSecret`, or `tenant`. Open the Excel app instance, fill the three fields, and select **Save**.
 
-**"OAuth authentication required. Please connect your Microsoft account first"**: Authentication Mode is set to `oauth` but no delegated token exists yet for the user. Complete the Microsoft connect flow before calling Excel tools, or switch the mode to `clientCredentials`.
+**`Client credentials auth failed: <description>`**: Microsoft Entra rejected the token request. The tenant ID is wrong, the client secret expired, or the application has no Graph application permissions. The description is the raw `error_description` returned by Microsoft.
 
-**"Client credentials auth failed"**: Azure AD rejected the client-credentials token request (wrong tenant id, expired or wrong client secret, or the app lacks application permissions). Re-check the credential values and the granted Graph permissions.
+**`OAuth authentication required. Please connect your Microsoft account first: <connect-url>`**: the instance runs in `oauth` mode and the calling user has no valid delegated token. Open the connect page, select **Connect with Microsoft**, then retry. Over MCP the same condition is returned as `OAuth authentication required. Connect your Microsoft account: <pages-url>/connect-excel`.
 
-**"File is locked"**: The workbook is open in the desktop Excel application. Close it or wait for auto-save to release the lock.
+**`OAuth is not configured for this workspace. Contact the administrator.`**: `oauthClientId` is empty. The connect page shows the same condition as an **OAuth is not configured** banner and hides the connect button.
 
-**"Invalid range address"**: Use A1 notation (e.g. `A1:C10`), not numeric row/column indices.
+**`Error: Invalid state parameter. Please retry authentication.`**: the OAuth state no longer matches the pending value, usually because the browser session changed mid-flow. Reopen the connect page and start over.
 
-**".xls not supported"**: Only `.xlsx` workbooks are supported by the Graph workbook API. Convert legacy `.xls` files to `.xlsx` first.
+**`Missing required parameter: <name>`**: the tool or instruction was called without a mandatory argument. JSON-RPC code `-32602`.
 
-<Note>
-  Microsoft Graph caps workbook requests at roughly 5 million cells per call and a 25 MB file size; split very large ranges into smaller calls to avoid `429`/oversize errors.
-</Note>
+**`Tool not found: <name>`**: the MCP client asked for a tool the router does not know. Re-run `tools/list` to refresh the manifest.
+
+**`API key not configured. Generate one from the API Key page.`**: the MCP endpoint has no `apiKey`. Generate one on the MCP Core **API Key** page of the connector workspace. JSON-RPC code `-32001`.
+
+**MCP API key header rejected**, with either of these messages:
+
+```text
+Missing mcp-api-key header. Add header "mcp-api-key" with a valid API key.
+Invalid mcp-api-key. Check that the API key value is correct.
+```
+
+The `tools/call` request did not carry the MCP API key header, or carried a value that does not match the configured key. `initialize`, `notifications/initialized`, and `tools/list` are answered without a key; `tools/call` is not. JSON-RPC code `-32001`.
+
+**`Cannot delete the last worksheet in a workbook.`**: `deleteWorksheet` refuses to leave a workbook with no sheets. Add a worksheet first.
+
+## Revoke, rotate, and remove
+
+- **Disconnect one user (delegated OAuth):** on the `/connect-excel` page, select **Disconnect**. The connector deletes the `excel_delegated_token` and `excel_refresh_token` user secrets and the stored OAuth metadata, then emits `excel.oauth.disconnected`. The next tool call returns the `OAuth authentication required` message with the connect link.
+- **Offboard a departing user:** disconnecting removes the platform-side tokens. Revoke the user's Microsoft sessions in Microsoft Entra as well, so the refresh token cannot be replayed.
+- **Rotate the client secret:** create a new secret on the app registration in Microsoft Entra, update the `azureClientSecret` workspace secret, and select **Save**. In `clientCredentials` mode the next call uses the new secret; in `oauth` mode existing refresh tokens keep working until they expire, and a failed refresh sends the user back through the connect page.
+- **Rotate the MCP API key:** generate a new key on the MCP Core **API Key** page, then update every agent capability and MCP client that sends the MCP API key header. Calls that still carry the previous key are rejected with the invalid-key message shown in [Common Issues](#common-issues).
+- **Remove the connector:** uninstall the **Excel** app instance from the workspace, and delete the **Excel** capability from AI Governance if a platform admin declared one. Uninstalling stops all access but does not delete the per-user token secrets, so ask each connected user to select **Disconnect** first.
 
 ## External Resources
 
@@ -588,7 +728,7 @@ This connector is used by three different roles. Jump to the section that matche
     Official reference for the Microsoft Graph workbook (Excel) API.
   </Card>
   <Card title="Excel API best practices" icon="lightbulb" href="https://learn.microsoft.com/en-us/graph/workbook-best-practice">
-    Performance and session guidance for the Graph workbook API.
+    Performance, session, and size guidance for the Graph workbook API.
   </Card>
   <Card title="Graph Explorer" icon="flask" href="https://developer.microsoft.com/en-us/graph/graph-explorer">
     Test Microsoft Graph calls interactively against your tenant.
