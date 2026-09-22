@@ -500,7 +500,7 @@ of them:
 user is in context at all, and on such a call the organization usually is not resolved either — the
 gateway then sees no organization settings and falls back to its own default, reporting
 `policySource: gateway`. Cover workspace-to-workspace traffic with the gateway-wide default rather
-than with a per-organization policy.
+than with a per-organization policy — see **Gateway-wide settings** below.
 </Note>
 
 **Modes.** `mode` is mandatory as soon as a class key exists:
@@ -595,17 +595,52 @@ So a typo in one class does not disable a correct one, and a mistyped policy nev
 organization its LLM traffic. The condition stays loud — the event repeats on every call until the
 policy is fixed — it is simply not fatal.
 
-**Gateway-wide lever.** Platform operators have `header_policy_enforcement` in the LLM Gateway
-config: `enabled` (default), `report_only` — which caps every declared mode at reporting, whatever
-the organizations configured — or `off`, which neutralises the control platform-wide. This is an
-operator control, not an organization one: an organization cannot re-enable a policy the platform
-turned off. An unrecognised value falls back to `enabled` and emits `HeaderPolicyEnforcementInvalid`,
-so a typo cannot silently switch a compliance control off.
+**Gateway-wide settings.** Two keys live in the LLM Gateway workspace's own configuration, under
+`config.value`. They are the platform-level half of the control; the organization settings above are
+the per-customer half.
 
-It lives in the LLM Gateway's runtime config, which is written only by
-`PATCH /v2/workspaces/{workspaceId}/config` — importing the workspace does not update it. That
-endpoint **replaces the whole config object**, so send the complete value, providers included, or
-you wipe the gateway's configuration.
+| Key | What it does |
+|---|---|
+| `header_policy` | The **default policy**, in the same per-class shape as the organization one. It applies to every organization that has not set its own `settings.llm.header_policy`, and it is the only policy that ever reaches `workspace`-class callers |
+| `header_policy_enforcement` | The operator **cap**: `enabled` (default), `report_only` — which caps every declared mode at reporting, whatever the organizations configured — or `off`, which neutralises the control platform-wide |
+
+```yaml
+# workspaces/llm-gateway/index.yml
+config:
+  value:
+    header_policy:
+      user:
+        headers: [x-user-email]
+        mode: report_only
+      workspace:
+        headers: [x-source-workspace-id]
+        mode: report_only
+    header_policy_enforcement: enabled
+```
+
+The shape differs from the organization form on one point: on the gateway the policy sits directly
+under `config.value`, not under an `llm` key. Everything else is identical — same caller classes,
+same modes, same validation, so a malformed entry emits `HeaderPolicyInvalid` with `source: gateway`
+and the valid entries still apply. The release ships `header_policy: {}`, so no default is in force
+until you set one.
+
+A gateway default is not a safe place to start enforcing: it reaches every organization that has not
+overridden it. Set `block` here only once the organizations have been through `report_only`
+individually, as in the rollout note below.
+
+`header_policy_enforcement` is an operator control, not an organization one: an organization cannot
+re-enable a policy the platform turned off. An unrecognised value falls back to `enabled` and emits
+`HeaderPolicyEnforcementInvalid`, so a typo cannot silently switch a compliance control off.
+
+**Deploying them.** Edit `index.yml` in the repository the gateway is pulled from, then run a
+platform pull — it rewrites the workspace configuration from `index.yml`. The exception is a
+repository that lists `index` in its
+[`pull.exclude`](/products/ai-builder/versioning#excluding-files-from-import): there the stored
+configuration is deliberately kept and your change never lands, so use the API below instead.
+
+To change either key live, without a release, use `PATCH /v2/workspaces/{workspaceId}/config`. That
+endpoint **replaces the whole `value` object**, so send the complete configuration, providers
+included, or you wipe the gateway's configuration.
 
 <Note>
 Roll it out on one organization first rather than gateway-wide. Start in `report_only`, watch
