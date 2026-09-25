@@ -4,8 +4,9 @@ info:
   title: LLM Gateway API
   description: |
     Public REST API for the Prisme.ai LLM Gateway - OpenAI-compatible
-    chat completions and embeddings, plus a managed model catalogue
-    with governance overrides per organization.
+    chat completions, embeddings and image generation/editing, a standard
+    rerank endpoint, a managed model catalogue with governance overrides
+    per organization, and quota status for users and organizations.
 
     The gateway abstracts multi-provider LLM access (OpenAI, Azure OpenAI,
     Anthropic, Google Vertex, AWS Bedrock, OpenAI-compatible providers) behind
@@ -36,8 +37,12 @@ tags:
     description: OpenAI-compatible text embeddings.
   - name: Rerank
     description: Rerank documents by relevance to a query (standard rerank contract, LLM-as-reranker backend).
+  - name: Images
+    description: OpenAI-compatible image generation and image editing.
   - name: Models
     description: Model catalogue (CRUD + bulk replace + governance-aware listing).
+  - name: Quotas
+    description: Effective LLM quota limits and current usage, per user and per organization.
   - name: Defaults
     description: Resolved default models for completions / embeddings / image generation / file parsing.
   - name: Test
@@ -121,8 +126,8 @@ paths:
           description: |
             Refused by a governance overlay. The machine-readable code is
             typically `MODEL_NOT_ALLOWED`, or `HEADER_POLICY_VIOLATION` when a
-            required upstream identity header would reach the provider empty —
-            `details.missing` then lists the header names.
+            required upstream identity header would reach the provider empty
+            (`details.missing` then lists the header names).
           content:
             application/json:
               schema:
@@ -182,7 +187,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Model not allowed for this caller (governance overlay).
+          description: |
+            Refused by a governance overlay: `MODEL_NOT_ALLOWED`, or
+            `HEADER_POLICY_VIOLATION` when a required upstream identity header
+            would reach the provider empty.
           content:
             application/json:
               schema:
@@ -277,6 +285,121 @@ paths:
           description: |
             The reranker backend failed or returned no parseable results
             (`code: RERANK_FAILED` or `RERANK_PARSE_FAILED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/images/generations:
+    post:
+      tags: [Images]
+      operationId: createImage
+      summary: Generate images
+      description: |
+        OpenAI-compatible image generation. The gateway resolves the model
+        (request `model`, else the org governance default, else the platform
+        default `config.defaults.image_generation`) and routes the call to the
+        provider (OpenAI, Azure OpenAI, Google Vertex Imagen).
+
+        **Size resolution.** Pass an abstract `aspect` + `tier`, or an explicit
+        pixel `size`. The gateway snaps it to a size listed in the model's
+        `capabilities.supported_sizes`; an exact supported `size` is kept as is.
+        Without a supported-sizes list, `size` is passed through (default
+        `1024x1024`). The size actually used is returned in `size`.
+
+        **Images are always returned as URLs.** When the provider only returns
+        base64 data, the gateway uploads it to Prisme.ai file storage and
+        returns a tokenised `url` instead, so `data[].b64_json` is never
+        present in the response.
+
+        **Governance.** Requires the `image-generation` model permission. A
+        model not allowed for the organization is either downgraded to the
+        governance fallback model (`soft_downgrade` quota policy) or refused
+        with `403 MODEL_NOT_ALLOWED`. A required upstream identity header that
+        would reach the provider empty is refused with
+        `403 HEADER_POLICY_VIOLATION`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageGenerationRequest'
+      responses:
+        '200':
+          description: Generated images.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagesResponse'
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            Missing `image-generation` permission (`FORBIDDEN`), model refused by
+            the organization governance (`MODEL_NOT_ALLOWED`), or header-policy
+            refusal (`HEADER_POLICY_VIOLATION`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        default:
+          description: |
+            Provider error, forwarded with the provider's HTTP status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/images/edits:
+    post:
+      tags: [Images]
+      operationId: editImage
+      summary: Edit an image
+      description: |
+        Edits an existing image from a prompt. Same model resolution,
+        governance and size resolution as `POST /v1/images/generations`
+        (the `image-generation` model permission applies).
+
+        The source image is passed as `image_url`, a URL the gateway can fetch
+        (for example a short-lived tokenised Prisme.ai file URL). The gateway
+        downloads it and sends it to the provider (multipart `images/edits`
+        for OpenAI / Azure `gpt-image` models, reference image for Vertex
+        Imagen). As for generation, results are always returned as URLs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageEditRequest'
+      responses:
+        '200':
+          description: Edited images.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagesResponse'
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            Missing `image-generation` permission (`FORBIDDEN`), model refused by
+            the organization governance (`MODEL_NOT_ALLOWED`), or header-policy
+            refusal (`HEADER_POLICY_VIOLATION`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        default:
+          description: |
+            Provider error, forwarded with the provider's HTTP status.
           content:
             application/json:
               schema:
@@ -457,14 +580,22 @@ paths:
       operationId: replaceModels
       summary: Bulk-replace the entire model catalogue
       description: |
-        **Destructive.** Deletes the entire models collection and inserts the
-        provided list. Used by the platform Models page "Import" flow.
+        Reconciles the models collection to the provided list. Used by the
+        platform Models page "Import" flow.
+
+        **Non-destructive reconcile.** Every incoming model is upserted
+        (keyed on `model_id`) in a single bulk write, then the models absent
+        from the list are pruned. The catalogue is never emptied mid-flight:
+        a failure returns `500 BULK_REPLACE_FAILED` and leaves the previous
+        catalogue in place (plus any rows already upserted).
 
         - Body must be `{ "models": [...] }` (max 500 items). Each item must
           carry at least `model_id` and `type`.
-        - Per-key cache (`global.models_cache`) is fully invalidated.
+        - An empty list clears the whole catalogue, and is refused with
+          `400 CONFIRMATION_REQUIRED` unless `confirm_clear_all: true` is sent.
+        - Cache (`global.models_cache`) is fully invalidated.
         - Emits a `model.bulk_replaced` audit event.
-        - Rate-limited: 5 calls per 3600 seconds per consumer
+        - Rate-limited: 2 calls per 60 seconds per consumer
           (`ModelsBulkReplace`).
       requestBody:
         required: true
@@ -480,6 +611,11 @@ paths:
                   maxItems: 500
                   items:
                     $ref: '#/components/schemas/ModelCreateInput'
+                confirm_clear_all:
+                  type: boolean
+                  description: |
+                    Required (`true`) when `models` is empty, to confirm wiping
+                    the entire catalogue. Ignored otherwise.
       responses:
         '200':
           description: Bulk replace summary.
@@ -487,20 +623,28 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [deleted, inserted]
+                required: [upserted, pruned, inserted, deleted]
                 properties:
-                  deleted:
+                  upserted:
                     type: integer
-                    description: Number of documents removed before the insert.
+                    description: Number of models inserted or updated (the full incoming list).
+                  pruned:
+                    type: integer
+                    description: Number of stale models removed (absent from the new list).
                   inserted:
                     type: integer
-                    description: Number of documents inserted.
+                    description: Backward-compatible alias for `upserted`.
+                  deleted:
+                    type: integer
+                    description: Backward-compatible alias for `pruned`.
         '400':
           description: |
             Validation error. Codes: `INVALID_BODY` (missing or non-array
             `models`), `INVALID_ITEMS` (one or more items missing `model_id` or
             `type` - `details` lists the offending entries),
-            `PAYLOAD_TOO_LARGE` (more than 500 items).
+            `PAYLOAD_TOO_LARGE` (more than 500 items). An empty `models` list
+            without `confirm_clear_all: true` is refused with
+            `error: CONFIRMATION_REQUIRED`.
           content:
             application/json:
               schema:
@@ -518,7 +662,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
-          description: 'Rate limit exceeded (`code: RATE_LIMITED`, 5 req / 3600 s per consumer).'
+          description: 'Rate limit exceeded (`code: RATE_LIMITED`, 2 req / 60 s per consumer).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: |
+            The reconcile failed (`code: BULK_REPLACE_FAILED`). Nothing is
+            pruned (no partial wipe); `details` carries the underlying error.
           content:
             application/json:
               schema:
@@ -697,6 +849,99 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /v1/quotas/me:
+    get:
+      tags: [Quotas]
+      operationId: getMyQuotas
+      summary: Get the caller's effective quotas
+      description: |
+        Effective LLM quota status for the calling user in their active
+        organization: the per-user rate limits (`llm.rpm`, `llm.tpm`) and the
+        organization monthly budgets (`llm.monthly_tokens`, `llm.monthly_cost`)
+        with current usage. Only limits that are actually configured are
+        returned as gauges.
+
+        The per-user limit is the most specific one configured: user override,
+        then per-role limit, then the plan's per-user default.
+
+        Usage figures are snapshots: rate gauges are refreshed on each LLM
+        request (`as_of` = time of the last request, and a sliding window means
+        the live value can only be lower), monthly usage is aggregated hourly.
+
+        **Requires a user session**: calls without a user identity (for
+        example an org API key) get `401 UNAUTHORIZED`. When the caller has no
+        active organization, the response carries an empty `gauges` list.
+
+        **Rate limiting.** 60 requests per 60 seconds per user.
+      responses:
+        '200':
+          description: Quota status for the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyQuotasResponse'
+        '401':
+          description: Missing authentication or no user session (`UNAUTHORIZED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: 'Rate limit exceeded (`error: RATE_LIMITED`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/quotas/usage:
+    get:
+      tags: [Quotas]
+      operationId: getOrgQuotasUsage
+      summary: Get the organization's quota usage
+      description: |
+        Organization-level quota status: the enforced LLM limits of the plan
+        (`llm.rpm`, `llm.tpm`, `llm.monthly_tokens`, `llm.monthly_cost`) with
+        current usage, the quota policy, the plan's contractual `included`
+        limits, the per-user defaults and the org's per-user quota settings.
+
+        Only what the gateway enforces carries usage; the `included` counters
+        (members, agents, interactions, storage) are returned as configured in
+        the plan, without usage.
+
+        Requires the `models:read` permission. **Rate limiting.** 60 requests
+        per 60 seconds per consumer.
+      responses:
+        '200':
+          description: Organization quota status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgQuotasUsageResponse'
+        '400':
+          description: 'The caller has no active organization (`error: NO_ORG_CONTEXT`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Missing `models:read` permission.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: 'Rate limit exceeded (`error: RATE_LIMITED`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
 components:
   securitySchemes:
     BearerAuth:
@@ -744,6 +989,7 @@ components:
             `RATE_LIMITED`, `MODEL_NOT_ALLOWED`, `HEADER_POLICY_VIOLATION`,
             `MODEL_NOT_FOUND`,
             `MODEL_EXISTS`, `MISSING_MODEL_ID`, `MISSING_TYPE`, `INVALID_BODY`,
+            `BULK_REPLACE_FAILED`,
             `INVALID_ITEMS`, `INVALID_DIMENSIONS`, `PAYLOAD_TOO_LARGE`,
             `METHOD_NOT_ALLOWED`, `PROVIDER_ERROR`, `PROVIDER_NO_RESPONSE`.
         details:
@@ -840,7 +1086,7 @@ components:
           items:
             $ref: '#/components/schemas/ChatMessage'
         temperature:
-          description: Sampling temperature (provider-dependent range, typically 0–2).
+          description: Sampling temperature (provider-dependent range, typically 0 to 2).
         max_tokens:
           description: Max tokens to generate.
         top_p:
@@ -946,8 +1192,30 @@ components:
           properties:
             prompt_tokens:
               type: integer
+              description: Total input tokens, cached context included.
             completion_tokens:
               type: integer
+              description: |
+                Total output tokens, reasoning **included**. Providers that report
+                thinking separately (Gemini's `thoughtsTokenCount`) have it folded
+                in by their adapter, so the figure is comparable across providers.
+                `cost` is computed from it.
+            completion_tokens_details:
+              type: object
+              description: |
+                Breakdown of `completion_tokens`. Present when the provider reports
+                one (OpenAI reasoning models, Gemini/Vertex). Absent otherwise:
+                Anthropic and Bedrock do reason but publish no separate count, so
+                the thinking stays inside `completion_tokens`.
+              properties:
+                reasoning_tokens:
+                  type: integer
+            cache_read_input_tokens:
+              type: integer
+              description: Cached input tokens re-read on this call (0 when caching is off).
+            cache_write_input_tokens:
+              type: integer
+              description: Input tokens written to the provider cache (0 when caching is off or unbilled).
             total_tokens:
               type: integer
             cost:
@@ -1007,6 +1275,11 @@ components:
                 type: string
         usage:
           type: object
+          description: |
+            Present on the final chunk. Same fields as the non-streaming
+            `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`,
+            `completion_tokens_details.reasoning_tokens`,
+            `cache_read_input_tokens`, `cache_write_input_tokens`).
           additionalProperties: true
 
     EmbeddingRequest:
@@ -1157,6 +1430,226 @@ components:
                   type: integer
                 output_tokens:
                   type: integer
+
+    ImageGenerationRequest:
+      type: object
+      properties:
+        model:
+          type: string
+          maxLength: 256
+          description: Image model id. Defaults to the org governance default, then the platform default.
+        prompt:
+          type: string
+          description: Text description of the image to generate.
+        size:
+          type: string
+          description: Explicit `WxH` pixel size. Kept as is when the model supports it, otherwise snapped (see `aspect` / `tier`).
+          example: 1024x1024
+        aspect:
+          type: string
+          enum: [square, portrait, landscape]
+          description: '**Prisme.ai extension.** Abstract orientation, snapped to a size the model supports.'
+        tier:
+          type: string
+          enum: [small, medium, large]
+          description: '**Prisme.ai extension.** Size tier within the orientation (default `medium`).'
+        style:
+          type: string
+          description: Provider style hint, forwarded to the provider when set.
+        'n':
+          type: number
+          description: Number of images to generate (default 1).
+        response_format:
+          type: string
+          enum: [url, b64_json]
+          description: |
+            Format requested from the provider (default `url`). The response
+            always carries URLs: base64 results are uploaded and replaced by a
+            `url`.
+        analytics_context:
+          type: object
+          description: '**Prisme.ai extension.** Caller-supplied analytics context (`orgSlug`, `agent_id`, `user_id`, `context_id`, `agent_allowed_models`).'
+          additionalProperties: true
+
+    ImageEditRequest:
+      type: object
+      properties:
+        model:
+          type: string
+          maxLength: 256
+          description: Image model id. Defaults to the org governance default, then the platform default.
+        prompt:
+          type: string
+          description: Instruction describing the edit.
+        image_url:
+          type: string
+          description: URL of the source image, fetched by the gateway.
+        size:
+          type: string
+          description: Explicit `WxH` pixel size (same resolution rules as generation).
+        aspect:
+          type: string
+          enum: [square, portrait, landscape]
+          description: '**Prisme.ai extension.** Abstract orientation.'
+        tier:
+          type: string
+          enum: [small, medium, large]
+          description: '**Prisme.ai extension.** Size tier (default `medium`).'
+        'n':
+          type: number
+          description: Number of images to return (default 1).
+        analytics_context:
+          type: object
+          description: '**Prisme.ai extension.** Caller-supplied analytics context.'
+          additionalProperties: true
+
+    ImagesResponse:
+      type: object
+      properties:
+        created:
+          type: integer
+          description: Unix timestamp of the generation.
+        model:
+          type: string
+          description: Model that produced the images (after governance resolution).
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              url:
+                type: string
+                description: URL of the image (a tokenised Prisme.ai file URL when the provider returned base64).
+        size:
+          type: string
+          description: '**Prisme.ai extension.** Size actually used after resolution.'
+      example:
+        created: 1767225600
+        model: gpt-image-1
+        size: 1024x1024
+        data:
+          - url: https://api.studio.prisme.ai/v2/files/file-abc.png?token=token-123
+
+    QuotaGauge:
+      type: object
+      required: [key, scope, window, limit, used, percent]
+      properties:
+        key:
+          type: string
+          enum: [llm.rpm, llm.tpm, llm.monthly_tokens, llm.monthly_cost]
+        scope:
+          type: string
+          enum: [user, org]
+        window:
+          type: string
+          enum: [minute, month]
+        limit:
+          type: number
+          description: Configured limit (requests, tokens or cost depending on `key`).
+        used:
+          type: number
+          description: Current usage in the window (0 until a first request is recorded).
+        percent:
+          type: number
+          description: '`used / limit` as a rounded percentage.'
+        as_of:
+          type: string
+          format: date-time
+          description: Time of the last recorded request (rate gauges only).
+
+    MyQuotasResponse:
+      type: object
+      required: [computed_at, policy, gauges]
+      properties:
+        computed_at:
+          type: string
+          format: date-time
+        policy:
+          type: string
+          description: Organization quota policy (`hard_block` by default, or `soft_downgrade`).
+          example: hard_block
+        display:
+          type: object
+          description: Organization display settings for the quota gauges (`settings.quotas.display`), when configured.
+          additionalProperties: true
+        gauges:
+          type: array
+          description: Configured limits only. Per-user gauges have `scope` `user`, monthly budgets `org`.
+          items:
+            $ref: '#/components/schemas/QuotaGauge'
+      example:
+        computed_at: '2026-01-15T10:00:00.000Z'
+        policy: hard_block
+        gauges:
+          - key: llm.rpm
+            scope: user
+            window: minute
+            limit: 20
+            used: 9
+            percent: 45
+            as_of: '2026-01-15T09:59:40.000Z'
+          - key: llm.monthly_tokens
+            scope: org
+            window: month
+            limit: 10000000
+            used: 6400000
+            percent: 64
+
+    OrgQuotasUsageResponse:
+      type: object
+      required: [orgSlug, computed_at, policy, enforced]
+      properties:
+        orgSlug:
+          type: string
+        computed_at:
+          type: string
+          format: date-time
+        usage_refreshed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Last refresh of the monthly usage aggregate (null when none this month).
+        policy:
+          type: string
+          description: Organization quota policy (`hard_block` by default, or `soft_downgrade`).
+        enforced:
+          type: array
+          description: Plan limits enforced by the gateway (`scope` `org`, `source` `plan`).
+          items:
+            allOf:
+              - $ref: '#/components/schemas/QuotaGauge'
+              - type: object
+                properties:
+                  source:
+                    type: string
+                    enum: [plan]
+        included:
+          description: Contractual limits included in the plan, as configured (no usage).
+          additionalProperties: true
+        per_user_defaults:
+          type: object
+          description: Plan default per-user limits (`rpm`, `tpm`).
+          additionalProperties: true
+        org_user_quotas:
+          type: object
+          description: Organization per-user quota settings (`overrides` by user, `by_role`).
+          additionalProperties: true
+      example:
+        orgSlug: acme-corp
+        computed_at: '2026-01-15T10:00:00.000Z'
+        usage_refreshed_at: '2026-01-15T09:00:00.000Z'
+        policy: hard_block
+        enforced:
+          - key: llm.monthly_tokens
+            scope: org
+            window: month
+            limit: 10000000
+            used: 6400000
+            percent: 64
+            source: plan
+        per_user_defaults:
+          rpm: 20
+          tpm: 20000
 
     Model:
       type: object
@@ -1396,9 +1889,11 @@ components:
         type:
           type: string
           maxLength: 32
-          enum: [embeddings, completions]
+          enum: [embeddings, completions, image_generation]
           description: |
             Kind of test to run. Defaults to `completions` when omitted.
+            `image_generation` generates one test image (image models cannot be
+            reached through chat completions).
 
     TestResponse:
       type: object
