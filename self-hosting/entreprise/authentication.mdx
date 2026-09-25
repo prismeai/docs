@@ -402,42 +402,103 @@ DISABLE_LOCAL_SIGNUP='true'
 
 ## Multi-Factor Authentication (MFA)
 
-Prisme.ai enforces **TOTP** (Time-based One-Time Password, [RFC 6238](https://datatracker.ietf.org/doc/html/rfc6238)) multi-factor authentication for **local (password) accounts**. This is the standard "authenticator app" method: users scan a QR code with Google Authenticator, Microsoft Authenticator, Authy, 1Password, etc., then enter a 6-digit code.
+Prisme.ai protects **local (password) accounts** with a second factor. Two methods are available:
+
+- **Passkeys** ([WebAuthn](https://www.w3.org/TR/webauthn-3/)), the recommended method: the user confirms the sign-in with Face ID, a fingerprint, Windows Hello, their device PIN or a security key. A passkey is bound to your domain, so it cannot be relayed to a phishing site. Passkeys are disabled until you [enable them](#enable-passkeys).
+- **Authenticator app** (TOTP, [RFC 6238](https://datatracker.ietf.org/doc/html/rfc6238)): the user scans a QR code with Google Authenticator, Microsoft Authenticator, Authy, 1Password or a similar app, then enters a 6-digit code.
 
 <Note>
   MFA applies **only to local accounts**. SSO accounts are exempt; their identity provider already enforces its own second factor. Anonymous sessions are also exempt.
 </Note>
 
-### Enabling / disabling
+### Require a second factor
 
-MFA for local accounts is controlled by a single environment variable on `prismeai-api-gateway`:
+Whether local accounts must use a second factor is controlled by one environment variable on `prismeai-api-gateway`:
 
 ```
 MFA_FORCE_LOCAL='true'   # default
 ```
 
-- **`true` (default)**: every local account must complete TOTP. Set it to `false` to disable platform-enforced MFA.
+- **`true` (default)**: every local account must complete a second factor at sign-in.
+- **`false`**: the second factor is optional. Users who set one up from their settings are still asked for it.
+
+<Info>
+  **Existing local users are migrated lazily.** When you enable `MFA_FORCE_LOCAL`, current users are not locked out and no database migration is required; each user sets up a second factor on their next sign-in.
+</Info>
+
+### Enable passkeys
+
+Passkeys are enabled as soon as you set `WEBAUTHN_RP_ID` on `prismeai-api-gateway`. Without it, users only get the authenticator app.
+
+```
+WEBAUTHN_RP_ID='prisme.example.com'
+```
+
+1. Set `WEBAUTHN_RP_ID` to the domain of your console, or to one of its parent domains. For a console served at `https://studio.prisme.example.com`, both `studio.prisme.example.com` and `prisme.example.com` are valid.
+2. If your console is served on several domains, list them all in `CONSOLE_URL`, or set `WEBAUTHN_ORIGINS` explicitly. Every origin must be `WEBAUTHN_RP_ID` itself or one of its subdomains.
+3. Restart `prismeai-api-gateway`.
+
+The gateway checks this configuration at startup and refuses to start if an accepted origin cannot use the domain, or if an origin other than `localhost` is not served over `https`.
+
+To verify, call `GET /v2/login/providers` on your API. The response contains `webauthn.enabled: true`, your `rpId` and the accepted `origins`.
+
+<Warning>
+  **Choose `WEBAUTHN_RP_ID` once and for all.** Every passkey is bound to this domain: changing it later makes all existing passkeys unusable, and each user has to set up a new one.
+</Warning>
+
+| Variable | Default | Description |
+|---|---|---|
+| `WEBAUTHN_RP_ID` | none (passkeys disabled) | Domain the passkeys are bound to. |
+| `WEBAUTHN_ORIGINS` | the `CONSOLE_URL` origins | Comma-separated origins accepted when verifying a passkey. They are compared exactly. |
+| `WEBAUTHN_RP_NAME` | `Prisme.ai` | Name displayed by the user's passkey manager. |
+| `WEBAUTHN_PASSWORDLESS` | `true` | Set to `false` to keep passkeys as a second factor only, without passwordless sign-in. |
+| `RATE_LIMIT_PASSKEY_OPTIONS` | `60` | Passwordless sign-in challenges per IP address and per minute. The sign-in page requests one each time it is displayed, to suggest the saved passkeys under the email field. |
+| `MFA_STEPUP_MAX_AGE` | `300` | How long, in seconds, a re-authentication allows a user to change their second factors or pair the mobile app. |
+
+Passkeys only work on the origins you accept. Workspace pages (`*.pages` hosts) are deliberately excluded: they run content written by workspace builders, so a passkey used there could be relayed. Consoles served outside `WEBAUTHN_RP_ID` cannot offer passkeys either.
+
+#### Turn passkeys off again
+
+Removing `WEBAUTHN_RP_ID` disables passkeys but keeps them stored. An account that only holds passkeys then has no usable second factor: at its next sign-in, it can set up an authenticator app with its password alone. If you do not want that, [reset the MFA](#reset-a-users-mfa) of those accounts instead, so that they choose a new factor under your control.
 
 ### User experience
 
-The factor is requested **after** a valid password sign-in, before the app loads:
+The second factor is requested **after** a valid password sign-in, before the app loads.
 
-1. **First sign-in (enrollment)**: the user confirms their password, scans the displayed QR code (or enters the secret key manually) with their authenticator app, then enters the generated 6-digit code.
-2. **Subsequent sign-ins (challenge)**: the user enters the current 6-digit code from their authenticator app.
+1. **First sign-in**: a user without a second factor chooses **Create a passkey** (recommended) or **Use an authenticator app**. The passkey option only appears when passkeys are enabled and the browser supports them.
+2. **Next sign-ins**: the user confirms with their passkey, or enters the 6-digit code of their authenticator app. They can switch to the other method if it is set up.
+3. **Passwordless sign-in**: with passkeys enabled, the sign-in page offers **Sign in with a passkey**, and the browser suggests the saved passkeys under the email field. A passkey verified with Face ID, a fingerprint or the device PIN signs the user in without a password and without a second step.
 
-<Info>
-  **Existing local users are migrated lazily.** When you enable `MFA_FORCE_LOCAL`, current users are not locked out and no database migration is required; each user simply enrolls an authenticator on their next sign-in.
-</Info>
+A user can only set up a factor during sign-in if they have none yet. To add, rename or remove factors afterwards, they go to **Settings** > **Security** > **Sign-in methods**. Adding, removing or replacing a factor requires a recent re-authentication (a sign-in or a confirmation in the last 5 minutes). The user receives an email each time a factor is added or removed.
+
+When a second factor is mandatory, the last one cannot be removed: the user adds another method first.
+
+After 5 consecutive wrong authenticator codes during a re-authentication, codes are refused for 15 minutes.
+
+### Reset a user's MFA
+
+When a user has lost access to every second factor, a platform super admin resets their MFA from **AI Governance** > **Users**:
+
+1. Open the user's actions menu, then select **Reset MFA**.
+2. Enter the reason for the reset. It is required and kept in the audit log (`gateway.mfa.adminReset` event); it is not sent to the user.
+3. Confirm.
+
+All the user's passkeys and their authenticator app are removed. The user is notified by email and chooses a new second factor at their next sign-in. Super admins cannot reset their own MFA: ask another super admin.
 
 ### SSO + local on the same deployment
 
 The local/SSO distinction is based on whether the account has a **local password**:
 
-- A **pure SSO user** (created via an identity provider, no local password) is never prompted for TOTP.
-- A **local user** (password) must complete TOTP.
+- A **pure SSO user** (created via an identity provider, no local password) is never prompted for a Prisme.ai second factor, and cannot add passkeys: their sign-in security belongs to their identity provider.
+- A **local user** (password) must complete a second factor when `MFA_FORCE_LOCAL` is `true`.
 
 <Warning>
-  Do **not** configure an SSO provider with the slug `prismeai`. That slug is reserved for the built-in local (password) provider. An SSO provider named `prismeai` would make its users look like local accounts and force them into TOTP enrollment, which they cannot complete (enrollment requires the current password), resulting in a lockout. Use any other slug for federation (e.g. `prisme-saas`, `prisme-client`).
+  Some SSO provider slugs are reserved:
+
+  - `prismeai` is the built-in local (password) provider. An SSO provider named `prismeai` would make its users look like local accounts and force them into a second factor enrollment they cannot complete, locking them out.
+  - `pwd`, `otp`, `hwk`, `swk` and `mfa` are the authentication method values Prisme.ai records for passwords, codes and passkeys. The gateway refuses to create a provider with one of these slugs, and does not load an existing one: recreate it under another slug.
+
+  Use any other slug for federation (for example `prisme-saas` or `prisme-client`).
 </Warning>
 
 ## Custom Attribute Mapping
