@@ -1,0 +1,290 @@
+openapi: '3.0.3'
+info:
+  version: 1.0.0
+  title: Prompt Library API
+  description: |
+    REST API for the Prompt Library workspace - reusable prompt templates
+    and per-app showcase catalogs (demo agents displayed on an app home page).
+
+    Visibility: a caller sees the prompts and showcases of its own
+    organization plus the platform-wide entries (entries with no org).
+    The organization is always taken from the session and cannot be
+    overridden by the caller.
+
+    The same workspace also exposes an MCP (JSON-RPC 2.0 over HTTP) endpoint
+    at `/mcp` (`prompts/list`, `prompts/get`, `tools/list`, `tools/call`) so
+    agents can search and retrieve prompts as a tool. It follows the MCP
+    specification and is not modeled as REST here.
+  contact:
+    name: Prisme.ai
+    url: https://prisme.ai
+servers:
+  - url: https://{host}/v2/workspaces/slug:prompt-library/webhooks
+    description: Prisme.ai workspace webhooks
+    variables:
+      host:
+        default: api.studio.prisme.ai
+        description: API host (override for self-hosted or sandbox)
+security:
+  - BearerAuth: []
+  - OrgApiKeyAuth: []
+tags:
+  - name: Prompts
+    description: Prompt templates visible to the caller's organization.
+  - name: Showcases
+    description: Per-app showcase catalogs (demo agents).
+paths:
+  /v1/prompts:
+    get:
+      tags: [Prompts]
+      operationId: listPrompts
+      summary: List prompts
+      description: |
+        Returns the enabled prompts visible to the caller (its organization's
+        prompts plus platform-wide prompts), with page/limit pagination.
+        Each item carries the full prompt `content`, so no second call is
+        needed to use a prompt.
+      parameters:
+        - name: page
+          in: query
+          required: false
+          description: Zero-based page index.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          description: Page size. Values above 100 are capped to 100.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: agent_id
+          in: query
+          required: false
+          description: Only return prompts scoped to this agent.
+          schema:
+            type: string
+          example: agent-abc
+        - name: category
+          in: query
+          required: false
+          description: Only return prompts of this category.
+          schema:
+            type: string
+          example: write
+      responses:
+        '200':
+          description: Page of prompts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromptListResponse'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/showcases:
+    get:
+      tags: [Showcases]
+      operationId: getShowcase
+      summary: Get the showcase catalog of an app
+      description: |
+        Returns the showcase bundle for the given app. The caller's
+        organization bundle is returned when it exists, otherwise the
+        platform-wide bundle. The response is the stored bundle with
+        `version` and `app` added at the top level.
+      parameters:
+        - name: app
+          in: query
+          required: true
+          description: App identifier.
+          schema:
+            type: string
+            maxLength: 64
+          example: secure-chat
+      responses:
+        '200':
+          description: Showcase bundle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShowcaseBundle'
+        '400':
+          description: Missing `app` query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No showcase bundle for this app.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        User-bound credential carrying an identity: either a session JWT
+        or a user access token (`at:*`) generated from the user settings UI.
+        Send as `Authorization: Bearer <token>`.
+    OrgApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-prismeai-api-key
+      description: |
+        Organization API key (`iak_{orgSlug}_{uuid}`), not tied to a user
+        identity. The organization of the key scopes what is visible.
+        Send as `x-prismeai-api-key: iak_...`.
+  schemas:
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Stable error code (e.g. UNAUTHORIZED, VALIDATION_ERROR, NOT_FOUND).
+        message:
+          type: string
+          description: Human-readable error message.
+    PromptArgument:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        required:
+          type: boolean
+    Prompt:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Unique slug identifier (letters, digits, hyphens, underscores).
+          example: write-executive-summary
+        title:
+          type: string
+          description: Human-readable display title.
+          example: Executive summary
+        description:
+          type: string
+          nullable: true
+          description: Short description of what the prompt does.
+        category:
+          type: string
+          nullable: true
+          description: Prompt category (e.g. write, learn, code, coach, brainstorm).
+          example: write
+        tags:
+          type: array
+          nullable: true
+          items:
+            type: string
+        content:
+          type: string
+          description: Prompt template text, with `{{arg_name}}` placeholders.
+        arguments:
+          type: array
+          nullable: true
+          description: Arguments the template accepts.
+          items:
+            $ref: '#/components/schemas/PromptArgument'
+        tool_choice:
+          type: string
+          nullable: true
+          description: Tool the LLM should be forced to use with this prompt.
+        suggested_tools:
+          type: array
+          nullable: true
+          description: Tools that work well with this prompt.
+          items:
+            type: string
+        agent_id:
+          type: string
+          nullable: true
+          description: Agent scope. Null for a prompt available to every agent.
+        orgSlug:
+          type: string
+          nullable: true
+          description: Organization scope. Null for a platform-wide prompt.
+        enabled:
+          type: boolean
+          description: Whether the prompt is active. Only enabled prompts are listed.
+    PromptListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Prompt'
+        total:
+          type: integer
+          description: Total number of matching prompts.
+        page:
+          type: integer
+        limit:
+          type: integer
+      example:
+        items:
+          - name: write-executive-summary
+            title: Executive summary
+            description: Turn a long document into a one-page summary.
+            category: write
+            tags: [summary]
+            content: 'Summarize the following text for an executive audience: {{text}}'
+            arguments:
+              - name: text
+                description: Text to summarize
+                required: true
+            tool_choice: null
+            suggested_tools: null
+            agent_id: null
+            orgSlug: null
+            enabled: true
+        total: 1
+        page: 0
+        limit: 20
+    ShowcaseBundle:
+      type: object
+      description: |
+        App-specific catalog. Only `version` and `app` are set by the
+        endpoint; the rest of the object is the stored bundle, whose shape is
+        decided by each app (for secure-chat: an `agents` array).
+      additionalProperties: true
+      properties:
+        version:
+          type: integer
+          example: 1
+        app:
+          type: string
+          example: secure-chat
+        agents:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      example:
+        version: 1
+        app: secure-chat
+        agents:
+          - id: demo-agent-analyst
+            name: Regulatory Analyst
+            description: Monitors regulatory updates and drafts impact notes.
+            status: published
+            tags: [compliance]

@@ -1,0 +1,417 @@
+openapi: '3.0.3'
+info:
+  version: 1.0.0
+  title: Capabilities API
+  description: |
+    REST API for the Capabilities workspace - the catalog of capabilities an
+    agent can be equipped with: MCP servers, guardrails, knowledge search,
+    functions, skills, sub-agents and memory.
+
+    The catalog holds two kinds of entries:
+    - **Built-in** entries (`built_in: true`), maintained by the platform and
+      visible to every organization. They cannot be modified or deleted.
+    - **Custom** entries, created by an organization and visible to that
+      organization only.
+
+    Reads are open to any authenticated member of the organization. Writes
+    (create, update, delete) require the `write` permission on the catalog,
+    which in practice only the organization Owner holds.
+
+    Authentication: these endpoints resolve the caller from its user identity,
+    so they require a user-bound credential (`Authorization: Bearer`). Org API
+    keys carry no user identity and are rejected with `401`.
+  contact:
+    name: Prisme.ai
+    url: https://prisme.ai
+servers:
+  - url: https://{host}/v2/workspaces/slug:capabilities/webhooks
+    description: Prisme.ai workspace webhooks
+    variables:
+      host:
+        default: api.studio.prisme.ai
+        description: API host (override for self-hosted or sandbox)
+security:
+  - BearerAuth: []
+tags:
+  - name: Catalog
+    description: List, create, read, update and delete catalog entries.
+paths:
+  /v1/servers:
+    get:
+      tags: [Catalog]
+      operationId: listCatalogEntries
+      summary: List catalog entries
+      description: |
+        Returns the built-in entries plus the caller organization's custom
+        entries, sorted by `type` then `name`.
+      parameters:
+        - name: type
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/CatalogEntryType'
+        - name: category
+          in: query
+          required: false
+          description: Filter by category (e.g. `crm`, `security`, `knowledge`).
+          schema:
+            type: string
+          example: productivity
+        - name: knowledge_compatible
+          in: query
+          required: false
+          description: Only entries whose MCP server was detected as Knowledge-compatible (`true`) or not (`false`).
+          schema:
+            type: boolean
+        - name: search
+          in: query
+          required: false
+          description: Case-insensitive match on `name`, `display_name` or `description`.
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          description: One-based page index.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 20
+      responses:
+        '200':
+          description: Page of catalog entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogEntryListResponse'
+        '401':
+          description: Authentication required.
+    post:
+      tags: [Catalog]
+      operationId: createCatalogEntry
+      summary: Create a custom catalog entry
+      description: |
+        Creates a custom entry owned by the caller's organization. Requires
+        the `write` permission on the catalog (organization Owner).
+
+        For `mcp` entries, the MCP server declared in `config_schema` is
+        probed for Knowledge compatibility and the `knowledge_*` fields are
+        filled in. A failed probe never fails the creation: the entry is
+        stored as not compatible, with the reason in
+        `knowledge_discovery_error`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogEntryCreate'
+            example:
+              name: Ticketing
+              display_name: Ticketing MCP
+              description: Create and search support tickets.
+              type: mcp
+              category: productivity
+              config_schema:
+                type: object
+                properties:
+                  server:
+                    type: string
+                    title: Server URL
+                    default: https://mcp.example.com/mcp
+      responses:
+        '200':
+          description: Entry created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogEntryCreated'
+        '400':
+          description: Missing `name` or `type`, or invalid `type`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication required.
+        '403':
+          description: Caller lacks the `write` permission on the catalog.
+  /v1/servers/{serverId}:
+    parameters:
+      - name: serverId
+        in: path
+        required: true
+        description: Catalog entry id.
+        schema:
+          type: string
+        example: template-custom-mcp
+    get:
+      tags: [Catalog]
+      operationId: getCatalogEntry
+      summary: Get a catalog entry
+      description: Returns a built-in entry or a custom entry of the caller's organization.
+      responses:
+        '200':
+          description: Catalog entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogEntry'
+        '401':
+          description: Authentication required.
+        '404':
+          description: Entry not found or not visible to the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      tags: [Catalog]
+      operationId: updateCatalogEntry
+      summary: Update a custom catalog entry
+      description: |
+        Updates the fields present in the body (empty values are ignored).
+        Only custom entries of the caller's organization can be updated, and
+        the `write` permission on the catalog is required. For `mcp` entries,
+        Knowledge compatibility is probed again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogEntryUpdate'
+            example:
+              description: Create, search and close support tickets.
+      responses:
+        '200':
+          description: Updated entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogEntry'
+        '401':
+          description: Authentication required.
+        '403':
+          description: Built-in entry, entry of another organization, or missing `write` permission.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Entry not found or not visible to the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [Catalog]
+      operationId: deleteCatalogEntry
+      summary: Delete a custom catalog entry
+      description: Only custom entries of the caller's organization can be deleted, and the `write` permission on the catalog is required.
+      responses:
+        '200':
+          description: Entry deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+                    example: true
+        '401':
+          description: Authentication required.
+        '403':
+          description: Built-in entry, entry of another organization, or missing `write` permission.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Entry not found or not visible to the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        User-bound credential carrying an identity: either a session JWT
+        or a user access token (`at:*`) generated from the user settings UI.
+        Send as `Authorization: Bearer <token>`.
+  schemas:
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+        code:
+          type: string
+          description: Stable error code (e.g. VALIDATION_ERROR, NOT_FOUND, FORBIDDEN).
+    CatalogEntryType:
+      type: string
+      enum: [mcp, guardrail, file_search, function, skill, sub_agent, memory]
+    CatalogEntryWritable:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Technical name. Also used to build the entry id on creation.
+        display_name:
+          type: string
+        description:
+          type: string
+        icon_url:
+          type: string
+        version:
+          type: string
+        documentation_url:
+          type: string
+        category:
+          type: string
+          description: Category within the type (e.g. `crm`, `communication`, `security`, `knowledge`).
+        auth:
+          type: object
+          additionalProperties: true
+          description: Authentication settings of the capability.
+        tools:
+          type: array
+          description: Tools exposed by the capability.
+          items:
+            type: object
+            additionalProperties: true
+        config_schema:
+          type: object
+          additionalProperties: true
+          description: |
+            JSON Schema of the per-agent configuration form. For `mcp` entries,
+            `properties.server.default` holds the MCP server URL.
+    CatalogEntryCreate:
+      allOf:
+        - $ref: '#/components/schemas/CatalogEntryWritable'
+        - type: object
+          required: [name, type]
+          properties:
+            type:
+              $ref: '#/components/schemas/CatalogEntryType'
+            guardrail_type:
+              type: string
+              description: Guardrail kind, for `guardrail` entries.
+            memory_type:
+              type: string
+              description: Memory kind, for `memory` entries.
+    CatalogEntryUpdate:
+      allOf:
+        - $ref: '#/components/schemas/CatalogEntryWritable'
+        - type: object
+          properties:
+            agent_tools:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+    CatalogEntryCreated:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Generated id, `<type>-<name slug>-<unique suffix>`.
+        name:
+          type: string
+        type:
+          $ref: '#/components/schemas/CatalogEntryType'
+        createdAt:
+          type: string
+          format: date-time
+    CatalogEntry:
+      allOf:
+        - $ref: '#/components/schemas/CatalogEntryWritable'
+        - type: object
+          properties:
+            id:
+              type: string
+            type:
+              $ref: '#/components/schemas/CatalogEntryType'
+            guardrail_type:
+              type: string
+              nullable: true
+            memory_type:
+              type: string
+              nullable: true
+            built_in:
+              type: boolean
+              description: True for platform-maintained entries.
+            orgSlug:
+              type: string
+              nullable: true
+              description: Owning organization of a custom entry.
+            knowledge_compatible:
+              type: boolean
+              nullable: true
+              description: Whether the MCP server can be used as a Knowledge source. Null when never probed.
+            knowledge_features:
+              type: object
+              nullable: true
+              additionalProperties: true
+            knowledge_profile:
+              type: object
+              nullable: true
+              additionalProperties: true
+            knowledge_checked_at:
+              type: string
+              format: date-time
+              nullable: true
+            knowledge_discovery_error:
+              type: object
+              nullable: true
+              properties:
+                code:
+                  type: string
+                message:
+                  type: string
+            createdAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+      example:
+        id: template-file-search
+        name: knowledge_base
+        display_name: Knowledge Base
+        description: Search through your knowledge bases using vector similarity.
+        type: file_search
+        category: knowledge
+        built_in: true
+        config_schema:
+          type: object
+          properties:
+            vector_store_id:
+              type: string
+              title: Knowledge Base
+          required: [vector_store_id]
+    CatalogEntryListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CatalogEntry'
+        total:
+          type: integer
+        page:
+          type: integer
+        limit:
+          type: integer

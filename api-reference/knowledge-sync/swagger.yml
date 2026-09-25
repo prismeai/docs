@@ -1,0 +1,1097 @@
+openapi: '3.0.3'
+info:
+  version: 1.0.0
+  title: Knowledge Connectors API
+  description: |
+    REST API behind the Connectors section of the Knowledge app - connect an
+    external source exposed by an MCP connector (for example SharePoint or
+    Google Drive) to a knowledge base, pick what to import, and keep it in
+    sync.
+    Powered by Prisme.ai's runtime; all endpoints are exposed under the
+    `knowledge-sync` workspace's webhook namespace.
+
+    **Connectors.** A connection points either at a Knowledge-compatible
+    entry of the organization's capabilities catalog (`capability_id`, listed
+    by `GET /v1/providers`), or directly at an MCP server URL
+    (`connector.server`), which must first pass `POST /v1/connectors/probe`.
+    Compatibility and visibility are re-checked on every use.
+
+    **Synchronization.** A connection with a non-empty `config.selection`
+    (canonical MCP Resource URIs, picked with the `resources` endpoints) and
+    a `vector_store_id` (the target knowledge base) starts its first sync
+    automatically, then syncs on its `sync_schedule` or on demand with
+    `POST /v1/connections/{connectionId}/sync`. Synced documents land in the
+    knowledge base (see the Storage API) tagged with the connection ID.
+
+    **Identity.** Connections belong to the calling user within their
+    current organization; every endpoint requires a user identity (session
+    JWT or user access token). Organization API keys carry no user identity
+    and are refused with `401`.
+  contact:
+    name: Prisme.ai
+    url: https://prisme.ai
+servers:
+  - url: https://{host}/v2/workspaces/slug:knowledge-sync/webhooks
+    description: Prisme.ai workspace webhooks
+    variables:
+      host:
+        default: api.studio.prisme.ai
+        description: API host (override for self-hosted or sandbox)
+security:
+  - BearerAuth: []
+tags:
+  - name: Providers
+    description: Knowledge-compatible connectors the caller may use, and pre-flight checks for a custom MCP server.
+  - name: Connections
+    description: Connection CRUD (connector, knowledge base, selection, schedule, access control).
+  - name: Resources
+    description: Browse the connector's resource tree to build a selection.
+  - name: Auth
+    description: Per-connection OAuth account status, connect and disconnect.
+  - name: Sync
+    description: Trigger a synchronization and follow its runs.
+paths:
+  /v1/providers:
+    get:
+      tags: [Providers]
+      operationId: listProviders
+      summary: List Knowledge-compatible connectors
+      description: |
+        Capabilities catalog entries of type MCP marked Knowledge-compatible
+        and visible to the caller (built-in or published in the caller's
+        organization). Endpoints, headers and auth URLs are never returned.
+      responses:
+        '200':
+          description: Available connectors.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Provider'
+                  object:
+                    type: string
+                    example: list
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: The capabilities catalog is not available (`MCP_NOT_AVAILABLE`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/connectors/probe:
+    post:
+      tags: [Providers]
+      operationId: probeConnectorServer
+      summary: Check an MCP server before connecting it
+      description: |
+        Answers two separate questions about an MCP server URL, without
+        creating anything: is it Knowledge-compatible, and may the caller
+        read it. Verdicts are returned with `200`; `reason` tells a server
+        that is not a Knowledge connector (`not_compatible`) from one that
+        refused the caller (`not_authorized`, MCP error -32001 or -32003) or
+        failed to answer (`not_reachable`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [server]
+              properties:
+                server:
+                  type: string
+                  description: MCP server URL (Streamable HTTP).
+                  example: https://api.studio.prisme.ai/v2/workspaces/slug:my-connector/webhooks/mcp
+      responses:
+        '200':
+          description: Probe verdict.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProbeResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /v1/connections:
+    get:
+      tags: [Connections]
+      operationId: listConnections
+      summary: List my connections
+      description: The caller's connections in the current organization, newest first (up to 100).
+      parameters:
+        - name: capability_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Only connections to this connector.
+      responses:
+        '200':
+          description: The caller's connections.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Connection'
+                  object:
+                    type: string
+                    example: list
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Connections]
+      operationId: createConnection
+      summary: Create a connection
+      description: |
+        Give either `capability_id` (a catalog connector) or
+        `connector.server` (a custom MCP server), never both. A custom server
+        is probed for compatibility, then read once with the caller's
+        identity: only a caller allowed to read it can attach it. Its
+        connection gets `capability_id: conn:<connection id>`.
+
+        Access control (`accessControl.enabled`) defaults to `true` when the
+        connector can check per-user access to a document, `false` otherwise.
+        When the body already has a selection and a knowledge base, the first
+        sync is queued immediately.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnectionRequest'
+            example:
+              capability_id: sharepoint-next
+              name: Team handbook
+              config:
+                auth_mode: service_account
+      responses:
+        '201':
+          description: Connection created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /v1/connections/{connectionId}:
+    get:
+      tags: [Connections]
+      operationId: getConnection
+      summary: Get a connection
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Connection ID.
+          example: conn_abc123
+      responses:
+        '200':
+          description: The connection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Connections]
+      operationId: updateConnection
+      summary: Update a connection
+      description: |
+        Only the fields sent change; `config`, `sync_schedule` and
+        `accessControl` are merged into the stored values. The connector is
+        re-checked first, and `capability_id` cannot change. When the update
+        makes a draft connection ready (selection and knowledge base both
+        set for the first time), its first sync is queued.
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Connection ID.
+          example: conn_abc123
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateConnectionRequest'
+            example:
+              vector_store_id: kb_abc123
+              config:
+                selection:
+                  - sharepoint://site/site-abc/drive/drive-abc
+                selection_label: Handbook
+              sync_schedule:
+                enabled: true
+                interval: daily
+      responses:
+        '200':
+          description: The updated connection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Connections]
+      operationId: deleteConnection
+      summary: Delete a connection
+      description: |
+        Deletes the connection and the documents it imported into its
+        knowledge base. Always possible, even when the connector is no longer
+        available. Storage cleanup is skipped when the caller no longer owns
+        the knowledge base.
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Connection ID.
+          example: conn_abc123
+      responses:
+        '200':
+          description: Connection deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+                    example: true
+                  id:
+                    type: string
+                    example: conn_abc123
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          description: Storage refused the document cleanup (`STORAGE_ERROR`); the connection is kept.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/connections/{connectionId}/resources:
+    get:
+      tags: [Resources]
+      operationId: listRootResources
+      summary: Browse top-level resources
+      description: Top-level resources of the connector (for example sites or drives), as seen by the caller.
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Connection ID.
+          example: conn_abc123
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/ResourceLimit'
+        - name: query
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Search text, forwarded to the connector.
+      responses:
+        '200':
+          description: A page of resources.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResourceList'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '502':
+          $ref: '#/components/responses/McpError'
+  /v1/connections/{connectionId}/resources/{resourceId}:
+    get:
+      tags: [Resources]
+      operationId: listChildResources
+      summary: Browse the children of a resource
+      description: |
+        Children of a parent resource. Resource URIs contain slashes, which
+        do not survive in a path segment: send any placeholder as
+        `resourceId` (for example `_`) and the parent URI in the
+        `resource_id` query parameter, which takes precedence.
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Connection ID.
+          example: conn_abc123
+        - name: resourceId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Parent resource URI, or a placeholder when `resource_id` is sent in the query.
+          example: _
+        - name: resource_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Parent resource URI. Overrides the path segment.
+          example: sharepoint://site/site-abc/drive/drive-abc
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/ResourceLimit'
+      responses:
+        '200':
+          description: A page of child resources.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResourceList'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '502':
+          $ref: '#/components/responses/McpError'
+  /v1/connections/{connectionId}/auth:
+    get:
+      tags: [Auth]
+      operationId: getConnectionAuthStatus
+      summary: Get the connection's account status
+      description: |
+        Whether an account is connected for this connection. A connector
+        without OAuth (or a custom MCP server) reports
+        `has_credentials: true` and `has_oauth: false`.
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Connection ID.
+          example: conn_abc123
+      responses:
+        '200':
+          description: Account status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Auth]
+      operationId: manageConnectionAuth
+      summary: Connect or disconnect the connection's account
+      description: |
+        `connect` returns the connector's OAuth URL to open in a browser
+        window; the account is bound to this connection only.
+        `disconnect` revokes that binding without touching the accounts the
+        user connected for other uses. Both answer `AUTH_NOT_CONFIGURED`
+        (400) when the connector has no OAuth.
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Connection ID.
+          example: conn_abc123
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [connect, disconnect]
+      responses:
+        '200':
+          description: Action result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthActionResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: Authentication required, or the connector refused the disconnect (`AUTH_FAILED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/connections/{connectionId}/sync:
+    get:
+      tags: [Sync]
+      operationId: getSyncStatus
+      summary: Get sync status, or one sync run
+      description: |
+        Without `sync_id`: the connection's sync status, its 5 most recent
+        runs (without their document lists) and the number of documents it
+        holds in the knowledge base (`document_count`, an empty string when
+        Storage cannot tell). With `sync_id`: that single run, including the
+        documents it indexed, updated and deleted.
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Connection ID.
+          example: conn_abc123
+        - name: sync_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Return this run only.
+      responses:
+        '200':
+          description: Sync status, or the requested run.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/SyncStatus'
+                  - $ref: '#/components/schemas/SyncRun'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Sync]
+      operationId: triggerSync
+      summary: Start a sync
+      description: |
+        Queues a sync run and returns immediately. A large source is imported
+        in bounded batches that chain automatically until nothing is left.
+        Refused while a run started less than the stale-sync timeout ago is
+        still in progress (`SYNC_IN_PROGRESS`, 409), and when the connection
+        has no selection or no knowledge base (`SYNC_NOT_CONFIGURED`, 400).
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Connection ID.
+          example: conn_abc123
+      responses:
+        '202':
+          description: Sync queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sync_id:
+                    type: string
+                    example: run_abc123
+                  status:
+                    type: string
+                    example: pending
+                  connection_id:
+                    type: string
+                    example: conn_abc123
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: A sync is already in progress (`SYNC_IN_PROGRESS`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        User-bound credential carrying an identity: either a session JWT
+        or a user access token (`at:*`) generated from the user settings UI.
+        Send as `Authorization: Bearer <token>`.
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+      description: '`next_cursor` of the previous page.'
+    ResourceLimit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+      description: Page size, forwarded to the connector.
+  responses:
+    Unauthorized:
+      description: Authentication required.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Authentication required
+            code: UNAUTHORIZED
+            status: 401
+    Forbidden:
+      description: The caller may not use this knowledge base or MCP server (`FORBIDDEN`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Connection or sync run not found (`CONNECTION_NOT_FOUND`, `SYNC_RUN_NOT_FOUND`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Connection not found
+            code: CONNECTION_NOT_FOUND
+            status: 404
+    ValidationError:
+      description: |
+        Invalid request: `VALIDATION_ERROR`, `INVALID_CAPABILITY` (unknown,
+        not visible or not Knowledge-compatible connector),
+        `INVALID_AUTH_MODE`, `INVALID_SYNC_INTERVAL`, `SYNC_NOT_CONFIGURED`
+        or `AUTH_NOT_CONFIGURED`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Provide either capability_id or connector.server, not both
+            code: VALIDATION_ERROR
+            status: 400
+    MethodNotAllowed:
+      description: Method not allowed on this path.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    McpError:
+      description: The connector returned an error (`MCP_ERROR`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+        code:
+          type: string
+          description: Stable SNAKE_CASE error code.
+        status:
+          type: integer
+          description: HTTP status, repeated in the body.
+        details:
+          type: object
+          additionalProperties: true
+    LocalizedText:
+      type: object
+      properties:
+        fr:
+          type: string
+        en:
+          type: string
+    Provider:
+      type: object
+      properties:
+        capability_id:
+          type: string
+          description: Catalog ID, used as `capability_id` when creating a connection.
+          example: sharepoint-next
+        slug:
+          type: string
+          description: Same value as `capability_id`.
+        appType:
+          type: string
+          description: Provider family declared by the connector.
+          example: sharepoint
+        name:
+          $ref: '#/components/schemas/LocalizedText'
+        icon:
+          type: string
+        description:
+          $ref: '#/components/schemas/LocalizedText'
+        version:
+          type: string
+        auth:
+          type: object
+          properties:
+            mode:
+              type: string
+              description: Auth type of the connector (for example `oauth2`).
+            needsConnect:
+              type: boolean
+              description: The user must connect an account before browsing.
+        resourceTree:
+          type: object
+          properties:
+            levels:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  label:
+                    $ref: '#/components/schemas/LocalizedText'
+                  recursive:
+                    type: boolean
+            selectable:
+              type: array
+              items:
+                type: string
+        capabilities:
+          type: object
+          additionalProperties: true
+          description: Knowledge features. `delegatedAccessCheck` is `live` when the connector can check a user's access to a document.
+          example:
+            delegatedAccessCheck: live
+        fileTypes:
+          type: array
+          items:
+            type: string
+        available:
+          type: boolean
+    ProbeResult:
+      type: object
+      properties:
+        compatible:
+          type: boolean
+        authorized:
+          type: boolean
+        reason:
+          type: string
+          enum: [not_compatible, not_reachable, not_authorized]
+          description: Set when `authorized` is `false`.
+        provider:
+          type: string
+        hierarchy:
+          type: array
+          items:
+            type: string
+        resource_access:
+          type: string
+          description: Resource access model declared by the connector.
+        delegated_access_check:
+          type: boolean
+          description: The connector can check a user's access to a document.
+        error:
+          type: object
+          additionalProperties: true
+          description: Upstream detail when the probe failed.
+    ConnectionConfig:
+      type: object
+      properties:
+        auth_mode:
+          type: string
+          enum: [service_account, delegated]
+          default: service_account
+        selection:
+          type: array
+          description: Canonical MCP Resource URIs to sync (`scheme://...`).
+          items:
+            type: string
+          example:
+            - sharepoint://site/site-abc/drive/drive-abc
+        selection_label:
+          type: string
+          maxLength: 300
+          description: Display name of the selection. Display only.
+    SyncSchedule:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+          default: false
+        interval:
+          type: string
+          enum: [hourly, every_6h, every_12h, daily]
+          default: daily
+    AccessControl:
+      type: object
+      description: Per-user access check on search results, performed by the connector.
+      properties:
+        enabled:
+          type: boolean
+        mode:
+          type: string
+          default: oauthCentral
+    CreateConnectionRequest:
+      type: object
+      required: [name]
+      properties:
+        capability_id:
+          type: string
+          description: Catalog connector ID. Mutually exclusive with `connector.server`.
+        connector:
+          type: object
+          properties:
+            server:
+              type: string
+              description: MCP server URL. Mutually exclusive with `capability_id`.
+        name:
+          type: string
+        config:
+          $ref: '#/components/schemas/ConnectionConfig'
+        vector_store_id:
+          type: string
+          description: Target knowledge base. The caller must be allowed to write to it.
+        sync_schedule:
+          $ref: '#/components/schemas/SyncSchedule'
+        accessControl:
+          $ref: '#/components/schemas/AccessControl'
+    UpdateConnectionRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        config:
+          $ref: '#/components/schemas/ConnectionConfig'
+        vector_store_id:
+          type: string
+        sync_schedule:
+          $ref: '#/components/schemas/SyncSchedule'
+        status:
+          type: string
+        accessControl:
+          $ref: '#/components/schemas/AccessControl'
+    SyncResult:
+      type: object
+      properties:
+        total:
+          type: integer
+        processed:
+          type: integer
+        indexed:
+          type: integer
+        updated:
+          type: integer
+        unchanged:
+          type: integer
+        deleted:
+          type: integer
+        failed:
+          type: integer
+        deferred:
+          type: integer
+          description: Files left for the next batch.
+        still_indexing:
+          type: integer
+        traversal_complete:
+          type: boolean
+        errors:
+          type: array
+          items:
+            type: string
+    SyncProgress:
+      type: object
+      properties:
+        total:
+          type: integer
+        processed:
+          type: integer
+        indexed:
+          type: integer
+        updated:
+          type: integer
+        unchanged:
+          type: integer
+        deleted:
+          type: integer
+        failed:
+          type: integer
+    Connection:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: conn_abc123
+        owner_id:
+          type: string
+          example: user-123
+        org_slug:
+          type: string
+          example: acme-corp
+        capability_id:
+          type: string
+          description: Catalog connector ID, or `conn:<connection id>` for a custom MCP server.
+          example: sharepoint-next
+        name:
+          type: string
+          example: Team handbook
+        config:
+          $ref: '#/components/schemas/ConnectionConfig'
+        accessControl:
+          $ref: '#/components/schemas/AccessControl'
+        vector_store_id:
+          type: string
+          nullable: true
+          example: kb_abc123
+        sync_schedule:
+          $ref: '#/components/schemas/SyncSchedule'
+        status:
+          type: string
+          enum: [active, syncing, error, disconnected]
+          description: '`disconnected` means the connector lost access to the account; reconnect it.'
+        last_sync:
+          type: object
+          nullable: true
+          properties:
+            run_id:
+              type: string
+            started_at:
+              type: string
+              format: date-time
+            completed_at:
+              type: string
+              format: date-time
+            result:
+              $ref: '#/components/schemas/SyncResult'
+        connector:
+          type: object
+          nullable: true
+          description: Set for a connection to a custom MCP server.
+          properties:
+            server:
+              type: string
+        knowledge_compatible:
+          type: boolean
+          nullable: true
+        knowledge_profile:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Knowledge profile recorded when a custom MCP server was probed.
+        knowledge_checked_at:
+          type: string
+          nullable: true
+        sync_state:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Internal incremental-sync state.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    Resource:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Canonical resource URI. Use it in `config.selection`.
+          example: sharepoint://site/site-abc/drive/drive-abc
+        type:
+          type: string
+          description: Resource kind, or its MIME type when the connector sends no kind.
+        name:
+          type: string
+          example: Documents
+        kind:
+          type: string
+          example: drive
+        has_children:
+          type: boolean
+        child_count:
+          type: integer
+          nullable: true
+        selectable:
+          type: boolean
+          description: Can be used as a sync root (any non-file resource).
+    ResourceList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Resource'
+        object:
+          type: string
+          example: list
+        has_more:
+          type: boolean
+        next_cursor:
+          type: string
+          nullable: true
+    AuthStatus:
+      type: object
+      properties:
+        connection_id:
+          type: string
+        auth_mode:
+          type: string
+          enum: [service_account, delegated]
+        has_oauth:
+          type: boolean
+          description: An account is connected for this connection.
+        has_credentials:
+          type: boolean
+          description: '`true` when the connector needs no account.'
+        oauth_expires_at:
+          type: string
+          description: Token expiry, when the connector reports it.
+    AuthActionResult:
+      type: object
+      properties:
+        action:
+          type: string
+          enum: [connect, disconnect]
+        redirect_url:
+          type: string
+          description: OAuth URL to open (`connect` only).
+        connection_id:
+          type: string
+        success:
+          type: boolean
+          description: '`disconnect` only.'
+    SyncRunSummary:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: run_abc123
+        connection_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, completed, partial, failed]
+          description: '`partial` means some documents failed or were deferred to a later batch.'
+        progress:
+          $ref: '#/components/schemas/SyncProgress'
+        result:
+          $ref: '#/components/schemas/SyncResult'
+        error:
+          type: string
+          nullable: true
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+    SyncDocumentRef:
+      type: object
+      properties:
+        name:
+          type: string
+        uri:
+          type: string
+    SyncRun:
+      allOf:
+        - $ref: '#/components/schemas/SyncRunSummary'
+        - type: object
+          properties:
+            owner_id:
+              type: string
+            documents:
+              type: object
+              nullable: true
+              properties:
+                indexed:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/SyncDocumentRef'
+                updated:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/SyncDocumentRef'
+                deleted:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/SyncDocumentRef'
+                truncated:
+                  type: boolean
+                  description: The lists were capped.
+    SyncStatus:
+      type: object
+      properties:
+        connection_id:
+          type: string
+        status:
+          type: string
+          enum: [active, syncing, error, disconnected]
+        last_sync:
+          type: object
+          additionalProperties: true
+        sync_schedule:
+          $ref: '#/components/schemas/SyncSchedule'
+        recent_runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncRunSummary'
+        document_count:
+          oneOf:
+            - type: integer
+            - type: string
+              enum: ['']
+          description: Documents this connection holds in the knowledge base. Empty string when Storage cannot tell.

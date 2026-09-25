@@ -1,0 +1,906 @@
+openapi: '3.0.3'
+info:
+  version: 1.0.0
+  title: Agent Evaluations API
+  description: |
+    REST API for the Agent Evaluations workspace - test cases attached to an
+    Agent Factory agent, evaluation runs that replay them against the agent,
+    and per-case results scored by an LLM judge.
+
+    A run is asynchronous: `POST /v1/eval/runs` returns a `pending` run
+    immediately, then poll `GET /v1/eval/runs/{runId}` until its status is
+    `completed`, `failed` or `cancelled`. A case passes when its score
+    reaches the workspace pass threshold (70 by default).
+
+    Authentication: the caller is resolved from its user identity, so a
+    user-bound credential (`Authorization: Bearer`) is expected.
+  contact:
+    name: Prisme.ai
+    url: https://prisme.ai
+servers:
+  - url: https://{host}/v2/workspaces/slug:agent-evaluations/webhooks
+    description: Prisme.ai workspace webhooks
+    variables:
+      host:
+        default: api.studio.prisme.ai
+        description: API host (override for self-hosted or sandbox)
+security:
+  - BearerAuth: []
+tags:
+  - name: Test Cases
+    description: Test cases of an agent (CRUD, bulk delete, import, export).
+  - name: Runs
+    description: Evaluation runs and their per-case results.
+paths:
+  /v1/eval/cases:
+    get:
+      tags: [Test Cases]
+      operationId: listTestCases
+      summary: List test cases of an agent
+      description: Returns the test cases of an agent, most recent first.
+      parameters:
+        - $ref: '#/components/parameters/AgentIdQueryRequired'
+        - name: enabled
+          in: query
+          required: false
+          description: Only enabled (`true`) or disabled (`false`) cases.
+          schema:
+            type: boolean
+        - name: tags
+          in: query
+          required: false
+          description: Comma-separated tags. Returns cases carrying at least one of them.
+          schema:
+            type: string
+          example: critical,regression
+        - name: page
+          in: query
+          required: false
+          description: One-based page index.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 50
+      responses:
+        '200':
+          description: Page of test cases.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestCaseListResponse'
+    post:
+      tags: [Test Cases]
+      operationId: createTestCase
+      summary: Create a test case
+      description: Creates an enabled test case for an agent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TestCaseCreate'
+            example:
+              agent_id: agent-abc
+              input: What are your opening hours?
+              expected_output: We are open from 9am to 6pm, Monday to Friday.
+              criteria: [accurate, concise]
+              tags: [faq]
+      responses:
+        '200':
+          description: Created test case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestCase'
+        '400':
+          description: Missing `agent_id` or `input`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [Test Cases]
+      operationId: deleteTestCases
+      summary: Bulk delete test cases of an agent
+      description: |
+        Deletes the test cases of an agent. Without filter, every case of the
+        agent is deleted. `tags` and `ids` narrow the deletion.
+      parameters:
+        - $ref: '#/components/parameters/AgentIdQueryRequired'
+        - name: tags
+          in: query
+          required: false
+          description: Comma-separated tags. Only cases carrying one of them are deleted.
+          schema:
+            type: string
+        - name: ids
+          in: query
+          required: false
+          description: Comma-separated case ids. Only these cases are deleted.
+          schema:
+            type: string
+          example: case_abc123,case_def456
+      responses:
+        '200':
+          description: Deletion result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted_count:
+                    type: integer
+                  agent_id:
+                    type: string
+        '400':
+          description: Missing `agent_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/eval/cases/{caseId}:
+    parameters:
+      - name: caseId
+        in: path
+        required: true
+        schema:
+          type: string
+        example: case_abc123
+    get:
+      tags: [Test Cases]
+      operationId: getTestCase
+      summary: Get a test case
+      responses:
+        '200':
+          description: Test case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestCase'
+        '404':
+          description: Test case not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      tags: [Test Cases]
+      operationId: updateTestCase
+      summary: Update a test case
+      description: |
+        Updates the fields present in the body. `agent_id` cannot be changed.
+        A case whose `enabled` flag was never set is re-enabled on update.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TestCaseFields'
+            example:
+              expected_output: We are open from 9am to 7pm, Monday to Saturday.
+              enabled: true
+      responses:
+        '200':
+          description: Updated test case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestCase'
+        '404':
+          description: Test case not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [Test Cases]
+      operationId: deleteTestCase
+      summary: Delete a test case
+      responses:
+        '200':
+          description: Test case deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+                    example: true
+                  id:
+                    type: string
+        '404':
+          description: Test case not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/eval/cases/import:
+    post:
+      tags: [Test Cases]
+      operationId: importTestCases
+      summary: Replace the test cases of an agent
+      description: |
+        Replaces **all** existing test cases of the agent with the given
+        list. Entries without `input` are skipped. If no entry is valid,
+        nothing is deleted and `400` is returned.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id, cases]
+              properties:
+                agent_id:
+                  type: string
+                cases:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/TestCaseFields'
+            example:
+              agent_id: agent-abc
+              cases:
+                - input: What are your opening hours?
+                  expected_output: We are open from 9am to 6pm.
+                  tags: [faq]
+      responses:
+        '200':
+          description: Import result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imported:
+                    type: integer
+                  deleted:
+                    type: integer
+                    description: Number of previous cases removed.
+                  skipped:
+                    type: integer
+                    description: Entries ignored because they had no `input`.
+                  agent_id:
+                    type: string
+        '400':
+          description: Missing `agent_id` or `cases`, or no valid case.
+  /v1/eval/cases/export:
+    get:
+      tags: [Test Cases]
+      operationId: exportTestCases
+      summary: Export the test cases of an agent
+      description: |
+        Returns the enabled test cases of an agent (up to 1000, oldest first)
+        as JSON, without ids, in the format accepted by
+        `POST /v1/eval/cases/import`.
+      parameters:
+        - $ref: '#/components/parameters/AgentIdQueryRequired'
+      responses:
+        '200':
+          description: Exported test cases.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cases:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TestCaseFields'
+                  count:
+                    type: integer
+                  agent_id:
+                    type: string
+        '400':
+          description: Missing `agent_id`.
+  /v1/eval/runs:
+    get:
+      tags: [Runs]
+      operationId: listEvaluationRuns
+      summary: List evaluation runs
+      description: Returns evaluation runs, most recent first. The response has no total count.
+      parameters:
+        - name: agent_id
+          in: query
+          required: false
+          schema:
+            type: string
+          example: agent-abc
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/RunStatus'
+        - name: page
+          in: query
+          required: false
+          description: One-based page index.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 10
+      responses:
+        '200':
+          description: Page of runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EvaluationRun'
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
+    post:
+      tags: [Runs]
+      operationId: startEvaluationRun
+      summary: Start an evaluation run
+      description: |
+        Creates a `pending` run and starts it asynchronously. Only one run
+        per agent can be pending or running at a time.
+
+        The run covers every enabled case of the agent, or only `case_id`
+        when it is given (send `mode: single` with it so the run is labeled
+        accordingly). `mode`, `sample_percent` and `tags_filter` are stored
+        on the run but do not change which cases are executed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+                mode:
+                  $ref: '#/components/schemas/RunMode'
+                case_id:
+                  type: string
+                  description: Run only this case.
+                model:
+                  type: string
+                  description: Model override for the agent during this run.
+                sample_percent:
+                  type: integer
+                  description: Stored on the run for `mode=sample`.
+                tags_filter:
+                  type: array
+                  items:
+                    type: string
+                  description: Stored on the run for `mode=tagged`.
+                batch_id:
+                  type: string
+                  description: Batch the run belongs to, when started as part of a scheduled batch.
+            example:
+              agent_id: agent-abc
+              mode: single
+              case_id: case_abc123
+      responses:
+        '200':
+          description: Run created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    example: run_abc123
+                  agent_id:
+                    type: string
+                  status:
+                    $ref: '#/components/schemas/RunStatus'
+                  mode:
+                    $ref: '#/components/schemas/RunMode'
+                  createdAt:
+                    type: string
+                    format: date-time
+        '400':
+          description: Missing `agent_id`, or the agent has no enabled test case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: A run is already pending or running for this agent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/eval/runs/{runId}:
+    parameters:
+      - name: runId
+        in: path
+        required: true
+        schema:
+          type: string
+        example: run_abc123
+    get:
+      tags: [Runs]
+      operationId: getEvaluationRun
+      summary: Get an evaluation run
+      parameters:
+        - name: include_results
+          in: query
+          required: false
+          description: Set to `true` to include the per-case results (up to 500).
+          schema:
+            type: string
+            enum: ['true', 'false']
+      responses:
+        '200':
+          description: Run details. `results` is empty unless `include_results=true`.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EvaluationRun'
+                  - type: object
+                    properties:
+                      results:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/EvaluationResult'
+        '404':
+          description: Run not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      tags: [Runs]
+      operationId: cancelEvaluationRun
+      summary: Cancel an evaluation run
+      description: Cancels a `pending` or `running` run. The request body is ignored.
+      responses:
+        '200':
+          description: Run cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  agent_id:
+                    type: string
+                  status:
+                    $ref: '#/components/schemas/RunStatus'
+                  progress:
+                    $ref: '#/components/schemas/RunProgress'
+        '400':
+          description: The run is neither pending nor running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Run not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [Runs]
+      operationId: deleteEvaluationRun
+      summary: Delete an evaluation run
+      description: Deletes the run and all its results.
+      responses:
+        '200':
+          description: Run deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+                    example: true
+                  deleted_results:
+                    type: integer
+        '404':
+          description: Run not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/eval/runs/{runId}/export:
+    parameters:
+      - name: runId
+        in: path
+        required: true
+        schema:
+          type: string
+        example: run_abc123
+    get:
+      tags: [Runs]
+      operationId: exportEvaluationRun
+      summary: Export the results of a run as CSV
+      description: |
+        Returns a JSON object whose `csv` field holds the results (up to 1000)
+        as CSV, with the columns `input,expected,actual,score,passed,reasoning,agent_tokens,agent_cost,tools_match`.
+      responses:
+        '200':
+          description: CSV export wrapped in JSON.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  csv:
+                    type: string
+                  run_id:
+                    type: string
+                  count:
+                    type: integer
+              example:
+                csv: "input,expected,actual,score,passed,reasoning,agent_tokens,agent_cost,tools_match\n\"What are your opening hours?\",\"9am to 6pm\",\"We open at 9am and close at 6pm.\",92,true,\"Matches the expected hours.\",310,0.0012,true"
+                run_id: run_abc123
+                count: 1
+        '404':
+          description: Run not found.
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        User-bound credential carrying an identity: either a session JWT
+        or a user access token (`at:*`) generated from the user settings UI.
+        Send as `Authorization: Bearer <token>`.
+  parameters:
+    AgentIdQueryRequired:
+      name: agent_id
+      in: query
+      required: true
+      description: Agent Factory agent id.
+      schema:
+        type: string
+      example: agent-abc
+  schemas:
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+        code:
+          type: string
+          description: Stable error code (e.g. VALIDATION_ERROR, CASE_NOT_FOUND, RUN_NOT_FOUND, RUN_ALREADY_RUNNING).
+        status:
+          type: integer
+          description: HTTP status, repeated in the body.
+    ExpectedTool:
+      type: object
+      properties:
+        name:
+          type: string
+        arguments:
+          type: object
+          additionalProperties: true
+          description: Arguments the call must match.
+    ConversationTurn:
+      type: object
+      properties:
+        text:
+          type: string
+          description: User message of the turn.
+        expected:
+          type: string
+          description: Expected agent answer for the turn.
+    TestCaseFields:
+      type: object
+      properties:
+        input:
+          type: string
+          description: User input sent to the agent.
+        expected_output:
+          type: string
+          nullable: true
+          description: Expected answer. Null for criteria-only judging.
+        criteria:
+          type: array
+          description: Criteria the judge checks (e.g. accurate, helpful, concise, polite, complete, safe).
+          items:
+            type: string
+        tags:
+          type: array
+          items:
+            type: string
+        expected_tools:
+          type: array
+          nullable: true
+          description: Tools the agent should call, with optional argument matching.
+          items:
+            $ref: '#/components/schemas/ExpectedTool'
+        forbidden_tools:
+          type: array
+          nullable: true
+          description: Tool names the agent must not call.
+          items:
+            type: string
+        expected_skills:
+          type: array
+          nullable: true
+          description: Skills that should be activated.
+          items:
+            type: string
+        conversation:
+          type: array
+          nullable: true
+          description: Multi-turn sequence. Replaces `input` when present.
+          items:
+            $ref: '#/components/schemas/ConversationTurn'
+        is_multi_turn:
+          type: boolean
+          nullable: true
+        enabled:
+          type: boolean
+    TestCaseCreate:
+      allOf:
+        - type: object
+          required: [agent_id, input]
+          properties:
+            agent_id:
+              type: string
+        - $ref: '#/components/schemas/TestCaseFields'
+    TestCase:
+      allOf:
+        - type: object
+          properties:
+            id:
+              type: string
+              example: case_abc123
+            agent_id:
+              type: string
+            createdAt:
+              type: string
+              format: date-time
+        - $ref: '#/components/schemas/TestCaseFields'
+    TestCaseListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TestCase'
+        total:
+          type: integer
+        page:
+          type: integer
+        limit:
+          type: integer
+    RunStatus:
+      type: string
+      enum: [pending, queued, running, completed, failed, cancelled]
+    RunMode:
+      type: string
+      enum: [full, sample, tagged, single]
+      default: full
+    RunProgress:
+      type: object
+      properties:
+        total:
+          type: integer
+        completed:
+          type: integer
+        passed:
+          type: integer
+        failed:
+          type: integer
+        errored:
+          type: integer
+          description: Cases whose execution failed. They are reported, never dropped.
+    EvaluationRun:
+      type: object
+      properties:
+        id:
+          type: string
+        agent_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        mode:
+          $ref: '#/components/schemas/RunMode'
+        progress:
+          $ref: '#/components/schemas/RunProgress'
+        score:
+          type: integer
+          nullable: true
+          description: Final score percentage (0-100).
+        duration_ms:
+          type: integer
+          nullable: true
+        cost_summary:
+          type: object
+          nullable: true
+          properties:
+            agent_tokens:
+              type: integer
+            judge_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+            total_agent_cost:
+              type: number
+            total_agent_duration_ms:
+              type: integer
+        regression:
+          type: object
+          nullable: true
+          description: Comparison with the previous run of the agent.
+          properties:
+            previous_run_id:
+              type: string
+            score_delta:
+              type: number
+            regressions:
+              type: array
+              items:
+                type: object
+                properties:
+                  case_id:
+                    type: string
+                  input:
+                    type: string
+                  prev_score:
+                    type: integer
+                  new_score:
+                    type: integer
+            improvements:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+            new_failures:
+              type: integer
+            new_passes:
+              type: integer
+        error:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+      example:
+        id: run_abc123
+        agent_id: agent-abc
+        status: completed
+        mode: full
+        progress: { total: 10, completed: 10, passed: 9, failed: 1, errored: 0 }
+        score: 90
+        duration_ms: 48210
+        createdAt: '2026-01-15T10:00:00.000Z'
+    EvaluationResult:
+      type: object
+      properties:
+        id:
+          type: string
+        run_id:
+          type: string
+        case_id:
+          type: string
+        agent_id:
+          type: string
+        input:
+          type: string
+        expected:
+          type: string
+          nullable: true
+        actual:
+          type: string
+          description: Agent answer.
+        score:
+          type: integer
+          description: Score from 0 to 100.
+        passed:
+          type: boolean
+        criteria_results:
+          type: object
+          nullable: true
+          additionalProperties:
+            type: boolean
+          example: { accurate: true, concise: false }
+        judge_reasoning:
+          type: string
+          nullable: true
+        duration_ms:
+          type: integer
+          nullable: true
+        tokens_used:
+          type: integer
+          nullable: true
+          description: Judge tokens.
+        agent_tokens:
+          type: integer
+          nullable: true
+        agent_duration_ms:
+          type: integer
+          nullable: true
+        agent_cost:
+          type: number
+          nullable: true
+        agent_tool_calls:
+          type: integer
+          nullable: true
+        agent_turns:
+          type: integer
+          nullable: true
+        tools_called:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              arguments:
+                type: object
+                additionalProperties: true
+              status:
+                type: string
+        tools_match:
+          type: boolean
+          nullable: true
+          description: True when every expected tool was called, no forbidden tool was used and arguments match.
+        tools_details:
+          type: object
+          nullable: true
+          properties:
+            missing:
+              type: array
+              items: {}
+            forbidden_called:
+              type: array
+              items: {}
+            arg_mismatches:
+              type: array
+              items: {}
+            skills_missing:
+              type: array
+              items: {}
+        turn_results:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              turn:
+                type: integer
+              input:
+                type: string
+              actual:
+                type: string
+              score:
+                type: integer
+              passed:
+                type: boolean
+              reasoning:
+                type: string
+        context_id:
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true
