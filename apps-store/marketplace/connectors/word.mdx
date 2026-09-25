@@ -1,6 +1,6 @@
 ---
 title: 'Word'
-description: 'Build, upload, parse, convert, version, and manage Microsoft Word documents stored in OneDrive or SharePoint'
+description: 'Read, generate, convert, version, and lock Microsoft Word documents stored in OneDrive or SharePoint from Agent Creator agents and Builder automations, through Microsoft Graph with Entra client credentials'
 ---
 
 <img
@@ -12,360 +12,257 @@ description: 'Build, upload, parse, convert, version, and manage Microsoft Word 
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The Word connector provides Microsoft Word document operations through the Microsoft Graph API. It can be used as a Builder app for deterministic document workflows or as an MCP server for AI agents that need to create, inspect, convert, update, version, and manage `.docx` files stored in OneDrive or SharePoint.
+The Word connector exposes Microsoft Word documents through the [Microsoft Graph](https://learn.microsoft.com/en-us/graph/api/resources/driveitem) drive item API. It ships as two pieces: the **Word** app, installed from the Apps marketplace into a Builder workspace, which provides 22 deterministic DSUL instructions; and the **Word MCP** connector workspace, which installs that app and republishes the same 22 operations as MCP tools over JSON-RPC 2.0 for **Agent Creator** agents. Both run in the app-instance context of the workspace that hosts them and resolve their Microsoft credential server-side. Agents and automations read metadata, parse document structure, generate `.docx` files from a JSON specification, convert, version, check out, and delete documents hosted on OneDrive or SharePoint.
+
+Authentication has a single mode. The connector requests a token from `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token` with `grant_type=client_credentials` and `scope=https://graph.microsoft.com/.default`. Microsoft sees the Microsoft Entra application, not the end user, and enforces the **application** permissions consented on that app registration. Best for unattended automations and intentionally shared document libraries; choose a different connector when Microsoft must enforce each user's own file permissions.
+
+<Warning>
+  Every caller shares one Entra identity. Any document that identity can reach is reachable by any agent or automation bound to the instance, and Microsoft audit logs attribute the change to the application rather than to a person. Grant the narrowest Graph application permissions the workflow needs, and scope the connector to a dedicated SharePoint site or document library rather than the whole tenant.
+</Warning>
+
+<Note>
+  Per-user delegated sign-in is not implemented. A request that sets the `azure-auth-mode` header to `delegated` is refused before any Graph call, with `Delegated authentication is not yet implemented. Use auth mode 'application' or omit the header.` If you need Microsoft to enforce each user's own file permissions, use a connector that supports delegated OAuth, such as [Excel](/apps-store/marketplace/connectors/excel) or [SharePoint](/apps-store/marketplace/connectors/sharepoint).
+</Note>
 
 <CardGroup cols={3}>
-  <Card title="Document Operations" icon="file-word">
-    Read metadata, download content, upload DOCX bytes, convert files, and delete documents
+  <Card title="Read and parse" icon="file-word">
+    Fetch document metadata by ID or path, search a drive, download `.docx` bytes, and parse a document into an addressable element tree of paragraphs, runs, and tables.
   </Card>
-  <Card title="Structured Authoring" icon="pen-to-square">
-    Build valid Word documents from a JSON specification with headings, paragraphs, tables, lists, images, and formatting
+  <Card title="Generate and convert" icon="pen-to-square">
+    Build a valid `.docx` from a JSON specification with headings, formatted runs, tables, lists, images, page setup, and headers and footers, then convert it to PDF, HTML, JPG, or PNG.
   </Card>
-  <Card title="Governance & Lifecycle" icon="clock-rotate-left">
-    Search files, inspect document structure, manage versions, checkout locks, following, and analytics
+  <Card title="Version and lock" icon="clock-rotate-left">
+    List, read, download, and restore versions, check documents out and back in, discard a checkout, follow a document, and read all-time view analytics.
   </Card>
 </CardGroup>
 
-## Prerequisites
+## Who is this for?
 
-- A **Microsoft Entra ID / Azure AD application** registered in your tenant
-- A **client secret** for that application
-- Microsoft Graph permissions granted with admin consent:
-  - `Files.Read.All` for read-only document access
-  - `Files.ReadWrite.All` for upload, update, delete, checkout, check-in, restore, and follow operations
-  - `Sites.Read.All` or `Sites.ReadWrite.All` when accessing SharePoint-hosted documents
-- Your **Directory (tenant) ID** and **Application (client) ID**
-- Optional **SharePoint Site ID** when the default target is a SharePoint site instead of the user's OneDrive
+This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
+
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot" href="#agent-builder-agent-creator">
+    You build agents in **Agent Creator** and want them to work with Word documents.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved" href="#platform-admin-governance-one-time-platform-setup">
+    You run the platform and want to know what one-time setup Word needs.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece" href="#workspace-builder-dsul">
+    You write Builder automations (DSUL) that call Word instructions directly.
+  </Card>
+</CardGroup>
+
+## How Word differs from the standard connector flow
+
+Word predates the tenant-context connector model, so most of the shared setup procedures do **not** apply to it. Read this before following a generic connector guide.
+
+| Shared flow | Applies to Word? |
+|---|---|
+| [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace) | **No.** Word ships no configuration app and no **Configuration app** field, provisions no `<connector>Auth` or `<connector>AuthorizedAgents` secrets, and has no **Authorized agents** allowlist. You enter the four Microsoft Entra values directly in the app instance configuration form, described under [Workspace builder (DSUL)](#workspace-builder-dsul). |
+| [Central OAuth client](/apps-store/marketplace/connectors/central-oauth) | **No.** Word has a single auth mode, Microsoft Entra client credentials held in the workspace's own secrets. There is no central platform client to select, no per-instance OAuth callback URL, and no per-user connection to make. |
+| [Declare a connector capability](/apps-store/marketplace/connectors/declare-capability) | **Partly.** The manual AI Governance path applies, with the deltas listed under [Platform admin (Governance)](#platform-admin-governance-one-time-platform-setup). The **Install capability** button, the **Capabilities catalog** section, the capability **Scope**, and the per-agent allowlist steps do not. |
+
+<Warning>
+  Because there is no per-agent allowlist, the **MCP API key is the only gate on `tools/call`**. Any agent or client that holds the key can call all 22 tools with the full reach of the Entra application. The separation between availability and authorization described in [Availability is not authorization](/apps-store/marketplace/connectors/declare-capability#availability-is-not-authorization) collapses here: treat the key as the credential it is, and give it only to agents you would grant the whole document library to.
+</Warning>
+
+## Prerequisites (Microsoft side)
+
+- A **Microsoft 365 / Microsoft Entra ID** tenant, with the documents you want to reach stored in **OneDrive** or **SharePoint**. The connector operates on Word `.docx` drive items.
+- An **app registration** in [Microsoft Entra ID](https://entra.microsoft.com) (**App registrations > New registration**), with a **client secret** created under **Certificates & secrets**.
+- Note the **Application (client) ID**, the **client secret value**, and the **Directory (tenant) ID**. For SharePoint-hosted files, also note the **site ID**.
+- Grant Microsoft Graph **application** permissions on that registration and have a Global Administrator grant admin consent. The connector workspace documents the permissions it expects:
+
+```text
+Files.Read.All
+Files.ReadWrite.All
+Sites.Read.All
+Sites.ReadWrite.All
+```
+
+Read-only deployments can grant only `Files.Read.All` and `Sites.Read.All`, at the cost of every write operation (upload, build, update, delete, checkout, check-in, discard, restore, follow) failing with `Access denied. Check permissions.`
+
+<Warning>
+  When neither a **SharePoint Site ID** on the instance nor a `driveId` on the call is available, the connector targets `https://graph.microsoft.com/v1.0/me/drive`. An application-permission token has no signed-in user, so Microsoft Graph cannot resolve `/me`. Set a **SharePoint Site ID** on the instance, or pass `driveId` on every call.
+</Warning>
+
+<Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
+  <Note>
+    **No platform-level credential.** Word follows the **static-credential** model: each workspace stores its own Microsoft Entra credentials in its own workspace secrets, and the connector resolves them server-side. There is nothing to register centrally: no shared key, no Governance OAuth auth-config JSON, and no central OAuth client, so [Central OAuth client](/apps-store/marketplace/connectors/central-oauth) does not apply to this connector.
+  </Note>
+
+  Optionally, to let agent builders pick Word from the capability catalog instead of pasting an MCP endpoint URL, declare it once as a named capability. Follow [Declare the capability manually in AI Governance](/apps-store/marketplace/connectors/declare-capability#declare-the-capability-manually-in-ai-governance) and enter these Word values:
+
+  | Manual field in AI Governance | Value for Word |
+  |---|---|
+  | Capability type | `mcp` |
+  | Server URL (**SSE/WebSocket URL**) | `<api-url>/workspaces/<workspace-id>/webhooks/mcp`, the MCP endpoint of the **Word MCP** connector workspace |
+  | **Scope** | Not required. Word runs no per-agent authorization check, so the `agent_id` requirement described on that page does not apply. |
+  | Authorization block | None. Word has no per-user OAuth, so there is no status, connect, or disconnect URL to declare. |
+  | Agent authentication | The MCP API key request header shown in the example below, carrying the connector workspace's MCP API key. Agent builders must set it on the capability themselves. |
+
+  Skip the final *Allowlist each agent at the connector* step of that procedure: this connector has no **Authorized agents** allowlist. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
+
+  <Warning>
+    Declaring the capability makes the connector **available** in the picker; it does not grant any Microsoft access by itself. Document access is governed by the Entra credentials and Graph application permissions configured in the workspace that runs the connector, and execution is gated only by the MCP API key.
+  </Warning>
+</Accordion>
 
 ---
 
 <Tabs>
-  <Tab title="Usage as App">
-    ## Usage as App
+  <Tab title="Agent builder (Agent Creator)">
+    ## Agent builder
 
-    ## Installation
-
-    1. Go to **Apps** in your workspace
-    2. Search for **Word** and install it
-    3. Open the app instance configuration and fill in the required Microsoft Graph credentials
-
-    ## Configuration
-
-    | Field | Description |
-    |-------|-------------|
-    | **Azure Client ID** | Microsoft Entra application (client) ID used to call Microsoft Graph |
-    | **Azure Client Secret** | Microsoft Entra application client secret, stored as a workspace secret |
-    | **Azure Tenant ID** | Microsoft Entra directory (tenant) ID |
-    | **SharePoint Site ID** | Optional default SharePoint site ID for SharePoint-based document operations |
-
-    ## File Access
-
-    Word operations target Microsoft Graph drive items. For OneDrive files, pass an `itemId` or `path` and optionally a `driveId`. For SharePoint files, also pass `siteId` or configure a default SharePoint Site ID on the app instance.
-
-    ```yaml
-    - Word.getDocument:
-        itemId: '{{documentItemId}}'
-        driveId: '{{driveId}}'
-        output: document
-    ```
-
-    ```yaml
-    - Word.getDocumentByPath:
-        path: Documents/Quarterly Report.docx
-        siteId: '{{sharePointSiteId}}'
-        driveId: '{{driveId}}'
-        output: document
-    ```
-
-    ## Available Instructions
-
-    Every instruction resolves Microsoft Graph credentials through the workspace configuration. Most operations accept `driveId` and `siteId` to override the configured default target.
-
-    ### Document Lookup & Search
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `getDocument` | `itemId`*, `select`, `expand`, `driveId`, `siteId` |
-    | `getDocumentByPath` | `path`*, `select`, `expand`, `driveId`, `siteId` |
-    | `searchDocuments` | `query`*, `top`, `driveId`, `siteId` |
-    | `getDocumentStructure` | `itemId`*, `includeContent`, `maxContentLength`, `driveId`, `siteId` |
-
-    ### Content Transfer & Creation
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `downloadDocument` | `itemId`*, `driveId`, `siteId` |
-    | `downloadDocumentByPath` | `path`*, `driveId`, `siteId` |
-    | `uploadDocument` | `itemId`*, `content`*, `contentType`, `driveId`, `siteId` |
-    | `uploadDocumentByPath` | `path`*, `content`*, `contentType`, `driveId`, `siteId` |
-    | `buildDocument` | `itemId` or `path`, `spec`*, `driveId`, `siteId` |
-    | `convertDocument` | `itemId`*, `format`*, `driveId`, `siteId` |
-
-    ### Metadata & Lifecycle
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `updateDocument` | `itemId`*, `name`, `description`, `driveId`, `siteId` |
-    | `deleteDocument` | `itemId`*, `driveId`, `siteId` |
-
-    ### Versions
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `listVersions` | `itemId`*, `driveId`, `siteId` |
-    | `getVersion` | `itemId`*, `versionId`*, `driveId`, `siteId` |
-    | `downloadVersionContent` | `itemId`*, `versionId`*, `driveId`, `siteId` |
-    | `restoreVersion` | `itemId`*, `versionId`*, `driveId`, `siteId` |
-
-    ### Checkout
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `checkoutDocument` | `itemId`*, `driveId`, `siteId` |
-    | `checkinDocument` | `itemId`*, `comment`, `driveId`, `siteId` |
-    | `discardCheckout` | `itemId`*, `driveId`, `siteId` |
-
-    ### Collaboration & Analytics
-
-    | Instruction | Arguments |
-    |-------------|-----------|
-    | `followDocument` | `itemId`*, `driveId`, `siteId` |
-    | `unfollowDocument` | `itemId`*, `driveId`, `siteId` |
-    | `getAnalytics` | `itemId`*, `driveId`, `siteId` |
+    **Goal:** let an agent you build in Agent Creator read, generate, and manage Word documents through Word MCP tools.
 
     <Note>
-      Arguments flagged with `*` are required. `buildDocument` requires `spec` and either `itemId` for rewrite mode or `path` for create mode.
+      Before an agent can call the connector, a workspace builder must have configured the **Word MCP** connector workspace with Microsoft Entra credentials and generated its MCP API key, as described under [Workspace builder (DSUL)](#workspace-builder-dsul). A platform admin may also have published a **Word** capability in the catalog, as described under [Platform admin (Governance)](#platform-admin-governance-one-time-platform-setup).
     </Note>
 
-    ## DSUL Examples
-
-    ### Search for Word Documents
-
-    ```yaml
-    - Word.searchDocuments:
-        query: contract
-        top: 10
-        driveId: '{{driveId}}'
-        output: documents
-    ```
-
-    ### Build a New Word Document
-
-    ```yaml
-    - Word.buildDocument:
-        path: Reports/generated-summary.docx
-        driveId: '{{driveId}}'
-        spec:
-          properties:
-            title: Generated Summary
-            author: Prisme.ai
-          sections:
-            - content:
-                - type: heading
-                  level: 1
-                  text: Quarterly Summary
-                - type: paragraph
-                  text: This document was generated from a Prisme.ai workflow.
-                - type: table
-                  headers:
-                    - Metric
-                    - Value
-                  rows:
-                    - - Revenue
-                      - '{{revenue}}'
-                    - - Active customers
-                      - '{{customerCount}}'
-        output: builtDocument
-    ```
-
-    ### Inspect and Convert a Document
-
-    ```yaml
-    - Word.getDocumentStructure:
-        itemId: '{{documentItemId}}'
-        includeContent: true
-        output: structure
-    - Word.convertDocument:
-        itemId: '{{documentItemId}}'
-        format: pdf
-        output: pdfContent
-    ```
-
-    ### Restore a Previous Version
-
-    ```yaml
-    - Word.listVersions:
-        itemId: '{{documentItemId}}'
-        output: versions
-    - Word.restoreVersion:
-        itemId: '{{documentItemId}}'
-        versionId: '{{versions.value[0].id}}'
-        output: restored
-    ```
-  </Tab>
-
-  <Tab title="Usage as MCP">
-    ## Usage as MCP
-
-    The Word MCP workspace exposes the same document operations as JSON-RPC tools. The MCP endpoint receives the `mcp-api-key` header, routes `tools/call` requests through `routeToolCall`, and delegates each operation to the Word app workspace, where Microsoft Graph authentication and Graph URL construction are handled.
-
-    ## MCP Configuration
-
-    | Field | Description |
-    |-------|-------------|
-    | **MCP API Key** | Configured on the Word MCP workspace and sent through the `mcp-api-key` header for MCP endpoint calls |
-
-    ## Plug into an Agent Creator capability
-
-    Agents consume MCP servers directly through **Agent Creator** capabilities. This is the preferred way to expose Word tools to an agent.
+    The connector resolves its Microsoft credential server-side; it is never exposed to the agent. Every tool call runs as the Entra application, so the agent inherits whatever that application can reach.
 
     <Steps>
-      <Step title="Create or open a workspace">
-        From the Prisme.ai console, create a new workspace or open the workspace that will host the connector.
+      <Step title="Get the MCP endpoint">
+        From the connector workspace, copy its MCP endpoint URL, or use the published **Word** capability if a platform admin declared one under [Platform admin (Governance)](#platform-admin-governance-one-time-platform-setup):
+
+        ```text
+        <api-url>/workspaces/<workspace-id>/webhooks/mcp
+        ```
+
+        The server answers `initialize` as `word-mcp`, version `1.0.0`, on MCP protocol version `2025-06-18`.
       </Step>
-      <Step title="Install and configure the Word app">
-        Install **Word** and configure the Microsoft Graph credentials from the *Usage as App* tab.
-      </Step>
-      <Step title="Copy the MCP endpoint and API key">
-        Open the Word MCP app instance configuration and copy the **MCP Endpoint** and **MCP API Key** values.
-      </Step>
-      <Step title="Open Agent Creator">
-        Open the agent you want to extend and add a capability.
-      </Step>
-      <Step title="Add the MCP capability">
-        Select a dedicated Word capability if one exists. Otherwise, use the generic `custom_mcp` capability, paste the MCP endpoint as the server URL, then add this header:
+      <Step title="Add the capability to your agent">
+        In your agent in Agent Creator, add a capability pointing at the MCP endpoint URL, and supply the connector workspace's MCP API key as the endpoint header the connector expects:
 
         ```json
         {
-          "mcp-api-key": "your-mcp-api-key"
+          "mcp-api-key": "<mcp-api-key>"
         }
         ```
+
+        `initialize`, `notifications/initialized`, and `tools/list` are answered without a key, so a capability that omits it appears to connect and then fails on the first tool call.
       </Step>
-      <Step title="Brief the agent">
-        Tell the agent when to use Word tools, which document locations it may access, and when to ask for confirmation before destructive actions such as deleting files, overwriting content, restoring versions, or discarding checkout changes.
+      <Step title="Test a read before a write">
+        Ask the agent to search for a document you can reach. It calls `searchDocuments` with a `query` and the `driveId` or `siteId` of the target library. A successful call returns matching file names and IDs, which confirms credentials, permissions, and drive addressing in one step.
+      </Step>
+      <Step title="Publish the agent">
+        Select **Publish**. Only the tools you enabled on the capability are exposed to end users.
       </Step>
     </Steps>
 
-    ## Legacy MCP Install (Advanced > Tools)
+    ### Brief the agent in its system prompt
 
-    Use this flow to plug the Word MCP into an AI Knowledge agent that does not yet support the native Agent Creator capability picker.
+    Wiring the capability is not enough: the agent must know the tools exist, how to address a file, and which operations are destructive. Copy-pasteable starter:
 
-    <Steps>
-      <Step title="Install the Word app">
-        Install and configure the Word app in the same workspace as your agent.
-      </Step>
-      <Step title="Copy the MCP credentials">
-        Open the MCP app instance configuration and copy the **MCP Endpoint** and **MCP API Key**.
-      </Step>
-      <Step title="Open your AI Knowledge project">
-        Navigate to **Advanced > Tools**.
-      </Step>
-      <Step title="Add an MCP tool">
-        Click **Add**, select the **MCP** tab, and paste the MCP endpoint URL.
-      </Step>
-      <Step title="Add the auth header">
-        Add the signed API key in the headers field:
+    ```text
+    You have access to the Word MCP server (Microsoft Graph). Use it to read, generate, convert, and version Word documents stored in OneDrive or SharePoint.
+    Always address a document by its itemId (the Graph drive item id), or by path with getDocumentByPath. Pass driveId to target a specific drive, and siteId for SharePoint-hosted libraries.
+    To create a document, call buildDocument with a JSON spec and a path. Never build a .docx by uploading Markdown or plain text through uploadDocument: that produces a corrupt file.
+    Before rewriting an existing document, call getDocumentStructure to inspect its paragraphs and tables, then call buildDocument with itemId to replace the content.
+    Ask the user to confirm before deleteDocument, restoreVersion, discardCheckout, or any buildDocument or uploadDocument call that targets an existing itemId, because those replace or remove content.
+    ```
 
-        ```json
-        {
-          "mcp-api-key": "your-mcp-api-key"
-        }
-        ```
-      </Step>
-      <Step title="Save">
-        The agent can now list and call the Word MCP tools.
-      </Step>
-    </Steps>
+    <Note>
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the MCP endpoint URL along with the API key header.
+    </Note>
 
-    ## Output Formats
+    ## Available tools
 
-    Every tool accepts an `outputFormat` parameter that controls the MCP response shape:
+    The connector exposes 22 MCP tools. Tool names and argument names are identical to the App instructions documented under [Workspace builder (DSUL)](#workspace-builder-dsul), plus one extra `outputFormat` argument on every tool.
 
-    - **`verbose`** (default) - human-readable text for LLM consumption
-    - **`structured`** - machine-readable JSON returned as text and in `structuredContent`
-    - **`both`** - currently returns JSON text and `structuredContent`, matching `structured` output
+    Every tool accepts `driveId` and `siteId`. `driveId` has no instance default; `siteId` falls back to the **SharePoint Site ID** configured on the instance.
 
-    ## Available Tools
-
-    ### Document Lookup & Search
+    ### Document metadata and search
 
     | Tool | Description |
     |------|-------------|
-    | `getDocument` | Get Word document metadata by ID |
-    | `getDocumentByPath` | Get Word document metadata by path |
-    | `searchDocuments` | Search for Word documents in a drive |
-    | `getDocumentStructure` | Parse Word document and return element tree |
+    | `getDocument` | Get Word document metadata by ID. |
+    | `getDocumentByPath` | Get Word document metadata by path. |
+    | `searchDocuments` | Search for Word documents in a drive. |
+    | `getDocumentStructure` | Parse Word document and return element tree. |
+    | `updateDocument` | Update document metadata (name, description). |
+    | `deleteDocument` | Delete document (moves to recycle bin). |
 
-    ### Content Transfer & Creation
-
-    | Tool | Description |
-    |------|-------------|
-    | `downloadDocument` | Download Word document content by ID |
-    | `downloadDocumentByPath` | Download Word document content by path |
-    | `uploadDocument` | Upload or replace a Word document from base64-encoded DOCX bytes, up to 4 MB |
-    | `uploadDocumentByPath` | Upload a Word document to a path from base64-encoded DOCX bytes |
-    | `buildDocument` | Create a valid Word `.docx` from a JSON spec and upload it |
-    | `convertDocument` | Convert a Word document to PDF or HTML format |
-
-    ### Metadata & Lifecycle
+    ### Content transfer and generation
 
     | Tool | Description |
     |------|-------------|
-    | `updateDocument` | Update document metadata such as name or description |
-    | `deleteDocument` | Delete a document by moving it to the recycle bin |
+    | `downloadDocument` | Download Word document content by ID, returned as base64. |
+    | `downloadDocumentByPath` | Download Word document content by path, returned as base64. |
+    | `uploadDocument` | Upload or replace a Word document from base64-encoded DOCX bytes (up to 4 MB). |
+    | `uploadDocumentByPath` | Upload a Word document to a path from base64-encoded DOCX bytes. |
+    | `buildDocument` | Create a valid Word `.docx` from a JSON spec and upload it. |
+    | `convertDocument` | Convert Word document to PDF or HTML format. |
 
-    ### Versions
-
-    | Tool | Description |
-    |------|-------------|
-    | `listVersions` | List all versions of a Word document |
-    | `getVersion` | Get metadata for a specific document version |
-    | `downloadVersionContent` | Download content of a specific document version |
-    | `restoreVersion` | Restore a document to a previous version |
-
-    ### Checkout
+    ### Version history
 
     | Tool | Description |
     |------|-------------|
-    | `checkoutDocument` | Check out a document to lock it for exclusive editing |
-    | `checkinDocument` | Check in a document to release the lock and save changes |
-    | `discardCheckout` | Discard checkout and revert to the last checked-in version |
+    | `listVersions` | List all versions of a Word document. |
+    | `getVersion` | Get metadata for a specific document version. |
+    | `downloadVersionContent` | Download content of a specific document version. |
+    | `restoreVersion` | Restore document to a previous version. |
 
-    ### Collaboration & Analytics
+    ### Checkout and locking
 
     | Tool | Description |
     |------|-------------|
-    | `followDocument` | Follow a document to receive notifications |
-    | `unfollowDocument` | Stop following a document |
-    | `getAnalytics` | Get document analytics such as views and viewers when available from Microsoft Graph |
+    | `checkoutDocument` | Check out a document to lock it for exclusive editing. |
+    | `checkinDocument` | Check in a document to release the lock and save changes. |
+    | `discardCheckout` | Discard checkout and revert to last checked-in version. |
 
-    ## Tool Details
+    ### Following and analytics
 
-    ### `buildDocument`
+    | Tool | Description |
+    |------|-------------|
+    | `followDocument` | Follow a document to receive notifications. |
+    | `unfollowDocument` | Stop following a document. |
+    | `getAnalytics` | Get document analytics. |
 
-    Creates or rewrites a Word document from a JSON document specification.
+    ## Output formats
+
+    Every tool accepts an `outputFormat` argument that controls the shape of the MCP response:
+
+    - `verbose` (the default) returns a single human-readable `content` text block.
+    - `structured` returns the JSON payload both as `content` text and as `structuredContent`.
+    - `both` returns the same payload as `structured`; the two values are not distinguished by the formatter.
+
+    ## Tool details
+
+    ### buildDocument
+
+    Generates a valid `.docx` from a JSON specification and uploads it. Pass `path` to create a new document (create mode), or `itemId` to overwrite an existing one (rewrite mode). Only `spec` is declared required in the tool schema; the connector then checks that exactly one of `path` or `itemId` is present.
 
     ```json
     {
       "name": "buildDocument",
       "arguments": {
-        "path": "Reports/generated-summary.docx",
-        "driveId": "b!drive-id",
+        "path": "Reports/quarterly-summary.docx",
+        "driveId": "<drive-id>",
         "spec": {
-          "properties": {
-            "title": "Generated Summary",
-            "author": "Prisme.ai"
-          },
+          "properties": { "title": "Quarterly Summary", "author": "Prisme.ai" },
           "sections": [
             {
+              "pageSetup": { "orientation": "portrait", "marginTop": 2 },
+              "footer": { "text": "Page {page} of {pages}" },
               "content": [
                 { "type": "heading", "level": 1, "text": "Quarterly Summary" },
-                { "type": "paragraph", "text": "Generated by an AI agent." },
+                {
+                  "type": "paragraph",
+                  "alignment": "justify",
+                  "runs": [
+                    { "text": "Revenue grew " },
+                    { "text": "12%", "bold": true, "color": "1A7F37" },
+                    { "text": " quarter over quarter." }
+                  ]
+                },
                 {
                   "type": "table",
-                  "headers": ["Metric", "Value"],
-                  "rows": [["Revenue", "$120k"], ["Customers", "42"]]
-                }
+                  "columns": [{ "header": "Metric", "width": 6 }, { "header": "Value" }],
+                  "rows": [["Revenue", "120000"], ["Active customers", "42"]]
+                },
+                { "type": "list", "ordered": false, "items": ["Renewals up", { "text": "Churn down", "items": ["EMEA only"] }] }
               ]
             }
           ]
@@ -377,21 +274,24 @@ The Word connector provides Microsoft Word document operations through the Micro
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `spec` | Yes | JSON specification with `sections` and document content elements |
-    | `itemId` | No | Existing document item ID for rewrite mode |
-    | `path` | No | File path for create mode; required when `itemId` is omitted |
-    | `driveId` | No | Drive ID; defaults to the configured OneDrive or SharePoint drive context |
-    | `siteId` | No | SharePoint site ID override |
+    | `spec` | Yes | Document specification. Must contain a non-empty `sections` array. |
+    | `path` | No | Target path for a new document, relative to the drive root. Required when `itemId` is omitted. |
+    | `itemId` | No | Existing Word document drive item ID to rewrite. |
+    | `driveId` | No | Microsoft Graph drive ID. |
+    | `siteId` | No | SharePoint site ID; overrides the instance default. |
 
-    ### `getDocumentStructure`
+    The `spec` grammar is documented in full under *Document specification* in [Workspace builder (DSUL)](#workspace-builder-dsul).
 
-    Downloads a DOCX file and parses it into a structured element tree that agents can inspect before rewriting or summarizing content.
+    ### getDocumentStructure
+
+    Downloads the `.docx` and parses it into an element tree with stable IDs that an agent can inspect before rewriting or summarising content.
 
     ```json
     {
       "name": "getDocumentStructure",
       "arguments": {
-        "itemId": "01ABCDEF2345",
+        "itemId": "<drive-item-id>",
+        "driveId": "<drive-id>",
         "includeContent": true,
         "maxContentLength": 2000,
         "outputFormat": "structured"
@@ -401,66 +301,24 @@ The Word connector provides Microsoft Word document operations through the Micro
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `itemId` | Yes | Document drive item ID |
-    | `includeContent` | No | Include text content in parsed elements |
-    | `maxContentLength` | No | Maximum content length returned per element |
-    | `driveId` | No | Drive ID override |
-    | `siteId` | No | SharePoint site ID override |
+    | `itemId` | Yes | Word document drive item ID. |
+    | `includeContent` | No | Include extracted text and run formatting in each element. Defaults to `true`. |
+    | `maxContentLength` | No | Maximum extracted characters per element. Defaults to `200`; `0` disables truncation. |
+    | `driveId` | No | Microsoft Graph drive ID. |
+    | `siteId` | No | SharePoint site ID; overrides the instance default. |
 
-    ### `uploadDocumentByPath`
+    `structuredData.elements` lists paragraphs (`p:<index>`, with runs `p:<index>:r:<index>`) and tables (`t:<index>`, with cells `t:<index>:r:<row>:c:<col>`). `structuredData.metadata` carries `totalParagraphs`, `totalTables`, `totalImages`, `hasHeaders`, and `hasFooters`.
 
-    Uploads a base64-encoded DOCX file to a drive path.
+    ### convertDocument
 
-    ```json
-    {
-      "name": "uploadDocumentByPath",
-      "arguments": {
-        "path": "Templates/template.docx",
-        "content": "UEsDBBQAAAA...",
-        "contentType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-      }
-    }
-    ```
-
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `path` | Yes | Target path in the drive |
-    | `content` | Yes | Base64-encoded DOCX bytes, up to 4 MB |
-    | `contentType` | No | MIME type; defaults to Word `.docx` |
-    | `driveId` | No | Drive ID override |
-    | `siteId` | No | SharePoint site ID override |
-
-    ### `searchDocuments`
-
-    Searches for Word documents in the configured drive context.
-
-    ```json
-    {
-      "name": "searchDocuments",
-      "arguments": {
-        "query": "contract",
-        "top": 10,
-        "outputFormat": "both"
-      }
-    }
-    ```
-
-    | Parameter | Required | Description |
-    |-----------|----------|-------------|
-    | `query` | Yes | Search query text |
-    | `top` | No | Maximum number of results to return |
-    | `driveId` | No | Drive ID override |
-    | `siteId` | No | SharePoint site ID override |
-
-    ### `convertDocument`
-
-    Converts a Word document to another format supported by Microsoft Graph download conversion.
+    Converts a document through the Microsoft Graph download-conversion parameter and returns the result as base64.
 
     ```json
     {
       "name": "convertDocument",
       "arguments": {
-        "itemId": "01ABCDEF2345",
+        "itemId": "<drive-item-id>",
+        "driveId": "<drive-id>",
         "format": "pdf",
         "outputFormat": "structured"
       }
@@ -469,20 +327,48 @@ The Word connector provides Microsoft Word document operations through the Micro
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `itemId` | Yes | Document drive item ID |
-    | `format` | Yes | Target format, typically `pdf` or `html` |
-    | `driveId` | No | Drive ID override |
-    | `siteId` | No | SharePoint site ID override |
+    | `itemId` | Yes | Word document drive item ID. |
+    | `format` | Yes | One of `pdf`, `html`, `jpg`, or `png`. Any other value returns `Invalid format '<value>'. Supported formats: pdf, html, jpg, png`. |
+    | `driveId` | No | Microsoft Graph drive ID. |
+    | `siteId` | No | SharePoint site ID; overrides the instance default. |
 
-    ### `restoreVersion`
+    `structuredData` returns `content` (base64), `contentType` (`application/pdf`, `text/html`, `image/jpeg`, or `image/png`), and `format`.
 
-    Restores a document to a previous version.
+    ### searchDocuments
+
+    Runs a Microsoft Graph drive search from the drive root.
+
+    ```json
+    {
+      "name": "searchDocuments",
+      "arguments": {
+        "query": "contract",
+        "driveId": "<drive-id>",
+        "top": 10,
+        "outputFormat": "both"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `query` | Yes | Search text used by Microsoft Graph drive search. |
+    | `top` | No | Maximum number of results. Defaults to `25`. |
+    | `driveId` | No | Microsoft Graph drive ID. |
+    | `siteId` | No | SharePoint site ID; overrides the instance default. |
+
+    `structuredData` returns `query`, `count`, `items`, and `hasMore`. `hasMore` is `true` when Microsoft Graph returned an `@odata.nextLink`; the connector does not follow it, so narrow the query or raise `top` to see more.
+
+    ### restoreVersion
+
+    Restores a document to a previous version. This is a write operation: Microsoft Graph creates a new version carrying the restored content, and the version you restore from stays in the history.
 
     ```json
     {
       "name": "restoreVersion",
       "arguments": {
-        "itemId": "01ABCDEF2345",
+        "itemId": "<drive-item-id>",
+        "driveId": "<drive-id>",
         "versionId": "2.0",
         "outputFormat": "verbose"
       }
@@ -491,45 +377,393 @@ The Word connector provides Microsoft Word document operations through the Micro
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `itemId` | Yes | Document drive item ID |
-    | `versionId` | Yes | Version ID returned by `listVersions` |
-    | `driveId` | No | Drive ID override |
-    | `siteId` | No | SharePoint site ID override |
+    | `itemId` | Yes | Word document drive item ID. |
+    | `versionId` | Yes | Version ID returned by `listVersions`. An unknown ID returns `Resource not found.` |
+    | `driveId` | No | Microsoft Graph drive ID. |
+    | `siteId` | No | SharePoint site ID; overrides the instance default. |
+  </Tab>
+
+  <Tab title="Workspace builder (DSUL)">
+    ## Workspace builder
+
+    **Goal:** configure the Word connector with a Microsoft Entra credential and call Word instructions from your automations, or expose them to agents over MCP.
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace.
+    2. Search for **Word** and install it.
+    3. Open the app instance configuration, fill in the Microsoft Entra values, and select **Save**.
+
+    To expose the same operations as MCP tools instead, use the **Word MCP** connector workspace: it installs the **Word** app for you, stores the Entra values in its own workspace secrets, and publishes the MCP endpoint at `<api-url>/workspaces/<workspace-id>/webhooks/mcp`.
+
+    <Note>
+      Do not follow [Install a connector in your workspace](/apps-store/marketplace/connectors/install-in-workspace) for Word. That flow describes the tenant-context model, where an `onInstall` automation provisions secrets and a **Configuration app** link. Word has neither: the three steps above are the whole installation, and credentials go in the app instance configuration form itself.
+    </Note>
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Azure Client ID** (`clientId`) | Microsoft Entra application (client) ID used to call Microsoft Graph. Backed by the `azureClientId` workspace secret. |
+    | **Azure Client Secret** (`clientSecret`) | Client secret value of that application. Backed by the `azureClientSecret` workspace secret and masked in the form. |
+    | **Azure Tenant ID** (`tenant`) | Microsoft Entra directory (tenant) ID (GUID). Backed by the `azureTenant` workspace secret. |
+    | **SharePoint Site ID** (`siteId`) | Optional default SharePoint site ID for SharePoint-hosted files. Backed by the `azureSiteId` workspace secret. |
+
+    The **Word MCP** connector workspace adds one field of its own, **MCP API Key** (`mcpApiKey`), backed by the `mcpApiKey` workspace secret. Generate it from the MCP Core **API Key** page rather than typing a value: `tools/call` is refused outright when no key is configured.
+
+    ## Authentication and runtime identity
+
+    The connector resolves a Microsoft Graph token through a three-step chain, and stops at the first step that yields credentials:
+
+    1. An `Authorization: Bearer <token>` request header, used as an already-acquired Graph access token.
+    2. The `azure-client-id`, `azure-client-secret`, and `azure-tenant` request headers, all three of which must be present.
+    3. The `clientId`, `clientSecret`, and `tenant` values configured on the app instance.
+
+    Step 3 is the supported path for both Builder automations and MCP agents: credentials stay in workspace secrets and never travel through a request. Steps 1 and 2 exist for callers that own their own Microsoft credential.
+
+    <Warning>
+      A request carrying `Authorization` or the `azure-*` credential headers runs with whatever permissions that token or application holds, bypassing the instance configuration entirely. Do not put Microsoft client secrets into agent instructions, capability headers, chat prompts, or automation source. Leave the headers unset and configure the instance instead.
+    </Warning>
+
+    Whichever step supplies the credential, a token acquired with steps 2 or 3 comes from the OAuth 2.0 client credentials grant, so **Microsoft sees the Entra application**, and Graph enforces the application permissions consented on it. There is no per-user identity, and Microsoft audit entries name the application.
+
+    Acquired tokens are cached as a user-scoped platform secret named `word_cc_token`, with a time to live of the provider's `expires_in` minus a 300-second safety buffer. A cached token is reused until it expires; there is no manual invalidation.
+
+    ## File addressing
+
+    **OneDrive** and **SharePoint** documents are addressed by `itemId` (the Graph drive item ID) or, for the `*ByPath` instructions, by `path` relative to the drive root, for example `Reports/quarterly-summary.docx`.
+
+    Every instruction also accepts `driveId` and `siteId`. `siteId` falls back to the **SharePoint Site ID** configured on the instance; `driveId` has no instance default and must always come from the call. The resulting Graph base URL is:
+
+    | `driveId` | `siteId` | Base URL |
+    |-----------|----------|----------|
+    | set | set | `/sites/<siteId>/drives/<driveId>` |
+    | set | unset | `/drives/<driveId>` |
+    | unset | set | `/sites/<siteId>/drive` |
+    | unset | unset | `/me/drive` |
+
+    <Warning>
+      The last row does not work with a client-credentials token: Microsoft Graph has no signed-in user to resolve `/me` against. Always configure a **SharePoint Site ID** or pass `driveId`.
+    </Warning>
+
+    ## Available instructions
+
+    Arguments marked `*` are validated before the Graph call: omitting one returns `Missing required parameter: <name>`. Every instruction also accepts `driveId`, `siteId`, and an optional `headers` object used by the authentication chain described above.
+
+    ### Document metadata and search
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `getDocument` | `itemId`*, `select` (OData `$select`), `expand` (OData `$expand`) |
+    | `getDocumentByPath` | `path`*, `select`, `expand` |
+    | `searchDocuments` | `query`*, `top` (defaults to `25`) |
+    | `getDocumentStructure` | `itemId`*, `includeContent` (defaults to `true`), `maxContentLength` (defaults to `200`) |
+    | `updateDocument` | `itemId`*, `name`, `description` |
+    | `deleteDocument` | `itemId`* |
+
+    ### Content transfer and generation
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `downloadDocument` | `itemId`* |
+    | `downloadDocumentByPath` | `path`* |
+    | `uploadDocument` | `itemId`*, `content`*, `contentType` (defaults to the Word `.docx` MIME type) |
+    | `uploadDocumentByPath` | `path`*, `content`*, `contentType` |
+    | `buildDocument` | `spec`* (must contain a non-empty `sections` array), plus `path` for create mode or `itemId` for rewrite mode |
+    | `convertDocument` | `itemId`*, `format`* (`pdf`, `html`, `jpg`, `png`) |
+
+    ### Version history
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `listVersions` | `itemId`* |
+    | `getVersion` | `itemId`*, `versionId`* |
+    | `downloadVersionContent` | `itemId`*, `versionId`* |
+    | `restoreVersion` | `itemId`*, `versionId`* |
+
+    ### Checkout and locking
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `checkoutDocument` | `itemId`* |
+    | `checkinDocument` | `itemId`*, `comment` |
+    | `discardCheckout` | `itemId`* |
+
+    ### Following and analytics
+
+    | Instruction | Arguments |
+    |-------------|-----------|
+    | `followDocument` | `itemId`* |
+    | `unfollowDocument` | `itemId`* |
+    | `getAnalytics` | `itemId`* |
+
+    <Note>
+      `discardCheckout` is the only operation that leaves the Graph `v1.0` endpoint: the connector rewrites the base URL to `beta` because Microsoft does not expose `discardCheckout` on `v1.0`. `getAnalytics` reads `/analytics/allTime` and reports `allTime.access.actionCount` as total views and `allTime.access.actorCount` as unique viewers; Microsoft does not return item analytics for every drive type, so an empty payload is a Graph answer rather than a connector failure.
+    </Note>
+
+    ## Limits
+
+    - **Uploads are single-request.** `uploadDocument`, `uploadDocumentByPath`, and the upload half of `buildDocument` `PUT` the bytes in one call; the instruction descriptions state a 4 MB ceiling and no resumable upload session is used.
+    - **Generated documents are size-checked.** `buildDocument` rejects a generated file whose decoded size exceeds 4194304 bytes, with `Generated document exceeds 4MB upload limit. Reduce content and try again.`
+    - **Upload requests time out after 30 seconds.**
+    - **Search results are not paginated.** `searchDocuments` returns one Graph page and sets `hasMore` when more exist.
+    - **The connector does not edit `.docx` content in place.** Use `getDocumentStructure` to read and `buildDocument` to rewrite.
+
+    ## Response shape
+
+    Instructions do not return the raw Microsoft Graph payload. They return a presentation envelope, and the data lives under `structuredData`:
+
+    ```yaml
+    - Word.getDocument:
+        itemId: '{{documentItemId}}'
+        driveId: '{{driveId}}'
+      output: document
+    # document.operation      -> read
+    # document.itemType       -> document
+    # document.identifier     -> the drive item id
+    # document.structuredData -> the raw Graph driveItem (id, name, size, webUrl, timestamps)
+    ```
+
+    A failing call returns either `{ error, status, message, code }` from the Graph error mapper, or `{ isError: true, content: [{ type: text, text }] }` for connector-level validation failures. Branch on `{{document.error}}` and `{{document.isError}}` before reading `structuredData`.
+
+    Successful writes also emit workspace events you can subscribe to: `word.document.built`, `word.document.uploaded`, `word.document.downloaded`, `word.document.converted`, `word.document.structure.read`, `word.document.updated`, `word.document.deleted`, `word.document.checkedOut`, `word.document.checkedIn`, `word.checkout.discarded`, `word.version.downloaded`, and `word.version.restored`.
+
+    ## Document specification
+
+    `buildDocument` takes a `spec` object with optional `properties` and a required, non-empty `sections` array. Omitting `sections`, or supplying a value that is not an array, returns `spec.sections is required and must be a non-empty array`.
+
+    | Key | Description |
+    |-----|-------------|
+    | `properties` | Word core properties: `title`, `author`, `subject`, `keywords`. |
+    | `sections[].pageSetup` | `orientation` (`portrait` or `landscape`), `pageWidth`, `pageHeight`, `marginTop`, `marginBottom`, `marginLeft`, `marginRight`. All measurements are in centimetres; margins default to `2.54`. |
+    | `sections[].header` and `sections[].footer` | `{ "text": "..." }`. The placeholders `{page}` and `{pages}` are replaced by live Word page-number fields. |
+    | `sections[].content` | Ordered array of content elements. |
+
+    Each content element has a `type` of `heading`, `paragraph`, `table`, `image`, `list`, or `pageBreak`:
+
+    | Type | Keys |
+    |------|------|
+    | `heading` | `text`, `level` (defaults to `1`). |
+    | `paragraph` | Either `text` or `runs`; plus `style`, `alignment` (`left`, `center`, `right`, `justify`), and `spacing.before` / `spacing.after` in points. Each run accepts `text`, `bold`, `italic`, `underline`, `strike`, `fontName`, `fontSize` (points), and `color` (RGB hex without `#`). |
+    | `table` | `columns` (array of `{ header, width }`, width in centimetres), `rows` (array of rows, each an array of strings or run-shaped cell objects), and optional `style`. Header cells are emitted bold. |
+    | `image` | `base64` (image bytes), plus optional `width` and `height` in centimetres. |
+    | `list` | `ordered` (numbered when `true`, bulleted otherwise) and `items`, where an item is a string or `{ text, items }` for nesting. |
+    | `pageBreak` | No keys. |
+
+    Malformed elements are skipped rather than failing the build, and each one adds a line to `structuredData.warnings`: a paragraph with neither `text` nor `runs`, a table with no `columns`, a row whose cell count does not match the column count, an image whose `base64` cannot be decoded, an unknown `type`, and list nesting deeper than three levels. Always read `warnings` after a build.
+
+    On success, `structuredData` returns `mode` (`create` or `rewrite`), `itemId`, `driveId`, `name`, `webUrl`, `warnings`, and a `stats` object counting `sections`, `headings`, `paragraphs`, `tables`, `images`, `lists`, and `totalElements`.
+
+    <Warning>
+      In rewrite mode `buildDocument` replaces the entire document content with the specification you pass; anything not described in `spec` is lost. Read the document with `getDocumentStructure` first, and confirm with the document owner before rewriting a shared file.
+    </Warning>
+
+    ## DSUL examples
+
+    ### Search for Word documents
+
+    ```yaml
+    - Word.searchDocuments:
+        query: contract
+        top: 10
+        driveId: '{{driveId}}'
+      output: documents
+    - conditions:
+        '{{documents.error}}':
+          - break: {}
+    - set:
+        name: files
+        value: '{{documents.structuredData.items}}'
+    ```
+
+    ### Read a SharePoint-hosted document by path
+
+    ```yaml
+    - Word.getDocumentByPath:
+        path: Documents/Quarterly Report.docx
+        siteId: '{{sharePointSiteId}}'
+        driveId: '{{driveId}}'
+      output: document
+    ```
+
+    ### Generate a new document
+
+    ```yaml
+    - Word.buildDocument:
+        path: Reports/quarterly-summary.docx
+        driveId: '{{driveId}}'
+        spec:
+          properties:
+            title: Quarterly Summary
+            author: Prisme.ai
+          sections:
+            - footer:
+                text: Page {page} of {pages}
+              content:
+                - type: heading
+                  level: 1
+                  text: Quarterly Summary
+                - type: paragraph
+                  text: This document was generated from a Prisme.ai automation.
+                - type: table
+                  columns:
+                    - header: Metric
+                      width: 6
+                    - header: Value
+                  rows:
+                    - - Revenue
+                      - '{{revenue}}'
+                    - - Active customers
+                      - '{{customerCount}}'
+      output: built
+    - set:
+        name: documentUrl
+        value: '{{built.structuredData.webUrl}}'
+    ```
+
+    ### Inspect a document, then convert it
+
+    ```yaml
+    - Word.getDocumentStructure:
+        itemId: '{{documentItemId}}'
+        driveId: '{{driveId}}'
+        includeContent: true
+        maxContentLength: 2000
+      output: structure
+    - Word.convertDocument:
+        itemId: '{{documentItemId}}'
+        driveId: '{{driveId}}'
+        format: pdf
+      output: converted
+    # converted.structuredData.content -> base64 PDF bytes
+    ```
+
+    ### Restore a previous version
+
+    ```yaml
+    - Word.listVersions:
+        itemId: '{{documentItemId}}'
+        driveId: '{{driveId}}'
+      output: versions
+    - Word.restoreVersion:
+        itemId: '{{documentItemId}}'
+        driveId: '{{driveId}}'
+        versionId: '{{versions.structuredData.versions[0].id}}'
+      output: restored
+    ```
+
+    ### Lock a document while editing it
+
+    ```yaml
+    - Word.checkoutDocument:
+        itemId: '{{documentItemId}}'
+        driveId: '{{driveId}}'
+      output: lock
+    - Word.uploadDocument:
+        itemId: '{{documentItemId}}'
+        driveId: '{{driveId}}'
+        content: '{{docxBase64}}'
+      output: uploaded
+    - Word.checkinDocument:
+        itemId: '{{documentItemId}}'
+        driveId: '{{driveId}}'
+        comment: Updated by the quarterly reporting automation
+      output: released
+    ```
+
+    ## Verify the installation
+
+    1. In your workspace, run an automation containing a single `Word.getDocument` call with the `itemId` and `driveId` of a document you can reach.
+    2. Confirm that `structuredData.name` and `structuredData.webUrl` match the document in OneDrive or SharePoint, and that `error` is unset.
+    3. Only then run a write instruction such as `Word.buildDocument` against a scratch path, and open the returned `structuredData.webUrl` in Word to confirm the file opens without a repair prompt.
+    4. Confirm that a caller without access is refused: call `Word.getDocument` with a `driveId` the Entra application has no permission on, and check that it returns status `403` with `Access denied. Check permissions.`
+
+    If step 1 returns `Authentication failed: Credentials not configured...`, the instance configuration is incomplete. If it returns `Access denied. Check permissions.`, the Graph application permissions or the admin consent are missing.
   </Tab>
 </Tabs>
 
 ---
 
-## Error Handling
+## Error handling
 
-| HTTP Status | Error | Solution |
-|-------------|-------|----------|
-| `400` | Invalid request, path, format, or document spec | Check required arguments, Graph path syntax, and `spec.sections` for `buildDocument` |
-| `401` | Authentication failed | Verify Azure Client ID, Client Secret, Tenant ID, and token permissions |
-| `403` | Insufficient Microsoft Graph permissions | Grant admin consent for the required Files and Sites permissions |
-| `404` | Document, drive, site, or version not found | Verify `itemId`, `path`, `driveId`, `siteId`, and `versionId` |
-| `409` | Conflict or checkout state prevents the operation | Check the document checkout status or retry after releasing the lock |
-| `413` | Generated or uploaded content is too large | Keep base64 DOCX uploads under the 4 MB connector limit |
-| `429` | Microsoft Graph throttling | Retry later or reduce request volume |
-| `500` | Microsoft Graph or connector runtime error | Inspect the tool response and workspace execution logs |
+The connector maps Microsoft Graph HTTP statuses to fixed messages and returns `{ error, status, message, code }`, where `code` is the Microsoft Graph error code when Graph supplied one.
 
-### Common Issues
+| HTTP status | Message | Resolution |
+|-------------|---------|------------|
+| 400 | `Bad request. Check parameters.` | Fix the arguments. For `buildDocument`, check `spec.sections` and the element grammar. |
+| 401 | `Authentication failed or token expired.` | Re-check the client ID, client secret, and tenant ID on the instance. |
+| 403 | `Access denied. Check permissions.` | Grant the missing Graph application permissions on the app registration and have a Global Administrator grant admin consent. |
+| 404 | `Resource not found.`, plus an operation hint such as `Document not found. Check the driveId and itemId are correct.`, `Path not found: <path>`, or `Version not found. Use listVersions to see available versions.` | Verify `itemId` or `path`, plus `driveId` and `siteId`, and `versionId` for version operations. |
+| 409 | `Conflict. Resource may be in use.` | Re-read the document and retry; check whether it is checked out. |
+| 423 | `Resource is locked.` | The document is checked out or open in the Office desktop app. Wait for the lock to clear, or call `discardCheckout` if you own the checkout. |
+| 429 | `Rate limited. Please wait and retry.`, or `Rate limited. Retry after <n> seconds.` when Microsoft Graph returns a retry hint. | Back off and retry, honouring the delay Microsoft returns. |
+| Any other status at or above 400 | `HTTP error <status>: <Graph message>` | Inspect the message, which carries the raw Graph error text. |
 
-**"Authentication failed"** - The Microsoft Graph credentials are missing, expired, or lack admin consent. Confirm the configured Azure app can acquire a token for Microsoft Graph.
+Transport-level failures do not reach that table. A request that never gets an HTTP response returns status `0` with `Graph API request failed before receiving a response (network error). Check authentication and connectivity.`, and a binary download that fails returns `Binary fetch failed: <details>`.
 
-**"Either itemId or path must be provided"** - `buildDocument` supports rewrite mode with `itemId` or create mode with `path`. Provide one of them with a valid `spec`.
+### Common issues
 
-**Upload exceeds 4 MB** - `uploadDocument`, `uploadDocumentByPath`, and generated `buildDocument` uploads use the small-file Microsoft Graph upload path. Reduce the document size before retrying.
+**`Authentication failed: Credentials not configured. Options: 1. Pass Authorization Bearer token header 2. Pass Azure-Client-Id, Azure-Client-Secret, Azure-Tenant headers 3. Configure app-level credentials`**: the instance has no `clientId`, `clientSecret`, or `tenant`, and no credential headers were supplied. Open the Word app instance, fill the three fields, and select **Save**.
 
-**SharePoint document not found** - SharePoint operations usually need the correct `siteId` and `driveId`. Configure a default SharePoint Site ID or pass these arguments per call.
+**`Authentication failed: Failed to acquire token: <error> - <description>`**: Microsoft Entra rejected the client credentials request. The tenant ID is wrong, the client secret expired, or the application has no Graph application permissions. The description is the raw `error_description` returned by Microsoft.
+
+**`Delegated authentication is not yet implemented. Use auth mode 'application' or omit the header.`**: a caller set the `azure-auth-mode` header to `delegated`. Remove the header; this connector supports only the application (client credentials) mode.
+
+**`No usable access token provided to executeGraphCall. Re-authentication is required.`**: the token step produced an error object instead of a token, usually right after a failed acquisition. Fix the underlying credential problem reported by the preceding message.
+
+**`Either itemId (rewrite mode) or path (create mode) must be provided`**: `buildDocument` was called with a valid `spec` but neither target. Provide `path` to create a document or `itemId` to rewrite one.
+
+**`spec.sections is required and must be a non-empty array`**: the `buildDocument` specification has no `sections`, or `sections` is not an array.
+
+**`Generated document exceeds 4MB upload limit. Reduce content and try again.`**: the generated `.docx` decoded to more than 4194304 bytes. Split the document, shrink embedded images, or drop `base64` image elements.
+
+**`Failed to build document: python-docx not available: <details>`**: the document generator could not load its Word library in the workspace runtime. Report the message to the workspace maintainer; nothing in the app configuration fixes it.
+
+**`Failed to upload document. The content must be base64-encoded DOCX bytes when using uploadDocumentByPath. Use buildDocument with a JSON spec to create a new Word document from text.`**: `content` was not valid base64 DOCX bytes, or Microsoft Graph rejected the upload. Agents hit this when they try to write Markdown or plain text as a `.docx`; use `buildDocument` instead. `uploadDocument` returns the same message naming `uploadDocument`.
+
+**`Failed to parse document: Invalid DOCX: not a valid ZIP file`** or **`Invalid DOCX: missing word/document.xml`**: `getDocumentStructure` downloaded a file that is not a Word document. Confirm the `itemId` points at a `.docx` rather than a `.doc`, PDF, or placeholder file.
+
+**`Invalid format '<value>'. Supported formats: pdf, html, jpg, png`**: `convertDocument` was called with an unsupported `format`.
+
+**`Document is not checked out. No lock to release.`** or **`Document is not checked out. Nothing to discard.`**: `checkinDocument` or `discardCheckout` ran against a document with no active checkout. Call `checkoutDocument` first, or skip the release step.
+
+**`Missing required parameter: <name>`**: the tool or instruction was called without a mandatory argument. JSON-RPC code `-32602`.
+
+**`Tool not found: <name>`**: the MCP client asked for a tool the router does not know. Re-run `tools/list` to refresh the manifest. JSON-RPC code `-32601`.
+
+**`API key not configured. Generate one from the API Key page.`**: the MCP endpoint has no API key configured. Generate one on the MCP Core **API Key** page of the connector workspace. JSON-RPC code `-32001`.
+
+**MCP API key header rejected**, with either of these messages:
+
+```text
+Missing mcp-api-key header. Add header "mcp-api-key" with a valid API key.
+Invalid mcp-api-key. Check that the API key value is correct.
+```
+
+The `tools/call` request did not carry the API key header, or carried a value that does not match the configured key. `initialize`, `notifications/initialized`, and `tools/list` are answered without a key; `tools/call` is not. JSON-RPC code `-32001`.
+
+## Revoke, rotate, and remove
+
+- **Rotate the client secret:** create a new secret on the app registration in Microsoft Entra, update the `azureClientSecret` workspace secret, and select **Save**. Cached tokens keep working until they expire, so allow up to one token lifetime before removing the old secret in Entra.
+- **Revoke all access immediately:** delete the client secret in Microsoft Entra, or remove the Graph application permissions from the app registration. The next token acquisition fails with `Failed to acquire token`, and a cached token stops working as soon as Microsoft revokes it.
+- **Reduce the blast radius:** narrow the Graph application permissions to read-only, or replace tenant-wide `Files.ReadWrite.All` with a site-scoped grant, so the shared identity cannot reach libraries outside the workflow.
+- **Rotate the MCP API key:** generate a new key on the MCP Core **API Key** page, then update every agent capability and MCP client that sends the API key header. Calls that still carry the previous key are rejected with the invalid-key message shown in [Common issues](#common-issues). Because there is no per-agent allowlist, rotating the key is the only way to revoke a single agent's access, and it revokes every other caller at the same time.
+- **Remove the connector:** uninstall the **Word** app instance from the workspace, and delete the **Word** capability from AI Governance if a platform admin declared one, as described in [Remove or update a capability](/apps-store/marketplace/connectors/declare-capability#remove-or-update-a-capability). Uninstalling stops all access; the cached `word_cc_token` platform secret expires on its own time to live.
+- **Recover a deleted document:** `deleteDocument` moves the item to the recycle bin, where the connector reports it can be restored within 93 days. Restore it from OneDrive or SharePoint; the connector has no restore-from-recycle-bin operation.
 
 ## External Resources
 
 <CardGroup cols={2}>
-  <Card title="Microsoft Graph DriveItem API" icon="microsoft" href="https://learn.microsoft.com/en-us/graph/api/resources/driveitem">
-    Reference for OneDrive and SharePoint file metadata, content, versions, and lifecycle operations.
+  <Card title="Microsoft Graph driveItem API" icon="book" href="https://learn.microsoft.com/en-us/graph/api/resources/driveitem">
+    Official reference for OneDrive and SharePoint file metadata, content, versions, and lifecycle operations.
+  </Card>
+  <Card title="Microsoft Graph client credentials flow" icon="key" href="https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant">
+    How Microsoft Entra issues application tokens and how admin consent applies to application permissions.
+  </Card>
+  <Card title="Graph Explorer" icon="flask" href="https://developer.microsoft.com/en-us/graph/graph-explorer">
+    Test Microsoft Graph calls interactively against your tenant.
   </Card>
   <Card title="Tool Agents" icon="robot" href="/products/agent-factory/capabilities">
-    Learn how to expose connector tools to AI agents through Prisme.ai capabilities.
+    Learn how Agent Creator agents consume MCP tools in Prisme.ai.
   </Card>
 </CardGroup>
