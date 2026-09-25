@@ -7,7 +7,11 @@ info:
 
     Resource identifiers use the physical prefixes emitted by the implementation (`vs_` knowledge base, `vsf_` document, `seed_` web source, `kb-` API-key slug).
 
-    This spec documents the public REST surface only. Internal helpers (private automations prefixed with `_`) and admin/GDPR lifecycle operations are not part of the public contract.
+    This spec documents the public REST surface only. Internal helpers (private automations prefixed with `_`) and admin/GDPR lifecycle operations are not part of the public contract, except the platform health probe listed under the Admin tag.
+
+    Each knowledge base also exposes a Model Context Protocol endpoint (`POST /v1/knowledge_bases/{knowledgeBaseId}/mcp`, JSON-RPC 2.0) giving agents filesystem-style read access to its content. It is listed under the MCP tag for its URL and auth only; use an MCP client rather than calling it as a REST resource.
+
+    The `Legacy` tag lists the two routes of the older `/v1/vector_stores` surface that the Prisme.ai apps still call. They are frozen: new integrations should use the `/v1/knowledge_bases` equivalents.
   contact:
     name: Prisme.ai
     url: https://prisme.ai
@@ -40,6 +44,10 @@ tags:
   description: Aggregate dashboard statistics.
 - name: Skills
   description: Prompt/instruction registry entries.
+- name: Legacy
+  description: Frozen `/v1/vector_stores` routes still called by the Prisme.ai apps. Prefer the `/v1/knowledge_bases` equivalents.
+- name: Admin
+  description: Platform health probe called by the AI Governance Infrastructure page. Requires elevated permissions, a platform administrator session (`platformRole` `superadmin` or `root`).
 paths:
   /v1/knowledge_bases:
     post:
@@ -443,15 +451,25 @@ paths:
         `(knowledge_base_id, source_key)`:
 
         - no existing row → insert, schedule indexing, **201**;
-        - existing row → refresh mutable fields (`fetch_url`, `tags`,
-          `metadata`, `filename`, `mime_type`, `bytes`), schedule a
-          fresh indexing run, **200**.
+        - existing row → refresh mutable fields (`tags`, `metadata`,
+          `filename`, `mime_type`, `bytes`), schedule a fresh indexing
+          run, **200**.
 
-        For `native_file_id` sources no fetch URL is stored; storage
-        mints short-lived ones at fetch time.
+        `fetch_url` is used for the indexing run the call triggers and
+        is never persisted. For `native_file_id` sources storage mints
+        short-lived fetch URLs itself.
+
+        `chunking_strategy` is a per-document override only: omit it
+        and the document follows its knowledge base's setting, read at
+        chunking time. A refresh that omits it keeps any override the
+        document already carries. The reserved value
+        `{"type": "default"}` is rejected here with
+        `400 VALIDATION_ERROR`; release an override through
+        `POST .../documents/{documentId}/reindex` instead.
 
         Connector sync = repeat this call per document per cycle with
-        the same `source_url` and a fresh `fetch_url`.
+        the same `source_url` and a fresh `fetch_url` (or inline
+        `content` when the provider has no fetchable URL).
 
         Requires `editor`+ on the knowledge base.
       security:
@@ -708,13 +726,29 @@ paths:
       description: |
         Deletes vectors (keyed by `document_id`), chunks, and the document
         row; notifies the crawler to drop `crawler_document_id` when
-        relevant. **Never deletes the native file** - call
+        relevant. By default the native file is kept - call
         `DELETE /v2/workspaces/{ws}/files/{id}` separately if the bytes
-        should go too. Requires `editor`+ **and** document ownership - a
+        should go too. The one exception is `delete_file: true` on a
+        `scope: conversation` document, which also deletes its native
+        file; knowledge-scoped files are never deleted by this route.
+        Requires `editor`+ **and** document ownership - a
         non-owner, non-admin editor deleting a document they do not own
         gets `403 FORBIDDEN`.
       security:
       - BearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                delete_file:
+                  type: boolean
+                  default: false
+                  description: |
+                    Also delete the native file bytes. Honoured only for
+                    `scope: conversation` documents; ignored otherwise.
       responses:
         '200':
           description: Detached.
@@ -776,11 +810,12 @@ paths:
         This is also the **rechunk** operation: pass
         `chunking_strategy` to re-run with new settings. The override
         is persisted on the document (replacing any previous
-        per-document override) so later re-runs reuse it. To rechunk
-        a whole store after changing the store-level
-        `chunking_strategy` (which only affects future runs), iterate
-        `GET /documents` and reindex each entry - there is
-        deliberately no bulk endpoint in v1.
+        per-document override) so later re-runs reuse it. Pass the
+        reserved value `{"type": "default"}` to clear the override so
+        the document follows its knowledge base again; this is the only
+        route that accepts it. Documents without an override pick up the
+        store-level `chunking_strategy` on their next run; to re-run a
+        whole store use `POST /v1/knowledge_bases/{knowledgeBaseId}/reindex`.
 
         For a `web_page` document this also re-fetches its URL through
         the crawler (a single-page refresh).
@@ -789,10 +824,11 @@ paths:
         - `uploaded_file` - storage mints a fresh native fetch URL;
           cannot expire.
         - `web_page` / `remote_file` - the crawler re-fetches the URL.
-        - `connector_document` - uses the stored ephemeral `fetch_url`;
-          if it has expired, the document transitions to
-          `status: fetch_expired` and the owning connector refreshes it
-          on its next sync (or on observing the emitted event).
+        - `connector_document` - re-fetched from the document's
+          registered source. Caller-supplied fetch URLs are not
+          persisted, so when the source needs a fresh signed URL the
+          owning connector re-sends the document through
+          `POST .../documents` on its next sync.
 
         Requires `editor`+.
       security:
@@ -811,7 +847,11 @@ paths:
                   additionalProperties: true
                   description: |
                     Rechunk with these settings. Persisted as the
-                    document's `chunking_strategy` override.
+                    document's `chunking_strategy` override. The reserved
+                    value `{"type": "default"}` clears that override, so
+                    the document follows its knowledge base again. This is
+                    the only route that accepts it; the others reject it
+                    with `VALIDATION_ERROR`.
                 parser:
                   type: string
                   description: |
@@ -1295,9 +1335,8 @@ paths:
       responses:
         '200':
           description: |
-            Paginated seeds, plus a knowledge-base-level `summary`
-            (§F-5): the unattributed residual (web pages with no seed
-            attribution) and the total web-page count.
+            Paginated seeds, plus a knowledge-base-level `summary`: the
+            unattributed residual (web pages with no seed attribution) and the total web-page count.
           content:
             application/json:
               schema:
@@ -1483,8 +1522,9 @@ paths:
                 limit:
                   type: integer
                   minimum: 1
-                  maximum: 50
+                  maximum: 100
                   default: 10
+                  description: Values above 100 are clamped to 100.
                 min_score:
                   type: number
                   description: Drop hits below this score.
@@ -1778,7 +1818,7 @@ paths:
         - agent
       description: |
         Type of access principal. `agent` is a first-class owner
-        principal for conversation/agent-owned knowledge bases (§F-6);
+        principal for conversation/agent-owned knowledge bases;
         `principal_id` is then the agent id (or its service-account id).
     - name: principalId
       in: path
@@ -2241,6 +2281,289 @@ paths:
           $ref: '#/components/responses/LegacyError403'
         '404':
           $ref: '#/components/responses/LegacyError404'
+  /v1/vector_stores:
+    get:
+      operationId: listVectorStoresLegacy
+      deprecated: true
+      tags:
+      - Legacy
+      summary: List vector stores (legacy)
+      description: |
+        Frozen legacy listing, still used by the agent tool
+        configuration pickers (`x-source: /storage/vector_stores`).
+        New integrations should call `GET /v1/knowledge_bases`.
+
+        Returns raw store rows, not the `KnowledgeBase` envelope, with
+        `role` added per row. Scoped by the caller's active `orgSlug`.
+      security:
+      - BearerAuth: []
+      parameters:
+      - name: scope
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 64
+        description: |
+          Comma-separated list among `own`, `shared`, `all`. Defaults to
+          `own,shared`. `all` returns every store of the organization
+          and is honoured only for callers with wildcard storage
+          permissions.
+      - name: page
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+      - name: pageSize
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+        description: Values above 100 are clamped to 100.
+      - name: status
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 64
+        description: Exact match on the store `status`.
+      - name: search
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 256
+        description: Case-insensitive substring match on `name` or `description`.
+      - name: include_agents
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - 'true'
+          - 'false'
+        description: With `scope=all`, also include agent-owned stores (excluded by default).
+      responses:
+        '200':
+          description: Paginated store rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      description: Raw store row. Only the fields below are stable.
+                      properties:
+                        id:
+                          type: string
+                          pattern: ^vs_[A-Za-z0-9-]+$
+                        name:
+                          type: string
+                        description:
+                          type: string
+                        status:
+                          type: string
+                        agent_id:
+                          type: string
+                        role:
+                          type: string
+                          enum:
+                          - owner
+                          - admin
+                          - editor
+                          - reader
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  pageSize:
+                    type: integer
+              example:
+                items:
+                - id: vs_3f1c2b7a-0d4e-4a8b-9c61-2e5f7a9b0c1d
+                  name: Product handbook
+                  description: Internal product documentation
+                  status: active
+                  role: owner
+                total: 1
+                page: 1
+                pageSize: 20
+        '401':
+          $ref: '#/components/responses/LegacyError401'
+        '403':
+          $ref: '#/components/responses/LegacyError403'
+  /v1/vector_stores/{vectorStoreId}/access:
+    parameters:
+    - name: vectorStoreId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: ^vs_[A-Za-z0-9-]+$
+        maxLength: 128
+      description: Store id (same id as the knowledge base).
+    post:
+      operationId: createVectorStoreAccessLegacy
+      deprecated: true
+      tags:
+      - Legacy
+      summary: Share a vector store (legacy)
+      description: |
+        Frozen legacy share, still used by the knowledge app for bulk
+        sharing. New integrations should call
+        `POST /v1/knowledge_bases/{knowledgeBaseId}/access`, which is an
+        idempotent upsert; this route instead answers `409` when the
+        principal already has a binding.
+
+        Requires the `share` permission (`owner` or `admin`). Agent-owned
+        stores, stores without an organization and the owner themself
+        cannot be shared (`400 VALIDATION_ERROR`). The principal is
+        validated against the store's organization.
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - principal_type
+              - principal_id
+              - role
+              properties:
+                principal_type:
+                  type: string
+                  enum:
+                  - user
+                  - group
+                  - org
+                principal_id:
+                  type: string
+                  maxLength: 256
+                role:
+                  type: string
+                  enum:
+                  - reader
+                  - editor
+                  - admin
+            example:
+              principal_type: user
+              principal_id: user-123
+              role: reader
+      responses:
+        '200':
+          description: Binding created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vector_store_id:
+                    type: string
+                  principal_type:
+                    type: string
+                  principal_id:
+                    type: string
+                  role:
+                    type: string
+                  email:
+                    type: string
+                    nullable: true
+                  orgSlug:
+                    type: string
+                  granted_by:
+                    type: string
+                  createdAt:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/LegacyError400'
+        '401':
+          $ref: '#/components/responses/LegacyError401'
+        '403':
+          $ref: '#/components/responses/LegacyError403'
+        '404':
+          $ref: '#/components/responses/LegacyError404'
+        '409':
+          description: 'The principal already has a binding (`code: ALREADY_EXISTS`).'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                    - ALREADY_EXISTS
+  /v1/test:
+    post:
+      tags:
+      - Admin
+      operationId: runStorageSelfTest
+      summary: Run the storage self-test
+      description: |
+        End-to-end probe of the storage stack: creates an ephemeral knowledge base (which also provisions its crawler), upserts a test vector, searches it, then deletes the knowledge base. Every step is reported; `ok` is `true` only when all steps succeeded. The probe always answers `200` once authorized, even when steps fail.
+
+        Requires a platform administrator session (`platformRole` `superadmin` or `root`); API keys and other users get `403`. The route does not dispatch on the HTTP method; POST is the method the platform UI uses.
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: false
+        description: No field is read. The platform UI sends an empty JSON object.
+        content:
+          application/json:
+            schema:
+              type: object
+              maxProperties: 0
+            example: {}
+      responses:
+        '200':
+          description: Self-test report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SelfTestReport'
+              example:
+                ok: true
+                steps:
+                - name: create_index
+                  ok: true
+                  response:
+                    id: vs_abc123
+                - name: insert_doc
+                  ok: true
+                - name: search
+                  ok: true
+                - name: cleanup
+                  ok: true
+                  response:
+                    status: deleting
+        '403':
+          description: The caller is not a platform administrator.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SelfTestReport'
+              example:
+                ok: false
+                steps:
+                - name: forbidden
+                  ok: false
+                  error:
+                    code: FORBIDDEN
+                    message: This endpoint is reserved to platform superadmins.
 components:
   securitySchemes:
     BearerAuth:
@@ -2297,6 +2620,41 @@ components:
               additionalProperties: true
       required:
       - error
+    SelfTestReport:
+      type: object
+      required:
+      - ok
+      - steps
+      properties:
+        ok:
+          type: boolean
+          description: '`true` when every step succeeded.'
+        steps:
+          type: array
+          items:
+            type: object
+            required:
+            - name
+            - ok
+            properties:
+              name:
+                type: string
+                enum:
+                - create_index
+                - insert_doc
+                - search
+                - cleanup
+                - forbidden
+              ok:
+                type: boolean
+              error:
+                type: object
+                description: Error raised by the step.
+                additionalProperties: true
+              response:
+                type: object
+                description: Raw response of the step (created knowledge base, vector router result, delete acknowledgement).
+                additionalProperties: true
     Pagination:
       type: object
       description: |
@@ -2454,7 +2812,7 @@ components:
           - type
           - id
           description: |
-            First-class owner principal (§F-6). For agent-owned
+            First-class owner principal. For agent-owned
             (conversation-scope) stores `type: agent` and `id` is the
             agent id - represented as a `principalType: agent` binding
             in the platform-managed `product_bindings` store, NOT a
@@ -2493,6 +2851,20 @@ components:
             Caller's effective role, computed at read time from access
             bindings. Null on cross-workspace (`workspace_jwt`) reads.
           nullable: true
+        permissions:
+          type: array
+          description: |
+            Actions the resolved `role` grants on this knowledge base
+            (`owner`: read, write, share, delete; `admin`: read, write,
+            share; `editor`: read, write; `reader`: read). Empty when
+            `role` is null.
+          items:
+            type: string
+            enum:
+            - read
+            - write
+            - share
+            - delete
         access_reason:
           type: string
           enum:
@@ -2666,8 +3038,7 @@ components:
             type: string
             pattern: ^seed_[A-Za-z0-9-]+$
           description: |
-            All seeds whose crawl scope covers this page
-            (multi-attribution, §F-5). Backs per-seed page counts and
+            All seeds whose crawl scope covers this page. Backs per-seed page counts and
             seed cascade-delete: deleting a seed removes it from this
             array and drops the row only when the array empties AND
             `origin: web_source`. Empty/absent ⇒ unattributed (counted
@@ -2688,8 +3059,8 @@ components:
           description: |
             Authoritative indexing status. Transitions are guarded by
             `index_generation` - stale or duplicate callbacks are
-            ignored. `fetch_expired` is connector-facing: the stored
-            ephemeral `fetch_url` no longer works and the owning
+            ignored. `fetch_expired` is connector-facing: the
+            ephemeral fetch URL no longer works and the owning
             connector must refresh it via the upsert (`POST
             /documents` with the same `source_url`); it is never a
             user-actionable error and never occurs for
@@ -2917,13 +3288,24 @@ components:
           description: |
             Operational URL used to retrieve bytes at index time. May
             be temporary, signed, tokenized. Write-only - never
-            returned by any response. Ignored for
+            returned by any response and never persisted: it only
+            serves the indexing run this call triggers. Ignored for
             `source_type: uploaded_file` (storage mints its own).
-            Refreshed on every upsert (200 path); connectors send a
-            fresh one on each sync.
+            Connectors send a fresh one on each sync.
+          maxLength: 2048
+        content:
+          type: string
+          maxLength: 2000000
+          writeOnly: true
+          description: |
+            Inline document content for `source_type: connector_document`
+            when the provider exposes no fetchable URL. Plain text, or a
+            `data:` URL for binary bytes. Takes precedence over
+            `fetch_url`; storage copies it into its own files registry
+            before indexing. Write-only, never returned.
         filename:
           type: string
-          maxLength: 255
+          maxLength: 512
         mime_type:
           type: string
         bytes:
@@ -2932,6 +3314,12 @@ components:
         chunking_strategy:
           type: object
           additionalProperties: true
+          description: |
+            Per-document override of the knowledge base chunking. Omit
+            to follow the knowledge base. `type` is one of `auto`,
+            `fixed`, `sentence`, `paragraph` (`static` is an alias of
+            `paragraph`) or `semantic`. The reserved `{"type": "default"}`
+            is rejected here (`400 VALIDATION_ERROR`).
         model:
           type: string
           maxLength: 256
@@ -3144,8 +3532,8 @@ components:
           type: object
           description: |
             Per-seed page counts, DB-derived from documents attributed
-            to this seed via `parent_web_source_ids` (multi-attribution,
-            §F-5). Independent of crawler reachability - these are
+            to this seed via `parent_web_source_ids` (multi-attribution).
+            Independent of crawler reachability - these are
             always available even when the crawler is unreachable.
           properties:
             pages_total:
@@ -3374,13 +3762,27 @@ components:
             conversation_id:
               type: string
               nullable: true
+        tags:
+          type: object
+          description: |
+            The two canonical connector tags of the document, so a
+            caller can run its own per-user access check without
+            re-reading each document. Both are empty for non-connector
+            documents; other document tags are not exposed here.
+          properties:
+            connection_id:
+              type: string
+              nullable: true
+            resource_uri:
+              type: string
+              nullable: true
     AccessBinding:
       type: object
       description: |
         Per-knowledge-base access binding, persisted in the
         platform-managed `product_bindings` store (storage owns no
         bindings collection). Principals: `user`, `group`, `org`, and
-        `agent` - agent ownership is first-class (§F-6). The owner
+        `agent` - agent ownership is first-class. The owner
         appears as an explicit `role: owner` binding; `admin` / `editor`
         / `reader` are grantable via the API (owner is not).
       required:
@@ -3432,7 +3834,7 @@ components:
     Processing:
       type: object
       description: |
-        Knowledge-base processing / parser-backend health (§F-5). The
+        Knowledge-base processing / parser-backend health. The
         crawler is the universal parse/fetch backend for EVERY document
         (uploads, single pages, web crawl), so this is present whenever
         the knowledge base has documents - even with zero web sources.
@@ -3610,8 +4012,7 @@ components:
           type: integer
           minimum: 0
           description: |
-            Real aggregate. (The legacy `stats.storageUsedBytes` was
-            dead code returning 0 - see `09` §B2 - fixed when porting.)
+            Total bytes stored in the knowledge base.
     Skill:
       type: object
       description: |
@@ -3779,9 +4180,9 @@ components:
             type: object
             description: |
               Legacy **flat** error envelope emitted by the not-yet-migrated
-              `/v1/skills*`, `/v1/stats`, `/v1/cleanup/*` and
+              `/v1/skills*`, `/v1/stats`, `/v1/vector_stores*`, `/v1/cleanup/*` and
               `/v1/export/by-user` routes (all other routes use the nested
-              `Error` envelope). The shape varies by route: `skills`/`stats`
+              `Error` envelope). The shape varies by route: `skills`/`stats`/`vector_stores`
               return `{ error: <message>, code: <CODE> }`; `cleanup`/`export`
               return `{ error: <CODE>, message: <message> }`. Same information,
               different field placement. These routes will migrate to the
@@ -3802,9 +4203,9 @@ components:
             type: object
             description: |
               Legacy **flat** error envelope emitted by the not-yet-migrated
-              `/v1/skills*`, `/v1/stats`, `/v1/cleanup/*` and
+              `/v1/skills*`, `/v1/stats`, `/v1/vector_stores*`, `/v1/cleanup/*` and
               `/v1/export/by-user` routes (all other routes use the nested
-              `Error` envelope). The shape varies by route: `skills`/`stats`
+              `Error` envelope). The shape varies by route: `skills`/`stats`/`vector_stores`
               return `{ error: <message>, code: <CODE> }`; `cleanup`/`export`
               return `{ error: <CODE>, message: <message> }`. Same information,
               different field placement. These routes will migrate to the
@@ -3825,9 +4226,9 @@ components:
             type: object
             description: |
               Legacy **flat** error envelope emitted by the not-yet-migrated
-              `/v1/skills*`, `/v1/stats`, `/v1/cleanup/*` and
+              `/v1/skills*`, `/v1/stats`, `/v1/vector_stores*`, `/v1/cleanup/*` and
               `/v1/export/by-user` routes (all other routes use the nested
-              `Error` envelope). The shape varies by route: `skills`/`stats`
+              `Error` envelope). The shape varies by route: `skills`/`stats`/`vector_stores`
               return `{ error: <message>, code: <CODE> }`; `cleanup`/`export`
               return `{ error: <CODE>, message: <message> }`. Same information,
               different field placement. These routes will migrate to the
@@ -3848,9 +4249,9 @@ components:
             type: object
             description: |
               Legacy **flat** error envelope emitted by the not-yet-migrated
-              `/v1/skills*`, `/v1/stats`, `/v1/cleanup/*` and
+              `/v1/skills*`, `/v1/stats`, `/v1/vector_stores*`, `/v1/cleanup/*` and
               `/v1/export/by-user` routes (all other routes use the nested
-              `Error` envelope). The shape varies by route: `skills`/`stats`
+              `Error` envelope). The shape varies by route: `skills`/`stats`/`vector_stores`
               return `{ error: <message>, code: <CODE> }`; `cleanup`/`export`
               return `{ error: <CODE>, message: <message> }`. Same information,
               different field placement. These routes will migrate to the

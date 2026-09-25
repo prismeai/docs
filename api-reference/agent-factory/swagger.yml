@@ -53,8 +53,17 @@ tags:
     description: Per-agent tool catalogue (system tools, MCP servers, function tools).
   - name: Retention
     description: Per-agent and org-wide conversation retention policies.
+  - name: Traces
+    description: Execution traces of agent turns (editor debugging, `agent-factory:traces:read`).
   - name: Evaluations
     description: Agent evaluation runs and results.
+  - name: Admin
+    description: |
+      GDPR operations called by the AI Insights admin screens. They require
+      elevated permissions: the caller must be a platform administrator
+      (`platformRole` `superadmin` or `root`). The export route also lets a
+      user export their own data. Each route is rate limited to 10 calls per
+      hour per caller.
 paths:
   /v1/profiles:
     get:
@@ -336,6 +345,20 @@ paths:
           schema:
             type: string
           description: 1-indexed page number.
+        - name: last_message_before
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 32
+          description: Inactive filter - agents with no message since this date (never-used agents included).
+        - name: last_message_after
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 32
+          description: Active filter - agents with a message at or after this date (never-used agents excluded).
       responses:
         '200':
           description: Page of agents (with `published_config` stripped on list rows).
@@ -456,13 +479,11 @@ paths:
             maxLength: 64
       responses:
         '200':
-          description: Agent record (Agent or AgentRestrictedView depending on caller's access).
+          description: Agent record.
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: '#/components/schemas/Agent'
-                  - $ref: '#/components/schemas/AgentRestrictedView'
+                $ref: '#/components/schemas/Agent'
         '401':
           description: Authentication required.
           content:
@@ -642,8 +663,18 @@ paths:
       summary: Import an agent from AGENTS.md
       description: |
         Parse an `AGENTS.md` document (YAML front matter + markdown
-        instructions) and create a new agent from it. Provisions a
-        service account; failure to provision rolls back the creation.
+        instructions) and either create a new agent from it or patch an
+        existing one.
+
+        Create vs update is decided solely by `target_agent_id`:
+          - omitted: CREATE (new agent, fresh id, SA provisioned)
+          - present: PATCH the matching agent (404 if not found in the
+            caller's org, 403 if the caller is neither the owner nor an
+            agent-factory admin)
+
+        Any `id:` carried by the file's frontmatter is ignored - round-trip
+        re-imports always create a new agent unless the caller explicitly
+        opts into a patch.
       requestBody:
         required: true
         content:
@@ -706,6 +737,93 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           description: Governance service is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/agents/{agentId}/citations/source_url:
+    get:
+      tags: [Agents]
+      operationId: resolveCitationSourceUrl
+      summary: Resolve a file_search citation link (302 redirect)
+      description: |
+        Stable, permanent link embedded in file_search `url_citation`
+        annotations for `uploaded_file` documents (web pages carry their
+        real `source_url` and never route here). On click: authorizes the
+        end user against the agent (`read`), verifies `knowledge_base_id` is
+        a file_search KB the agent uses (draft or published), resolves a
+        fresh short-lived URL from storage as a trusted source, and
+        302-redirects to it. Minting happens per click, so this link never
+        expires even though the native URL it resolves to is short-lived.
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+        - name: knowledge_base_id
+          in: query
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+          description: The file_search knowledge base the cited document belongs to.
+        - name: document_id
+          in: query
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+          description: The cited document id.
+      responses:
+        '302':
+          description: |
+            Redirect to the freshly-minted short-lived native URL
+            (`Location` header). The target URL expires; re-click to
+            re-resolve.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        '400':
+          description: Missing knowledge_base_id or document_id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            The end user is not authorized on the agent, or the
+            knowledge_base_id is not attached to it as a file_search tool in
+            either its draft or published config.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: |
+            Citation source unavailable (dangling native file, or storage
+            could not resolve it).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Method not allowed (only GET is accepted).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: Upstream storage resolution failed (technical error).
           content:
             application/json:
               schema:
@@ -1414,6 +1532,54 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /v1/agents/{agentId}/unpublish:
+    post:
+      tags: [Publishing]
+      operationId: unpublishAgent
+      summary: Unpublish an agent
+      description: |
+        Revert a published agent to `draft`: clears `published_config` and
+        `published_at`, resets visibility to `private` and
+        `has_draft_changes` to `false`. The live agent fields (the current
+        draft) are kept as-is. Requires publish rights on the agent.
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+      responses:
+        '200':
+          description: Agent reverted to draft.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentUnpublishResponse'
+        '400':
+          description: Validation error - the agent is not published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Agent not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/agents/{agentId}/discard-draft:
     post:
       tags: [Publishing]
@@ -1624,6 +1790,30 @@ paths:
           schema:
             type: string
           description: 1-indexed page number.
+        - name: scope
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 8
+          description: |
+            `org` widens the listing to all users of the agent. Honoured only for
+            privileged callers (trusted source, platform admin, org admin);
+            otherwise the listing stays self-scoped.
+        - name: from_date
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 64
+          description: ISO lower bound on `last_message_at`.
+        - name: to_date
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 64
+          description: ISO upper bound on `last_message_at`.
       responses:
         '200':
           description: Page of conversations.
@@ -1932,6 +2122,260 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /v1/agents/{agentId}/conversations/{contextId}/usage:
+    get:
+      tags: [Conversations]
+      operationId: getConversationUsage
+      summary: Usage totals for one conversation
+      description: |
+        Tokens, cost, carbon and message count for one conversation,
+        aggregated from each turn's `task.metadata.usage` (the same source
+        as the per-message usage shown in chat, so per-message lines always
+        sum to these totals). Broken down per model in `by_model`, an array
+        because model names contain dots.
+
+        Self-scoped: a user only reads their own conversation. Privileged
+        and trusted-monitoring callers may read any user's conversation of
+        this agent. At most 500 turns are aggregated.
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+        - name: contextId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+      responses:
+        '200':
+          description: Conversation usage totals.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationUsage'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Agent or conversation not found (`CONVERSATION_NOT_FOUND`) in the caller's scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/agents/{agentId}/connector_accounts:
+    get:
+      tags: [Conversations]
+      operationId: listConnectorAccounts
+      summary: List the caller's connector accounts for an agent's knowledge bases
+      description: |
+        For each `file_search` knowledge base the agent draws on, returns the
+        connector accounts the calling user has (or can connect), so a chat
+        surface can offer to connect or disconnect one. Answers about the
+        caller only. A knowledge base whose connector cannot be queried
+        contributes nothing (no error). Disconnecting through `disconnect_url`
+        drops only the credential the reader connected for this agent.
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+      responses:
+        '200':
+          description: Connector accounts of the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectorAccountList'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Agent not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Method not allowed (only GET is accepted).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/agents/{agentId}/traces/{correlationId}:
+    get:
+      tags: [Traces]
+      operationId: getAgentTrace
+      summary: Execution trace of one agent turn
+      description: |
+        Assembles the trace of one agent turn (identified by its
+        `correlationId`) for the agent's editor: knowledge-base passages
+        retrieved and their scores, tool calls, the chronology of what ran,
+        errors, and the model, tokens, cost and latency of the turn (merged
+        from the LLM Gateway). Step inputs and outputs are not included;
+        fetch one on demand with
+        `GET /v1/agents/{agentId}/traces/{correlationId}/events/{eventId}`.
+
+        Requires the `agent-factory:traces:read` org permission (or the
+        `agent-factory:*` / `*` wildcards, or platform admin). Owning or
+        editing the agent is not enough.
+
+        Caveats reported in the payload: `retrieval` is only populated for
+        turns run from the editing surface, and `summary.details_expired`
+        flags traces older than the 14-day cleanup of step details. The
+        timeline is capped at 2000 events (`summary.timeline_truncated`).
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+        - name: correlationId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+        - name: excludeAutomation
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Comma-separated automation slugs to leave out of the timeline.
+            Defaults to `_stream-event` (one execution per streamed chunk).
+            Send `__none__` to keep every step.
+        - name: x-draft-mode
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: ['true']
+          description: Resolve the agent as its editor does (draft configuration).
+      responses:
+        '200':
+          description: Assembled trace.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentTrace'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden - `agent-factory:traces:read` is required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Agent not found, or no trace for this correlationId on this agent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: The event store could not be read (`SEARCH_FAILED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/agents/{agentId}/traces/{correlationId}/events/{eventId}:
+    get:
+      tags: [Traces]
+      operationId: getAgentTraceEvent
+      summary: Inputs and outputs of one trace step
+      description: |
+        Returns the inputs and outputs of one step of a trace, fetched on
+        demand. Same permission as the trace (`agent-factory:traces:read`).
+        The event must belong both to the given correlation and to an
+        execution of the given agent. Known secret keys are stripped from
+        `input` and `output`; the raw event is never served (open it in the
+        Builder activity view, under workspace access control).
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+        - name: correlationId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+        - name: x-draft-mode
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: ['true']
+          description: Resolve the agent as its editor does (draft configuration).
+      responses:
+        '200':
+          description: Step detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentTraceEvent'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden - `agent-factory:traces:read` is required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Agent or event not found for this trace.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: The event store could not be read (`SEARCH_FAILED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/agents/{agentId}/messages/send:
     post:
       tags: [Messages]
@@ -2045,7 +2489,6 @@ paths:
         resolution. The same HITL approval flow as `messages/send`
         applies - a streaming task may park in `input-required` until
         resolved.
-
       parameters:
         - name: agentId
           in: path
@@ -2220,6 +2663,163 @@ paths:
                 $ref: '#/components/schemas/Error'
         '404':
           description: Task not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      tags: [Tasks]
+      operationId: updateTaskFromHook
+      summary: Update a task from a hook callback
+      description: |
+        Callback used by `async` and `stream` hook targets (the
+        `callback.patch_url` they receive) to update the task they were
+        invoked for. Authenticated with the callback token from
+        `callback.token`, sent in `X-Hook-Token` (or
+        `Authorization: Bearer cbt_...`). User credentials are not used on
+        this method. When `status` is set, a `task.status` event is emitted to
+        the task's subscribers.
+      security:
+        - HookCallbackTokenAuth: []
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskHookUpdateInput'
+            example:
+              status:
+                state: completed
+      responses:
+        '200':
+          description: Task updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  taskId:
+                    type: string
+                  status:
+                    type: object
+                    additionalProperties: true
+        '401':
+          description: Missing, invalid or expired callback token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Task not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Callback replayed or bound to another hook invocation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/agents/{agentId}/tasks/{taskId}/events:
+    post:
+      tags: [Tasks]
+      operationId: pushTaskEvent
+      summary: Push an event into a task from a hook callback
+      description: |
+        Callback used by `async` and `stream` hook targets (the
+        `callback.url` they receive) to forward incremental updates to the
+        client that started the task. The event is broadcast to the task's
+        SSE/WebSocket subscribers; `task.status` and `task.output.completed`
+        are persisted, `task.output.delta` is not.
+
+        Authenticated with the callback token from `callback.token`, sent in
+        `X-Hook-Token` (or `Authorization: Bearer cbt_...`).
+      security:
+        - HookCallbackTokenAuth: []
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskHookEventInput'
+            example:
+              event: task.output.delta
+              data:
+                delta: Partial answer
+      responses:
+        '200':
+          description: Event accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  taskId:
+                    type: string
+                  event:
+                    type: string
+                  seq:
+                    type: integer
+                    description: Sequence number of this callback event for the hook invocation.
+        '400':
+          description: '`event` missing or not one of the accepted events.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing, invalid or expired callback token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Task not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Method not allowed (only POST is accepted).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Callback replayed or bound to another hook invocation.
           content:
             application/json:
               schema:
@@ -2475,6 +3075,18 @@ paths:
           schema:
             type: string
             maxLength: 128
+        - name: version
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Historical version number to read. Omit for the current version (unknown version returns 404 `ARTIFACT_VERSION_NOT_FOUND`).
+        - name: versions
+          in: query
+          required: false
+          schema:
+            type: string
+          description: When present (e.g. `1`), the response includes `versions`, the version history metadata (up to 200, newest first, no content).
       responses:
         '200':
           description: Artifact record + resolved version content.
@@ -2509,12 +3121,13 @@ paths:
     patch:
       tags: [Artifacts]
       operationId: updateArtifact
-      summary: Update artifact content (full replace OR line patches)
+      summary: Update artifact content or restore a version
       description: |
-        Two mutation modes - exactly one of `content` (full replace,
-        creates a new version) or `patches` (line-level operations,
-        applied atomically) MUST be present. `base_version` opts into
-        optimistic concurrency control.
+        Two mutation modes, both creating a new current version:
+        `restore_version` re-commits a historical version's content (it
+        wins when both are sent), otherwise `content` replaces the whole
+        document. `base_version` opts into optimistic concurrency control
+        on the `content` mode.
       parameters:
         - name: artifactId
           in: path
@@ -2541,10 +3154,9 @@ paths:
                 additionalProperties: true
                 description: |
                   Helper-defined update result - includes the new
-                  `current_version`, `total_versions`, and (for `patches`
-                  mode) the resolved diff/version metadata.
+                  `current_version` and `total_versions`.
         '400':
-          description: Validation error - neither `content` nor `patches` provided.
+          description: Validation error - neither `content` nor `restore_version` provided.
           content:
             application/json:
               schema:
@@ -3369,6 +3981,76 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /v1/agents/{agentId}/tools/{toolId}/capabilities:
+    get:
+      tags: [Tools]
+      operationId: getAgentToolCapabilities
+      summary: List the tools an attached MCP server exposes
+      description: |
+        Runs the server's `tools/list` and returns each advertised tool with
+        the `canonical_name` the model calls it by (the name a
+        `tool_permissions` rule must target to reach that tool), plus its
+        `inputSchema` and `annotations` exactly as published. `canonical_name`
+        is computed by the runtime's own naming helper: consume it, never
+        derive it.
+
+        Always `200` once the entry is resolved. `status` says whether the
+        list could be fetched (`ok`), whether the caller has to connect to an
+        OAuth-gated server first (`auth_required`, empty `items`), or whether
+        the server did not answer (`unavailable`, empty `items`, `error`).
+        Only `mcp` entries have capabilities: any other type is a `400`. The
+        list is served from the same per-server cache the runtime uses, with
+        the same rule: never cached for auth-bearing catalog entries.
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+        - name: toolId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        '200':
+          description: Server tools, or the reason they could not be listed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolCapabilities'
+        '400':
+          description: The entry is not an MCP server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Tool not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/agents/{agentId}/retention:
     get:
       tags: [Retention]
@@ -3376,7 +4058,7 @@ paths:
       summary: Get an agent's retention policy
       description: |
         Returns the raw agent-level retention policy (or null if none)
-        plus the resolved `effective` values (agent → org → platform
+        plus the resolved `effective` values (agent -> org -> platform
         defaults).
       parameters:
         - name: agentId
@@ -3517,6 +4199,107 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /v1/orgs/{orgSlug}/agents:
+    get:
+      tags: [Agents]
+      operationId: listOrgAgents
+      summary: List all agents of an organization (admin)
+      description: |
+        Org-wide agent listing for administrators (agent-factory admin or
+        platform admin), whatever the owner or visibility. The caller must
+        belong to `orgSlug`. Rows expose the published snapshot when one
+        exists and never carry `published_config`. Sorted descending.
+      parameters:
+        - name: orgSlug
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 32
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 200
+          description: Case-insensitive match on name or description.
+        - name: last_message_after
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 40
+          description: ISO date - only agents with a message at or after this date.
+        - name: last_message_before
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 40
+          description: ISO date - agents with no message since this date (never-used agents included).
+        - name: min_messages
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Minimum `messages_count`.
+        - name: created_before
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 40
+          description: ISO date - only agents created before this date.
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [created, last_message, messages]
+          description: Sort field, always descending (default `created`).
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Page size (max 100, default 20).
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: string
+          description: 1-indexed page number.
+      responses:
+        '200':
+          description: Page of the org's agents.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentListResponse'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden - not a member of this org, or not an agent-factory / platform admin.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Method not allowed (only GET is accepted).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/orgs/{orgSlug}/retention:
     get:
       tags: [Retention]
@@ -3525,7 +4308,7 @@ paths:
       description: |
         Org-scoped retention policy. Admin-only (platform admin or
         agent-factory admin). Returns the raw policy document plus the
-        resolved `effective` values (org override → platform defaults).
+        resolved `effective` values (org override -> platform defaults).
       parameters:
         - name: orgSlug
           in: path
@@ -3751,6 +4534,144 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /v1/admin/user-deletion:
+    post:
+      tags: [Admin]
+      operationId: adminDeleteUserData
+      summary: Delete a user's data (GDPR erasure)
+      description: |
+        Erases a user's data across the platform: anonymizes their
+        conversations, transfers ownership of their agents to the calling
+        admin, deletes their shares, ratings, access requests, access
+        bindings, tasks and artifacts, then asks the Tools Memories, Knowledges
+        and AI Insights workspaces to delete their data. Each step is best
+        effort: failures are reported in `errors` and do not stop the run.
+
+        Requires a platform administrator session (`platformRole` `superadmin`
+        or `root`); other callers get `403`. Rate limited to 10 calls per hour
+        per admin. With `dry_run: true`, nothing is deleted and the counts
+        preview what would be affected (cross-workspace counts stay at `0`).
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminUserRequest'
+            example:
+              user_id: user-123
+      responses:
+        '200':
+          description: Deletion (or dry-run preview) report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserDeletionResult'
+        '400':
+          description: Missing or invalid `user_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminError'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminError'
+        '403':
+          description: The caller is not a platform administrator.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminError'
+              example:
+                error: Platform admin access required
+                code: FORBIDDEN
+                status: 403
+        '405':
+          description: Method not allowed (only POST is accepted).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminError'
+        '429':
+          description: Rate limit exceeded (10 per hour per admin).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminError'
+  /v1/admin/user-export:
+    post:
+      tags: [Admin]
+      operationId: adminExportUserData
+      summary: Export a user's data (GDPR access)
+      description: |
+        Collects a user's data across the platform: conversations, shares,
+        ratings, access requests, access bindings, archived tasks and owned
+        agents, plus their memories (Tools Memories), files and knowledge
+        bases (Knowledges) and insights (AI Insights). Each source is best
+        effort: failures are reported in `errors`.
+
+        Allowed for a platform administrator (`platformRole` `superadmin` or
+        `root`) on any user, and for any authenticated user on their own
+        `user_id`; other callers get `403`. Rate limited to 10 calls per hour
+        per caller.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [user_id]
+              properties:
+                user_id:
+                  type: string
+                  maxLength: 128
+                  description: Identifier of the user whose data is exported.
+            example:
+              user_id: user-123
+      responses:
+        '200':
+          description: Consolidated export.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserExportResult'
+        '400':
+          description: Missing or invalid `user_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminError'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminError'
+        '403':
+          description: The caller is neither a platform administrator nor the exported user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminError'
+        '405':
+          description: Method not allowed (only POST is accepted).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminError'
+        '429':
+          description: Rate limit exceeded (10 per hour per caller).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminError'
 components:
   securitySchemes:
     BearerAuth:
@@ -3777,6 +4698,14 @@ components:
         For Agent Factory, these keys can be generated directly from
         the Agent Factory UI (in addition to the AI Governance settings).
         Send as `x-prismeai-api-key: iak_...`.
+    HookCallbackTokenAuth:
+      type: apiKey
+      in: header
+      name: X-Hook-Token
+      description: |
+        Short-lived callback token (`cbt_...`) minted for one hook
+        invocation and delivered to the hook target in `callback.token`.
+        `Authorization: Bearer cbt_...` is also accepted.
   schemas:
     # ----------------------------------------------------------------
     # Common envelopes
@@ -3795,6 +4724,159 @@ components:
           type: object
           description: Optional structured context for the error.
           additionalProperties: true
+    AdminError:
+      type: object
+      description: |
+        Error body of the Admin routes. Authentication failures return
+        `error` + `message`; permission, validation, method and rate-limit
+        failures return `error` (message text) + `code` + `status`.
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Error code (authentication failures) or human-readable message.
+        message:
+          type: string
+          description: Human-readable message (authentication failures).
+        code:
+          type: string
+          description: Stable error code (FORBIDDEN, VALIDATION_ERROR, METHOD_NOT_ALLOWED).
+        status:
+          type: integer
+          description: HTTP status, repeated in the body.
+    AdminUserRequest:
+      type: object
+      additionalProperties: false
+      required: [user_id]
+      properties:
+        user_id:
+          type: string
+          maxLength: 128
+          description: Identifier of the user whose data is erased.
+        dry_run:
+          type: boolean
+          default: false
+          description: When `true`, only count what would be affected; nothing is deleted.
+    AdminStepError:
+      type: object
+      properties:
+        step:
+          type: string
+          description: Step that failed (e.g. conversations, shares, storage, ai_insights).
+        error:
+          type: string
+          description: Error message of the failed step.
+    AdminUserDeletionResult:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+        user_id:
+          type: string
+        conversations_anonymized:
+          type: integer
+        agents_transferred:
+          type: integer
+        shares_deleted:
+          type: integer
+        ratings_deleted:
+          type: integer
+        access_requests_deleted:
+          type: integer
+        agent_bindings_deleted:
+          type: integer
+        tasks_archive_deleted:
+          type: integer
+        memories_deleted:
+          type: integer
+        storage_files_deleted:
+          type: integer
+        storage_vector_stores_deleted:
+          type: integer
+        insights_deleted:
+          type: integer
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminStepError'
+      example:
+        dry_run: false
+        user_id: user-123
+        conversations_anonymized: 12
+        agents_transferred: 1
+        shares_deleted: 2
+        ratings_deleted: 3
+        access_requests_deleted: 0
+        agent_bindings_deleted: 4
+        tasks_archive_deleted: 5
+        memories_deleted: 6
+        storage_files_deleted: 2
+        storage_vector_stores_deleted: 1
+        insights_deleted: 7
+        errors: []
+    AdminUserExportResult:
+      type: object
+      properties:
+        exported_at:
+          type: string
+          format: date-time
+        user_id:
+          type: string
+        data:
+          type: object
+          description: Raw records per source, as stored by each workspace.
+          properties:
+            conversations: { type: array, items: { type: object, additionalProperties: true } }
+            shares: { type: array, items: { type: object, additionalProperties: true } }
+            ratings: { type: array, items: { type: object, additionalProperties: true } }
+            access_requests: { type: array, items: { type: object, additionalProperties: true } }
+            agent_bindings: { type: array, items: { type: object, additionalProperties: true } }
+            tasks_archive: { type: array, items: { type: object, additionalProperties: true } }
+            agents: { type: array, items: { type: object, additionalProperties: true } }
+            memories: { type: array, items: { type: object, additionalProperties: true } }
+            files: { type: array, items: { type: object, additionalProperties: true } }
+            vector_stores: { type: array, items: { type: object, additionalProperties: true } }
+            insights: { type: array, items: { type: object, additionalProperties: true } }
+            gdpr_requests: { type: array, items: { type: object, additionalProperties: true } }
+        counts:
+          type: object
+          description: Number of records per source.
+          additionalProperties:
+            type: integer
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminStepError'
+      example:
+        exported_at: '2026-01-15T10:00:00.000Z'
+        user_id: user-123
+        data:
+          conversations: []
+          shares: []
+          ratings: []
+          access_requests: []
+          agent_bindings: []
+          tasks_archive: []
+          agents: []
+          memories: []
+          files: []
+          vector_stores: []
+          insights: []
+          gdpr_requests: []
+        counts:
+          conversations: 0
+          shares: 0
+          ratings: 0
+          access_requests: 0
+          agent_bindings: 0
+          tasks_archive: 0
+          agents: 0
+          memories: 0
+          files: 0
+          vector_stores: 0
+          insights: 0
+          gdpr_requests: 0
+        errors: []
     DeletedResult:
       type: object
       description: Generic delete acknowledgement.
@@ -3850,8 +4932,12 @@ components:
           type: object
           description: |
             Optional `jsonmatch` pattern compared against the tool call's
-            arguments. The rule's policy only fires when the pattern matches;
-            otherwise the call runs without prompting.
+            arguments. The rule's policy only fires when the pattern matches.
+            A matching conditional rule beats a rule without `conditions` on
+            the same tool, whatever their order in the array; when no
+            conditional rule matches, the call falls through to the tool's
+            rule without `conditions`, then to a legacy rule on the bare tool
+            name, then to the server's rule, then to `default`.
           additionalProperties: true
         approvers:
           type: array
@@ -3863,12 +4949,17 @@ components:
       description: |
         Human-in-the-Loop configuration. Sets a default policy plus optional
         per-tool overrides. Policies:
-          - `auto`: run immediately (default).
-          - `always_ask`: halt every call on approval.
-          - `ask_external`: halt only on MCP tool calls.
-          - `ask_first`: halt the first time a tool runs in a session; cache
-            keyed per child name unless an MCP parent rule is configured (then
-            cached per parent).
+          - `auto` - run immediately (default).
+          - `always_ask` - halt every call on approval.
+          - `ask_external` - halt only on MCP tool calls.
+          - `ask_first` - halt the first time a tool runs in a session, then
+            auto-approve that tool for the rest of the session. The approval
+            is cached per tool (the namespaced `<parent>__<child>` name for an
+            MCP child) whatever level the rule is written at: under an MCP
+            server rule, approving one child does not approve its siblings.
+            When the matched rule carries `conditions`, the approval is also
+            scoped to those conditions (e.g. `records` with
+            `action: delete` is approved apart from `records` itself).
       properties:
         default:
           type: string
@@ -3974,6 +5065,29 @@ components:
           type: integer
         tool_call_budget:
           type: integer
+        effective_defaults:
+          type: object
+          description: |
+            Editor view only (x-draft-mode, caller with edit rights). The values
+            the runtime applies when an advanced field is left empty: profile
+            limits first, then the workspace defaults; max_tokens is the model's
+            declared response limit, or null when the provider drops max_tokens
+            (its own default applies). temperature_ignored is true when the
+            model's provider drops the temperature parameter.
+          properties:
+            temperature:
+              type: number
+            temperature_ignored:
+              type: boolean
+            max_tokens:
+              type: integer
+              nullable: true
+            max_turns:
+              type: integer
+            token_budget:
+              type: integer
+            tool_call_budget:
+              type: integer
         canvas_enabled:
           type: boolean
         visibility:
@@ -4026,7 +5140,8 @@ components:
           nullable: true
           description: |
             The CALLER's effective rights on this agent, computed at read time.
-            It has the same shape as `role` on knowledge bases.
+            It has the same shape as `role` on knowledge bases. Returned by
+            `GET /v1/agents/{agent_id}` and by the list endpoint.
 
             - `owner`  - owns the agent.
             - `admin`  - platform admin, agent-factory admin in the agent's
@@ -4046,9 +5161,9 @@ components:
                          view.
 
             Reading an agent is much wider than editing it (a published+public
-            agent is readable org-wide), which is why an editor UI gates on this
-            rather than on the global `agent-factory:agents:write` scope.
-            Informational - write endpoints still authorize on their own.
+            agent is readable org-wide), which is why Agent Creator gates its UI
+            on this rather than on the global `agent-factory:agents:write`
+            scope. Informational - write endpoints still authorize on their own.
         access_reason:
           type: string
           description: >-
@@ -4056,9 +5171,9 @@ components:
             `published`, `trusted-source:<workspace>`,
             `binding:<principal>[:<role>]`, `wildcard-scope`, `scope` or
             `permission`. Diagnostic companion to `role`, and internal
-            authorization topology - so it is returned by
-            `GET /v1/agents/{agent_id}` only when the request carries
-            `x-draft-mode`, never on a consumer read or in the list.
+            authorization topology - so it rides with the editor surface only:
+            `GET /v1/agents/{agent_id}` returns it when the request carries
+            `x-draft-mode`, and never on a consumer read or in the list.
         is_owner:
           type: boolean
           description: >-
@@ -4070,51 +5185,6 @@ components:
         updatedAt:
           type: string
           format: date-time
-    AgentRestrictedView:
-      type: object
-      description: |
-        Public-facing fields returned to callers without binding when the agent
-        is `restricted`. Subset of the full Agent record.
-      properties:
-        id:
-          type: string
-        name:
-          type: string
-        description:
-          type: string
-        icon_url:
-          type: string
-        category:
-          type: string
-        tags:
-          type: array
-          items:
-            type: string
-        visibility:
-          type: string
-          enum: [restricted]
-        starters:
-          type: array
-          items:
-            type: object
-            additionalProperties: true
-        status:
-          type: string
-        rating:
-          type: number
-        ratings_count:
-          type: integer
-        orgSlug:
-          type: string
-        published_at:
-          type: string
-          format: date-time
-        owner_id:
-          type: string
-        messages_count:
-          type: integer
-        conversations_count:
-          type: integer
     AgentCreateInput:
       type: object
       required: [instructions]
@@ -4180,8 +5250,12 @@ components:
             type: string
         temperature:
           type: number
+          nullable: true
+          description: Send null to reset to the default temperature.
         icon_url:
           type: string
+          nullable: true
+          description: Send null or an empty string to remove the icon.
         skills:
           type: array
           items:
@@ -4205,12 +5279,20 @@ components:
             type: string
         max_tokens:
           type: integer
+          nullable: true
+          description: Send null to remove the per-agent limit (the LLM Gateway limit applies).
         max_turns:
           type: integer
+          nullable: true
+          description: Send null to reset to the profile or platform default.
         token_budget:
           type: integer
+          nullable: true
+          description: Send null to reset to the profile or platform default.
         tool_call_budget:
           type: integer
+          nullable: true
+          description: Send null to remove the per-agent budget.
         canvas_enabled:
           type: boolean
         visibility:
@@ -4222,6 +5304,8 @@ components:
           maxLength: 128
         tags:
           type: array
+          nullable: true
+          description: Send null or an empty array to remove all tags.
           items:
             type: string
         starters:
@@ -4261,6 +5345,13 @@ components:
           type: string
           maxLength: 200000
           description: Full AGENTS.md document (front matter + markdown).
+        target_agent_id:
+          type: string
+          maxLength: 128
+          description: |
+            Optional - when set, patches the matching agent instead of
+            creating a new one. Frontmatter `id:` is ignored; only this
+            field triggers the patch path.
     AgentImportResponse:
       allOf:
         - $ref: '#/components/schemas/AgentCreateResponse'
@@ -4269,6 +5360,314 @@ components:
             imported:
               type: boolean
               example: true
+            action:
+              type: string
+              enum: [created, updated]
+              description: |
+                Indicates whether the call created a new agent or patched
+                an existing one (based on `target_agent_id`).
+    AgentUnpublishResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: draft
+        visibility:
+          type: string
+          example: private
+        unpublished_at:
+          type: string
+          format: date-time
+    ConversationUsageTotals:
+      type: object
+      properties:
+        messages:
+          type: integer
+          description: Turns that carried usage (one per assistant turn with an LLM call).
+        tokens_input:
+          type: integer
+        tokens_output:
+          type: integer
+        tokens_total:
+          type: integer
+        cost:
+          type: number
+        carbon:
+          type: number
+          description: Global warming potential of the turns (from `usage.carbon.gwp.value`).
+    ConversationUsage:
+      type: object
+      properties:
+        context_id:
+          type: string
+        agent_id:
+          type: string
+        title:
+          type: string
+        totals:
+          $ref: '#/components/schemas/ConversationUsageTotals'
+        by_model:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/ConversationUsageTotals'
+              - type: object
+                properties:
+                  model:
+                    type: string
+        meta:
+          type: object
+          properties:
+            source:
+              type: string
+              example: tasks
+            messages_count:
+              type: integer
+            generated_at:
+              type: string
+              format: date-time
+    ConnectorAccountList:
+      type: object
+      properties:
+        object:
+          type: string
+          example: list
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              knowledge_base_id:
+                type: string
+              capability_id:
+                type: string
+              capability_name:
+                type: string
+              connected:
+                type: boolean
+              connect_url:
+                type: string
+              disconnect_url:
+                type: string
+              usage:
+                type: string
+                description: Scope of the connection (bound to this agent).
+    AgentTrace:
+      type: object
+      properties:
+        correlationId:
+          type: string
+        agent_id:
+          type: string
+        summary:
+          type: object
+          properties:
+            eventCount:
+              type: integer
+            errorCount:
+              type: integer
+            toolCallCount:
+              type: integer
+            retrievalCount:
+              type: integer
+            model:
+              type: string
+            startTime:
+              type: string
+              format: date-time
+            endTime:
+              type: string
+              format: date-time
+            details_expired:
+              type: boolean
+            timeline_truncated:
+              type: boolean
+            workspaceId:
+              type: string
+        usage:
+          type: object
+          properties:
+            input_tokens:
+              type: integer
+            output_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+            cost:
+              type: number
+            duration_ms:
+              type: integer
+            completions:
+              type: integer
+        retrieval:
+          type: array
+          items:
+            type: object
+            properties:
+              query:
+                type: string
+              tool_name:
+                type: string
+              knowledge_base_id:
+                type: string
+              status:
+                type: string
+              returned:
+                type: integer
+              total_found:
+                type: integer
+              duplicates_filtered:
+                type: integer
+              passages:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              timestamp:
+                type: string
+                format: date-time
+        tool_calls:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+              tool_call_id:
+                type: string
+              tool_name:
+                type: string
+              display_name:
+                type: string
+              status:
+                type: string
+              error:
+                nullable: true
+              timestamp:
+                type: string
+                format: date-time
+        timeline:
+          type: array
+          description: Projected steps (never raw payloads), sorted by emission time.
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              id:
+                type: string
+                description: Event id, to pass to the step-detail endpoint.
+              workspaceId:
+                type: string
+              timestamp:
+                type: string
+                format: date-time
+              startedAt:
+                type: string
+                format: date-time
+              type:
+                type: string
+              automation:
+                type: string
+              appInstance:
+                type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              automation:
+                type: string
+              appInstance:
+                type: string
+              trigger:
+                type: object
+                additionalProperties: true
+              error:
+                nullable: true
+              message:
+                type: string
+              details:
+                nullable: true
+              timestamp:
+                type: string
+                format: date-time
+    AgentTraceEvent:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        automation:
+          type: string
+        appInstance:
+          type: string
+        workspaceId:
+          type: string
+        duration:
+          type: number
+        trigger:
+          type: object
+          additionalProperties: true
+        expired:
+          type: boolean
+          description: True when the 14-day cleanup already removed this step's inputs and outputs.
+        input:
+          nullable: true
+          description: Step inputs, known secret keys removed.
+        output:
+          nullable: true
+          description: Step outputs, known secret keys removed.
+        source:
+          type: object
+          properties:
+            correlationId:
+              type: string
+            automationSlug:
+              type: string
+            appInstanceFullSlug:
+              type: string
+            appInstanceDepth:
+              type: integer
+            workspaceId:
+              type: string
+            userId:
+              type: string
+            sessionId:
+              type: string
+            serviceTopic:
+              type: string
+    TaskHookEventInput:
+      type: object
+      required: [event]
+      properties:
+        event:
+          type: string
+          enum: [task.status, task.output.delta, task.output.completed]
+        data:
+          type: object
+          additionalProperties: true
+          description: A2A-shaped payload of the event.
+    TaskHookUpdateInput:
+      type: object
+      properties:
+        status:
+          type: object
+          additionalProperties: true
+          description: A2A task status (`state`, optional `timestamp`, defaulted to now).
+        artifacts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        output:
+          type: object
+          additionalProperties: true
     AgentListResponse:
       type: object
       description: Page of agents (with `published_config` stripped on list rows).
@@ -4496,6 +5895,64 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Tool'
+    ServerTool:
+      type: object
+      description: |
+        One tool advertised by an MCP server (`tools/list`), with the name the
+        runtime exposes it under.
+      required: [name, canonical_name]
+      properties:
+        name:
+          type: string
+          description: Tool name exactly as the server advertises it (what `tools/call` receives).
+        canonical_name:
+          type: string
+          pattern: '^[a-zA-Z0-9_-]{1,64}$'
+          description: |
+            `<parent>__<child>` name the model calls the tool by, and the value
+            a `tool_permissions.tools[].tool` rule must carry to target this
+            tool. Both segments sanitised to `[A-Za-z0-9_-]`, the pair trimmed
+            to 64 characters. Computed by the runtime; never derive it.
+        description:
+          type: string
+        inputSchema:
+          type: object
+          additionalProperties: true
+          description: |
+            JSON Schema of the tool's arguments, as published. A
+            `properties.action.enum` is the Prisme schema convention for
+            several operations behind one tool; a rule may target one of them
+            with `conditions: {action: "<value>"}`.
+        annotations:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: |
+            MCP tool annotations as published (`readOnlyHint`,
+            `destructiveHint`, …), `null` when the server publishes none.
+            Forwarded raw; nothing is derived from them.
+    ToolCapabilities:
+      type: object
+      description: |
+        Tools an MCP server attached to an agent exposes, as returned by
+        `GET /v1/agents/{agentId}/tools/{toolId}/capabilities`.
+      required: [status, items]
+      properties:
+        status:
+          type: string
+          enum: [ok, auth_required, unavailable]
+          description: |
+            `ok`: `items` is the server's list. `auth_required`: OAuth-gated
+            server the caller is not connected to; `items` is empty.
+            `unavailable`: the handshake or `tools/list` failed; `items` is
+            empty and `error` carries the message.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServerTool'
+        error:
+          type: string
+          description: Transport or JSON-RPC error message when `status` is `unavailable`.
     # ----------------------------------------------------------------
     # Conversations
     # ----------------------------------------------------------------
@@ -4526,7 +5983,7 @@ components:
         title:
           type: string
           maxLength: 512
-          description: Optional title (default `New conversation`).
+          description: Optional title. If omitted, the client localizes a default title.
     ConversationUpdateInput:
       type: object
       properties:
@@ -4752,8 +6209,28 @@ components:
           type: integer
         total_versions:
           type: integer
+        version:
+          type: integer
+          description: Version whose `content` is returned.
         content:
           type: string
+        versions:
+          type: array
+          description: Only with `?versions=1`.
+          items:
+            type: object
+            properties:
+              version:
+                type: integer
+              createdAt:
+                type: string
+                format: date-time
+              changeSummary:
+                type: string
+              createdByType:
+                type: string
+              bytes:
+                type: integer
         conversation_id:
           type: string
         agent_id:
@@ -4783,19 +6260,15 @@ components:
     ArtifactPatchInput:
       type: object
       description: |
-        Two mutation modes - exactly one of `content` (full replace,
-        creates a new version) or `patches` (line-level operations,
-        applied atomically) MUST be present.
+        Send `content` (full replace) or `restore_version` (fork a
+        historical version into a new current version).
       properties:
         content:
           type: string
           description: Full replacement content (creates a new version).
-        patches:
-          type: array
-          description: Line-level operations applied atomically.
-          items:
-            type: object
-            additionalProperties: true
+        restore_version:
+          type: number
+          description: Historical version number to re-commit as the new current version.
         change_summary:
           type: string
           maxLength: 512
@@ -5248,7 +6721,7 @@ components:
     # ----------------------------------------------------------------
     RetentionEffective:
       type: object
-      description: Resolved retention values (agent → org → platform defaults).
+      description: Resolved retention values (agent -> org -> platform defaults).
       properties:
         conversations_retention_days:
           type: integer
