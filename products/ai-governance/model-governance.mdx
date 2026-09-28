@@ -180,6 +180,95 @@ Each metric shows:
 - Percentage consumed
 - Visual progress bar (yellow at 80%, red at 95%)
 
+## Model pricing
+
+Every cost figure the platform shows you — Total Cost and Cost by Model in [Observability → LLM](/products/ai-governance/observability#llm-tab), the Cost ($) series in [Insights → Consumption](/products/ai-insights/consumption#llm-requests), the `llm.cost.monthly` quota metric above — is computed from prices **you** enter in the model catalog. The platform ships no price list and reads no provider invoice.
+
+### How a cost is calculated
+
+On every call, the LLM Gateway multiplies the tokens actually consumed by the model's catalog prices:
+
+```
+cost = prompt_tokens     × input_per_1m_tokens  / 1 000 000
+     + completion_tokens × output_per_1m_tokens / 1 000 000
+```
+
+The result is rounded to 6 decimals and emitted on the `analytics.llm.completion` event, which is what every dashboard aggregates.
+
+There is **no multiplier and no margin** anywhere in the chain. A displayed cost is tokens × your catalog price, and nothing else. If a dashboard total is off by a factor, the prices in the catalog are off by that same factor — that is the only place the discrepancy can come from.
+
+### Prices are environment data, not a platform default
+
+Prices are configuration, like credentials or quotas: each environment carries its own, and a platform administrator enters them. The providers' public list prices are a reasonable starting point. If you buy through a negotiated contract, a reseller, or committed-use discounts, enter **your contractual prices** instead — otherwise the dashboards report list price while you are billed something else.
+
+<Warning>
+**A model with no price costs 0, silently.** The gateway computes a cost only when **both** the input and the output price are set. Otherwise the cost is `0` — no error, no warning, no badge. The model keeps working, and it appears free in every dashboard, in the per-user chargeback table, and against the `llm.cost.monthly` quota.
+
+Scale mistakes are just as quiet. The fields are **per 1M tokens**: entering a per-1K price there understates every cost by a factor of 1000, and nothing flags it.
+
+Embedding models use the input price only; leaving their output price empty is normal and does not zero the cost.
+</Warning>
+
+### Costs are never recalculated
+
+A cost is frozen at the moment of the call and stored on the event. Correcting a price changes **future calls only** — history keeps whatever it was computed with. There is no backfill, so a period priced wrongly stays wrong in the dashboards. Fix the price as soon as you notice it, and treat the affected window as known-bad rather than waiting for it to correct itself.
+
+### Currency
+
+Dashboards label costs `$`. The platform performs no conversion: whatever number you enter is the number displayed. If your contract is in euros, entering euro prices makes every dashboard read euros under a `$` sign — pick one currency per environment and stay with it.
+
+### Setting prices in Govern
+
+Reserved to platform superadmins.
+
+1. Go to **Govern → Models** and open the **Models** tab.
+2. Click the model to open it.
+3. In the **Pricing** block (**Tarification** in the French interface), fill **Input (per 1M tokens)** and **Output (per 1M tokens)**.
+4. Save.
+
+Both fields take the price of **one million** tokens. For a model listed at $2.50 per million input tokens and $10.00 per million output tokens, enter `2.5` and `10`.
+
+### Setting prices by API
+
+```http
+PATCH {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/{model_id}
+```
+
+```json
+{
+  "pricing": {
+    "input_per_1m_tokens": 2.5,
+    "output_per_1m_tokens": 10
+  }
+}
+```
+
+The model cache is flushed automatically, so the new price applies to the next call.
+
+<Note>
+The PATCH **replaces the whole `pricing` object** — it does not merge field by field. Always send both keys, even when changing one: sending only `output_per_1m_tokens` drops the input price, and the model silently falls back to a cost of 0.
+</Note>
+
+<Warning>
+**Bulk import replaces the entire catalog.** Importing a JSON catalog from the **⋮** menu (and `PUT /v1/models`) is a wholesale replacement, not a merge: **every model absent from the file is deleted**, and the prices carried by the file overwrite the ones in place.
+
+Import files therefore carry the *source* environment's prices. After importing from another environment — staging into production, or one tenant into another — re-check prices model by model before trusting any dashboard.
+</Warning>
+
+### `cost_tier` is a label, not a price
+
+Do not confuse pricing with the **Cost tier** field (`low` / `medium` / `high`) in the model's Metrics block. The tier drives the [Cost Optimized routing strategy](#routing-strategies) and the soft-downgrade policy, and it is what end users see in the model picker. It never enters the cost calculation.
+
+The two are independent in the data but must stay consistent in practice: a model priced at the top of your catalog and tagged `low` will be picked first by cost-optimized routing and read as cheap by everyone choosing a model. Set the tier from the prices, and revisit it whenever prices change. See [Available Models → Cost tiers](/products/ai-governance/available-models#cost-tiers).
+
+### Checklist after adding or importing models
+
+- Every enabled `completion` model has **both** prices set.
+- Prices are per **1M** tokens, in a single currency across the environment.
+- Every embedding model has its input price set.
+- Each `cost_tier` is consistent with the model's actual prices.
+- Run one test call per model, then confirm a **non-zero** cost for it in Observability → LLM. A model sitting at 0 after a real call has no price.
+
 ## Per-Agent Model Restrictions
 
 <Frame>
