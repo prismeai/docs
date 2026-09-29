@@ -291,7 +291,9 @@ paths:
         List agents with multi-scope filter. Supported scopes (comma-separated):
         `own`, `shared`, `published`, `all`. Default `own`. The reserved
         action `?action=explore` returns all public+restricted published
-        agents in the caller's organization.
+        agents in the caller's organization. The `shared` scope also lists
+        agents with no published version that were explicitly shared with
+        the caller, served as their draft at the role the share carries.
       parameters:
         - name: scope
           in: query
@@ -470,6 +472,10 @@ paths:
         `published_config`). Non-owners with binding receive the record
         with `published_config` stripped. Restricted agents seen by
         callers without binding return only public-facing fields.
+
+        An agent with no published version is served (as its draft) to its
+        editors and to callers it was explicitly shared with; anyone else
+        gets 404.
       parameters:
         - name: agentId
           in: path
@@ -497,7 +503,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '404':
-          description: Agent not found.
+          description: Agent not found, or the agent has no published version and the caller is neither an editor nor an explicit grantee.
           content:
             application/json:
               schema:
@@ -939,8 +945,19 @@ paths:
       description: |
         Create a binding granting a user, group, or org access to this
         agent. User and group principals are validated against the
-        agent's organization via `ai-governance-v2`. Default role is
-        `admin` if `role_slug` is omitted.
+        agent's organization via `ai-governance-v2`.
+
+        An `org` target may be the agent's own org (no extra requirement),
+        another organization, or the literal wildcard `*` meaning every
+        authenticated member of at least one org. Any target beyond the
+        agent's own org requires the `agent-factory:sharing:cross-org`
+        permission (403 without it), and a specific foreign org is only
+        accepted when the sharer is an active member of it (uniform 400
+        otherwise; platform admins bypass).
+
+        Default role when `role_slug` is omitted: `admin` for same-org
+        shares (historical default), `user` for any org target beyond the
+        agent's own org.
       parameters:
         - name: agentId
           in: path
@@ -962,7 +979,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/AccessShareResponse'
         '400':
-          description: Validation error (invalid principal_type, missing principal_id, cross-org sharing, etc.).
+          description: Validation error (invalid principal_type, missing principal_id, unknown or `owner` role_slug, sharer not a member of the target org, etc.).
           content:
             application/json:
               schema:
@@ -974,7 +991,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Forbidden.
+          description: Forbidden - including an org target beyond the agent's own org without the `agent-factory:sharing:cross-org` permission.
           content:
             application/json:
               schema:
@@ -992,17 +1009,114 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: Binding already exists.
+          description: Binding already exists (the unique tuple distinguishes each org target, `*` included).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
   /v1/agents/{agentId}/access/{principalType}/{principalId}:
+    patch:
+      tags: [Access]
+      operationId: updateAgentAccess
+      summary: Change an agent share's role
+      description: >-
+        Change the role of the binding for the given (principal_type,
+        principal_id) pair, in place. Revoking and re-creating is not
+        equivalent: the two calls have no transaction around them, and the
+        revoke half is refused when the binding is the resource's last one.
+
+
+        `owner` is not accepted, although it is a defined agent role: it is the
+        only share role carrying `delete`, and this endpoint is reachable by
+        anyone holding `share`. It also never conferred ownership - an agent's
+        owner is its `owner_id`, and a binding with that role resolves to
+        `admin`.
+
+
+        The caller's own access cannot be changed, for the same reason it
+        cannot be revoked: lowering one's own role drops them out of the panel
+        they are acting from, on an agent they may be the only administrator
+        of.
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+        - name: principalType
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [user, group, org]
+            maxLength: 32
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role_slug]
+              properties:
+                role_slug:
+                  type: string
+                  enum: [user, admin]
+                  maxLength: 64
+      responses:
+        '200':
+          description: Binding updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated:
+                    type: boolean
+                  binding:
+                    $ref: '#/components/schemas/AccessBinding'
+        '400':
+          description: >-
+            Invalid `principal_type`, unknown or forbidden `role_slug`, or an
+            attempt to change the caller's own access
+            (`CANNOT_MODIFY_OWN_ACCESS`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No binding found for this principal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     delete:
       tags: [Access]
       operationId: revokeAgentAccess
       summary: Revoke an agent access binding
-      description: Delete the binding for the given (principal_type, principal_id) pair.
+      description: >-
+        Delete the binding for the given (principal_type, principal_id) pair.
+        The caller's own access cannot be revoked here
+        (`CANNOT_MODIFY_OWN_ACCESS`): it would drop them out of the panel they
+        are acting from, on an agent they may be the only administrator of.
       parameters:
         - name: agentId
           in: path
@@ -1031,7 +1145,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/DeletedResult'
         '400':
-          description: Invalid `principal_type`.
+          description: >-
+            Invalid `principal_type`, or an attempt to revoke the caller's own
+            access (`CANNOT_MODIFY_OWN_ACCESS`).
           content:
             application/json:
               schema:
@@ -1055,7 +1171,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '405':
-          description: Method not allowed (only DELETE is accepted).
+          description: Method not allowed (only PATCH and DELETE are accepted).
           content:
             application/json:
               schema:
@@ -2443,7 +2559,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Forbidden.
+          description: Forbidden, including an agent with no published version called by someone who is neither an editor nor an explicit grantee.
           content:
             application/json:
               schema:
@@ -2542,7 +2658,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Forbidden.
+          description: Forbidden, including an agent with no published version called by someone who is neither an editor nor an explicit grantee.
           content:
             application/json:
               schema:
@@ -5070,7 +5186,8 @@ components:
           description: |
             Editor view only (x-draft-mode, caller with edit rights). The values
             the runtime applies when an advanced field is left empty: profile
-            limits first, then the workspace defaults; max_tokens is the model's
+            limits first, then the workspace defaults (max_turns has no profile
+            default: the workspace default applies, 50 when unset); max_tokens is the model's
             declared response limit, or null when the provider drops max_tokens
             (its own default applies). temperature_ignored is true when the
             model's provider drops the temperature parameter.
@@ -5174,6 +5291,14 @@ components:
             authorization topology - so it rides with the editor surface only:
             `GET /v1/agents/{agent_id}` returns it when the request carries
             `x-draft-mode`, and never on a consumer read or in the list.
+
+
+            The `binding:` prefix carries a second job: it is what lets an agent
+            with no published version be served to someone it was explicitly
+            shared with - never published or withdrawn alike, since withdrawing
+            empties the catalogue and not the shares. A public consumer
+            (`public`), an admin (`admin`) and an RBAC scope (`wildcard-scope`,
+            `scope`) do not match it and keep the refusal.
         is_owner:
           type: boolean
           description: >-
@@ -5193,8 +5318,14 @@ components:
           type: string
           maxLength: 256
         description:
-          type: string
-          maxLength: 4096
+          description: Plain string, or an object of per-locale strings.
+          oneOf:
+            - type: string
+              maxLength: 4096
+            - type: object
+              additionalProperties:
+                type: string
+                maxLength: 4096
         instructions:
           type: string
           maxLength: 100000
@@ -5228,6 +5359,23 @@ components:
           items:
             type: object
             additionalProperties: true
+        max_turns:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Persisted only when provided; otherwise the workspace default applies (max_turns has no profile default). 0 and negative values are rejected.
+        token_budget:
+          type: integer
+          description: Overrides the profile default when provided.
+        tool_call_budget:
+          type: integer
+          description: Overrides the profile default when provided.
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+        tool_activation:
+          $ref: '#/components/schemas/ToolActivation'
     AgentUpdateInput:
       type: object
       description: Partial agent update payload. Any subset of the writable Agent fields.
@@ -5236,8 +5384,14 @@ components:
           type: string
           maxLength: 256
         description:
-          type: string
-          maxLength: 4096
+          description: Plain string, or an object of per-locale strings.
+          oneOf:
+            - type: string
+              maxLength: 4096
+            - type: object
+              additionalProperties:
+                type: string
+                maxLength: 4096
         instructions:
           type: string
           maxLength: 100000
@@ -5252,6 +5406,10 @@ components:
           type: number
           nullable: true
           description: Send null to reset to the default temperature.
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
         icon_url:
           type: string
           nullable: true
@@ -5283,8 +5441,9 @@ components:
           description: Send null to remove the per-agent limit (the LLM Gateway limit applies).
         max_turns:
           type: integer
+          minimum: 1
           nullable: true
-          description: Send null to reset to the profile or platform default.
+          description: Send null to reset to the workspace default (max_turns has no profile default). 0 and negative values are rejected.
         token_budget:
           type: integer
           nullable: true
@@ -6463,11 +6622,11 @@ components:
         principal_id:
           type: string
           maxLength: 128
-          description: User id (or email for user type, resolved server-side), group id, or org slug.
+          description: User id (or email for user type, resolved server-side), group id, or org slug. For `org`, the target may be the agent's own org, another org (sharer must be a member), or the literal `*` for all authenticated users belonging to at least one org - both beyond-own-org forms require `agent-factory:sharing:cross-org`.
         role_slug:
           type: string
           maxLength: 64
-          description: Role to grant. Defaults to `admin`.
+          description: Role to grant, `admin` or `user` (`owner` is refused). Defaults to `admin` for same-org shares, `user` for any org target beyond the agent's own org.
     AccessShareResponse:
       type: object
       properties:

@@ -163,6 +163,76 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '429':
           $ref: '#/components/responses/RateLimited'
+  /v1/analytics/llm-timeseries:
+    get:
+      tags: [Analytics]
+      operationId: getAnalyticsLlmTimeseries
+      summary: Get LLM usage time series
+      description: |
+        Drill-down LLM usage computed live from LLM Gateway events: completion
+        versus embedding requests, costs and tokens per time bucket, plus a
+        per-user breakdown for the same window. Unlike
+        `/v1/analytics/llm-requests` (pre-aggregated daily rollups, period
+        preset only), the series can be restricted to a single user, call
+        type or model and sliced to an arbitrary range: `from_date` and
+        `to_date` together take precedence over `period` (`meta.period` is
+        then `custom`). Buckets are hourly when the window spans at most 2
+        days, daily otherwise, unless `granularity` is set. `call_type`
+        exists on completions only, so setting it narrows the series to
+        completions. `by_user` rows carry no `conversations` count. User names
+        and emails are resolved with the caller's own credentials.
+        Rate limit: 100 requests per minute.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - name: user_id
+          in: query
+          required: false
+          description: Restrict to a single user.
+          schema:
+            type: string
+            maxLength: 128
+            pattern: ^[a-zA-Z0-9_-]+$
+        - name: call_type
+          in: query
+          required: false
+          description: |
+            Restrict to a single completion call type (`external`,
+            `agent_turn`, `title_generation`, `session_summary`,
+            `history_summary`, `context_compaction`, ...).
+          schema:
+            type: string
+            maxLength: 40
+            pattern: ^[a-z_]+$
+        - name: model
+          in: query
+          required: false
+          description: Restrict to a single model ID.
+          schema:
+            type: string
+            maxLength: 128
+            pattern: ^[a-zA-Z0-9._:-]+$
+        - name: granularity
+          in: query
+          required: false
+          description: Bucket size. Chosen from the window span when omitted.
+          schema:
+            type: string
+            enum: [hourly, daily]
+      responses:
+        '200':
+          description: LLM usage time series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsLlmTimeseries'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /v1/analytics/agents:
     get:
       tags: [Analytics]
@@ -1611,6 +1681,10 @@ components:
                 type: number
               cost_embeddings:
                 type: number
+              tokens_completions:
+                type: integer
+              tokens_embeddings:
+                type: integer
         by_user:
           type: array
           items:
@@ -1649,6 +1723,95 @@ components:
               type: number
         meta:
           $ref: '#/components/schemas/PeriodMeta'
+    AnalyticsLlmTimeseries:
+      type: object
+      properties:
+        series:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date-time
+                description: Bucket start; carries the hour for hourly buckets.
+              completions:
+                type: integer
+              embeddings:
+                type: integer
+              cost_completions:
+                type: number
+              cost_embeddings:
+                type: number
+              tokens_completions:
+                type: integer
+              tokens_embeddings:
+                type: integer
+              carbon:
+                type: number
+        by_user:
+          type: array
+          items:
+            type: object
+            properties:
+              user_id:
+                type: string
+              name:
+                type: string
+                nullable: true
+              email:
+                type: string
+                nullable: true
+              completions:
+                type: integer
+              embeddings:
+                type: integer
+              tokens_input:
+                type: integer
+                description: Includes embedding tokens.
+              tokens_output:
+                type: integer
+              messages:
+                type: integer
+                description: User chat turns.
+              cost:
+                type: number
+              carbon_kgco2:
+                type: number
+        totals:
+          type: object
+          properties:
+            completions:
+              type: integer
+            embeddings:
+              type: integer
+            cost_completions:
+              type: number
+            cost_embeddings:
+              type: number
+            tokens_completions:
+              type: integer
+            tokens_embeddings:
+              type: integer
+            carbon:
+              type: number
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/PeriodMeta'
+            - type: object
+              properties:
+                granularity:
+                  type: string
+                  enum: [hourly, daily]
+                user_id:
+                  type: string
+                  description: The `user_id` filter, echoed back.
+                call_type:
+                  type: string
+                  description: The `call_type` filter, echoed back.
+                model:
+                  type: string
+                  description: The `model` filter, echoed back.
     AnalyticsAgents:
       type: object
       properties:

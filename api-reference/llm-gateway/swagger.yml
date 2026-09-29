@@ -59,11 +59,27 @@ paths:
         Bedrock, OpenAI-compatible) based on the resolved model spec.
 
         **Streaming.** When `stream: true`, the response is a `text/event-stream`
-        of OpenAI-compatible delta chunks (`ChatCompletionChunk`) terminated by
-        a literal `data: [DONE]` payload. Provider-native stream shapes
+        of OpenAI-compatible delta chunks (`ChatCompletionChunk`) followed by a
+        literal `data: [DONE]` payload, then one final `chat.completion` frame
+        (same shape as `ChatCompletionResponse`) carrying the assembled message,
+        `finish_reason` and `usage`. Provider-native stream shapes
         (Anthropic, Bedrock, Vertex) are normalised to OpenAI deltas before
         being forwarded. Provider errors mid-stream are emitted as a synthetic
-        chunk with a `content` message followed by `[DONE]`.
+        chunk carrying an `error` object and a `content` fallback message,
+        followed by `[DONE]`.
+
+        **Failover.** When the requested model was attempted and failed, and a
+        fallback answered instead (governance failover mapping merged with
+        `fallback_models`), the switch is reported as
+        `failover: { from_model, to_model }` on the response body, or on the
+        first forwarded chunk when streaming.
+
+        **Thinking blocks.** Anthropic thinking blocks are never streamed. They
+        are returned on the assistant message as `reasoning_details`, tagged
+        with `reasoning_model` (the model that answered). Send both back
+        verbatim when replaying the turn: the gateway forwards the blocks only
+        to that same model, drops them for any other, and never sends the
+        `reasoning_model` tag to a provider.
 
         When `stream: false` (default), the response is a single JSON
         `ChatCompletionResponse`. The non-streaming response is enriched with
@@ -75,6 +91,9 @@ paths:
         - `analytics_context` - caller-supplied context (`orgSlug`, `agent_id`,
           `user_id`, `context_id`, `agent_allowed_models`, `call_type`,
           `message_turn`) used to enrich `analytics.llm.completion` events.
+        - `fallback_models` - ordered models tried when the requested model
+          fails, merged with the governance failover mapping; each one is
+          checked against the caller's access like the primary.
 
         **Rate limiting.** 100 requests per 60 seconds per consumer
         (`auth.user_id` or `session.id`).
@@ -96,7 +115,7 @@ paths:
             Successful completion. Content type depends on `request.stream`:
             - `application/json`: non-streaming `ChatCompletionResponse`.
             - `text/event-stream`: SSE stream of `ChatCompletionChunk` payloads
-              terminated by `data: [DONE]`.
+              followed by `data: [DONE]` and a final `chat.completion` frame.
           content:
             application/json:
               schema:
@@ -105,8 +124,9 @@ paths:
               schema:
                 description: |
                   Server-Sent Events stream. Each `data:` line carries a JSON
-                  `ChatCompletionChunk` (delta), and the final `data:` line is
-                  the literal string `[DONE]`. The schema below describes the
+                  `ChatCompletionChunk` (delta), then a literal `[DONE]` line,
+                  then one final `chat.completion` frame shaped like
+                  `ChatCompletionResponse`. The schema below describes the
                   per-chunk JSON payload.
                 allOf:
                   - $ref: '#/components/schemas/ChatCompletionChunk'
@@ -1041,6 +1061,32 @@ components:
           description: Tool calls emitted by an assistant message.
           items:
             $ref: '#/components/schemas/ToolCall'
+        reasoning_details:
+          type: array
+          description: |
+            Anthropic thinking blocks produced with this assistant message
+            (`thinking` blocks carry `thinking` and `signature`,
+            `redacted_thinking` blocks carry `data`). Returned by the gateway
+            and meant to be sent back verbatim when the turn is replayed.
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              type:
+                type: string
+                enum: [thinking, redacted_thinking]
+              thinking:
+                type: string
+              signature:
+                type: string
+              data:
+                type: string
+        reasoning_model:
+          type: string
+          description: |
+            Gateway model id that produced `reasoning_details`. On replay the
+            blocks are forwarded only when this matches the model being
+            called; the tag itself is never sent to a provider.
 
     ToolCall:
       type: object
@@ -1068,7 +1114,7 @@ components:
 
     ChatCompletionRequest:
       type: object
-      required: [model, messages]
+      required: [messages]
       description: |
         OpenAI-compatible chat completion request. Only the fields actually
         accepted by the gateway are documented here.
@@ -1079,7 +1125,8 @@ components:
           description: |
             Model id from the catalogue (e.g. `gpt-4o`,
             `eu.anthropic.claude-sonnet-4-20250514-v1:0`,
-            `vertex-gemini-2.5-flash`).
+            `vertex-gemini-2.5-flash`). Defaults to the gateway's
+            `defaults.completions` model when omitted.
         messages:
           type: array
           description: Conversation history (system + user/assistant/tool turns).
@@ -1122,6 +1169,16 @@ components:
           additionalProperties: true
         seed:
           description: Provider seed for reproducible sampling (where supported).
+        fallback_models:
+          type: array
+          maxItems: 5
+          items:
+            type: string
+          description: |
+            **Prisme.ai extension.** Ordered fallback models tried when the
+            requested model fails (merged with the governance failover
+            mapping). Each one is checked against the caller's access like
+            the primary.
         task_id:
           type: string
           maxLength: 128
@@ -1185,7 +1242,12 @@ components:
                 type: string
                 description: |
                   `stop`, `length`, `tool_calls`, `content_filter`, or another
-                  provider-specific value.
+                  provider-specific value. Anthropic and Bedrock stop reasons
+                  are normalised: unfinished answers (`max_tokens`,
+                  `model_context_window_exceeded`, `pause_turn`) become
+                  `length`, refusals (`refusal`, `guardrail_intervened`,
+                  `content_filtered`) become `content_filter`, any other
+                  present value becomes `stop`.
         usage:
           type: object
           description: Token, cost, and carbon accounting.
@@ -1234,13 +1296,16 @@ components:
                 **Prisme.ai extension.** Carbon-footprint estimate produced by
                 `_compute-carbon-footprint`.
               additionalProperties: true
+        failover:
+          $ref: '#/components/schemas/FailoverInfo'
 
     ChatCompletionChunk:
       type: object
       description: |
         Single chunk in a streaming chat completion. Forwarded as the JSON
-        payload of an SSE `data:` line. The final SSE payload of a stream is
-        the literal string `[DONE]` (not JSON).
+        payload of an SSE `data:` line. A literal `[DONE]` payload (not JSON)
+        closes the delta sequence, followed by one final `chat.completion`
+        frame shaped like `ChatCompletionResponse`.
       properties:
         id:
           type: string
@@ -1273,6 +1338,28 @@ components:
                       additionalProperties: true
               finish_reason:
                 type: string
+        failover:
+          allOf:
+            - $ref: '#/components/schemas/FailoverInfo'
+          description: Present on the first forwarded chunk when the gateway switched model.
+        error:
+          type: object
+          description: |
+            Present on the synthetic chunk emitted when the provider fails
+            mid-stream. `choices[0].delta.content` then carries the same
+            message for consumers that only read deltas.
+          properties:
+            message:
+              type: string
+            code:
+              type: string
+            provider:
+              type: string
+            model:
+              type: string
+            details:
+              type: object
+              additionalProperties: true
         usage:
           type: object
           description: |
@@ -1281,6 +1368,19 @@ components:
             `completion_tokens_details.reasoning_tokens`,
             `cache_read_input_tokens`, `cache_write_input_tokens`).
           additionalProperties: true
+
+    FailoverInfo:
+      type: object
+      description: |
+        Reported when the requested model was attempted, failed, and a
+        fallback answered instead. Absent when no switch happened.
+      properties:
+        from_model:
+          type: string
+          description: Model requested by the caller.
+        to_model:
+          type: string
+          description: Model that actually answered.
 
     EmbeddingRequest:
       type: object

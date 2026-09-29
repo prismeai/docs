@@ -224,7 +224,9 @@ paths:
         `accessControl` are merged into the stored values. The connector is
         re-checked first, and `capability_id` cannot change. When the update
         makes a draft connection ready (selection and knowledge base both
-        set for the first time), its first sync is queued.
+        set for the first time), its first sync is queued. Sending
+        `config.selection` cancels any sync in flight (its runs end
+        `cancelled`) so the next sync lists the new selection.
       parameters:
         - name: connectionId
           in: path
@@ -269,9 +271,10 @@ paths:
       summary: Delete a connection
       description: |
         Deletes the connection and the documents it imported into its
-        knowledge base. Always possible, even when the connector is no longer
-        available. Storage cleanup is skipped when the caller no longer owns
-        the knowledge base.
+        knowledge base. Any sync in flight is cancelled first and the
+        connection stays `deleting` until its row is gone. Always possible,
+        even when the connector is no longer available. Storage cleanup is
+        skipped when the caller no longer owns the knowledge base.
       parameters:
         - name: connectionId
           in: path
@@ -514,8 +517,9 @@ paths:
         Queues a sync run and returns immediately. A large source is imported
         in bounded batches that chain automatically until nothing is left.
         Refused while a run started less than the stale-sync timeout ago is
-        still in progress (`SYNC_IN_PROGRESS`, 409), and when the connection
-        has no selection or no knowledge base (`SYNC_NOT_CONFIGURED`, 400).
+        still in progress or while the connection is being deleted
+        (`SYNC_IN_PROGRESS`, 409), and when the connection has no selection
+        or no knowledge base (`SYNC_NOT_CONFIGURED`, 400).
       parameters:
         - name: connectionId
           in: path
@@ -548,7 +552,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: A sync is already in progress (`SYNC_IN_PROGRESS`).
+          description: A sync is already in progress, or the connection is being deleted (`SYNC_IN_PROGRESS`).
           content:
             application/json:
               schema:
@@ -894,8 +898,8 @@ components:
           $ref: '#/components/schemas/SyncSchedule'
         status:
           type: string
-          enum: [active, syncing, error, disconnected]
-          description: '`disconnected` means the connector lost access to the account; reconnect it.'
+          enum: [active, syncing, error, disconnected, deleting]
+          description: '`disconnected` means the connector lost access to the account; reconnect it. `deleting` is set while a DELETE removes the imported documents; no sync can start in that state.'
         last_sync:
           type: object
           nullable: true
@@ -1019,8 +1023,8 @@ components:
           type: string
         status:
           type: string
-          enum: [pending, running, completed, partial, failed]
-          description: '`partial` means some documents failed or were deferred to a later batch.'
+          enum: [pending, running, completed, partial, failed, cancelled]
+          description: '`partial` means some documents failed or were deferred to a later batch. `cancelled` means the connection''s selection changed or the connection was deleted while the run was in flight; `error` then says which.'
         progress:
           $ref: '#/components/schemas/SyncProgress'
         result:
@@ -1079,7 +1083,7 @@ components:
           type: string
         status:
           type: string
-          enum: [active, syncing, error, disconnected]
+          enum: [active, syncing, error, disconnected, deleting]
         last_sync:
           type: object
           additionalProperties: true
