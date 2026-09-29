@@ -71,16 +71,25 @@
   class Voices {
     constructor(manifest, base) {
       this.m = manifest; this.base = base;
-      const AC = window.AudioContext || window.webkitAudioContext;
-      this.ctx = AC ? new AC() : null;             // sans Web Audio : vidéo et textes seulement
-      if (this.ctx) { this.gain = this.ctx.createGain(); this.gain.connect(this.ctx.destination); }
+      this.ctx = null;                             // créé au premier geste (voir ensure)
       this.buffers = {}; this.pending = {}; this.src = null; this.token = 0;
       this.lang = null; this.video = null;
+    }
+    // WebKit crée un contexte ouvert hors geste, ou page en arrière-plan, à l'état « interrupted » et ne l'en
+    // sort pas tout seul : on le crée au premier geste et on le relance dès qu'il ne tourne pas
+    ensure() {
+      if (this.ctx) return this.ctx;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;                        // sans Web Audio : vidéo et textes seulement
+      this.ctx = new AC();
+      this.gain = this.ctx.createGain(); this.gain.connect(this.ctx.destination);
+      this.volume();
+      return this.ctx;
     }
     key(rate) { const v = (this.m.voices || {})[this.lang] || {}; return v[String(rate)] ? String(rate) : "1"; }
     load(lang, key) {
       const id = lang + "@" + key, url = ((this.m.voices || {})[lang] || {})[key];
-      if (!this.ctx || !url) return Promise.reject(new Error("voix absente : " + id));
+      if (!this.ensure() || !url) return Promise.reject(new Error("voix absente : " + id));
       if (!this.pending[id]) {
         this.pending[id] = fetch(new URL(url, this.base)).then((r) => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
           .then((b) => new Promise((ok, ko) => this.ctx.decodeAudioData(b, ok, ko)))
@@ -90,10 +99,10 @@
       return this.pending[id];
     }
     unlock() {
-      if (!this.ctx) return;
+      if (!this.ensure()) return;
       // iPhone en mode silencieux : le Web Audio suit le bouton silence sauf en session « playback »
       if (navigator.audioSession && navigator.audioSession.type !== "playback") { try { navigator.audioSession.type = "playback"; } catch (e) { /* non supporté */ } }
-      if (this.ctx.state === "suspended") this.ctx.resume();
+      if (this.ctx.state !== "running") this.ctx.resume().catch(() => {});
     }
     // mémoire : un tampon décodé pèse ~0,2 Mo/s ; on ne garde que la voix courante et sa vitesse 1
     purge(keep) {
