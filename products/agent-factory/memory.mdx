@@ -10,8 +10,8 @@ Prisme.ai agents have three independent memory layers. Each one answers a differ
 | Layer | Question it answers | Scope | Backend | How it's updated |
 |---|---|---|---|---|
 | **Working memory** | *"Does my agent remember what we said 5 messages ago in this same conversation?"* | One conversation | Conversation database | Automatic: past turns of the current conversation are reloaded into the prompt at each turn |
-| **Session memory** | *"Does my agent remember what we discussed in a different conversation last week?"* | One user × one agent, across all their conversations | Fast in-memory session store | Automatic: at the end of each completed conversation, the platform asks an LLM to merge the new exchange into a rolling summary, which is reloaded into the next conversation's prompt |
-| **Long-term memory** | *"Can my agent save a specific preference I tell it to remember and recall it later by semantic search?"* | One user × one agent (or shared user-wide) | Dedicated memory service (vector search) | Tool-driven: the agent calls `memory_remember` when something is worth keeping; `memory_recall` (and an automatic pre-load) brings it back later |
+| **Session memory** | *"Does my agent remember what we discussed in a different conversation earlier today?"* | One user × one agent, across their conversations, for the duration of the user's login session | User session store, reset at each new login | Automatic: after the first completed exchange of each conversation, the platform asks an LLM to merge that exchange into a rolling summary, which is added to the agent's instructions in the user's later conversations |
+| **Long-term memory** | *"Can my agent save a specific preference I tell it to remember and recall it later?"* | One user × one agent | Dedicated memory service | Tool-driven: the agent calls `memory_remember` when something is worth keeping; `memory_recall` (and an automatic pre-load) brings it back later |
 
 Practical consequences:
 
@@ -33,6 +33,8 @@ If you inspect an agent's raw memory config, the structure is:
 ```
 
 `session_memory` is a top-level toggle, separate from `types[]` which holds working memory and long-term memory side by side. The three are fully independent; you can enable any combination.
+
+You edit this JSON in the agent's **Memory** capability (**Capabilities → Memory → Parameters (JSON)**). The profile sets its values when the agent is created and each time the profile changes: `session_memory` is `true` on Workflow, Light Agent, Full Agent and Orchestrator (only Simple sets it to `false`), and `long_term` is enabled on Full Agent and Orchestrator. The `session_memory: false` shown in the default JSON of the capability catalog only applies when you add the Memory capability by hand.
 </Note>
 
 ## Working memory: budget and compaction
@@ -82,8 +84,45 @@ A quick decision guide for new agents:
 | Personal assistant that should remember explicit user preferences | ✓ | ✓ | ✓ |
 
 <Tip>
-Session memory's summary is generated **asynchronously** at the end of a conversation, so enabling it doesn't add latency to user-facing responses. The summary becomes available the *next* time the user opens a conversation with the same agent.
+Session memory's summary is generated **asynchronously**, so enabling it doesn't add latency to user-facing responses. It is kept in the user's login session: a new login starts from an empty summary, and it is never shared with another user. The Playground never uses it: test it from the published agent.
 </Tip>
+
+## Turn off cross-conversation memory
+
+To keep each conversation strictly isolated, turn off session memory, and long-term memory if the agent has it, while keeping working memory.
+
+<Steps>
+  <Step title="Open the Memory capability">
+    In the agent, go to **Capabilities** and open **Memory**.
+  </Step>
+  <Step title="Edit Parameters (JSON)">
+    Set `session_memory` to `false`. On Full Agent and Orchestrator, also set `long_term` to `"enabled": false`. Keep your current `working_memory` values: that is the memory of the current conversation.
+
+    ```json
+    {
+      "session_memory": false,
+      "types": [
+        { "id": "working_memory", "enabled": true, "config": { "max_tokens": 4000, "compaction_strategy": "summarize" } },
+        { "id": "long_term", "enabled": false, "config": { "max_memories": 50 } }
+      ]
+    }
+    ```
+  </Step>
+  <Step title="Save, then republish the agent">
+    Conversations run the published version. From the next message on, in every conversation, the agent no longer reads or writes the session summary.
+  </Step>
+  <Step title="Check the isolation">
+    In the published agent, not the Playground, share a distinctive fact in one conversation, then open a new conversation and ask for it. The agent does not know it, while it still remembers earlier messages of the same conversation.
+  </Step>
+</Steps>
+
+Through the API, send `PATCH /v1/agents/{agent_id}` with the updated `tools` array and without the `profile` field, then `POST /v1/agents/{agent_id}/publish`.
+
+<Warning>
+- **Don't remove the Memory capability to turn memory off.** If it is the agent's only capability, the profile restores it at run time, session memory included. If the agent has other capabilities, removing it also turns off working memory: the agent forgets earlier messages of the current conversation.
+- **A profile change resets these values** to the profile's (`session_memory: true` on every profile except Simple). Repeat the change after any profile change.
+- **Turning it off doesn't erase anything.** The summary already built stays in the user's login session and comes back if session memory is turned on again; a new login starts from scratch. Long-term memories stay stored until they are forgotten or wiped.
+</Warning>
 
 ## How long-term memory works
 
@@ -134,19 +173,13 @@ When long-term memory is enabled on an agent, three tools are injected into its 
 
 ### Automatic pre-load on every user message
 
-On **every** user turn, before the LLM is called, the agent runs a similarity search against the user's stored memories using the new message as the query and injects the top relevant ones into the prompt. The agent sees them as background context and can answer without explicitly calling `memory_recall`.
+On **every** user turn, before the LLM is called, the platform loads the user's most recently updated memories for this agent, up to `max_memories` (default: 50), and injects them into the prompt. The agent sees them as background context and can answer without explicitly calling `memory_recall`.
 
 This means the user often does not need to remind the agent of past preferences; the agent already has them in front of it, fresh for each message.
 
-### Semantic recall via vector embeddings
+### Recall order
 
-Memories are not stored as plain text alone. Each memory is also embedded as a vector. When the agent calls `memory_recall("what are my dietary restrictions?")`, the service:
-
-1. Embeds the query into the same vector space.
-2. Returns the top‑K most similar stored memories, ranked by semantic distance.
-3. The agent reads them and answers.
-
-This is why the user can ask the question in any wording ("what can't I eat?", "any food I avoid?") and still get the right memories back.
+When the agent calls `memory_recall`, the service returns the user's memories for this agent, most recently updated first, up to the requested number. Each memory is stored with a vector embedding, but recall does not rank memories by semantic similarity: the wording of the question does not change which memories come back. Keep `max_memories` large enough for the memories that matter to stay within reach.
 
 ## Memory types
 
@@ -163,12 +196,11 @@ The agent picks the type when calling `memory_remember`. You don't need to manag
 
 ## Scoping
 
-Memories are stored per **user**. They are also optionally scoped per **agent**:
+Memories are stored per **user** and per **agent**. A memory saved by an agent through `memory_remember` is visible only to that agent, for that user.
 
-- **User-only memory**: visible to that user across all agents they interact with on the platform. Useful for general user preferences ("I prefer concise answers").
-- **User + agent memory**: visible only to one agent for that user. Useful for agent-specific context ("For this support agent, always start by checking ticket history").
+The memory service also accepts user-wide memories (`scope: global`), which every agent of that user loads. Agents never save memories at that scope themselves.
 
-Two different users never see each other's memories. Two different agents within the same user account see each other's memories only if those memories were saved as user-only.
+Two different users never see each other's memories.
 
 ## Tags
 
@@ -180,11 +212,11 @@ When the agent stores a memory, it can attach a small set of short lowercase key
   <Step title="Choose a profile that supports it">
     Long-term memory is available on the **Full Agent** and **Orchestrator** profiles. Simpler profiles do not include the memory tools.
   </Step>
-  <Step title="Enable it in Settings">
-    Go to **Settings → Memory** and turn on **Long-term memory**.
+  <Step title="Check the Memory capability">
+    In **Capabilities → Memory → Parameters (JSON)**, the `long_term` entry must have `"enabled": true`. Full Agent and Orchestrator set it when the agent is created or its profile changes. Save and republish after any change.
   </Step>
   <Step title="Set the recall budget">
-    Choose how many memories the agent can pull in per turn (default: 50). Higher values give the agent more context but consume more of the prompt window.
+    In the same JSON, `config.max_memories` sets how many memories the agent can pull in per turn (default: 50). Higher values give the agent more context but consume more of the prompt window.
   </Step>
   <Step title="Tell the agent what's worth remembering">
     Add explicit guidance in the agent's **Instructions**, for example:
