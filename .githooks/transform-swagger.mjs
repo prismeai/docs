@@ -33,6 +33,8 @@
  *      both workspace and organization keys (see `authentication.mdx`), so this
  *      naming is worth revisiting with the API owners rather than treating as
  *      settled.
+ *   9. Replace em dashes with "-". The docs style bans them (commit f41952f) but
+ *      upstream prose keeps reintroducing them on every sync.
  *
  * Usage:
  *   npm run swagger:transform                              # canonical entry point
@@ -384,7 +386,10 @@ function transform(filePath) {
   const stringifyOptions = { flowCollectionPadding: false };
   const serialized = doc.toString(stringifyOptions);
   const stable = parseDocument(serialized).toString(stringifyOptions);
-  writeFileSync(filePath, stable);
+
+  // 9. Same-width replacement, so line folding (and stability) is unaffected.
+  counters.emDashesReplaced = (stable.match(/\u2014/g) || []).length;
+  writeFileSync(filePath, stable.replace(/\u2014/g, '-'));
   return counters;
 }
 

@@ -30,6 +30,12 @@ tags:
     description: Cross-workspace and per-workspace observability dashboards, traces, and feeds.
   - name: Orgs
     description: Organization listing and audit logs.
+  - name: Admin
+    description: |
+      Maintenance operations called by the Observability dashboard. They
+      require elevated permissions: an `observability` `read` grant (RBAC)
+      and a platform administrator session (`platformRole` `superadmin` or
+      `root`).
 paths:
   /v1/announcements:
     get:
@@ -644,44 +650,59 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /v1/observability/platform/summary:
+  /v1/observability/platform/ops:
     get:
       tags: [Observability]
-      operationId: getPlatformObservabilitySummary
-      summary: Get a cross-organization platform observability summary
+      operationId: getPlatformOps
+      summary: Get interaction volume and error health across an organization
       description: |
-        Aggregated view of platform health, performance, infrastructure,
-        and cost across every active workspace in the requested window.
-        Discovers active workspaces first, then runs the bulk aggregator
-        in `summary_only` mode.
+        Platform Ops view: interaction volume and error health across the
+        workspaces of an organization, or across every organization for
+        platform super admins. Computed directly from events (not from the
+        metrics cache):
+        - `total_interactions` - count of `runtime.interactions.triggered`.
+        - `failed_interactions` - distinct correlation ids among `error` and
+          `runtime.fetch.failed` events.
+        - `error_rate` - `failed_interactions / total_interactions`.
+        - `avg_rpm` - `total_interactions` per minute over the window.
 
-        Requires `observability_platform:read` permission. Rate-limited
-        to 100 calls per minute.
+        The response also carries a daily timeseries, the 10 workspaces with
+        the most errors, and the 10 most recent error events.
+
+        **Scope.** `orgSlug` is required. `orgSlug=all` is the cross-org view
+        and is restricted to platform super admins. Any other value must be an
+        organization the caller belongs to (super admins may pick any org).
+
+        Requires `observability:read` permission. Rate-limited to 60 calls per
+        minute.
       parameters:
         - in: query
+          name: orgSlug
+          required: true
+          schema: { type: string }
+          description: Organization slug, or `all` for the platform-wide view (super admin only).
+        - in: query
           name: period
-          schema: { type: string, maxLength: 10, enum: [1h, 24h, 7d, 30d] }
+          schema: { type: string, enum: [24h, 7d, 30d] }
           description: Preset window (default `24h`).
         - in: query
           name: start
           schema: { type: string, format: date-time }
-          description: Custom range start (overrides `period`; never cached).
+          description: Custom range start (overrides `period`). The window is capped at 90 days.
         - in: query
           name: end
           schema: { type: string, format: date-time }
-          description: Custom range end (overrides `period`; never cached).
-        - in: query
-          name: granularity
-          schema: { type: string, enum: [5m, hourly, daily] }
-          description: Granularity override.
+          description: Custom range end (overrides `period`).
       responses:
         '200':
-          description: Platform summary.
+          description: Platform ops view.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/PlatformObservabilitySummary' }
+              schema: { $ref: '#/components/schemas/PlatformOpsResponse' }
         '400':
-          description: Validation error.
+          description: |
+            `orgSlug_required` (missing `orgSlug`) or `period_too_large` (window
+            longer than 90 days, `max_days` is returned).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -691,7 +712,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: Forbidden - missing `observability_platform:read` permission.
+          description: |
+            Forbidden - missing `observability:read` permission, `orgSlug=all`
+            without super admin role, or an organization the caller does not
+            belong to.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -767,8 +791,27 @@ paths:
         the current open interval on demand and self-heals gaps in closed
         intervals.
 
+        **Organization scope.** `orgSlug` is required and filters the
+        workspace events by organization, so the caller only sees that org's
+        slice of a multi-org workspace. `orgSlug=all` removes the filter
+        (global workspace stats) and is restricted to the workspace owner and
+        platform super admins; `orgSlug=__no_org__` returns only events with
+        no organization. Other callers may only pass an organization they
+        belong to.
+
         Requires `observability:read` permission.
       parameters:
+        - in: query
+          name: orgSlug
+          required: true
+          schema: { type: string }
+          description: Organization slug, `all` (owner / super admin only) or `__no_org__`.
+        - in: query
+          name: sections
+          schema: { type: string }
+          description: |
+            Comma-separated subset of `health,metrics,errors,costs,usage` to
+            build. Skipped sections come back `null`. Default: all sections.
         - in: query
           name: period
           schema: { type: string, enum: [15m, 30m, 1h, 24h, 7d, 30d] }
@@ -793,13 +836,21 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/WorkspaceDashboard' }
+        '400':
+          description: '`orgSlug_required` - `orgSlug` is missing.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401':
           description: Unauthenticated.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: Forbidden - missing `observability:read` permission.
+          description: |
+            Forbidden - missing `observability:read` permission, `orgSlug=all`
+            without owner / super admin role, or an organization the caller
+            does not belong to.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1266,6 +1317,98 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /v1/admin/refresh-metrics:
+    post:
+      tags: [Admin]
+      operationId: adminRefreshMetrics
+      summary: Recalculate a workspace's observability metrics
+      description: |
+        Re-aggregates the cached observability metrics of a workspace and
+        invalidates its cached summary, so the next dashboard read recomputes
+        the headline numbers. Powers the "Recalculate Metrics" button.
+
+        With `period_start` and `period_end`, the whole window is
+        re-aggregated; without them (both are needed), only the current open
+        interval of the chosen granularity is.
+
+        Requires an `observability` `read` grant and a platform administrator
+        session (`platformRole` `superadmin` or `root`); other callers get
+        `403`. Rate limited to 10 calls per hour per caller.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [workspaceId]
+              properties:
+                workspaceId:
+                  type: string
+                  description: Workspace whose metrics are recalculated.
+                orgSlug:
+                  type: string
+                  default: all
+                  description: Organization partition to refresh. Omitted or `all` refreshes the cross-organization rollup. Must match the partition the dashboard shows.
+                period_start:
+                  type: string
+                  format: date-time
+                  description: Start of the window to refresh. Used only together with `period_end`.
+                period_end:
+                  type: string
+                  format: date-time
+                  description: End of the window to refresh. Used only together with `period_start`.
+                granularity:
+                  type: string
+                  enum: [5m, hourly, daily]
+                  default: hourly
+                  description: Aggregation bucket size. Any other value falls back to `hourly`.
+            example:
+              workspaceId: ws-abc123
+              orgSlug: acme-corp
+              period_start: '2026-01-14T00:00:00.000Z'
+              period_end: '2026-01-15T00:00:00.000Z'
+              granularity: hourly
+      responses:
+        '200':
+          description: Metrics recalculated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminRefreshMetricsResult'
+        '400':
+          description: '`workspaceId` is missing.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminError' }
+              example:
+                error: MISSING_WORKSPACE_ID
+                message: body.workspaceId is required
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminError' }
+        '403':
+          description: Missing `observability` `read` grant, or the caller is not a platform administrator.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminError' }
+              example:
+                error: FORBIDDEN
+                message: Platform admin access required
+        '405':
+          description: Method not allowed (only POST is accepted).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminError' }
+        '429':
+          description: Rate limit exceeded (10 per hour).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminError' }
 
 components:
   securitySchemes:
@@ -1294,6 +1437,75 @@ components:
         LLM Gateway).
         Send as `x-prismeai-api-key: iak_...`.
   schemas:
+    AdminError:
+      type: object
+      description: Error body of the Admin routes.
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Error code (FORBIDDEN, MISSING_WORKSPACE_ID, RATE_LIMITED, METHOD_NOT_ALLOWED) or, for authentication and RBAC failures, the error message.
+        code:
+          type: string
+          description: Stable error code (authentication and RBAC failures).
+        message:
+          type: string
+          description: Human-readable message.
+    AdminRefreshMetricsResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [refreshed]
+        workspaceId:
+          type: string
+        org_slug:
+          type: string
+          description: Refreshed organization partition (`all` for the cross-organization rollup).
+        granularity:
+          type: string
+          enum: [5m, hourly, daily]
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        details:
+          type: object
+          description: Aggregation report. On an invalid window it carries `error` and `entries_written` `0` instead.
+          additionalProperties: true
+          properties:
+            entries_written:
+              type: integer
+            summary:
+              type: object
+              additionalProperties: true
+            intervals:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+            granularity:
+              type: string
+            period_start:
+              type: string
+            period_end:
+              type: string
+            error:
+              type: string
+      example:
+        status: refreshed
+        workspaceId: ws-abc123
+        org_slug: acme-corp
+        granularity: hourly
+        period_start: '2026-01-14T00:00:00.000Z'
+        period_end: '2026-01-15T00:00:00.000Z'
+        details:
+          entries_written: 24
+          granularity: hourly
+          period_start: '2026-01-14T00:00:00.000Z'
+          period_end: '2026-01-15T00:00:00.000Z'
     Error:
       type: object
       required: [error, message]
@@ -1478,52 +1690,79 @@ components:
     # ──────────────────────────────────────────────────────────────────
     # Observability - platform summary
     # ──────────────────────────────────────────────────────────────────
-    PlatformObservabilitySummary:
+    PlatformOpsResponse:
       type: object
       properties:
-        meta:
+        period:
           type: object
           properties:
-            period: { type: string }
-            period_start: { type: string, format: date-time }
-            generated_at: { type: string, format: date-time }
-            workspaces_discovered: { type: integer }
-        health:
+            type: { type: string, description: 'Resolved period (`24h`, `7d`, `30d` or custom).' }
+            start: { type: string, format: date-time }
+            end: { type: string, format: date-time }
+        scope:
           type: object
           properties:
-            score: { type: number }
-            status: { type: string }
-            uptime: { type: number }
-        performance:
+            org_slug: { type: string, nullable: true, description: Scoped organization (null for the cross-org view). }
+            cross_org: { type: boolean }
+        summary:
           type: object
           properties:
             total_interactions: { type: integer }
-            total_executions: { type: integer }
-            p50_ms: { type: number }
-            p95_ms: { type: number }
-            p99_ms: { type: number }
-            error_rate: { type: number }
-        infrastructure:
-          type: object
-          properties:
-            by_provider:
-              type: object
-              additionalProperties: true
-        cost:
-          type: object
-          properties:
-            total: { type: number }
-            total_tokens: { type: integer }
-            total_carbon_kgco2: { type: number }
-            by_model:
-              type: object
-              additionalProperties: true
-            forecast_monthly: { type: number }
-        alerts:
+            failed_interactions: { type: integer }
+            error_rate: { type: number, description: 'Ratio between 0 and 1 (4 decimals).' }
+            avg_rpm: { type: number, description: Average interactions per minute over the window. }
+            unique_users: { type: integer }
+        daily:
           type: array
           items:
             type: object
-            additionalProperties: true
+            properties:
+              day: { type: string, format: date, description: 'Day (`YYYY-MM-DD`).' }
+              interactions: { type: integer }
+              unique_users: { type: integer }
+        top_workspaces_by_errors:
+          type: array
+          description: Up to 10 workspaces, most error events first.
+          items:
+            type: object
+            properties:
+              workspace_id: { type: string }
+              workspace_slug: { type: string }
+              workspace_name: { type: string }
+              total_interactions: { type: integer }
+              unique_users: { type: integer }
+              failed_interactions: { type: integer }
+              error_rate: { type: number }
+              errors: { type: integer, description: Number of error events. }
+        recent_errors:
+          type: array
+          description: Up to 10 most recent error events, newest first.
+          items:
+            type: object
+            properties:
+              at: { type: string, format: date-time }
+              workspace_id: { type: string, description: Empty for platform-level errors. }
+              workspace_name: { type: string }
+              type: { type: string, enum: [error, runtime.fetch.failed] }
+              code: { type: string }
+              message: { type: string }
+              correlation_id: { type: string }
+        meta:
+          type: object
+          properties:
+            computed_at: { type: string, format: date-time }
+            source: { type: string, enum: [events] }
+      example:
+        period: { type: 24h, start: '2026-01-14T10:00:00.000Z', end: '2026-01-15T10:00:00.000Z' }
+        scope: { org_slug: acme-corp, cross_org: false }
+        summary: { total_interactions: 1200, failed_interactions: 12, error_rate: 0.01, avg_rpm: 0.83, unique_users: 45 }
+        daily:
+          - { day: '2026-01-15', interactions: 1200, unique_users: 45 }
+        top_workspaces_by_errors:
+          - { workspace_id: ws-abc, workspace_slug: support-bot, workspace_name: Support bot, total_interactions: 300, unique_users: 20, failed_interactions: 8, error_rate: 0.0267, errors: 11 }
+        recent_errors:
+          - { at: '2026-01-15T09:58:00.000Z', workspace_id: ws-abc, workspace_name: Support bot, type: error, code: PROVIDER_ERROR, message: Upstream timeout, correlation_id: corr-123 }
+        meta: { computed_at: '2026-01-15T10:00:01.000Z', source: events }
 
     # ──────────────────────────────────────────────────────────────────
     # Observability - workspace dashboard
@@ -1775,6 +2014,7 @@ components:
           type: object
           properties:
             source: { type: string }
+            sections: { type: string, description: 'Requested `sections` list, or `all`.' }
             data_points: { type: integer }
             includes_current_interval: { type: boolean }
             summary_cached: { type: boolean }
