@@ -404,7 +404,7 @@ DISABLE_LOCAL_SIGNUP='true'
 
 Prisme.ai protects **local (password) accounts** with a second factor. Two methods are available:
 
-- **Passkeys** ([WebAuthn](https://www.w3.org/TR/webauthn-3/)), the recommended method: the user confirms the sign-in with Face ID, a fingerprint, Windows Hello, their device PIN or a security key. A passkey is bound to your domain, so it cannot be relayed to a phishing site. Passkeys are disabled until you [enable them](#enable-passkeys).
+- **Passkeys** ([WebAuthn](https://www.w3.org/TR/webauthn-3/)), the recommended method: the user confirms the sign-in with Face ID, a fingerprint, Windows Hello, their device PIN or a security key. A passkey is bound to your domain, so it cannot be relayed to a phishing site. Passkeys are enabled by default (see [Configure passkeys](#configure-passkeys)).
 - **Authenticator app** (TOTP, [RFC 6238](https://datatracker.ietf.org/doc/html/rfc6238)): the user scans a QR code with Google Authenticator, Microsoft Authenticator, Authy, 1Password or a similar app, then enters a 6-digit code.
 
 <Note>
@@ -426,40 +426,61 @@ MFA_FORCE_LOCAL='true'   # default
   **Existing local users are migrated lazily.** When you enable `MFA_FORCE_LOCAL`, current users are not locked out and no database migration is required; each user sets up a second factor on their next sign-in.
 </Info>
 
-### Enable passkeys
+### Configure passkeys
 
-Passkeys are enabled as soon as you set `WEBAUTHN_RP_ID` on `prismeai-api-gateway`. Without it, users only get the authenticator app.
+Passkeys are enabled by default: you have nothing to configure for a console served over `https` on a single domain. Every passkey is bound to a domain, called the RP ID. By default it is the domain of your console: for a console served at `https://studio.prisme.example.com`, the RP ID is `studio.prisme.example.com`.
 
-```
-WEBAUTHN_RP_ID='prisme.example.com'
-```
-
-1. Set `WEBAUTHN_RP_ID` to the domain of your console, or to one of its parent domains. For a console served at `https://studio.prisme.example.com`, both `studio.prisme.example.com` and `prisme.example.com` are valid.
-2. If your console is served on several domains, list them all in `CONSOLE_URL`, or set `WEBAUTHN_ORIGINS` explicitly. Every origin must be `WEBAUTHN_RP_ID` itself or one of its subdomains.
-3. Restart `prismeai-api-gateway`.
-
-The gateway checks this configuration at startup and refuses to start if an accepted origin cannot use the domain, or if an origin other than `localhost` is not served over `https`.
-
-To verify, call `GET /v2/login/providers` on your API. The response contains `webauthn.enabled: true`, your `rpId` and the accepted `origins`.
-
-<Warning>
-  **Choose `WEBAUTHN_RP_ID` once and for all.** Every passkey is bound to this domain: changing it later makes all existing passkeys unusable, and each user has to set up a new one.
-</Warning>
+At startup, `prismeai-api-gateway` logs the RP ID it uses and where it comes from. To verify, call `GET /v2/login/providers` on your API: the response contains `webauthn.enabled: true`, your `rpId` and the accepted `origins`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `WEBAUTHN_RP_ID` | none (passkeys disabled) | Domain the passkeys are bound to. |
-| `WEBAUTHN_ORIGINS` | the `CONSOLE_URL` origins | Comma-separated origins accepted when verifying a passkey. They are compared exactly. |
+| `WEBAUTHN_ENABLED` | `true` | Set to `false` to turn passkeys off. The RP ID is kept, so the passkeys already created work again once you turn them back on. |
+| `WEBAUTHN_RP_ID` | the domain of the console | Domain the passkeys are bound to: the console domain or one of its parent domains. |
+| `WEBAUTHN_ORIGINS` | the `CONSOLE_URL` origins | Comma-separated origins accepted when verifying a passkey. They are compared exactly. When set, the default RP ID is the domain of its first origin. |
 | `WEBAUTHN_RP_NAME` | `Prisme.ai` | Name displayed by the user's passkey manager. |
 | `WEBAUTHN_PASSWORDLESS` | `true` | Set to `false` to keep passkeys as a second factor only, without passwordless sign-in. |
 | `RATE_LIMIT_PASSKEY_OPTIONS` | `60` | Passwordless sign-in challenges per IP address and per minute. The sign-in page requests one each time it is displayed, to suggest the saved passkeys under the email field. |
 | `MFA_STEPUP_MAX_AGE` | `300` | How long, in seconds, a re-authentication allows a user to change their second factors or pair the mobile app. |
 
-Passkeys only work on the origins you accept. Workspace pages (`*.pages` hosts) are deliberately excluded: they run content written by workspace builders, so a passkey used there could be relayed. Consoles served outside `WEBAUTHN_RP_ID` cannot offer passkeys either.
+Passkeys only work on the origins you accept, and every origin must be the RP ID itself or one of its subdomains. Workspace pages (`*.pages` hosts) are deliberately excluded: they run content written by workspace builders, so a passkey used there could be relayed.
 
-#### Turn passkeys off again
+#### Several consoles, or no https
 
-Removing `WEBAUTHN_RP_ID` disables passkeys but keeps them stored. An account that only holds passkeys then has no usable second factor: at its next sign-in, it can set up an authenticator app with its password alone. If you do not want that, [reset the MFA](#reset-a-users-mfa) of those accounts instead, so that they choose a new factor under your control.
+When the default RP ID cannot serve every accepted origin, the gateway turns passkeys off and logs a warning, but still starts. This happens when:
+
+- your console is served on several domains (for example `studio.prisme.example.com` and `admin.prisme.example.com`): set `WEBAUTHN_RP_ID` to their common parent domain, here `prisme.example.com`;
+- your console is not served over `https`: browsers only allow passkeys on `https` origins and on `localhost`.
+
+When you set `WEBAUTHN_RP_ID` yourself, the gateway checks it at startup and refuses to start if an accepted origin cannot use it.
+
+#### Pin the passkey domain
+
+<Warning>
+  **The RP ID is permanent.** Changing it makes every existing passkey unusable. With the default RP ID, changing `CONSOLE_URL` (or the first entry of `WEBAUTHN_ORIGINS`) changes it too.
+</Warning>
+
+To keep passkeys valid whatever happens to `CONSOLE_URL`, set `WEBAUTHN_RP_ID` explicitly, ideally when you first deploy. Use the value the gateway logged at startup if passkeys are already in use, since a different value invalidates them.
+
+A passkey can only follow the console within its RP ID. If you expect the console address to change, choose the parent domain from the start:
+
+| `WEBAUTHN_RP_ID` | Console moves from `studio.prisme.example.com` to `app.prisme.example.com` | Console moves to `ai.example.org` |
+|---|---|---|
+| `studio.prisme.example.com` | Passkeys lost | Passkeys lost |
+| `prisme.example.com` | Passkeys kept | Passkeys lost |
+
+Widening the RP ID later, from `studio.prisme.example.com` to `prisme.example.com`, is also a change: it invalidates the existing passkeys.
+
+#### Move the console to another domain
+
+When the console moves outside its RP ID, passkeys cannot follow. Users can no longer sign in with them, and an account whose only second factor is a passkey stays blocked at the second step. Before the move:
+
+1. Ask your users to add an authenticator app in **Settings** > **Security** > **Sign-in methods**.
+2. After the move, [reset the MFA](#reset-a-users-mfa) of the accounts that only had passkeys. They choose a new second factor at their next sign-in.
+3. Set `WEBAUTHN_RP_ID` to the new domain, or leave the default.
+
+#### Turn passkeys off
+
+Set `WEBAUTHN_ENABLED` to `false`. Passkeys stay stored. An account that only holds passkeys then has no usable second factor: at its next sign-in, it can set up an authenticator app with its password alone. If you do not want that, [reset the MFA](#reset-a-users-mfa) of those accounts instead, so that they choose a new factor under your control.
 
 ### User experience
 
