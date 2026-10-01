@@ -253,8 +253,50 @@
       return this.tracks[l];
     }
 
+    // Certains hébergeurs (Mintlify, servi par Vercel) ignorent l'en-tête Range : sans réponse 206, le navigateur
+    // ne peut pas se positionner (il repart de 0) et Safari peut refuser la lecture. On le détecte une fois ; dans
+    // ce cas la vidéo est téléchargée entière au premier geste et lue depuis la mémoire (Blob), où tout se positionne.
+    probeRange() {
+      this.src = this.url(this.m.video.src);
+      this.ranged = fetch(this.src, { headers: { Range: "bytes=0-1" }, cache: "no-store" })   // pas le cache HTTP, qui sait servir un 206
+        .then((r) => {
+          if (r.body) r.body.cancel().catch(() => {});
+          this.noRange = r.status !== 206;
+          if (!this.noRange) this.pendingSeek = null;            // positionnement natif : rien à rejouer
+          return !this.noRange;
+        })
+        .catch(() => true);
+    }
+    ensureSeekable() {
+      if (this.blobLoad) return;
+      this.blobLoad = this.ranged.then((ok) => {
+        if (ok || this.disposed) return null;
+        return fetch(this.src).then((r) => { if (!r.ok) throw new Error(r.status); return r.blob(); }).then((b) => {
+          if (this.disposed) return;
+          const p = this.player, t = this.pendingSeek != null ? this.pendingSeek : p.currentTime();
+          const resume = !p.paused(), rate = p.playbackRate(), started = p.hasStarted();
+          this.objectUrl = URL.createObjectURL(b);
+          p.src({ src: this.objectUrl, type: "video/mp4" });   // recharge l'élément : pause, vitesse 1, couverture
+          p.one("loadedmetadata", () => {
+            p.playbackRate(rate); p.currentTime(t); this.pendingSeek = null;
+            if (started) p.hasStarted(true);                    // sinon la couverture revient par-dessus la vidéo
+            if (resume) p.play();
+          });
+        });
+      }).catch(() => {});
+    }
+
     wire() {
       const p = this.player, v = (this.voices.video = p.tech(true).el());
+      this.probeRange();
+      // tant que la copie en mémoire n'est pas prête, on retient la position demandée (barre, sommaire, clavier)
+      // pour l'appliquer ensuite : le navigateur, lui, la ramène aussitôt dans la zone déjà chargée
+      const currentTime = p.currentTime.bind(p);
+      p.currentTime = (t) => {
+        // noRange encore indéfini = sonde en cours : on retient aussi, au cas où
+        if (t !== undefined && this.noRange !== false && !this.objectUrl) this.pendingSeek = t;
+        return t === undefined ? currentTime() : currentTime(t);
+      };
       v.muted = false;                             // la vidéo n'a pas de son : son volume règle la voix
       const restart = () => this.voices.restart(), stop = () => this.voices.stop();
       ["play", "playing", "seeked", "ratechange"].forEach((e) => p.on(e, restart));
@@ -263,7 +305,7 @@
       p.on("timeupdate", () => this.render());
       this.timers.push(setInterval(() => this.voices.watchdog(), 1000));
       // l'audio ne démarre qu'après un geste de l'utilisateur : déverrouillé au premier clic / touche
-      const first = () => { this.voices.unlock(); if (!this.started) { this.started = true; this.voices.load(this.lang, "1").catch(() => {}); } };
+      const first = () => { this.voices.unlock(); if (!this.started) { this.started = true; this.voices.load(this.lang, "1").catch(() => {}); this.ensureSeekable(); } };
       ["pointerdown", "keydown"].forEach((e) => this.root.addEventListener(e, first, true));
       p.on("play", first);
 
@@ -361,6 +403,7 @@
       this.disposed = true;
       this.timers.forEach(clearInterval);
       this.voices.dispose();
+      if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
       try { this.player.dispose(); } catch (e) { /* déjà détruit */ }
     }
   }
