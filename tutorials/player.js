@@ -259,7 +259,12 @@
     probeRange() {
       this.src = this.url(this.m.video.src);
       this.ranged = fetch(this.src, { headers: { Range: "bytes=0-1" }, cache: "no-store" })   // pas le cache HTTP, qui sait servir un 206
-        .then((r) => { if (r.body) r.body.cancel().catch(() => {}); this.noRange = r.status !== 206; return !this.noRange; })
+        .then((r) => {
+          if (r.body) r.body.cancel().catch(() => {});
+          this.noRange = r.status !== 206;
+          if (!this.noRange) this.pendingSeek = null;            // positionnement natif : rien à rejouer
+          return !this.noRange;
+        })
         .catch(() => true);
     }
     ensureSeekable() {
@@ -268,10 +273,15 @@
         if (ok || this.disposed) return null;
         return fetch(this.src).then((r) => { if (!r.ok) throw new Error(r.status); return r.blob(); }).then((b) => {
           if (this.disposed) return;
-          const p = this.player, t = this.pendingSeek != null ? this.pendingSeek : p.currentTime(), resume = !p.paused();
+          const p = this.player, t = this.pendingSeek != null ? this.pendingSeek : p.currentTime();
+          const resume = !p.paused(), rate = p.playbackRate(), started = p.hasStarted();
           this.objectUrl = URL.createObjectURL(b);
-          p.src({ src: this.objectUrl, type: "video/mp4" });
-          p.one("loadedmetadata", () => { p.currentTime(t); this.pendingSeek = null; if (resume) p.play(); });
+          p.src({ src: this.objectUrl, type: "video/mp4" });   // recharge l'élément : pause, vitesse 1, couverture
+          p.one("loadedmetadata", () => {
+            p.playbackRate(rate); p.currentTime(t); this.pendingSeek = null;
+            if (started) p.hasStarted(true);                    // sinon la couverture revient par-dessus la vidéo
+            if (resume) p.play();
+          });
         });
       }).catch(() => {});
     }
@@ -283,7 +293,8 @@
       // pour l'appliquer ensuite : le navigateur, lui, la ramène aussitôt dans la zone déjà chargée
       const currentTime = p.currentTime.bind(p);
       p.currentTime = (t) => {
-        if (t !== undefined && this.noRange && !this.objectUrl) this.pendingSeek = t;
+        // noRange encore indéfini = sonde en cours : on retient aussi, au cas où
+        if (t !== undefined && this.noRange !== false && !this.objectUrl) this.pendingSeek = t;
         return t === undefined ? currentTime() : currentTime(t);
       };
       v.muted = false;                             // la vidéo n'a pas de son : son volume règle la voix
