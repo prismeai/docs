@@ -789,10 +789,13 @@ paths:
         - `uploaded_file` - storage mints a fresh native fetch URL;
           cannot expire.
         - `web_page` / `remote_file` - the crawler re-fetches the URL.
-        - `connector_document` - uses the stored ephemeral `fetch_url`;
-          if it has expired, the document transitions to
-          `status: fetch_expired` and the owning connector refreshes it
-          on its next sync (or on observing the emitted event).
+        - `connector_document` - its content was fetched through the
+          connector with a short-lived signed URL that is never stored,
+          so storage cannot fetch it again: the request is refused with
+          `409 CONNECTOR_RESYNC_REQUIRED` before the document is touched,
+          and only a new synchronization of the connection refreshes it.
+          A connector document materialized as a native file is
+          re-fetched like an `uploaded_file`.
 
         Requires `editor`+.
       security:
@@ -836,6 +839,21 @@ paths:
           $ref: '#/components/responses/Error403'
         '404':
           $ref: '#/components/responses/Error404'
+        '409':
+          description: |
+            The document comes from a connector and has no native file:
+            it can only be refreshed by synchronizing its connection
+            again. The document is left unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                connector_resync_required:
+                  value:
+                    error:
+                      code: CONNECTOR_RESYNC_REQUIRED
+                      message: This document comes from a connector and can only be refreshed by synchronizing its connection again.
         '429':
           $ref: '#/components/responses/Error429'
         '502':
@@ -1089,9 +1107,12 @@ paths:
       description: |
         One POST queues the full extraction pipeline (fetch → parse →
         chunk → embed) on EVERY known document of the knowledge base -
-        uploaded files, connector/remote docs AND existing web pages
-        (including auto-discovered ones) - re-processing them with the
-        current store settings plus each document's persisted overrides.
+        uploaded files, remote docs AND existing web pages (including
+        auto-discovered ones) - re-processing them with the current store
+        settings plus each document's persisted overrides. Connector
+        documents without a native file are skipped and counted in
+        `skipped_connector`: only a synchronization of their connection
+        can refresh them.
         Use after a store-level parser or chunking change to roll it out
         across the whole KB. No request body: per-document overrides stay
         on `POST /documents/{document_id}/reindex`.
@@ -1106,9 +1127,10 @@ paths:
         for an empty KB), and the terminal
         `storage.kb.reindex.dispatch_completed` event likewise reports
         counts of what was queued (`visited`, `dispatched`,
-        `skipped_missing_file`, `dispatch_failed`). There is intentionally
-        NO completion or progress tracking; a document that later fails to
-        parse/embed surfaces through its own `status`, not here.
+        `skipped_missing_file`, `skipped_connector`, `dispatch_failed`).
+        There is intentionally NO completion or progress tracking; a
+        document that later fails to parse/embed surfaces through its own
+        `status`, not here.
 
         Documented characteristics of the dispatch-only design:
         - **Best-effort live set, not a snapshot.** Documents are walked
