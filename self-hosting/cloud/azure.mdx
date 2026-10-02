@@ -52,7 +52,7 @@ A certificate covering both is the easiest path. Manage it in Key Vault and refe
 
 ## Microsoft Entra ID passwordless auth
 
-Entra ID lets you replace static passwords for Redis and PostgreSQL with short-lived tokens, using [system-assigned or user-assigned managed identities](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/overview).
+Entra ID lets you replace static passwords for Redis and PostgreSQL, and the account key of Azure Blob Storage, with short-lived tokens, using [system-assigned or user-assigned managed identities](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/overview).
 
 Two modes are available. They differ in **how the token reaches the pod**, and that difference decides what you have to configure:
 
@@ -172,7 +172,7 @@ last-one-wins problem disappears, and **[Applying the pod label](#applying-the-p
 
 Each backing-service client is configured independently. Setting only some of them leaves the rest on username/password authentication, which fails or silently keeps using an old secret.
 
-There are **seven**, across **two Helm releases**:
+There are **nine**, across **two Helm releases**:
 
 | Values key | Backing service | Release |
 |---|---|---|
@@ -183,23 +183,27 @@ There are **seven**, across **two Helm releases**:
 | `prismeai-runtime.storage.collections.azureManagedIdentityClientId` | PostgreSQL — collections | core |
 | `prismeai-runtime.cache.contexts.azureManagedIdentityClientId` | **Redis** — contexts cache | core |
 | `global.storage.searchengines.azureManagedIdentityClientId` | **Redis** — crawler / searchengine | **apps** |
+| `global.storage.workspaces.azureManagedIdentityClientId` | **Blob**: workspace models (workspaces, runtime) | core |
+| `global.storage.uploads.azureManagedIdentityClientId` | **Blob**: uploads (workspaces) | core |
 
-For Option A, set `azureSystemIdentity: true` at those same seven paths instead.
+For Option A, set `azureSystemIdentity: true` at those same nine paths instead. The two Blob keys also need `azure_blob_accountUrl` (step 8).
 
 <Note>
-**Four of the seven are Redis.** Configuring "the PostgreSQL ones" plus the broker still leaves **sessions**, **contexts** and the crawler/searchengine cache authenticating with a password.
+**Four of the nine are Redis.** Configuring "the PostgreSQL ones" plus the broker still leaves **sessions**, **contexts** and the crawler/searchengine cache authenticating with a password.
 
 Watch `global.storage.searchengines` in particular: the key says *searchengines*, but its value is a Redis URL (`redis://user:password@host:6379/4`) and it configures a Redis client. It is in the `apps` release, not `core`.
 </Note>
 
 <Warning>
-Managed identity covers **Redis and PostgreSQL only**. Elasticsearch is configured separately with `ELASTIC_USER` / `ELASTIC_PASSWORD` and has no identity option, and Blob storage uses `UPLOADS_STORAGE_AZURE_BLOB_CONNECTION_STRING` — an account key. Both remain credential-based no matter what you set above, so "passwordless" applies to two of the four backing services.
+Managed identity covers **Redis, PostgreSQL and Azure Blob Storage**. Elasticsearch is configured separately with `ELASTIC_USER` / `ELASTIC_PASSWORD` and has no identity option, so it remains credential-based no matter what you set above.
+
+Blob Storage needs a platform release whose Blob driver accepts an identity (`*_STORAGE_AZURE_BLOB_ACCOUNT_URL`). Earlier releases accept only `azure_blob_connectionString`, which carries the account key.
 </Warning>
 
 ### 4. Remove static passwords
 
 ```yaml
-# for each of the seven clients above
+# for each of the seven Redis and PostgreSQL clients above
 password: ''
 ```
 
@@ -285,6 +289,46 @@ Use that URL for the `url` key of each PostgreSQL `existingSecret` — `global.s
 <Warning>
 The separate `.user` value has **no effect** under Entra authentication: the chart omits `*_STORAGE_USER` whenever `azureManagedIdentityClientId` or `azureSystemIdentity` is set. If the principal is in neither the URL nor that variable, the driver sends an empty username and PostgreSQL answers `no PostgreSQL user name specified in startup packet`, which points nowhere near the real cause.
 </Warning>
+
+### 8. Azure Blob Storage
+
+Both Blob storages are configured in the core release: `global.storage.workspaces` (workspace models, read by workspaces and runtime) and `global.storage.uploads`. Give the identity the **Storage Blob Data Contributor** role on the account, then replace the connection string with the account URL:
+
+```bash
+az role assignment create \
+  --assignee-object-id <objectId> --assignee-principal-type ServicePrincipal \
+  --role "Storage Blob Data Contributor" \
+  --scope $(az storage account show -g RESOURCE_GROUP -n ACCOUNT_NAME --query id -o tsv)
+```
+
+```yaml
+global:
+  storage:
+    workspaces:
+      driver: AZURE_BLOB
+      azure_blob_container: models
+      azure_blob_accountUrl: https://ACCOUNT_NAME.blob.core.windows.net/
+      azureManagedIdentityClientId: <clientId>   # or azureSystemIdentity: true
+      azure_blob_connectionString: ''
+    uploads:
+      driver: AZURE_BLOB
+      azure_blob_container: uploads
+      azure_blob_accountUrl: https://ACCOUNT_NAME.blob.core.windows.net/
+      azureManagedIdentityClientId: <clientId>   # or azureSystemIdentity: true
+      azure_blob_connectionString: ''
+```
+
+With an identity configured, the chart renders no connection string and the driver ignores one if present (it logs a warning). The role takes **up to 10 minutes** to apply; until then requests fail with `AuthorizationPermissionMismatch`.
+
+Once both storages authenticate with the identity, **disable shared key access** on the account (`az storage account update --allow-shared-key-access false`, or `shared_access_key_enabled = false` in Terraform). Until then, anyone who can read the account keys, which includes every Owner and Contributor of the subscription, can still reach every blob.
+
+<Warning>
+**A storage firewall restricted to your cluster's egress IP blocks the cluster.** Azure Storage IP network rules do not apply to requests from the same Azure region, and an AKS cluster in the account's region reaches it over the Azure backbone rather than through its egress IP. Every request then fails with `403 AuthorizationFailure` / `This request is not authorized to perform this operation`, whatever the credential. Allow the AKS subnet with a virtual network rule (service endpoint `Microsoft.Storage`) or a private endpoint instead.
+</Warning>
+
+<Note>
+Keep **blob versioning** and **soft delete** enabled: the platform's file restore uses them. With versioning on, restore copies the latest version back, a server-side copy that the identity's token authorizes on its own (verified with shared key access disabled).
+</Note>
 
 ### Applying the pod label
 
@@ -386,7 +430,11 @@ on the cluster. Do not start by looking at the databases.
 | PostgreSQL: `28000 The access token has invalid format` | A **static password is being sent instead of a token**. The message points at the token; the cause is a leftover `password` — see step 4 |
 | PostgreSQL: `function pgaadauth_create_principal(...) does not exist` | You are connected to the application database instead of `postgres` |
 | Redis: `WRONGPASS` or `NOPERM` with a valid token | No access policy assignment, or it was assigned to the clientId instead of the objectId |
-| Only some services authenticate | Not all seven values keys are set — see step 3 |
+| Only some services authenticate | Not all nine values keys are set; see step 3 |
+| Blob: `403 AuthorizationPermissionMismatch` | The identity has no **Storage Blob Data Contributor** role on the account, or it was assigned less than 10 minutes ago; see step 8 |
+| Blob: `403 AuthorizationFailure` on every request, even with an account key | The storage firewall: IP rules do not match same-region traffic from AKS. Use a virtual network rule or a private endpoint; see step 8 |
+| Blob: `KeyBasedAuthenticationNotPermitted` | Shared key access is disabled and a service still uses a connection string: its identity values are not set, or the release predates identity support for Blob |
+| Blob: `an Azure identity is configured but the account URL is empty` | `azure_blob_accountUrl` is missing next to `azureManagedIdentityClientId` / `azureSystemIdentity` |
 
 ---
 
