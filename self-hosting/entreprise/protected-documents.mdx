@@ -1,36 +1,126 @@
 ---
 title: 'Rights-Protected Documents'
-description: 'Let the Crawler index documents protected by Microsoft Purview sensitivity labels (Azure Rights Management / MIP), and understand the permission it requires'
+description: 'Let the Crawler index documents protected by Microsoft Purview sensitivity labels (Azure Rights Management / MIP), with the connection owner''s rights or with an application-wide permission'
 ---
 
-Documents protected by **Microsoft Purview Information Protection** — a sensitivity label that applies encryption, also known as Azure Rights Management or MIP — are encrypted at rest. A crawler that fetches one receives ciphertext: the text extractor finds nothing usable, and the document ends up in the knowledge base as an empty or meaningless entry.
+Documents protected by **Microsoft Purview Information Protection** (a sensitivity label that applies encryption, also known as Azure Rights Management or MIP) are encrypted at rest. A crawler that fetches one receives ciphertext: the text extractor finds nothing usable, and the document ends up in the knowledge base as an empty or meaningless entry.
 
-The `prismeai-crawler` microservice can decrypt these documents before parsing them, so their text reaches the index like any other document's. This page covers what that requires, what it costs you in terms of permissions, and how to verify it works.
+The `prismeai-crawler` microservice can decrypt these documents before parsing them, so their text reaches the index like any other document's. This page helps you choose how the decryption keys are obtained, set it up, and verify it works.
 
 <Note>
-  This capability is **off by default** and stays off until you configure it. A deployment that has not been configured refuses protected documents and reports them explicitly — it never silently indexes garbage.
+  This capability is **off by default** and stays off until you configure it. A deployment that has not been configured refuses protected documents and reports them explicitly. It never silently indexes garbage.
 </Note>
 
 ## How it works
 
 <Steps>
   <Step title="The crawler recognises the protection">
-    Before parsing, the crawler inspects the bytes it downloaded. Office files (`.docx`, `.xlsx`, `.pptx`) and PDFs carry a recognisable marker when they are rights-protected. Unprotected documents are passed straight through — nothing leaves the process.
+    Before parsing, the crawler inspects the bytes it downloaded. Office files (`.docx`, `.xlsx`, `.pptx`) and PDFs carry a recognisable marker when they are rights-protected. Unprotected documents are passed straight through, and nothing leaves the process.
   </Step>
   <Step title="It reads the licence embedded in the document">
-    Every protected document carries its own *publishing licence*: a signed document naming the organisation that protected it and the sensitivity label that was applied. The crawler checks both against your configuration **before** contacting Microsoft.
+    Every protected document carries its own *publishing licence*: a signed document naming the organisation that protected it and the sensitivity label that was applied. The crawler checks both against your configuration **before** anyone contacts Microsoft.
   </Step>
-  <Step title="It asks Azure Rights Management for the content key">
-    One call per document, authenticating as itself with your own application credentials. The key is unique to each document; there is no key to cache.
+  <Step title="The content key is requested from Azure Rights Management">
+    One request per document. The key is unique to each document, so there is no key to cache. Who makes the request, and with whose rights, depends on the [mode](#choose-a-mode).
   </Step>
   <Step title="It decrypts in memory, parses, and indexes the text">
-    The stored file is **never modified** — it stays encrypted and keeps enforcing its own rules for anyone who downloads it. Only the extracted text reaches the search index.
+    The stored file is **never modified**: it stays encrypted and keeps enforcing its own rules for anyone who downloads it. Only the extracted text reaches the search index.
   </Step>
 </Steps>
 
-## The permission, and the decision it represents
+## Choose a mode
 
-This is the part to settle before anything else, and it is a security decision rather than a technical one.
+`MIP_MODE` selects who asks Microsoft for each key. It has no default, and the crawler never falls back from one mode to the other.
+
+| | `delegated` | `application` |
+|---|---|---|
+| Whose rights obtain the key | The **owner of the SharePoint connection** the document came from | An application registration holding **`Content.SuperUser`** |
+| What can be decrypted | Only documents that person may open | Any protected document in the tenant, regardless of its rights |
+| Secret held by the crawler | None | A client secret |
+| Who calls Microsoft | The platform runtime, on the connection's behalf | The crawler |
+| Name in your Purview audit log | The connection owner | The application |
+| Documents covered | Documents synchronised by the SharePoint connector | Connector documents and files uploaded by hand |
+| Tenant-wide permission to approve | None | `Content.SuperUser` |
+
+Choose `delegated` when your security policy rules out a tenant-wide decryption permission. Choose `application` only if you must also index protected files uploaded by hand, and your security officer accepts what [the `Content.SuperUser` permission](#application-mode-the-permission-and-the-decision-it-represents) grants.
+
+Both modes apply the same local checks before any request: the licence must come from your tenant, and its label must be in your allowlist.
+
+<Warning>
+  Once a document is indexed, **the knowledge base is the access boundary, not the label**, unless delegated access control is enabled on the SharePoint connection. The index does not carry the document's rights: anyone who can read a knowledge base can read what was decrypted into it. Admit only labels whose protection already grants reading to the **whole audience of every knowledge base this crawler feeds**, such as a label for all employees. In delegated mode this still matters: the connection owner may open documents that other readers of the knowledge base may not.
+</Warning>
+
+## Delegated mode: setup
+
+In delegated mode the crawler posts each document's publishing licence to the platform. The platform identifies the SharePoint connection the document came from, signs in to Azure Rights Management as that connection's owner with the token the connection already holds, and returns Microsoft's answer to the crawler. The person's token never leaves the connector.
+
+**Before you start:**
+- the SharePoint connector uses the **central OAuth client** (`oauthCentral`), set up as described in [SharePoint](/apps-store/marketplace/connectors/sharepoint);
+- you can edit the `prismeai-crawler` environment and restart it;
+- you can change the egress rules of the platform runtime pods.
+
+{/* REVIEW: minimum platform, searchengine and crawler versions that ship delegated mode, once released. */}
+
+<Steps>
+  <Step title="Upgrade the platform, the search engine, then the crawler">
+    The search engine must store the relay settings that the platform writes for each knowledge base, and the platform must know how to relay a licence. Upgrade both before you set `MIP_MODE=delegated` on the crawler.
+
+    On an existing deployment, the Knowledge Sync workspace configuration must list `storage` in `rights_license_source_workspaces`. An upgrade does not change an existing workspace configuration, so set it by hand:
+
+    ```yaml
+    rights_license_source_workspaces:
+      - storage
+    ```
+  </Step>
+
+  <Step title="Add the Rights Management scope to the SharePoint connector">
+    On the central OAuth application registration in Microsoft Entra, add the delegated permission **Azure Rights Management Services → `user_impersonation`**. A user can consent to it; admin consent is needed only if your tenant blocks user consent.
+
+    {/* REVIEW: delegated mode was measured with consent requested at sign-in; confirm whether listing the permission on the registration is required or only recommended. */}
+
+    Then, in the SharePoint connector's configuration app, add this scope to the **Scopes** field:
+
+    ```text
+    https://aadrm.com/user_impersonation
+    ```
+
+    The **Scopes** field **replaces** the default list, so keep the Graph scopes the connector uses, for example:
+
+    ```text
+    offline_access https://graph.microsoft.com/Sites.Read.All https://graph.microsoft.com/Files.Read.All https://graph.microsoft.com/User.Read https://aadrm.com/user_impersonation
+    ```
+
+    Save the configuration. Each owner of an existing SharePoint connection must then **reconnect once**, to consent to the new scope. Until they do, their protected documents are refused with `MipOwnerNotConnected`.
+  </Step>
+
+  <Step title="Open egress from the platform runtime to Microsoft">
+    In delegated mode the platform runtime pods, not the crawler, reach Microsoft. Allow `login.microsoftonline.com` and `api.aadrm.com` on port 443 from the runtime pods. See [Network prerequisites](#network-prerequisites).
+  </Step>
+
+  <Step title="Collect your tenant identifiers and the labels to index">
+    You need your Entra tenant ID, your `RightsManagementServiceId`, and the GUIDs of the labels you admit. See [Retrieve your RightsManagementServiceId](#retrieve-your-rightsmanagementserviceid) and [Collect the label GUIDs](#collect-the-label-guids).
+  </Step>
+
+  <Step title="Configure the crawler">
+    Set `MIP_MODE=delegated`, `MIP_TENANT_ID`, `MIP_RMS_SERVICE_ID` and `MIP_ALLOWED_LABELS` on `prismeai-crawler` (see [Environment variables](#environment-variables)), then restart it. Leave `MIP_CLIENT_ID` and `MIP_CLIENT_SECRET` unset: delegated mode does not read them.
+  </Step>
+
+  <Step title="Synchronise each knowledge base">
+    The platform writes a knowledge base's relay settings to its search engine when it synchronises that knowledge base. Until then, its protected documents are refused with `MipNotConfigured`, and copies indexed earlier are kept. Trigger a synchronisation of every knowledge base fed by SharePoint.
+  </Step>
+</Steps>
+
+**Verify:** the crawler logs `Protected-document decryption enabled` with `mode=delegated` at startup (see [Verifying the setup](#verifying-the-setup)). Then, in a synchronised knowledge base, a protected document with an allowed label is indexed and searchable, and your Purview audit log shows an `AcquireLicense` event under the connection owner's name.
+
+### Switching from application mode
+
+Changing `MIP_MODE` does not re-check documents already indexed. An unchanged protected document is not decrypted again (see [A recrawl does not re-request keys](#behaviour-worth-knowing)), so what `Content.SuperUser` decrypted stays searchable until its bytes change. To apply delegated mode to existing documents, reindex the knowledge bases concerned after clearing the crawler's `mip-body:` fingerprints.
+
+{/* REVIEW: give the exact Redis key pattern and command for clearing the mip-body: fingerprints, or the product operation that does it. */}
+
+## Application mode: the permission, and the decision it represents
+
+This is the part to settle before anything else in application mode, and it is a security decision rather than a technical one.
 
 The crawler needs the **`Content.SuperUser`** application role on the *Azure Rights Management Services* API. That role does exactly what its name says: it lets the caller obtain the content key of any protected document in your tenant, **regardless of the rights that document grants**. A document shared with three named people can be decrypted by a holder of this role.
 
@@ -55,15 +145,15 @@ Equally important is what the role does **not** allow, because this is usually w
   </Card>
 </CardGroup>
 
-The allowlist is the control that makes the permission proportionate. `Content.SuperUser` is tenant-wide; the allowlist narrows it back down to the labels you decide are appropriate for a searchable knowledge base. An unset allowlist means *decrypt nothing* — never *decrypt everything*.
+The allowlist is the control that makes the permission proportionate. `Content.SuperUser` is tenant-wide; the allowlist narrows it back down to the labels you decide are appropriate for a searchable knowledge base. An unset allowlist means *decrypt nothing*, never *decrypt everything*. Anyone who can upload a file into a knowledge base can have a document they are not allowed to open decrypted for them.
 
-## Setup
+## Application mode: setup
 
 Three of the five steps below need a different administrator role. Plan for that: the consent step in particular usually needs someone other than the person doing the rest.
 
 <Steps>
   <Step title="Create an application registration">
-    In the Microsoft Entra admin center, **Identity → Applications → App registrations → New registration**. Single-tenant, no redirect URI — the crawler never signs a user in. Note the **Application (client) ID** and the **Directory (tenant) ID**, then create a client secret under **Certificates & secrets**.
+    In the Microsoft Entra admin center, **Identity → Applications → App registrations → New registration**. Single-tenant, no redirect URI: the crawler never signs a user in. Note the **Application (client) ID** and the **Directory (tenant) ID**, then create a client secret under **Certificates & secrets**.
 
     *Minimum role:* **Application Developer** (or Cloud Application Administrator).
   </Step>
@@ -71,82 +161,87 @@ Three of the five steps below need a different administrator role. Plan for that
   <Step title="Add Content.SuperUser and grant admin consent">
     On the registration, **API permissions → Add a permission → APIs my organization uses → Azure Rights Management Services → Application permissions → `Content.SuperUser`**. Then **Grant admin consent** for the tenant.
 
-    *Minimum role:* **Cloud Application Administrator** (or Application Administrator). A Global Administrator is **not** required — the restriction that forces a more privileged role applies only to Microsoft Graph app roles, and this permission is on a different API. Without the consent step the permission is listed but inactive, and every protected document will be refused.
+    *Minimum role:* **Cloud Application Administrator** (or Application Administrator). A Global Administrator is **not** required: the restriction that forces a more privileged role applies only to Microsoft Graph app roles, and this permission is on a different API. Without the consent step the permission is listed but inactive, and every protected document will be refused.
 
     <Note>
       You do **not** need to enable the tenant's *super-user feature* through PowerShell (`Enable-AipServiceSuperUserFeature`). That feature governs user accounts; the Entra application role above is sufficient on its own and has been verified as such.
     </Note>
   </Step>
 
-  <Step title="Retrieve your RightsManagementServiceId">
-    This is **not** your Entra tenant ID. It is a separate GUID identifying your rights-management service, and it is the one that appears in the licence of every document your tenant protects. The crawler compares it against each document to avoid ever contacting Microsoft about a file protected by someone else.
-
-    ```powershell
-    Install-Module -Name AIPService
-    Connect-AipService
-    Get-AipServiceConfiguration | Select-Object RightsManagementServiceId
-    ```
-
-    *Minimum role:* an account allowed to administer the rights-management service — **Global Administrator**, or an Azure Information Protection / Compliance administrator.
-
-    <Warning>
-      Run this from **Windows**. The `AIPService` module installs and imports elsewhere, but on macOS `Connect-AipService` fails during the TLS handshake with `discover.aadrm.com`, which is served under Microsoft's internal PKI — its root certificate only ships in the Windows certificate store. This affects administration only, not the crawler at runtime.
-    </Warning>
+  <Step title="Collect your tenant identifiers and the labels to index">
+    See [Retrieve your RightsManagementServiceId](#retrieve-your-rightsmanagementserviceid) and [Collect the label GUIDs](#collect-the-label-guids).
   </Step>
 
-  <Step title="Collect the label GUIDs you want indexed">
-    In the **Microsoft Purview portal → Information protection → Sensitivity labels**, select a label; its GUID appears in the page URL. Or list them all:
-
-    ```powershell
-    Connect-IPPSSession
-    Get-Label | Format-Table DisplayName, Guid
-    ```
-
-    <Warning>
-      Once a document is indexed, **the knowledge base is the access boundary, not the label.** The crawler obtains the key whoever submitted the file, and the index does not carry the document's rights: anyone who can read a knowledge base can read what was decrypted into it, and anyone who can upload a file into one can have a document they are not allowed to open decrypted for them.
-
-      Admit only labels whose protection already grants reading to the **whole audience of every knowledge base this crawler feeds**, such as a label for all employees. Never admit a label restricted to a group or to named people.
-    </Warning>
-
-    Braces and letter case do not matter; the crawler normalises both.
+  <Step title="Open egress from the crawler to Microsoft">
+    Allow `login.microsoftonline.com` and `api.aadrm.com` on port 443 from the crawler pods. See [Network prerequisites](#network-prerequisites).
   </Step>
 
   <Step title="Configure the crawler">
-    Set the environment variables below on `prismeai-crawler` and restart it. Watch the startup logs — the crawler tells you immediately whether it is ready (see [Verifying the setup](#verifying-the-setup)).
+    Set `MIP_MODE=application` and the five other variables below on `prismeai-crawler`, and restart it. Watch the startup logs: the crawler tells you immediately whether it is ready (see [Verifying the setup](#verifying-the-setup)).
   </Step>
 </Steps>
 
-## Environment Variables
+## Tenant identifiers and labels
+
+### Retrieve your RightsManagementServiceId
+
+This is **not** your Entra tenant ID. It is a separate GUID identifying your rights-management service, and it is the one that appears in the licence of every document your tenant protects. The crawler compares it against each document to avoid ever contacting Microsoft about a file protected by someone else.
+
+```powershell
+Install-Module -Name AIPService
+Connect-AipService
+Get-AipServiceConfiguration | Select-Object RightsManagementServiceId
+```
+
+*Minimum role:* an account allowed to administer the rights-management service: **Global Administrator**, or an Azure Information Protection / Compliance administrator.
+
+<Warning>
+  Run this from **Windows**. The `AIPService` module installs and imports elsewhere, but on macOS `Connect-AipService` fails during the TLS handshake with `discover.aadrm.com`, which is served under Microsoft's internal PKI: its root certificate only ships in the Windows certificate store. This affects administration only, not the crawler at runtime.
+</Warning>
+
+### Collect the label GUIDs
+
+In the **Microsoft Purview portal → Information protection → Sensitivity labels**, select a label; its GUID appears in the page URL. Or list them all:
+
+```powershell
+Connect-IPPSSession
+Get-Label | Format-Table DisplayName, Guid
+```
+
+Braces and letter case do not matter; the crawler normalises both. Apply the rule in the warning under [Choose a mode](#choose-a-mode) when you pick them.
+
+## Environment variables
 
 <Accordion title="Rights-Protected Document Environment Variables">
-  These settings are **all-or-nothing**: the first five must be set together. If any one of them is missing, protected documents are refused and a warning naming the missing variables is logged at startup.
+  Every variable the mode needs is required. If any one of them is missing, protected documents are refused and a warning naming the missing variables is logged at startup.
 
   | Variable Name | Description | Default Value | Affected Services |
   |---------------|-------------|---------------|-------------------|
-  | `MIP_TENANT_ID` | Directory (tenant) ID of the Entra tenant that issues the application token. | | prismeai-crawler |
-  | `MIP_CLIENT_ID` | Application (client) ID of the registration holding `Content.SuperUser`. | | prismeai-crawler |
-  | `MIP_CLIENT_SECRET` | Client secret of that registration. Provide it through a Kubernetes secret, never in a ConfigMap. | | prismeai-crawler |
-  | `MIP_RMS_SERVICE_ID` | Your tenant's `RightsManagementServiceId`. **Not** the Entra tenant ID — see step 3 above. A document whose licence names a different service is refused without any call to Microsoft. | | prismeai-crawler |
+  | `MIP_MODE` | `delegated` or `application`. See [Choose a mode](#choose-a-mode). | | prismeai-crawler |
+  | `MIP_TENANT_ID` | Directory (tenant) ID of the Entra tenant your documents belong to. | | prismeai-crawler |
+  | `MIP_CLIENT_ID` | `application` mode only. Application (client) ID of the registration holding `Content.SuperUser`. | | prismeai-crawler |
+  | `MIP_CLIENT_SECRET` | `application` mode only. Client secret of that registration. Provide it through a Kubernetes secret, never in a ConfigMap. | | prismeai-crawler |
+  | `MIP_RMS_SERVICE_ID` | Your tenant's `RightsManagementServiceId`. **Not** the Entra tenant ID. A document whose licence names a different service is refused without any call to Microsoft. | | prismeai-crawler |
   | `MIP_ALLOWED_LABELS` | Comma-separated list of sensitivity label GUIDs allowed to be decrypted. **Unset means decrypt nothing.** Braces and case are ignored. Add `sharepoint-library` to also decrypt files protected by a SharePoint library with IRM enabled, which carry no label. This assumes delegated access control is enabled on the SharePoint connection and that no user can upload files by hand. Protection a person applied without a label is never decrypted. | | prismeai-crawler |
 
   <Tip>
-    Leave all five unset to keep the feature off. That is a supported configuration, not an incomplete one, and it is what the startup log will report.
+    Leave all of them unset to keep the feature off. That is a supported configuration, not an incomplete one, and it is what the startup log will report.
   </Tip>
 </Accordion>
 
+These settings apply to every knowledge base the crawler serves. One crawler deployment therefore decrypts documents of **one** Microsoft tenant, with one allowlist.
+
 ## Network prerequisites
 
-The crawler makes outbound HTTPS calls to exactly two destinations:
+| Destination | Purpose | Reached from, `delegated` | Reached from, `application` |
+|---|---|---|---|
+| `login.microsoftonline.com` | Obtaining a token | Platform runtime pods | Crawler pods |
+| `api.aadrm.com` | Requesting each document's content key | Platform runtime pods | Crawler pods |
 
-| Destination | Purpose |
-|---|---|
-| `login.microsoftonline.com` | Obtaining an application token |
-| `api.aadrm.com` | Requesting each document's content key |
-
-Both must be reachable from the crawler pods, on port 443. If your egress is filtered, allow these two host names; see [Network Policies](/self-hosting/kubernetes/network-policies) for where to declare them.
+Both must be reachable on port 443. If your egress is filtered, allow these two host names; see [Network Policies](/self-hosting/kubernetes/network-policies) for where to declare them. In delegated mode, the crawler only reaches the platform API.
 
 <Warning>
-  **TLS inspection breaks this path.** An inspecting proxy or firewall presents its own certificate, which the crawler's trust store does not accept: the handshake fails and every protected document fails with it. Exempt these host names from inspection — simplest and recommended — or add the appliance's CA to the crawler container's trust store.
+  **TLS inspection breaks this path.** An inspecting proxy or firewall presents its own certificate, which the caller's trust store does not accept: the handshake fails and every protected document fails with it. Exempt these host names from inspection (simplest and recommended), or add the appliance's CA to the trust store of the pods that reach them.
 </Warning>
 
 ## Verifying the setup
@@ -157,16 +252,17 @@ The crawler diagnoses its own configuration at startup, so a mistake surfaces on
 
 | Log message | Meaning |
 |---|---|
-| `Protected-document decryption enabled` | All five settings are present. The `allowed_labels` field reports how many entries you listed. |
+| `Protected-document decryption enabled` | Every setting the mode needs is present. The `mode` field shows which mode, and `allowed_labels` how many entries you listed. |
 | `Protected-document decryption disabled (not configured)` | Nothing is set. This is the default and is not a problem. |
-| `Protected-document decryption disabled: incomplete configuration` | Some settings are set and some are not. The `missing` field names them — usually a typo in a variable name. |
+| `Protected-document decryption disabled: unknown MIP_MODE` | `MIP_MODE` holds something other than `delegated` or `application`, usually a typo. The `mode` field shows the value read. |
+| `Protected-document decryption disabled: incomplete configuration` | Some settings are set and some are not. The `missing` field names them, usually a typo in a variable name. |
 
-**Is it going to work?** When enabled, two further checks run:
+**Is it going to work?** In application mode, two further checks run. Delegated mode runs none: the crawler never reaches Microsoft itself.
 
 | Log message | Meaning |
 |---|---|
-| `Azure RMS credentials accepted` | The application token was minted: tenant ID, client ID and secret are correct. It does **not** prove admin consent — a token is issued without the role, and the refusal only comes with the first document (`MipAccessDenied`). |
-| `Azure RMS credentials could not be verified at boot; protected documents will fail` | The token could not be obtained. The `error` field carries Microsoft's own message — typically an expired or mistyped secret, or missing admin consent. |
+| `Azure RMS credentials accepted` | The application token was minted: tenant ID, client ID and secret are correct. It does **not** prove admin consent: a token is issued without the role, and the refusal only comes with the first document (`MipAccessDenied`). |
+| `Azure RMS credentials could not be verified at boot; protected documents will fail` | The token could not be obtained. The `error` field carries Microsoft's own message, typically an expired or mistyped secret, or missing admin consent. |
 | `Rights-management endpoint reachable` | A TLS handshake with the rights-management host succeeded. |
 | `Rights-management endpoint unreachable, or a TLS-inspecting appliance sits on the path` | Either egress is blocked or the connection is being intercepted. |
 
@@ -181,33 +277,38 @@ The crawler diagnoses its own configuration at startup, so a mistake surfaces on
 | Not protected | Indexed normally; nothing leaves the process |
 | Protected Office file, label allowed, extraction rights granted | Decrypted and indexed |
 | Protected PDF, same conditions | Decrypted and indexed |
-| Encrypted with a password rather than a label | Refused — `MipPasswordProtected` |
-| Protected PDF in an older format (`/MicrosoftIRMVersion 1`) | Refused — `MipPdfNotSupported` |
-| No credentials, or an empty allowlist | Refused — `MipNotConfigured` |
-| Licence issued by another organisation | Refused — `MipForeignTenant` |
-| Rights refused by the service | Refused — `MipAccessDenied` |
-| Viewing granted, content extraction withheld | Refused — `MipExtractionDenied` |
-| Label outside the allowlist | Refused — `MipLabelNotAllowed` |
-| Protected without a label, other than by a SharePoint library admitted with `sharepoint-library` | Refused — `MipLabelNotAllowed` |
-| Service unreachable or throttled | Retried — `MipServiceUnavailable` |
+| Encrypted with a password rather than a label | Refused: `MipPasswordProtected` |
+| Protected PDF in an older format (`/MicrosoftIRMVersion 1`) | Refused: `MipPdfNotSupported` |
+| No mode, missing settings, or an empty allowlist | Refused: `MipNotConfigured` |
+| Delegated: knowledge base not synchronised since the upgrade | Refused: `MipNotConfigured`, indexed copy kept |
+| Delegated: file uploaded by hand, or from a connector that cannot relay a licence | Refused: `MipNoDelegate` |
+| Delegated: the connection owner must reconnect | Refused: `MipOwnerNotConnected`, indexed copy kept |
+| Licence issued by another organisation | Refused: `MipForeignTenant` |
+| Rights refused by the service | Refused: `MipAccessDenied` |
+| Viewing granted, content extraction withheld | Refused: `MipExtractionDenied` |
+| Label outside the allowlist | Refused: `MipLabelNotAllowed` |
+| Protected without a label, other than by a SharePoint library admitted with `sharepoint-library` | Refused: `MipLabelNotAllowed` |
+| Service or platform unreachable or throttled | Retried: `MipServiceUnavailable` |
 
 Each code is the `error` field of the document's `item.error` event, so a refusal is visible per document rather than buried in a log.
 
+A refusal also removes the copy an earlier crawl indexed, so a label or rights withdrawn since then stop being searchable. The two exceptions marked *indexed copy kept* do not mean the document's rights changed, only that the relay is missing or cannot sign in.
+
 ### What to do about each refusal
 
-<Accordion title="Acting on a refusal code">
-  | Code | What to do |
-  |---|---|
-  | `MipForeignTenant` | **Usually nothing.** A protected attachment received from a partner or client is legitimately undecryptable by you, and contacting Microsoft about it would write an entry into *their* audit log. Expect these; they are not a misconfiguration. |
-  | `MipNotConfigured` | Check the five variables. If the startup log says *incomplete configuration*, its `missing` field names the culprit. |
-  | `MipLabelNotAllowed` | Decide whether that label belongs in the knowledge base. If it does, add its GUID to `MIP_ALLOWED_LABELS`; if not, the refusal is the correct outcome. If the message says the licence names no sensitivity label, the file was protected without one. Coming from a SharePoint library with IRM, `sharepoint-library` admits it; protection a person applied by hand is refused by design. |
-  | `MipAccessDenied` | The service answered and said no. Verify admin consent was granted for `Content.SuperUser`, and that the label's protection has not expired or been revoked. |
-  | `MipExtractionDenied` | The label grants viewing but not content extraction. Indexing would exceed what the licence permits, so this is enforced deliberately. Changing it means changing the label's rights in Purview. |
-  | `MipPasswordProtected` | No service holds the key to a password-encrypted file. Remove the password at the source, or accept that it cannot be indexed. |
-  | `MipServiceUnavailable` | Transient; the document stays in the retry path. Persisting means a network or egress problem — check the two startup reachability lines. |
-  | `MipPdfNotSupported` | A PDF in a protection format the crawler does not read. Open one in a text editor and check `/MicrosoftIRMVersion`: `1` is the older format, a known limit (see [Known limits](#known-limits)). Anything else, report it with the producing application. |
-  | `MipUnsupportedContainer` | The licence was readable but the container layout is not one the crawler handles. Report it with the producing application and version. |
-</Accordion>
+| Code | What to do |
+|---|---|
+| `MipForeignTenant` | **Usually nothing.** A protected attachment received from a partner or client is legitimately undecryptable by you, and contacting Microsoft about it would write an entry into *their* audit log. Expect these; they are not a misconfiguration. |
+| `MipNotConfigured` | Check the variables. If the startup log says *incomplete configuration*, its `missing` field names the culprit. In delegated mode, if the message says the knowledge base has no relay configured, synchronise that knowledge base. |
+| `MipNoDelegate` | Expected in delegated mode for files uploaded by hand: no connection owner can be asked for their key. Index them in application mode, or accept that they stay unindexed. |
+| `MipOwnerNotConnected` | The connection owner's sign-in can no longer be used: revoked, expired, or missing consent to the Rights Management scope. Ask them to reconnect the SharePoint connection. A refused document comes back at the next synchronisation that retries it, which can be up to 24 hours after the reconnection unless the document changes. |
+| `MipLabelNotAllowed` | Decide whether that label belongs in the knowledge base. If it does, add its GUID to `MIP_ALLOWED_LABELS`; if not, the refusal is the correct outcome. If the message says the licence names no sensitivity label, the file was protected without one. Coming from a SharePoint library with IRM, `sharepoint-library` admits it; protection a person applied by hand is refused by design. |
+| `MipAccessDenied` | The service answered and said no. In application mode, verify admin consent was granted for `Content.SuperUser`. In delegated mode, the connection owner may simply not have the right to open that document. In both, check that the label's protection has not expired or been revoked. |
+| `MipExtractionDenied` | The label grants viewing but not content extraction. Indexing would exceed what the licence permits, so this is enforced deliberately. Changing it means changing the label's rights in Purview. |
+| `MipPasswordProtected` | No service holds the key to a password-encrypted file. Remove the password at the source, or accept that it cannot be indexed. |
+| `MipServiceUnavailable` | Transient; the document stays in the retry path. Persisting means a network or egress problem: in application mode, check the two startup reachability lines; in delegated mode, check the runtime pods' egress. |
+| `MipPdfNotSupported` | A PDF in a protection format the crawler does not read. Open one in a text editor and check `/MicrosoftIRMVersion`: `1` is the older format, a known limit (see [Known limits](#known-limits)). Anything else, report it with the producing application. |
+| `MipUnsupportedContainer` | The licence was readable but the container layout is not one the crawler handles. Report it with the producing application and version. |
 
 ### Behaviour worth knowing
 
@@ -215,14 +316,14 @@ Each code is the `error` field of the document's `item.error` event, so a refusa
   <Card title="A recrawl does not re-request keys" icon="rotate">
     The bytes of a protected document are fingerprinted per URL. A periodic recrawl that finds the same bytes stops before the key request, so a weekly crawl does not add a weekly `AcquireLicense` entry to your audit log.
   </Card>
-  <Card title="Widening the allowlist takes effect" icon="list-check">
-    Documents refused for `MipNotConfigured`, `MipLabelNotAllowed`, `MipAccessDenied` or `MipExtractionDenied` are **not** permanently skipped. Fix the configuration, the consent or the label, and the next crawl picks them up. Only refusals caused by the file itself are remembered.
+  <Card title="Fixing the configuration takes effect" icon="list-check">
+    Documents refused for `MipNotConfigured`, `MipLabelNotAllowed`, `MipAccessDenied`, `MipExtractionDenied`, `MipNoDelegate` or `MipOwnerNotConnected` are **not** permanently skipped. Fix the configuration, the consent, the connection or the label, and a later crawl picks them up. Only refusals caused by the file itself are remembered.
   </Card>
 </CardGroup>
 
 ## Operating requirement: temporary storage
 
-Some parsing paths write intermediate files to disk — image extraction and the LibreOffice-based conversions both use `TMP_MEDIA_FOLDER` (default `/tmp/prismeai-crawler/`). For a protected document, those intermediate files contain **decrypted content**.
+Some parsing paths write intermediate files to disk: image extraction and the LibreOffice-based conversions both use `TMP_MEDIA_FOLDER` (default `/tmp/prismeai-crawler/`). For a protected document, those intermediate files contain **decrypted content**.
 
 For a self-hosted deployment this is an operating requirement rather than a detail:
 
@@ -231,17 +332,19 @@ For a self-hosted deployment this is an operating requirement rather than a deta
 - keep it out of any backup or log-shipping scope.
 
 <Warning>
-  If your threat model does not allow decrypted content to touch a filesystem at all — even an in-memory one — then this capability is not suitable for that deployment. Say so before enabling it rather than after.
+  If your threat model does not allow decrypted content to touch a filesystem at all, even an in-memory one, then this capability is not suitable for that deployment. Say so before enabling it rather than after.
 </Warning>
 
 ## If you also use the SharePoint connector
 
 A labelled document may reach the crawler either still encrypted or already in cleartext, depending on how the source serves it. Both are handled: the crawler decides from the bytes it actually receives, and a document that arrives unprotected is indexed with no key request at all.
 
-Nothing about your SharePoint configuration needs to change to use this feature.
+In application mode, nothing about your SharePoint configuration needs to change. Delegated mode needs the Rights Management scope described in [Delegated mode: setup](#delegated-mode-setup).
 
 ## Known limits
 
+- **One Microsoft tenant per crawler deployment.** The tenant, the rights-management service and the allowlist are crawler settings, shared by every knowledge base it serves. A licence from any other tenant is refused with `MipForeignTenant`.
+- **Delegated mode covers SharePoint connector documents only.** Files uploaded by hand have no connection owner and are refused with `MipNoDelegate`.
 - **Only version 2 of Microsoft's PDF protection format is supported.** PDFs protected by the Microsoft Purview Information Protection client or by a SharePoint library with IRM carry `/MicrosoftIRMVersion 2` and are supported. A PDF carrying `/MicrosoftIRMVersion 1`, an earlier format, is refused with `MipPdfNotSupported` rather than mis-parsed. If PDFs are being refused with that code, open one in a text editor and look for that key: its value tells you which format you have.
 - **Only the commercial Microsoft cloud is supported**, every region of it included. The US Government (GCC High) and China (21Vianet) clouds use other host names and have never been exercised.
 - **A document with no sensitivity label anywhere is refused**, even if its licence would otherwise grant access. The allowlist has nothing to match against, and defaulting to "allow" would defeat it.
@@ -253,8 +356,11 @@ Nothing about your SharePoint configuration needs to change to use this feature.
   <Card title="Crawler & SearchEngine" icon="spider" href="/self-hosting/entreprise/crawler-searchengine">
     Deploying and configuring the crawling and indexing microservices
   </Card>
+  <Card title="SharePoint connector" icon="microsoft" href="/apps-store/marketplace/connectors/sharepoint">
+    Setting up the central OAuth client and its scopes
+  </Card>
   <Card title="Network Policies" icon="network-wired" href="/self-hosting/kubernetes/network-policies">
-    Declaring the egress the crawler needs
+    Declaring the egress Microsoft requires
   </Card>
 </CardGroup>
 
