@@ -12,7 +12,7 @@ description: 'Read and act on SonarQube / SonarQube Cloud code-quality data from
   style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
 />
 
-The SonarQube app exposes the [SonarQube](https://www.sonarsource.com/products/sonarqube/) and [SonarQube Cloud](https://sonarcloud.io) Web API. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. It covers projects, components, issues, security hotspots, measures, metrics, quality gates, quality profiles, rules, organizations, user tokens, analyses, branches, webhooks and SVG badges. Authentication is a **SonarQube User Token** stored in the workspace and resolved server-side and never passed through the agent.
+The SonarQube app exposes the [SonarQube](https://www.sonarsource.com/products/sonarqube/) and [SonarQube Cloud](https://sonarcloud.io) Web API. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call as tools, or as a Builder app whose instructions you call directly from DSUL. It covers projects, components, issues, security hotspots, measures, metrics, quality gates, quality profiles, rules, organizations, user tokens, analyses, branches, webhooks and SVG badges. Authentication is a **SonarQube User Token**, either one token shared by the workspace or **each user's own token**, resolved server-side and never passed through the agent. Each installed instance serves its own MCP endpoint and is set up through a configuration app.
 
 <CardGroup cols={3}>
   <Card title="Code Quality" icon="shield-check">
@@ -44,43 +44,63 @@ This connector is used by three different roles. Jump to the section that matche
 
 ## Prerequisites
 
-- A **SonarQube** server (self-hosted) or a **SonarQube Cloud** account.
-- A **User Token** generated in **My Account > Security > Generate Tokens** (passed server-side as `Authorization: Bearer <token>`).
+- A **SonarQube Server** (self-hosted) or a **SonarQube Cloud** account.
+- A **User Token** (type *User token*, not an analysis token) generated in **My Account > Security > Generate Tokens**: one shared token for the workspace, or one per user in per-user mode (see *Authentication modes* in the *Workspace builder* tab).
 - The **API base URL** of your instance:
-  - SonarCloud: `https://sonarcloud.io/api`
+  - SonarQube Cloud: `https://sonarcloud.io/api`
   - Self-hosted: `https://<your-sonarqube-host>/api`
-- For SonarCloud only: the **organization key** that owns your projects (most search and create operations require it; use `searchOrganizations` to discover the keys visible to your token).
+- For SonarQube Cloud only: the **organization key** that owns your projects (most search and create operations require it; use `searchOrganizations` to discover the keys visible to your token).
+- Prisme.ai platform **27.5.7 or later**. The SonarQube API must be reachable from the platform's runtime.
+
+| SonarQube | Supported | How the token is sent |
+|-----------|-----------|------------------------|
+| Server 9.9 LTS | Yes | `Authorization: Basic` (token as login, empty password) |
+| Server 10.x and later (incl. 2025.x LTA) | Yes | `Authorization: Basic` |
+| Cloud | Expected (not re-verified with this version) | `Authorization: Basic`, retried once as `Bearer` when rejected |
+
+The connector always tries Basic first and falls back to Bearer on a `401`, so you never pick a scheme: SonarQube Server before 10.0 only accepts Basic, SonarQube Cloud documents Bearer. Server versions older than 9.9 are not tested.
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
-  **Goal:** SonarQube is a **per-workspace** connector: each workspace pastes its own SonarQube User Token (see the *Workspace builder* tab), so there is **no platform-wide credential to provision**. The only optional platform task is to publish SonarQube as a reusable **capability** in AI Governance so agent builders can enable it from the catalog instead of pasting a raw MCP endpoint.
+  **Goal:** SonarQube is a **per-workspace** connector: each workspace that installs it chooses its authentication mode and owns its credentials (see the *Workspace builder* tab), so there is **no platform-wide credential to provision** and no central OAuth client. The only optional platform task is to make a workspace's SonarQube connector available in the Capabilities catalog.
 
   <Note>
-    There is no shared SonarQube credential and no central OAuth client for this connector. The SonarQube User Token always lives in the consuming workspace and is resolved server-side. A Governance capability you publish here points at a specific workspace's MCP endpoint; that workspace still owns the credential.
+    The simplest path is the **Add to catalog** button in the connector's configuration app (*Agents* tab): it creates the catalog entry with the right MCP endpoint, scope and, in per-user mode, the connect/status/disconnect URLs. Declare the capability by hand only if you cannot use that button.
   </Note>
 
-  ## Declare the capability in AI Governance (optional)
+  ## Declare the capability in AI Governance by hand (optional)
 
   <Steps>
     <Step title="Open AI Governance > Capabilities">
       Create (or edit) the **SonarQube** capability.
     </Step>
     <Step title="Point it at the MCP endpoint">
-      Set the capability's MCP server URL to the connector's **MCP Endpoint** (the workspace running the connector), and set its **Scope** to:
+      Set the capability's MCP server URL to the connector's **MCP endpoint**, shown in the configuration app (*Agents* tab). It has the form `https://<api-host>/v2/workspaces/slug:<workspace>/webhooks/<instance>.mcp`. Set its **Scope** to:
 
       ```text
       context_id,agent_id,user_id
       ```
 
-      The `agent_id` in the scope is what lets the connector identify the calling agent.
+      The `agent_id` in the scope is what lets the connector identify the calling agent; the agent must also be allowed in the configuration app (*Agents* tab).
+    </Step>
+    <Step title="Per-user mode only: add the connection URLs">
+      In per-user mode, each user connects their own SonarQube token. The capability needs an `auth` block of type `oauth2` with an empty scope list and these three URLs, all on the same instance:
+
+      ```json
+      {
+        "type": "oauth2",
+        "status_url": "https://<api-host>/v2/workspaces/slug:<workspace>/webhooks/<instance>.oauthStatus",
+        "connect_url": "https://<api-host>/v2/workspaces/slug:<workspace>/webhooks/<instance>.oauthConnect",
+        "disconnect_url": "https://<api-host>/v2/workspaces/slug:<workspace>/webhooks/<instance>.oauthDisconnect",
+        "scopes": []
+      }
+      ```
+
+      There is no OAuth flow behind these names: `connect_url` opens a form where the user pastes their own SonarQube token. Encode spaces in the instance name as `%20`.
     </Step>
     <Step title="Make it available to agent builders">
-      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles; there is no per-capability role grant for this connector.
+      Once created, the capability appears in the capability picker for agent builders in your organization, who enable it on their agents. Access to the catalog follows your organization's existing roles.
     </Step>
   </Steps>
-
-  <Warning>
-    Declaring the capability makes the connector **available**; the SonarQube credential is still owned by the workspace that installed the app. There is **no OAuth auth-config JSON** to attach in Governance: authentication is a server-side User Token, not a per-user OAuth flow.
-  </Warning>
 </Accordion>
 
 ---
@@ -95,26 +115,23 @@ This connector is used by three different roles. Jump to the section that matche
       Before an agent can call the connector, a *Workspace builder* must have installed and configured the SonarQube app in a workspace (see the *Workspace builder* tab). Optionally, a *Platform admin* may have published a SonarQube capability in AI Governance (see the *Platform admin setup* accordion above).
     </Note>
 
-    The SonarQube credential is resolved server-side from the installed app's configuration and never exposed to the agent. Your agent is identified through the capability *Scope* that Agent Creator injects.
+    The SonarQube credential is resolved server-side and never exposed to the agent: the workspace's shared token, or, in per-user mode, the calling user's own token. Your agent is identified through the capability *Scope* that Agent Creator injects, and must be allowed in the connector's configuration app.
 
     <Steps>
       <Step title="Install and configure the connector in a workspace">
-        Follow the *Workspace builder* tab: install **SonarQube** in your workspace and provide the **API base URL** and **User Token**.
+        Follow the *Workspace builder* tab: install **SonarQube** in a workspace, open its configuration app and set the authentication mode and API base URL.
       </Step>
       <Step title="Add the MCP capability to your agent">
-        In your agent, add a capability pointing at the workspace's **MCP Endpoint** URL, and set its **Scope** to:
-
-        ```text
-        context_id,agent_id,user_id
-        ```
-
-        The server URL and identity propagation are then wired; the SonarQube token is fetched server-side from the app configuration.
+        In the configuration app, open the *Agents* tab, tick your agent and click **Install capability**. This adds the MCP tool with the right endpoint and scope (`context_id,agent_id,user_id`), plus the per-user connection URLs in per-user mode. Alternatively, pick the SonarQube capability from the catalog if an administrator published it.
+      </Step>
+      <Step title="Per-user mode: connect your SonarQube token">
+        On the first use, Agent Creator shows a **Connect** button on the SonarQube capability. It opens a form where you paste your own SonarQube **User token**; the connector checks it against SonarQube before storing it in your personal secrets. Every tool call then runs with your SonarQube permissions. Use **Disconnect** to remove it.
       </Step>
       <Step title="Brief the agent in its system prompt">
         Wiring the capability is not enough: the agent also needs to know the MCP exists and when to reach for it. Add a short paragraph to the agent's system prompt. Copy-pasteable starter:
 
         ```text
-        You have access to the SonarQube MCP server. Use it whenever the user asks about code-quality data: projects, issues, security hotspots, measures, quality gates, rules or badges. Examples: "List the blocker issues in project X", "What's the coverage of auth-service?", "Show the security hotspots opened this week", "Why is the quality gate failing on main?". On SonarCloud, most search and create operations need an organization key; call searchOrganizations first if you don't know it. Prefer calling MCP tools directly over guessing, and confirm with the user before any destructive action (mark issues as false positive, change severity, delete a project or branch).
+        You have access to the SonarQube MCP server. Use it whenever the user asks about code-quality data: projects, issues, security hotspots, measures, quality gates, rules or badges. Examples: "List the blocker issues in project X", "What's the coverage of auth-service?", "Show the security hotspots opened this week", "Why is the quality gate failing on main?". On SonarCloud, most search and create operations need an organization key; call searchOrganizations first if you don't know it. Prefer calling MCP tools directly over guessing, and confirm with the user before any destructive action (mark issues as false positive, change severity, delete a project or branch). If a tool answers that SonarQube is not connected for this user, ask the user to click Connect on the SonarQube capability.
         ```
 
         Refine the trigger keywords (project keys, branch names, rule families) so the agent reliably picks up the right intent in your context.
@@ -122,7 +139,7 @@ This connector is used by three different roles. Jump to the section that matche
     </Steps>
 
     <Note>
-      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP Endpoint** URL. Newer Agent Creator agents use the native capability picker described above.
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP endpoint** URL shown in the configuration app (*Agents* tab). Newer Agent Creator agents use the native capability picker described above.
     </Note>
 
     ## Available Tools
@@ -391,35 +408,60 @@ This connector is used by three different roles. Jump to the section that matche
 
     ## Installation
 
-    1. Go to **Apps** in your workspace
-    2. Search for **SonarQube** and install it
-    3. Open the app instance configuration and fill in the required fields
+    1. Go to **Apps** in your workspace, search for **SonarQube** and install it. Pick an instance name; spaces are allowed.
+    2. Open the instance configuration and follow the **Configuration app** link (`configAppUrl`, filled in automatically a few seconds after install).
+    3. In the *Authentication* tab, choose the mode, set the API base URL and save (see below).
+    4. In the *Agents* tab, allow the agents that may call the connector and install the capability on them.
 
-    ## Configuration
+    ## Authentication modes
 
-    | Field | Description |
-    |-------|-------------|
-    | **SonarQube API Base URL** | Base URL of the SonarQube API. Defaults to `https://sonarcloud.io/api`; replace with your self-hosted instance URL when applicable |
-    | **API Token** | SonarQube User Token, stored as a workspace secret. Passed server-side as `Authorization: Bearer <token>` |
-    | **MCP Endpoint** | Auto-populated on install; the URL of the MCP endpoint for this instance (used to wire the *Agent builder* capability) |
+    | Mode | What the workspace admin sets | Whose SonarQube permissions apply | Best for |
+    |------|-------------------------------|-----------------------------------|----------|
+    | **One token for the whole workspace** | A SonarQube User token + the API base URL | The token owner's, for every user and agent | Service accounts, automations without a user (scheduled runs) |
+    | **Personal token per user** | The API base URL only | Each Prisme.ai user's own SonarQube account | Interactive agents where results must follow each person's SonarQube rights |
 
-    | Auth mode | What you provide | Best for |
-    |-----------|------------------|----------|
-    | User Token (Bearer) | A SonarQube **User Token** + the **API base URL** | Standard setup; the token is stored as a workspace secret and resolved server-side on every call |
+    Both are stored in the workspace secret `sonarqubeAuth`, written by the configuration app. Switching to per-user mode deletes the shared token from it.
+
+    ### One token for the whole workspace
+
+    Paste the User token and the API base URL, then **Save authentication** and **Test connection**. The test calls `api/users/current` and reports the SonarQube login the token belongs to.
+
+    ### Personal token per user
+
+    Set only the API base URL and save. Each user then connects their own token:
+
+    - **From Agent Creator**: the **Connect** button on the capability opens the token form (see the *Agent builder* tab).
+    - **From the configuration app**: **Connect my token** opens the same form for the signed-in user; **Test connection** then tests that user's own token.
+
+    What the connector does with a personal token:
+
+    | Event | Behaviour |
+    |-------|-----------|
+    | Connect | The token is checked with `api/users/current` (`isLoggedIn` must be `true`) before being stored in the user's personal secrets, replacing any previous one. A rejected token keeps the previous one. An unreachable SonarQube is reported as such, not as an invalid token. |
+    | Tool call | Runs with that user's token. A user who has not connected gets the message *SonarQube is not connected for this user*. |
+    | SonarQube answers `401` | The token is revoked or expired: it is removed, the agent is told to reconnect, and the capability shows **Connect** again. |
+    | SonarQube answers `403` | The token is kept: it is valid but lacks permission on that resource. |
+    | Disconnect | The user's token is deleted. |
+
+    <Warning>
+      In per-user mode, a call needs a signed-in Prisme.ai user. Automations without one (scheduled runs, events without a user) get *not connected* errors. Use the shared-token mode for them, in a separate instance if needed.
+    </Warning>
+
+    Tokens never appear in clear in the workspace activity feed, in either mode.
 
     <Note>
-      SonarQube identifiers are project keys, component keys, issue keys, rule keys and login names, never numeric IDs except for quality-gate `gateId`. Most list / search operations accept `p` (page index, 1-based) and `ps` (page size, max 500) for pagination. On SonarCloud, most search and create operations also require an `organization` key.
+      SonarQube identifiers are project keys, component keys, issue keys and login names, never numeric IDs except for quality-gate `gateId`. Most list / search operations accept `p` (page index, 1-based) and `ps` (page size, max 500) for pagination. On SonarCloud, most search and create operations also require an `organization` key.
     </Note>
 
     ## Available Instructions
 
-    Every instruction resolves credentials from the workspace configuration.
+    Every instruction resolves credentials like the MCP tools: the workspace's shared token, or the calling user's own token in per-user mode.
 
     ### System & Authentication
 
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
-    | `validateAuthentication` | Validate the current token against the instance. | `{ valid }` |
+    | `validateAuthentication` | Validate the current token against the instance. | `{ valid, login }` |
     | `getServerVersion` | Get the SonarQube server version. | A version string |
     | `listLanguages` | List supported languages; optional `q` filter on name. | `{ languages: [{ key, name }] }` |
 
@@ -598,6 +640,124 @@ This connector is used by three different roles. Jump to the section that matche
   </Tab>
 </Tabs>
 
+## Migrating from the previous version
+
+Earlier versions of the SonarQube app used a **central MCP endpoint** (`/workspaces/slug:sonarqube/webhooks/mcp`) authenticated with an `mcp-api-key` header, and stored the token in the instance configuration (`token`, bound to the workspace secret `sonarqubeToken`). The current version serves an **MCP endpoint per installed instance**, keeps its settings in the secrets `sonarqubeAuth` and `sonarqubeAuthorizedAgents`, and is configured through its configuration app.
+
+The token is carried over automatically. Agents and capabilities are not: each workspace has one reconfiguration step to run and its agents to re-authorize. Follow this section for every workspace where the app is installed.
+
+### What changes, and when
+
+New code takes effect as soon as the platform publishes the new app version: installed instances are not pinned to a version. Their configuration, however, is only migrated when the instance is reconfigured (step 3). In between:
+
+| Usage | Right after the upgrade | After step 3 | After steps 4–5 |
+|-------|-------------------------|--------------|-----------------|
+| DSUL instructions (`SonarQube.searchIssues`, …) | Work, with the old token | Work | Work |
+| Agents using the old capability (central endpoint + `mcp-api-key`) | Fail with *This SonarQube capability was installed for a previous version of the connector and no longer works…* | Same | Replaced by the new capability |
+| New per-instance MCP endpoint | Refuses every agent (no allowlist yet) | Refuses agents not allowed yet | Works |
+
+Plan the migration so that steps 3 to 5 follow the upgrade closely: agents lose SonarQube between the upgrade and step 5.
+
+### Before you start
+
+- **Platform**: 27.5.7 or later.
+- **Inventory**, per workspace where SonarQube is installed: the instance name (slug), the agents that use the SonarQube capability, and who can generate a new SonarQube token if needed.
+- **Access**: a workspace editor account on each of these workspaces, and an API access token for that account (step 3 is an API call).
+- **Decide the mode** for each workspace: keep one shared token, or switch to personal tokens (see *Authentication modes* in the *Workspace builder* tab).
+
+### Step 1 — Deploy the new version
+
+The SonarQube app is part of the workspaces delivered with the platform image (`extended` group). On startup, the platform imports the bundled workspaces and republishes the SonarQube app, which updates every installed instance.
+
+- Check that the platform's startup import includes the `extended` group (`STARTUP_IMPORT_GROUPS`). Otherwise, import the `sonarqube` workspace from the `release` repository manually.
+- To confirm the new version is live: in any workspace, open the SonarQube instance configuration. The new version shows a single read-only **Configuration app** field; the old one showed *SonarQube API Base URL*, *API Token*, *MCP Endpoint* and *MCP API Key*.
+
+### Step 2 — Check that DSUL instructions still work (optional)
+
+Run any automation that calls `SonarQube.<instruction>` in an affected workspace. It should behave as before: until step 3, the connector reads the old `token` / `baseUrl` instance settings.
+
+### Step 3 — Reconfigure each instance
+
+The instance must receive a configuration change to run its installation routine again. That routine:
+
+- creates the secret `sonarqubeAuth`, **pre-filled with the old token and API base URL**;
+- creates the secret `sonarqubeAuthorizedAgents`, empty;
+- links both to the instance;
+- fills in the **Configuration app** link.
+
+<Warning>
+  Opening the instance configuration in the Builder and saving it unchanged does **nothing**: no change, no event. Use the API call below.
+</Warning>
+
+Send one configuration change per instance. Clearing `configAppUrl` is harmless: the routine fills it in again.
+
+```bash
+API_URL="https://<your-api-host>/v2"      # the platform API, including /v2
+WORKSPACE_ID="<workspace id>"
+INSTANCE="<instance slug, URL-encoded: spaces as %20>"
+TOKEN="<API access token of a workspace editor>"
+
+curl -X PATCH "$API_URL/workspaces/$WORKSPACE_ID/apps/$INSTANCE/config" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"configAppUrl": ""}'
+```
+
+Check the result a few seconds later:
+
+```bash
+curl "$API_URL/workspaces/$WORKSPACE_ID/apps/$INSTANCE/config" -H "Authorization: Bearer $TOKEN"
+```
+
+The response must contain a non-empty `configAppUrl`, and `auth` / `authorizedAgents` bindings. If `configAppUrl` is still empty, look in the workspace activity feed for an event whose type ends with `sonarqube.onInstall.failed`: the routine stops without writing anything when it cannot read the workspace secrets or configuration.
+
+<Note>
+  **Alternative without the API**: uninstall the instance and install it again under the same name. The routine then runs, but it cannot recover the old settings: `sonarqubeAuth` is created with an empty token and the SonarQube Cloud URL. Enter **both the token and your API base URL** again in step 4. The old `sonarqubeToken` secret is left in place.
+</Note>
+
+### Step 4 — Check authentication in the configuration app
+
+Open the **Configuration app** link from step 3, *Authentication* tab:
+
+- **Keeping a shared token**: the token and API base URL are pre-filled. Click **Test connection**; it must report success.
+- **Switching to personal tokens**: select *Personal token per user*, keep the API base URL, **Save authentication**. The shared token is removed from `sonarqubeAuth`. Users connect on their first use (see the *Agent builder* tab).
+
+### Step 5 — Re-authorize agents
+
+In the *Agents* tab:
+
+1. Tick each agent from your inventory (or **Allow all agents**). The list is empty after migration, so every agent is refused until allowed.
+2. Click **Install capability** on each agent. It adds the new SonarQube MCP tool.
+3. Remove the **old** SonarQube capability from each agent: the MCP tool whose server URL ends with `/workspaces/slug:sonarqube/webhooks/mcp`. **Install capability** only replaces a tool named `sonarqube` or pointing at the new endpoint, so an old capability under another name stays and keeps failing.
+4. If an administrator had published SonarQube in the Capabilities catalog, publish it again with **Add to catalog** / **Update catalog entry** (or update the entry by hand, see *Platform admin setup*) so that it points at the new endpoint.
+
+### Step 6 — Rotate the shared SonarQube token
+
+The previous version wrote the token in clear in the activity events of the **central `sonarqube` workspace** each time an agent used it (`runtime.automations.executed`, `accessToken` argument). The current version masks it.
+
+- After migration, generate a new SonarQube token for every workspace that kept a shared token, paste it in the configuration app, then revoke the old one in SonarQube.
+- If you switched to personal tokens, revoke the old shared token in SonarQube.
+- Treat the stored events of the `sonarqube` workspace as containing credentials (retention, access rights, purge).
+
+### Step 7 — Clean up (optional)
+
+These leftovers are no longer read and are harmless:
+
+| Leftover | Where | How to remove |
+|----------|-------|---------------|
+| Secret `sonarqubeToken` | Each workspace with an instance | `DELETE $API_URL/workspaces/$WORKSPACE_ID/security/secrets/sonarqubeToken` |
+| Keys `token`, `baseUrl`, `mcpApiKey`, `mcpEndpoint` | Instance configuration | Leave them: removing them requires rewriting the whole instance configuration |
+| Key `sonarqubeToken` | Workspace configuration (`config.value`) | Leave it, or remove it when editing the workspace configuration |
+| Secret `appSecret` | The central `sonarqube` workspace | Delete it once no workspace uses the previous version |
+
+### Verification checklist
+
+- [ ] Each instance configuration has a non-empty `configAppUrl`.
+- [ ] **Test connection** succeeds (shared mode), or a user connects with **Connect my token** and **Test connection** succeeds (per-user mode).
+- [ ] An allowed agent answers a SonarQube question; its tool call goes to `/webhooks/<instance>.mcp`.
+- [ ] No agent still has the old capability (`/workspaces/slug:sonarqube/webhooks/mcp`).
+- [ ] Old shared tokens are revoked in SonarQube.
+
 ---
 
 ## Error Handling
@@ -605,7 +765,7 @@ This connector is used by three different roles. Jump to the section that matche
 | HTTP Status | Error | Solution |
 |-------------|-------|----------|
 | 400 | Bad Request | Verify required arguments; on SonarCloud, most operations need `organization` (discover it with `searchOrganizations`) |
-| 401 | Unauthorized | Verify the User Token and `baseUrl` |
+| 401 | Unauthorized | Verify the User Token and `baseUrl`. In per-user mode, the user's token is removed and they must connect again |
 | 403 | Forbidden | Check the SonarQube permissions of the token owner (admin-only operations such as `searchUserTokens` for other users) |
 | 404 | Not Found | Verify project keys, component keys, issue keys and login names |
 | 409 | Conflict | Resource already exists (project key, token name, …); pick a different identifier |
@@ -614,9 +774,19 @@ This connector is used by three different roles. Jump to the section that matche
 
 ### Common Issues
 
-**"Not configured"**: The app instance has no User Token. Generate one in *SonarQube > My Account > Security > Generate Tokens* and paste it in the app configuration (see the *Workspace builder* tab).
+**"SonarQube is not configured for this workspace"**: Shared-token mode with no token. Open the configuration app (*Authentication* tab), paste a User token generated in *SonarQube > My Account > Security > Generate Tokens*, then save.
 
-**"Invalid credentials"**: SonarQube rejected the token (revoked, expired or wrong instance). Re-generate the User Token and re-paste it, and confirm the **API base URL** matches your instance (SonarCloud vs self-hosted).
+**"SonarQube is not connected for this user"**: Per-user mode and the user has not connected a token yet, or it was removed after SonarQube rejected it. Click **Connect** on the SonarQube capability in Agent Creator (or **Connect my token** in the configuration app).
+
+**"SonarQube rejected your personal token (revoked or expired), so it was removed"**: The user's token was revoked or has expired in SonarQube. Generate a new one and connect again.
+
+**"SonarQube rejected the token" when connecting**: The token is wrong, revoked, or belongs to another SonarQube instance. Check the API base URL configured by the administrator, and use a token of type *User token*.
+
+**"SonarQube could not be reached or answered an error"** when connecting: The platform cannot reach the API base URL (network, proxy, TLS) or SonarQube answered an error. The token was not stored. Check the URL (it must end with `/api`) and that the platform's runtime can reach it.
+
+**"This agent is not authorized to use this connector"**: Allow the agent in the configuration app (*Agents* tab), or use **Install capability**, which does it for you.
+
+**"This SonarQube capability was installed for a previous version of the connector"**: The agent still uses the central endpoint of the previous version. See [Migrating from the previous version](#migrating-from-the-previous-version), steps 3 to 5.
 
 **"organization parameter is missing"**: On SonarCloud, most search and create operations require the `organization` key. Pass it explicitly in the tool arguments or as a default in your DSUL automation; call `searchOrganizations` to discover the keys your token can see.
 
