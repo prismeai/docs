@@ -269,6 +269,115 @@ The two are independent in the data but must stay consistent in practice: a mode
 - Each `cost_tier` is consistent with the model's actual prices.
 - Run one test call per model, then confirm a **non-zero** cost for it in Observability → LLM. A model sitting at 0 after a real call has no price.
 
+## Reference catalogue (recommended metrics)
+
+The LLM Gateway ships a **reference catalogue**: Prisme.ai's recommended values for the Metrics block of each known model. It covers completion and embedding models, and is maintained with the platform: it changes only when the LLM Gateway workspace is updated.
+
+For each model, an entry carries:
+
+| Field | Content |
+|---|---|
+| `key` | Canonical model id, e.g. `claude-sonnet-4-6` |
+| `aliases` | Known deployment ids for the same model, e.g. `vertex-claude-sonnet-4-6` |
+| `suggested` | Recommended `eco_score`, `cost_tier`, `energy_per_token`, `pue_profile` (completion models only) |
+| `reference_pricing` | Indicative provider list price, in USD. **Never written** to your models: see [Prices are environment data](#prices-are-environment-data-not-a-platform-default) |
+| `spec` | Type, context window, capabilities, and embedding dimensions |
+
+The response also states its `methodology_version`, `source` and `verified_at` date. `energy_per_token` follows the method described in [Carbon Footprint](/products/ai-governance/carbon-footprint); `eco_score` and `cost_tier` are tiers derived from energy and from the reference price.
+
+```http
+GET {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/catalog
+```
+
+Reading the catalogue changes nothing in your environment.
+
+### Using the catalogue in Govern
+
+Reserved to platform superadmins, in **Govern → Models**.
+
+**In the model form.** Open a model, or add one:
+
+- The **Catalogue model** select (**Modèle catalogue** in the French interface), at the top of the form, links the model to a catalogue entry. When it is empty, it is pre-selected by matching the model id, and re-matched as you type the id, until you pick an entry yourself. Choose **None** to unlink the model.
+- Next to each metric (Eco score, Cost tier, Energy/Token, PUE profile), the training date and the context window, a **Prisme.ai suggestion** badge shows the recommended value when yours differs. **Apply** copies it into the field. A suggestion bar does the same for capabilities, listing only the flags that differ.
+- On a new model, the fields you have not touched are pre-filled from the linked entry.
+- An info icon on the **Pricing** heading shows the entry's reference price. It is indicative only and is never copied into your prices.
+
+Nothing is saved until you save the model.
+
+**From the ⋮ menu, Update from catalogue** (**Mettre à jour depuis le catalogue**) opens a window with two sections:
+
+- **To update** runs the [sync](#aligning-an-environment-with-the-catalogue) as a dry run and lists, per model, each metric that differs, as old value → recommended value, along with the models about to be linked to an entry. **Apply** on a row applies that model only; **Apply all** applies every row.
+- **Add models** lists the [model ids declared but not registered](#models-declared-but-not-registered). Pick the catalogue entry for each (one is pre-selected by matching) and add the model in one click: it is created with the entry's spec and recommended metrics. Set its prices afterwards — they are not filled in (see [Model pricing](#model-pricing)).
+
+<Warning>
+**Apply all overwrites the four metrics on every listed model**, including values you set on purpose. Check the old → new table first, and use the per-row **Apply** when only some models should change.
+</Warning>
+
+### Linking a model to the catalogue: `catalog_id`
+
+Each model can carry a `catalog_id`, the `key` of its catalogue entry. Model ids differ from one environment to the next (`az-gpt-4o`, `vertex-claude-sonnet-4-6`…), so the link is resolved **once by name** and then stored. From then on, everything joins on `catalog_id` without re-matching names.
+
+In Govern, it is the **Catalogue model** select of the model form. By API, set it when creating or editing a model (`POST /v1/models`, `PATCH /v1/models/{model_id}`): a string of at most 128 characters. Send `null` to unlink the model.
+
+### Aligning an environment with the catalogue
+
+`POST /v1/models/catalog/sync` brings the Metrics block of the environment's models in line with the catalogue. It is what the **To update** section of **Update from catalogue** runs. It works in two steps per model:
+
+1. **Back-fill `catalog_id`** when the model has none. The model id is matched against catalogue keys and aliases, ignoring case and separators (`-`, `.`, `_`, `:`, spaces), then again after stripping common deployment prefixes (`az-`, `azure-`, `vertex-`, `gcp-`, `bedrock-`, `aws-`, `openai-`, `oai-`, `ovh-`). An exact match always wins over a looser one.
+2. **Apply the recommended metrics** of the entry found by `catalog_id`. Only the selected `metrics` fields are updated; pricing and every other field are left as they are. Embedding entries carry no recommended metrics, so embedding models only get their `catalog_id`.
+
+```http
+POST {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/catalog/sync
+```
+
+```json
+{
+  "dry_run": true,
+  "model_ids": ["az-gpt-4o", "vertex-claude-sonnet-4-6"],
+  "fields": ["eco_score", "energy_per_token"]
+}
+```
+
+| Body field | Default | Effect |
+|---|---|---|
+| `dry_run` | `true` | Report what would change, write nothing. Send `false` to apply. |
+| `model_ids` | all models | Restrict the sync to these models. |
+| `fields` | the four metrics | Restrict which `metrics` fields are updated. |
+
+The response lists what was (or would be) done:
+
+```json
+{
+  "dry_run": true,
+  "summary": { "total": 2, "backfilled": 1, "patched": 1, "unchanged": 1, "unmatched": 0 },
+  "backfilled": [
+    { "model_id": "az-gpt-4o", "catalog_id": "gpt-4o", "match": "alias" }
+  ],
+  "patched": [
+    {
+      "model_id": "vertex-claude-sonnet-4-6",
+      "catalog_id": "claude-sonnet-4-6",
+      "fields": ["energy_per_token"],
+      "before": { "energy_per_token": 0.00001 },
+      "after": { "energy_per_token": 0.000016 }
+    }
+  ],
+  "unmatched": []
+}
+```
+
+`match` tells how the back-fill resolved the id: `exact`, `alias`, `strong` (after prefix stripping) or `strong_alias`. A model listed in `unmatched` has no catalogue entry; set its metrics by hand.
+
+<Warning>
+**Run a dry run first, and read it.** With `"dry_run": false`, the sync overwrites the selected metrics on every matched model, including values you set on purpose. Use `fields` and `model_ids` to keep it to what you mean to change. The model cache is flushed for each updated model, so the new values apply to the next call.
+</Warning>
+
+### Models declared but not registered
+
+`GET /v1/models/unregistered` lists the model ids declared in the gateway's provider configuration that are not yet registered as models in your environment, each with its provider (`openai`, `azure`, `openailike`, `anthropic`, `vertex`, `bedrock`). It feeds the **Add models** section of **Update from catalogue**. Only the ids are returned, never the provider credentials.
+
+The sync and the unregistered list require write access to models; reading the reference catalogue requires read access.
+
 ## Per-Agent Model Restrictions
 
 <Frame>
