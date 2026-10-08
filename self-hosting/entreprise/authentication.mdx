@@ -584,6 +584,55 @@ All authentication methods support mapping identity provider attributes to Prism
   You can inspect available attributes by examining `gateway.login.succeeded` events or by reading the `{{user}}` variable from a test automation.
 </Accordion>
 
+## Password policy
+
+These settings apply to local (email and password) accounts, wherever a password is set: sign-up, password reset, and the password change users make from **Settings** > **Security** > **Sign-in methods**. They follow NIST SP 800-63B-4: a length rule and a list of forbidden passwords, without composition rules or periodic rotation.
+
+A new password is refused when it:
+
+- is shorter than `PASSWORD_MIN_LENGTH` (default `8`, never lower) or longer than `PASSWORD_MAX_LENGTH` (default `128`), counted after Unicode normalization (NFKC);
+- is longer than 72 bytes in UTF-8 while `PASSWORD_PEPPER` is not set (see [Password hashing](#password-hashing));
+- contains the email address, its local part, the first name or the last name of the user;
+- is the current password;
+- appears in known data breaches;
+- does not match `PASSWORD_VALIDATION_REGEXP`, when this deprecated variable is still set.
+
+The console reads both length bounds from the public `GET /v2/login/providers` route, so the sign-up, reset and change forms always show the rule of your instance.
+
+### Breached passwords
+
+`PASSWORD_BREACH_CHECK` controls how breached passwords are detected:
+
+| Value | Behavior |
+|-------|----------|
+| `local` (default) | Compares the password with a list of common passwords shipped with the gateway. No outbound call. |
+| `hibp` | Also queries the [Have I Been Pwned](https://haveibeenpwned.com/API/v3#PwnedPasswords) range API. Only the first 5 characters of the password's SHA-1 leave the gateway (k-anonymity), with response padding. If the API cannot be reached within `PASSWORD_BREACH_CHECK_TIMEOUT` milliseconds, the shipped list alone applies and the user is not blocked. Point `PASSWORD_BREACH_CHECK_URL` to a self-hosted mirror if needed. |
+| `off` | No check. |
+
+### Password hashing
+
+Passwords are hashed with bcrypt. When `PASSWORD_PEPPER` is set, new hashes are computed over an HMAC-SHA256 of the password keyed by this secret: bcrypt then takes the whole password into account, beyond its 72-byte limit, and hashes from other leaks cannot be tested against yours. Existing hashes keep working; each password is re-hashed the next time it is set.
+
+Without `PASSWORD_PEPPER`, passwords are hashed with plain bcrypt, which only reads their first 72 bytes. New passwords are then limited to 72 bytes once encoded in UTF-8, whatever `PASSWORD_MAX_LENGTH` says: 72 characters for ASCII text, fewer for accented or non-Latin scripts. The maximum length served to the console is capped to 72 accordingly, and the gateway logs a warning at startup.
+
+<Warning>
+Generate `PASSWORD_PEPPER` once (for example with `openssl rand -base64 32`), store it in a Kubernetes secret, and set it before going to production. **Never change it or lose it**: every password hashed with it would stop working, and the affected users would have to reset their password. Rolling the gateway back to a version that does not know the pepper has the same effect for passwords set in between.
+</Warning>
+
+### What a password change revokes
+
+When a user changes or resets their password, Prisme.ai:
+
+- signs out every other session of the user (browsers and paired phones), and refuses any OIDC session, refresh token or authorization code issued before the change, so a revoked browser cannot sign back in silently;
+- emails the user, with a link to reset the password if they did not make the change;
+- emits a `gateway.passwordChange.succeeded` event (`gateway.passwordReset.succeeded` for a reset).
+
+Personal access tokens are kept: a reset mostly follows a forgotten password, tokens have a mandatory expiry date, and users can delete theirs from **Settings** > **Security** > **Access tokens**.
+
+A change from the settings keeps the session it was made from and requires a recent re-authentication (passkey, password, or password and authenticator code). A reset signs out every session. Accounts that sign in only through SSO cannot change their password nor receive a reset link.
+
+Password managers that support it are sent to the change screen by `/.well-known/change-password` on the console address. For end users, see [Change your password](/get-started/change-password).
+
 ## Troubleshooting
 
 <Accordion title="Common Issues and Solutions">
