@@ -309,6 +309,68 @@ For example `https://api.example.com/saml/customer1` and `https://api.example.co
   Some identity providers and federations reject Entity IDs that are not URIs. Avoid bare strings such as `prismeai`. Changing the Entity ID later requires updating the IdP side at the same time, or logins fail with an audience mismatch.
 </Warning>
 
+### Service provider metadata
+
+Each enabled SAML provider publishes Prisme.ai's service provider metadata (Entity ID, ACS endpoint and, when request signing is on, the signing certificate) at:
+
+```
+https://API_URL/v2/login/saml/<ProviderName>/metadata
+```
+
+Give this URL, or the XML it returns, to your IdP administrator instead of entering each value by hand. The endpoint is public: it only contains what the IdP needs to know about Prisme.ai.
+
+### Signing authentication requests
+
+Some identity providers require the authentication requests (AuthnRequests) sent by Prisme.ai to be signed: their metadata then contains `WantAuthnRequestsSigned="true"`. Prisme.ai signs them with an RSA key, and the IdP checks the signature with the matching certificate.
+
+This is independent of `WantAssertionsSigned`, which concerns the assertions the IdP sends back, signed with the IdP's own certificate (`idpCert`, or the one read from its metadata).
+
+<Tabs>
+  <Tab title="Organization SSO">
+    In **AI Governance → Authentication**, enable **Sign Authentication Requests** on the SAML provider and save. A key pair and a self-signed certificate are generated and stored in the provider configuration. Then register the certificate on your IdP, or send it the service provider metadata, which includes it. See [Signing authentication requests](/products/ai-governance/identity-access#signing-authentication-requests).
+  </Tab>
+  <Tab title="Configuration file">
+    Generate a key pair and a certificate, and keep the private key secret:
+
+    ```bash
+    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+      -keyout sp-saml.key -out sp-saml.crt -subj "/CN=https://API_URL/saml/<ProviderName>"
+    ```
+
+    Then reference them in the provider configuration, ideally through [environment variables](#mount-configuration-file). Write the PEM content on a single line with its line breaks as `\n`, as for `idpCert` (a multi-line value would be folded by YAML):
+
+    ```bash
+    export SAML_SP_PRIVATE_KEY="$(awk '{printf "%s\\n", $0}' sp-saml.key)"
+    export SAML_SP_CERTIFICATE="$(awk '{printf "%s\\n", $0}' sp-saml.crt)"
+    ```
+
+    ```yaml
+    providers:
+      <ProviderName>:
+        type: saml
+        config:
+          idp_metadata_filepath: "/path/towards/idp-saml-metadata.xml"
+          issuer: "https://API_URL/saml/<ProviderName>"
+          privateKey: "${SAML_SP_PRIVATE_KEY}"
+          publicCert: "${SAML_SP_CERTIFICATE}"
+          signatureAlgorithm: sha256
+    ```
+
+    Register `sp-saml.crt` on your IdP. If `publicCert` is omitted, a certificate is issued from the private key at startup: the public key stays the same, so signatures still verify, but the service provider metadata then shows a different certificate after each restart.
+  </Tab>
+</Tabs>
+
+| Field | Meaning |
+|-------|---------|
+| `signAuthnRequests` | Sign AuthnRequests. Set from the organization SSO page; when enabled without a key, a key pair is generated on save. Set to `false` to stop signing while keeping the key. |
+| `privateKey` | PEM RSA private key used to sign. **Write-only**: the API never returns it. Omit it on update to keep the stored key, send `null` to remove it. |
+| `publicCert` | PEM X.509 certificate matching `privateKey`, to register on the IdP. |
+| `signatureAlgorithm` | `sha256` (default) or `sha512`. `sha1` is rejected by the API, and only tolerated with a warning in the configuration file. |
+
+<Note>
+  The private key is part of the SSO configuration, encrypted at rest only when `SECRETS_MASTER_KEYS` is configured (see [Secrets Encryption](/products/ai-governance/identity-access#secrets-encryption)). A key set before `signatureAlgorithm` existed used to sign with SHA-1: it now signs with SHA-256 unless you set the algorithm explicitly.
+</Note>
+
 ## Mount Configuration File  
 
 Whether you configured an OIDC or SAML provider, you can now mount the configuration file inside the `prismeai-api-gateway` container at `/www/services/api-gateway/authProviders.config.yml`.  
