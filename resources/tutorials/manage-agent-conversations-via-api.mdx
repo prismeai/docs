@@ -121,6 +121,72 @@ HTTP 200 already committed. Never treat HTTP 200 alone as success.
 See [Stream an agent reply via SSE](/agent-factory/messages/stream-an-agent-reply-via-sse-a2a)
 for the request schema and stream contract.
 
+## Optional - Send a message that survives a retry
+
+A mobile client can lose the response to a send: the app is killed, or the
+network drops before the reply arrives. Retrying the same request would run the
+agent twice and, without a `contextId`, open a second conversation. To make the
+retry safe, send through `messages/send` with an idempotency key.
+
+<Steps>
+  <Step title="Mint a key before the first attempt">
+    Generate a key once per logical message, for example a UUID stored with
+    the queued message, and keep it for every retry of that message. The key
+    is 1 to 128 characters of `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`.
+  </Step>
+  <Step title="Upload attachments, if any">
+    Read the upload target from the agent instead of hardcoding a workspace:
+
+    ```bash
+    UPLOAD_URL=$(curl -s -H "Authorization: Bearer $TOKEN" \
+      "$BASE/v1/agents/$AGENT_ID" | jq -r '.attachments.upload.url')
+
+    curl -s -H "Authorization: Bearer $TOKEN" \
+      -F "file=@report.pdf" -F "public=false" \
+      "$UPLOAD_URL"
+    ```
+
+    The response is an array of files. Put each file's `url` in a part of the
+    message, for example
+    `{"url": "<url>", "filename": "report.pdf", "mediaType": "application/pdf"}`.
+  </Step>
+  <Step title="Send with the key">
+    ```bash
+    curl -s \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -X POST "$BASE/v1/agents/$AGENT_ID/messages/send" \
+      -d "{\"message\":{\"metadata\":{\"clientMessageId\":\"$MESSAGE_KEY\"},\"parts\":[{\"text\":\"Summarize the attached report.\"}]}}"
+    ```
+
+    Send the exact same request again if you did not receive the response.
+  </Step>
+</Steps>
+
+How the server answers a retry with the same key:
+
+| Situation | Response |
+|---|---|
+| The first send finished | The first response, unchanged, with `task.replayed: true`. The agent does not run again. |
+| The first send is still running | `409 MESSAGE_IN_PROGRESS`, with `details.contextId` and `details.retryAfter` in seconds. |
+| The first send never finished (after 15 minutes by default) | A `failed` task with `task.replayed: true`. `task.id` is absent when no task was created. |
+
+Keep these rules in mind:
+
+- The key alone identifies the message. The server does not compare the body
+  of a retry with the first one, so a different message sent under a used key
+  gets the first answer. Mint a new key for every new message.
+- Retries count against the rate limits. A retry over the limit gets `429`,
+  not the stored answer.
+- The key needs a user identity. With an organization API key that has no user
+  behind it, the server ignores the key and sends the message normally.
+- Keys are kept for 7 days by default. After that, the same key is treated as
+  a new message.
+- `messages/stream` does not support the key.
+
+See [Send a message to an agent](/agent-factory/messages/send-a-message-to-an-agent-a2a-non-streaming)
+for the request schema and every response.
+
 ## Troubleshooting
 
 | Symptom | What to check |
@@ -131,6 +197,9 @@ for the request schema and stream contract.
 | `404 CONVERSATION_NOT_FOUND` | The `agentId`, `contextId`, and authenticated user identify the same conversation. |
 | The history appears reversed | Reverse `messages`, but do not reverse each task's `history`. |
 | The streamed response appears empty | Inspect the summary frame: handle `error.error` when present; otherwise read `task.status.state`. |
+| `409 MESSAGE_IN_PROGRESS` | The first send with this `clientMessageId` is still running. Wait `details.retryAfter` seconds, or open `details.contextId`. |
+| A retry returns an unrelated answer | The `clientMessageId` was reused for a different message. Mint a new key per message. |
+| `400 VALIDATION_ERROR` on `clientMessageId` | The key is longer than 128 characters or contains a character outside `A-Za-z0-9._:-`. |
 
 ## Related API operations
 
