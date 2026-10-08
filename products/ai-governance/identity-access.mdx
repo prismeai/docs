@@ -99,9 +99,13 @@ An organization can have multiple join rules; they use OR logic between entries 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `field` | string | Dot-notation path on the user object (e.g. `email`, `authData.google.hd`, `meta.department`) |
-| `operator` | string | `equals`, `startsWith`, or `endsWith` (case-insensitive) |
-| `value` | string | The value to match against |
+| `field` | string | User attribute to match: `email`, `firstName`, `lastName`, `groups`, or a dot-notation path under `authData` (identity provider claims, e.g. `authData.google.hd`, `authData.okta.department`) or `meta` (e.g. `meta.department`) |
+| `operator` | string | `equals`, `startsWith`, `endsWith`, `matches` (wildcard pattern, `*` matches any characters) or `contains` (element of an array, or substring of a string) |
+| `value` | string | The value to match against, case-insensitive, up to 512 characters |
+
+<Warning>
+Rules can only match the attributes listed above. A rule on any other user field (credentials, platform role…) is rejected when saved, and a rule saved before this restriction no longer matches anyone.
+</Warning>
 
 ### Creating a Join Rule
 
@@ -128,8 +132,56 @@ Join rules are evaluated on every `/me` API call (the first call the platform ma
 When an organization's join rules are updated, the platform re-evaluates all existing members who joined via join rules:
 
 - Members who **no longer match** any rule are automatically removed from the organization
-- New users who now match are **not** retroactively added; they join on their next `/me` call
+- New users who now match are **not** retroactively added; they join on their next `/me` call, unless you apply the rules right away (see below)
 - Re-evaluation processes members in batches of 500
+
+Only members who joined **through a join rule** are re-evaluated. Members added by an invitation, an invitation code, SSO auto-join or by an administrator are never removed by a rule change.
+
+For a member who joined through a join rule, a rule change has two possible outcomes:
+
+| The member… | Result |
+|-------------|--------|
+| still matches at least one rule | Stays in the organization with the **same role and groups**, even if the rule that now matches first assigns other groups or another role |
+| no longer matches any rule | Is removed from the organization |
+
+<Note>
+A rule's `role` and `groups` are only assigned when the user joins the organization. To move existing members to the groups of a new ruleset, update their groups from the **Groups** screen.
+</Note>
+
+### Simulating and applying rules
+
+Before saving a ruleset, you can measure its impact with `POST /v2/orgs/{orgSlug}/join-rules/apply`. It requires the `orgs:join-rules:manage` permission and runs as a **dry run by default**: nothing is written.
+
+```bash
+curl -X POST "$API_URL/v2/orgs/acme/join-rules/apply" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "joinRules": [
+      { "rules": [{ "field": "authData.acme.code", "operator": "startsWith", "value": "R/1/2/" }], "groups": ["team-12"] },
+      { "rules": [{ "field": "authData.acme.code", "operator": "startsWith", "value": "R/1/" }] }
+    ]
+  }'
+```
+
+| Body field | Description |
+|------------|-------------|
+| `joinRules` | Candidate ruleset. When omitted, the organization's current rules are evaluated. |
+| `dryRun` | `true` by default. Set to `false` to apply the rules. |
+| `sampleLimit` | Number of users listed in each sample of the response (default 1000, max 2000). It never limits the processing. |
+
+The response reports:
+
+- `rulesDiff`: rules added, removed or moved compared to the current ruleset
+- `shadowedRules`: rules that can never apply because an earlier rule already matches every user they would match, for example a short prefix placed above a longer one
+- `members`: current members who joined through a join rule and would be removed
+- `joiners`: platform users who are not members yet and would join, with the number per rule and, for each listed user, the rule that matches first, the role and the groups they would get. Anonymous, pending and deactivated users are ignored.
+
+<Note>
+The joiners are searched among **all** platform users. A platform administrator sees every joiner in the sample. An organization administrator only sees joiners who belong to no organization yet; the counts include everyone.
+</Note>
+
+With `"dryRun": false`, the candidate rules are saved, then, in the background, the members who no longer match are removed and **every** matching user is added right away, without waiting for their next login. Calling it again is safe: users who are already members are skipped. Each call, dry run included, is recorded in the organization's audit log.
 
 ## Invitation Codes
 
