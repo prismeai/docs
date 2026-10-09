@@ -36,10 +36,12 @@ tags:
     description: OpenAI-compatible text embeddings.
   - name: Rerank
     description: Rerank documents by relevance to a query (standard rerank contract, LLM-as-reranker backend).
+  - name: Audio
+    description: OpenAI-compatible speech-to-text (audio transcriptions).
   - name: Models
     description: Model catalogue (CRUD + bulk replace + governance-aware listing).
   - name: Defaults
-    description: Resolved default models for completions / embeddings / image generation / file parsing.
+    description: Resolved default models for completions / embeddings / image generation / transcription / file parsing.
   - name: Test
     description: Smoke-test reachability of a model through the gateway.
 paths:
@@ -282,6 +284,166 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /v1/audio/transcriptions:
+    post:
+      tags: [Audio]
+      operationId: createTranscription
+      summary: Transcribe audio into text
+      description: |
+        OpenAI-compatible speech-to-text endpoint. An official OpenAI SDK
+        pointed at the gateway calls it unchanged
+        (`client.audio.transcriptions.create(...)`): set the SDK base URL to
+        `https://{host}/v2/workspaces/slug:llm-gateway/webhooks/v1` and pass a
+        user access token as the API key. This is the endpoint behind chat
+        dictation.
+
+        The audio is sent as a multipart `file` part. It is processed in
+        memory and never stored: it is not written to storage, to the
+        activity feed, or to logs.
+
+        **Model resolution.** When `model` is omitted, the gateway uses the
+        organization's default transcription model, then the platform default
+        transcription model. A model not declared on any provider is answered
+        with `400`.
+
+        **Response formats.** `json` (default) and `verbose_json` return JSON,
+        `text` returns `text/plain`. `srt` and `vtt` are refused with
+        `400 UNSUPPORTED_RESPONSE_FORMAT`.
+
+        **Permission.** Requires `llm-gateway:models:read`, like any model
+        use (held by the system Member role and by custom roles).
+
+        **Governance.** The organization's allowed models apply: a model
+        outside the allowlist is refused with `403 MODEL_NOT_ALLOWED`, or,
+        under a `soft_downgrade` quota policy, replaced by the default
+        transcription model.
+
+        **Analytics.** Each successful call emits an
+        `analytics.llm.transcription` event, so usage appears in analytics.
+      x-codeSamples:
+        - lang: bash
+          label: curl
+          source: |
+            curl https://{host}/v2/workspaces/slug:llm-gateway/webhooks/v1/audio/transcriptions \
+              -H "Authorization: Bearer $PRISME_TOKEN" \
+              -F file=@meeting-notes.m4a \
+              -F language=fr
+        - lang: python
+          label: Python (OpenAI SDK)
+          source: |
+            from openai import OpenAI
+
+            client = OpenAI(
+                base_url="https://{host}/v2/workspaces/slug:llm-gateway/webhooks/v1",
+                api_key="<your user access token>",
+            )
+
+            with open("meeting-notes.m4a", "rb") as audio:
+                transcript = client.audio.transcriptions.create(
+                    model="gpt-4o-transcribe",
+                    file=audio,
+                    language="fr",
+                )
+
+            print(transcript.text)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: |
+                    Audio file to transcribe, 25 MB maximum by default. Supported
+                    formats: `flac`, `m4a`, `mp3`, `mp4`, `mpeg`, `mpga`, `oga`,
+                    `ogg`, `wav`, `webm`.
+                model:
+                  type: string
+                  maxLength: 256
+                  description: |
+                    Transcription model id, for example `gpt-4o-transcribe`.
+                    Defaults to the organization's default transcription
+                    model, then to the platform default.
+                language:
+                  type: string
+                  description: |
+                    ISO-639-1 language of the audio, for example `fr`. Improves
+                    accuracy on short recordings. Detected by the model when
+                    omitted.
+                prompt:
+                  type: string
+                  description: Text that guides the transcription, such as expected vocabulary or the previous segment.
+                temperature:
+                  type: number
+                  description: Sampling temperature, passed to the provider.
+                response_format:
+                  type: string
+                  enum: [json, text, verbose_json]
+                  default: json
+                  description: '`srt` and `vtt` are not supported.'
+      responses:
+        '200':
+          description: |
+            Transcribed text. `application/json` for `json` and
+            `verbose_json`, `text/plain` for `text`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [text]
+                properties:
+                  text:
+                    type: string
+                    description: Transcribed text.
+                  usage:
+                    type: object
+                    description: Provider usage, when the provider reports it.
+                    additionalProperties: true
+            text/plain:
+              schema:
+                type: string
+        '400':
+          description: |
+            Invalid request: no `file` part (`FILE_REQUIRED`), `srt` or `vtt`
+            requested (`UNSUPPORTED_RESPONSE_FORMAT`), no transcription model
+            configured for the organization or the platform
+            (`NO_TRANSCRIPTION_MODEL`), or a `model` declared on no provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            Missing `llm-gateway:models:read` permission, or
+            model not allowed for this caller by the organization's governance
+            (`MODEL_NOT_ALLOWED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Audio file larger than the size limit, 25 MB by default (`FILE_TOO_LARGE`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: The transcription provider returned an error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /v1/defaults:
     get:
       tags: [Defaults]
@@ -345,7 +507,7 @@ paths:
           name: type
           schema:
             type: string
-            enum: [completion, embeddings, image_generation]
+            enum: [completion, embeddings, image_generation, transcription]
           description: Filter by model type.
         - in: query
           name: enabled
@@ -662,6 +824,9 @@ paths:
         - `type: "completions"` (default) → calls `OpenAI.chat-completion` with
           a single-turn user message and a `get_weather` tool definition,
           returns `{ ok, response }`.
+        - `type: "transcription"` → sends 0.1 second of silent WAV audio to
+          `/v1/audio/transcriptions` and returns `{ ok, response }`. An empty
+          transcript is a pass. The test call is not counted as usage.
 
         On error, the call is wrapped in a `try`/`catch` and returns
         `{ ok: false, response: <error> }`.
@@ -1172,7 +1337,7 @@ components:
         type:
           type: string
           maxLength: 64
-          enum: [completion, embeddings, image_generation]
+          enum: [completion, embeddings, image_generation, transcription]
           description: Model family.
         display:
           type: object
@@ -1261,7 +1426,7 @@ components:
         type:
           type: string
           maxLength: 64
-          enum: [completion, embeddings, image_generation]
+          enum: [completion, embeddings, image_generation, transcription]
         display:
           type: object
         capabilities:
@@ -1293,7 +1458,7 @@ components:
         type:
           type: string
           maxLength: 64
-          enum: [completion, embeddings, image_generation]
+          enum: [completion, embeddings, image_generation, transcription]
         display:
           type: object
         capabilities:
@@ -1365,6 +1530,15 @@ components:
           properties:
             model_id:
               type: string
+        transcription:
+          type: object
+          description: |
+            Speech-to-text model used by chat dictation. An empty `model_id`
+            means no transcription model is configured, or the caller is not
+            allowed to use it.
+          properties:
+            model_id:
+              type: string
         file_parsing:
           type: object
           description: Per-input-kind defaults for file-parsing flows.
@@ -1396,7 +1570,7 @@ components:
         type:
           type: string
           maxLength: 32
-          enum: [embeddings, completions]
+          enum: [embeddings, completions, transcription]
           description: |
             Kind of test to run. Defaults to `completions` when omitted.
 
