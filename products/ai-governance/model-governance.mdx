@@ -378,6 +378,67 @@ The response lists what was (or would be) done:
 
 The sync and the unregistered list require write access to models; reading the reference catalogue requires read access.
 
+## Prompt caching
+
+Prompt caching is on by default for conversations: requests that carry an
+`analytics_context.context_id` or a `prompt_cache_key`. Repeated context —
+system prompt, tools, conversation history and tool results — is re-read at
+a discount instead of being billed again. One-shot calls, which carry
+neither, are not cached: on Anthropic and Bedrock a cache write costs 1.25×
+the input and would never be read back.
+
+| Provider | How it is cached |
+|---|---|
+| Anthropic, Azure Claude, Vertex Claude | The gateway marks the end of the leading system messages and asks for automatic caching of the whole prompt prefix |
+| Bedrock (Claude 3.5 Haiku, Claude 3.7 and later, Nova) | The gateway places cache points after the leading system messages and after the last message |
+| OpenAI, Azure GPT | Automatic on the provider side; the gateway adds a per-conversation cache key |
+| Mistral | Enabled by the per-conversation cache key the gateway sends |
+| Gemini | Automatic on the provider side |
+
+On Claude models, the mark after the system messages lets a new conversation
+re-read tools and system prompt cached by an earlier one, as long as both are
+byte-identical — typically every conversation of the same agent. System
+messages sent mid-conversation come after that mark, so they don't invalidate
+it. Keep per-user content (memories, user name, dates) out of the leading
+system messages, or each user gets their own cache entry.
+
+**Per request**, set `prompt_cache` in the `/chat/completions` body:
+`false` turns caching off for a conversation call that will never be
+re-read, `true` turns it on for a call without a conversation — for example
+a batch of calls sharing the same system prompt. The automatic caching of
+OpenAI, Azure GPT and Gemini cannot be turned off; before GPT-5.6 it has no
+write cost.
+
+**Per model**, override the default in the model's `provider_config.prompt_cache`:
+
+```http
+PATCH {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/{model_id}
+```
+
+```json
+{
+  "provider_config": {
+    "prompt_cache": { "enabled": false }
+  }
+}
+```
+
+The PATCH replaces the whole `provider_config`: send its other keys (such
+as `additional_body`) along with `prompt_cache`.
+
+Set `enabled: false` for a model without caching support, or `enabled: true`
+to force it on a model outside the provider's supported list once its
+support is proven — on Bedrock this lifts the model allow-list above (also
+needed for an application inference profile ARN, which does not name the
+model family); on
+Azure GPT and Mistral it lifts the cache-key host allow-list (direct OpenAI
+always receives the key).
+
+Cache reads and writes appear in the API response as
+`usage.cache_read_input_tokens` / `usage.cache_write_input_tokens`, and in
+analytics as `tokens.cache_read` / `tokens.cache_write` on the
+`analytics.llm.completion` event.
+
 ## Per-Agent Model Restrictions
 
 <Frame>
