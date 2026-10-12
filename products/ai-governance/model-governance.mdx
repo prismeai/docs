@@ -325,6 +325,7 @@ In Govern, it is the **Catalogue model** select of the model form. By API, set i
 
 1. **Back-fill `catalog_id`** when the model has none. The model id is matched against catalogue keys and aliases, ignoring case and separators (`-`, `.`, `_`, `:`, spaces), then again after stripping common deployment prefixes (`az-`, `azure-`, `vertex-`, `gcp-`, `bedrock-`, `aws-`, `openai-`, `oai-`, `ovh-`). An exact match always wins over a looser one.
 2. **Apply the recommended metrics** of the entry found by `catalog_id`. Only the selected `metrics` fields are updated; pricing and every other field are left as they are. Embedding entries carry no recommended metrics, so embedding models only get their `catalog_id`.
+3. **Uncheck Accepts forced tool choice** on completion models that the catalogue measured as refusing a forced `tool_choice`, when the model has no value yet. This sets `provider_config.supports_forced_tool_choice` to `false` and keeps the rest of the Provider Config. A model left unset already accepts forced tool choice, so models the catalogue measured as accepting are not changed. A value already set on the model is never overwritten. If it differs from the catalogue, the model is listed under `divergent`.
 
 ```http
 POST {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/catalog/sync
@@ -342,14 +343,14 @@ POST {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/catalog/sync
 |---|---|---|
 | `dry_run` | `true` | Report what would change, write nothing. Send `false` to apply. |
 | `model_ids` | all models | Restrict the sync to these models. |
-| `fields` | the four metrics | Restrict which `metrics` fields are updated. |
+| `fields` | the four metrics and `supports_forced_tool_choice` | Restrict which fields are updated. |
 
 The response lists what was (or would be) done:
 
 ```json
 {
   "dry_run": true,
-  "summary": { "total": 2, "backfilled": 1, "patched": 1, "unchanged": 1, "unmatched": 0 },
+  "summary": { "total": 2, "backfilled": 1, "patched": 1, "unchanged": 1, "unmatched": 0, "divergent": 0 },
   "backfilled": [
     { "model_id": "az-gpt-4o", "catalog_id": "gpt-4o", "match": "alias" }
   ],
@@ -362,11 +363,12 @@ The response lists what was (or would be) done:
       "after": { "energy_per_token": 0.000016 }
     }
   ],
-  "unmatched": []
+  "unmatched": [],
+  "divergent": []
 }
 ```
 
-`match` tells how the back-fill resolved the id: `exact`, `alias`, `strong` (after prefix stripping) or `strong_alias`. A model listed in `unmatched` has no catalogue entry; set its metrics by hand.
+`match` tells how the back-fill resolved the id: `exact`, `alias`, `strong` (after prefix stripping) or `strong_alias`. A model listed in `unmatched` has no catalogue entry; set its metrics by hand. An entry of `divergent` (`{model_id, catalog_id, field, current, catalog}`) is a model whose forced tool choice flag differs from the catalogue. The sync leaves it alone. Run the Test button probe on that model to decide which value is right for your environment. A model your environment serves differently from the provider's own API may accept forced tool choice even though the catalogue says it refuses it: if the dry run proposes `supports_forced_tool_choice` for such a model, leave it out with `model_ids` or `fields`.
 
 <Warning>
 **Run a dry run first, and read it.** With `"dry_run": false`, the sync overwrites the selected metrics on every matched model, including values you set on purpose. Use `fields` and `model_ids` to keep it to what you mean to change. The model cache is flushed for each updated model, so the new values apply to the next call.
