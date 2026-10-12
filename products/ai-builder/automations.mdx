@@ -1292,6 +1292,10 @@ Calls an HTTP endpoint.
 **Bounding a server that never answers.** Without `timeout`, a host that accepts the connection and then stays silent holds the automation for the underlying 300s default: the tool stays "running", the task stays in the working status and no error is raised. Set `timeout` on calls to endpoints you do not control, such as remote MCP servers, so a silent peer fails fast instead of freezing the run. Self-hosters can change the platform-wide defaults with `FETCH_HEADERS_TIMEOUT` and `FETCH_BODY_TIMEOUT`, see [Environment Variables](/self-hosting/kubernetes/environment-variables).
 </Note>
 
+<Note>
+**When the execution is cancelled**, `fetch` does not raise: it returns `{ aborted: true, error }`, and a streamed response ends with a frame carrying the same fields after everything received so far. See [Cancelling an execution](#cancelling-an-execution).
+</Note>
+
 ### `wait`
 
 Blocks the automation until a matching event arrives or a timeout elapses.
@@ -1457,8 +1461,39 @@ Any instruction can raise the following platform errors regardless of its own lo
 | `WorkspaceQuotaExceeded` | The workspace has hit its event/run quota. |
 | `WorkflowTimeoutError` | The whole automation run exceeded its max duration. |
 | `ConfigurationError` | An expression references a variable scope that is unavailable in the current trigger (e.g. `{{user}}` in a cron). |
+| `AbortError` | The execution was cancelled and its grace period is over (`details.code` is `EXECUTION_ABORTED`). See [Cancelling an execution](#cancelling-an-execution). |
 
 Wrap calls in `try/catch` to recover from these.
+
+### Cancelling an execution
+
+An execution is cancelled in two cases:
+
+- **Its client leaves.** A webhook whose client asked for an event stream (`Accept: text/event-stream`), such as a chat answer, is cancelled when that client closes the connection before the end of the response: the Stop button, a closed tab. Only the execution that webhook triggered is cancelled: automations triggered by events in the same run go on. A client of a JSON webhook that gives up does not cancel it.
+- **An automation asks for it.** Emit `runtime.executions.abortRequested` with the `correlationId` of the run to stop. Every execution of that run is cancelled, in every workspace and on every runtime instance. The request is honored only if the emitting workspace runs an execution of that run that a client started (a webhook, an endpoint or an event sent by a client), not one triggered by another automation's `emit`.
+
+```yaml
+- emit:
+    event: runtime.executions.abortRequested
+    payload:
+      correlationId: '{{runCorrelationId}}' # recorded when the run started, from {{run.correlationId}}
+      reason: canceled
+```
+
+A cancelled execution is not stopped at once, so that it can finalize, for example to save a partial answer:
+
+- a `fetch` in progress is cut and returns `{ aborted: true, error }`, and a new `fetch` returns the same without sending any request;
+- a streamed `fetch` ends with a last frame `{ aborted: true, error, concatenated }` after every frame received so far (`concatenated` holds the accumulated text when the `stream` option concatenates);
+- a call to another workspace's webhook made from the same platform returns the callee's partial result with `aborted: true` and `error`;
+- a `wait` ends at once with no event.
+
+`error` is always `{ "error": "AbortError", "message": "Execution aborted (<reason>)", "details": { "code": "EXECUTION_ABORTED", "reason": "<reason>" } }`. Test `aborted` to tell a cancellation from a failure.
+
+Once the grace period is over (10 seconds by default, `EXECUTION_ABORT_GRACE_PERIOD`), the next instruction raises that same `AbortError`, which `try`/`catch` cannot keep running.
+
+<Note>
+A `fetch` over HTTP to a webhook stops the callee only if the callee streams its response: a callee answering in JSON runs to its end.
+</Note>
 
 ## Condition and Expression syntax
 
@@ -2327,6 +2362,33 @@ Workspaces can listen to a specific subset of native events:
 </Accordion>
 
 <Accordion title="Runtime Events">
+  <ResponseField name="runtime.executions.abortRequested" type="event">
+    Emitted by an automation to cancel every execution of a run. See [Cancelling an execution](#cancelling-an-execution).
+
+    Payload:
+
+    ```json
+    {
+      "correlationId": "correlation id of the run to stop",
+      "reason": "canceled"
+    }
+    ```
+  </ResponseField>
+
+  <ResponseField name="runtime.executions.aborted" type="event">
+    Emitted by the runtime once it honored a `runtime.executions.abortRequested`. Automations cannot emit it.
+
+    Payload:
+
+    ```json
+    {
+      "correlationId": "correlation id of the stopped run",
+      "reason": "canceled",
+      "requestedBy": "id of the workspace that asked for it"
+    }
+    ```
+  </ResponseField>
+
   <ResponseField name="runtime.fetch.failed" type="event">
     Emitted when a fetch receives a 4xx or 5xx HTTP status
 
