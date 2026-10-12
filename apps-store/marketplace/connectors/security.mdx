@@ -1,0 +1,88 @@
+---
+title: 'Connector security'
+description: 'Answers to the questions a security review asks before a connector goes to production: permissions, agent access, shared knowledge bases, credentials, models, network egress and audit'
+---
+
+This page answers the questions a security review usually asks before an App + MCP connector is used in production. For each question, it explains what the platform guarantees and what you control through configuration. Most production requirements are met by how you configure the production instance, not by changing the connector.
+
+The values that depend on the connector (read-only scopes, outbound hosts, modes to avoid) are listed in the **Security** section of each connector page. The underlying model (endpoints, trust domains, authorization layers) is described in [Connector architecture](/apps-store/marketplace/connectors/architecture), which also holds the checklist for the reviewer.
+
+## How a connector reaches the provider
+
+Every connector uses one of four authentication families. The family decides whose identity the provider sees, and therefore how the questions below are answered.
+
+| Family | Connectors | Whose identity the provider sees |
+|---|---|---|
+| Delegated OAuth, Microsoft | OneNote, SharePoint, Outlook, Microsoft Teams, Power BI | Each user's own Microsoft 365 account |
+| Delegated OAuth, other provider | Google Workspace, Jira, Confluence, GitLab, HubSpot, Figma, Monday, Snowflake | Each user's own provider account |
+| Delegated OAuth or integration user | Salesforce | Each user's account in `oauth` mode; one integration user in `jwt` or `clientCredentials` mode |
+| Application credentials | Word, Excel (client credentials by default) | The Entra application, with the permissions consented on it |
+| Technical account or API key | SAP LeanIX, Gryzzly, DataGalaxy, WebDAV, ServiceNow, Tableau, SonarQube | One shared account, configured by the administrator |
+| Platform only | Knowledges | The Prisme.ai user, no third-party provider |
+
+With delegated OAuth, the provider applies each user's own permissions: an agent only reaches what the person using it can already open. With a technical account, every caller acts with that account's rights, so the account itself must carry the least privilege.
+
+## Can an agent get more rights than it needs?
+
+The rights an agent can use are the scopes (or, for a technical account, the role) granted to the connector, and you choose them.
+
+- In the connector's configuration app, request only the read scopes when the agents must not modify anything. The provider then refuses every write itself, whatever the agent tries. The read-only scopes of each connector are listed in its **Security** section.
+- With the platform's central OAuth client (`oauthCentral`), the scopes a workspace may request depend on the connector and on the central application registered with the provider: check the connector's **Security** section.
+- On the provider side, restrict the permissions consented on the application registration as well. Some providers, Microsoft Entra among them, issue tokens that carry every permission consented earlier, whatever the connector requests.
+- For a technical account, create a dedicated account with a read-only role, and rotate its key.
+
+## Are all agents allowed to call the connector?
+
+When the connector is installed in your workspace, the MCP endpoint of that installation checks the calling agent against the **Authorized agents** list. The list is empty at installation, so every agent is refused until you add it by name. Leave **Allow all agents** off in production.
+
+The list filters on the agent identifier sent with each call. It keeps the connector out of agents you did not choose, but it is not an authentication of the caller: what protects the data is the user's own provider connection (delegated OAuth) or the rights of the technical account. Size those rights accordingly.
+
+Some connectors also offer a global endpoint, hosted in the platform's core workspace and shared by every organization. It accepts every agent by design and stays unusable until the platform maintainer configures the central OAuth application. Its protection is the per-user OAuth: each user connects their own account. If your policy requires a per-agent allowlist, install the connector in your own workspace and use its endpoint.
+
+ServiceNow, Tableau, SonarQube, Word and Excel follow an older model with no agent list: access is controlled by installing the connector in a workspace and by its API key.
+
+## Can a shared knowledge base expose content a reader cannot open?
+
+This applies to connectors that feed knowledge bases with a per-user connection: OneNote, SharePoint, Outlook, Microsoft Teams, Confluence and Google Workspace.
+
+A knowledge base is synchronized with the account of the person who connected it. When the base is shared, the platform checks, for each reader and each document, that the reader can open the document at the provider, with the reader's own connection. Documents the reader cannot open are left out of their results, and a reader who never connected their account gets no results from that source.
+
+This per-reader access control is enabled by default on new knowledge base connections, and the owner of the base can turn it off. Keep it on for every base shared beyond its owner.
+
+A connector that uses a technical account (WebDAV, for example) has no per-reader check: every document the account can read in the configured scope is indexed and visible to every reader of the base. Share such a base only with people entitled to the whole indexed scope.
+
+## Can a static token or key be used permanently?
+
+Connectors with delegated OAuth also accept a token pasted directly in the configuration (`accessToken` mode). It is a testing aid, not a production mechanism: every caller then acts with the identity of whoever pasted the token, so the provider no longer applies per-user permissions.
+
+- For Microsoft and Google, an access token expires after about an hour, so the mode cannot work permanently anyway.
+- Personal access tokens and API tokens (GitLab, Jira, Confluence, Snowflake) can last much longer. Do not use them in production when per-user permissions are required.
+- Application-level modes (client credentials, service account, JWT) are not delegated either: avoid them when the provider must apply each user's permissions.
+- For connectors whose only mode is a technical account, keep the key in the workspace secrets, give it a read-only role and rotate it.
+
+The modes to avoid for each connector are listed in its **Security** section.
+
+## Who can change scopes and credentials?
+
+Credentials, scopes and the agent list are stored in the secrets and configuration of the workspace where the connector is installed, and edited through its configuration app. Anyone with editor rights on that workspace can change them.
+
+- Restrict the production workspace to its administrators. Do not grant editor rights on a connector workspace to business builders.
+- Agents and agent builders never receive client secrets or users' tokens: the connector attaches credentials only when it calls the provider.
+- The client secret of the central OAuth application stays in the platform's core workspace and is never exposed to workspaces or users.
+
+## Which models receive the provider's content?
+
+A connector never calls a language model itself. The provider's content reaches only the model of the agent that requested it and, when the connector feeds a knowledge base, the embedding model of that base. Both are chosen among the models your organization has approved, in the region they are deployed in.
+
+## Which hosts does a connector contact?
+
+Each connector calls a fixed set of provider hosts, listed in its **Security** section, and the agent cannot change the destination: tools map to a fixed list of operations.
+
+- Most connectors contact fixed hosts, which you can allow by name in your egress control.
+- Connectors for self-hosted or per-instance providers (GitLab self-managed, Jira and Confluence Data Center, Salesforce, Snowflake, SAP LeanIX, WebDAV, ServiceNow, Tableau, SonarQube) contact the address the administrator sets at installation. That address is never supplied by a user or an agent.
+
+## What is recorded?
+
+Every automation run produces an execution event in the workspace activity feed, readable by the members of the workspace where the connector is installed. Connectors redact the provider's content (documents, messages, responses) from these events, while keeping identifiers, statuses and operation names readable for troubleshooting. Content converted by a Custom Code step (for example a page turned into Markdown) can still appear in that step's own execution event, which is one more reason to restrict the workspace to its administrators.
+
+Some connectors also emit dedicated audit events for the provider calls they make, recording who called which operation, without the content. When a connector does, its **Security** section lists the events.
