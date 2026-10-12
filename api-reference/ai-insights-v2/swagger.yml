@@ -1,0 +1,1709 @@
+openapi: '3.0.3'
+info:
+  version: 1.0.0
+  title: AI Insights API
+  description: |
+    Public REST API for the Prisme.ai AI Insights workspace - analyzed
+    conversations, analysis triggering and status, evaluation criteria,
+    message feedback, organization analytics, memory analytics, and the
+    agent relationship graph.
+
+    All endpoints are scoped to the caller's organization (resolved from
+    the session). Unless stated otherwise, every endpoint requires an
+    authenticated user and an `ai-insights:*` permission, checked against
+    `user.meta.permissions`. A permission is granted by its exact name, by
+    its family wildcard (e.g. `ai-insights:analytics:*`), by
+    `ai-insights:*`, or by `iam:*`. Users with no explicit permissions get
+    the defaults: `ai-insights:conversations:read`,
+    `ai-insights:conversations:analyze`, `ai-insights:analytics:read`,
+    `ai-insights:gdpr:view`, `ai-insights:feedback:write`.
+  contact:
+    name: Prisme.ai
+    url: https://prisme.ai
+servers:
+  - url: https://{host}/v2/workspaces/slug:ai-insights-v2/webhooks
+    description: Prisme.ai workspace webhooks
+    variables:
+      host:
+        default: api.studio.prisme.ai
+        description: API host (override for self-hosted or sandbox)
+security:
+  - BearerAuth: []
+tags:
+  - name: Insights
+    description: Per-conversation analysis results and analysis status.
+  - name: Analysis
+    description: Trigger conversation analysis and manage evaluation criteria per agent.
+  - name: Feedback
+    description: Like / dislike feedback on agent messages.
+  - name: Analytics
+    description: Organization-wide usage, quality, cost, adoption, and queue metrics.
+  - name: Memories
+    description: Analytics built from the memories users accumulate with agents.
+  - name: Graph
+    description: Agent relationship graph - tools, categories, similarity, and clusters.
+  - name: Admin
+    description: Platform administration endpoints.
+paths:
+  # ──────────────────────────────────────────────────────────────────
+  # Insights
+  # ──────────────────────────────────────────────────────────────────
+  /v1/insights:
+    get:
+      tags: [Insights]
+      operationId: listInsights
+      summary: List analyzed conversations
+      description: |
+        Returns the insights (analysis results) of the caller's organization,
+        most recent first (`analyzed_at` descending). Requires
+        `ai-insights:conversations:read`.
+      parameters:
+        - in: query
+          name: agent_id
+          schema: { type: string }
+          description: Only return insights for this agent.
+        - in: query
+          name: conversation_id
+          schema: { type: string }
+          description: Only return the insight for this conversation.
+        - in: query
+          name: user_id
+          schema: { type: string }
+          description: Only return insights for conversations of this user.
+        - in: query
+          name: from_date
+          schema: { type: string, format: date-time }
+          description: Lower bound (inclusive) on `analyzed_at`, ISO 8601.
+        - in: query
+          name: to_date
+          schema: { type: string, format: date-time }
+          description: Upper bound (inclusive) on `analyzed_at`, ISO 8601.
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20 }
+          description: Max items to return.
+        - in: query
+          name: offset
+          schema: { type: integer, default: 0 }
+          description: Number of items to skip.
+      responses:
+        '200':
+          description: Paginated list of insights.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  insights:
+                    type: array
+                    items: { $ref: '#/components/schemas/Insight' }
+                  pagination:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      limit: { type: integer }
+                      offset: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/insights/status:
+    get:
+      tags: [Insights]
+      operationId: getInsightsStatus
+      summary: Get the analysis status of conversations
+      description: |
+        Returns the analysis status of each requested conversation, in the
+        order of `conversation_ids`. Conversations that were never queued or
+        analyzed are returned with `status: none`. Requires
+        `ai-insights:conversations:read`.
+      parameters:
+        - in: query
+          name: conversation_ids
+          required: true
+          schema: { type: string }
+          example: conv_123,conv_456
+          description: Comma-separated list of conversation IDs.
+      responses:
+        '200':
+          description: One status entry per requested conversation.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  statuses:
+                    type: array
+                    items: { $ref: '#/components/schemas/ConversationStatus' }
+        '400':
+          description: '`conversation_ids` is missing.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ──────────────────────────────────────────────────────────────────
+  # Analysis
+  # ──────────────────────────────────────────────────────────────────
+  /v1/agents/{agent_id}/analyze:
+    post:
+      tags: [Analysis]
+      operationId: analyzeAgentConversations
+      summary: Trigger analysis of an agent's conversations
+      description: |
+        Analyzes conversations of an agent against its evaluation criteria.
+
+        - **`batch`** (default): the request is queued in the analysis queue
+          and each conversation is marked `pending`. Poll
+          [`GET /v1/insights/status`](#tag/insights) to follow progress.
+        - **`realtime`**: each conversation is analyzed synchronously and the
+          response reports how many analyses succeeded. Only used when
+          `conversation_ids` is provided; otherwise the request falls back to
+          batch mode.
+
+        The caller must own the agent, have the `org_admin` role, or hold
+        `iam:*`. Requires `ai-insights:conversations:analyze`.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnalyzeInput' }
+            examples:
+              batch:
+                summary: Queue two conversations
+                value:
+                  conversation_ids: [conv_123, conv_456]
+              realtime:
+                summary: Analyze immediately, re-running existing analyses
+                value:
+                  mode: realtime
+                  conversation_ids: [conv_123]
+                  force: true
+      responses:
+        '200':
+          description: Analysis queued (batch) or completed (realtime).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/AnalyzeQueuedResponse'
+                  - $ref: '#/components/schemas/AnalyzeCompletedResponse'
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Agent not found or not accessible.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/agents/{agent_id}/evaluation-criteria:
+    get:
+      tags: [Analysis]
+      operationId: getEvaluationCriteria
+      summary: Get an agent's evaluation criteria
+      description: |
+        Returns the criteria used to evaluate the agent's conversations: the
+        agent's custom criteria if they were set, otherwise the default
+        criteria (`resolution`, `clarity`, `accuracy`, `sentiment`).
+
+        The caller must own the agent, have the `org_admin` role, or hold
+        `iam:*`.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      responses:
+        '200':
+          description: Current evaluation criteria.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent_id: { type: string }
+                  criteria:
+                    type: array
+                    items: { $ref: '#/components/schemas/EvaluationCriterion' }
+                  is_custom:
+                    type: boolean
+                    description: '`true` when the criteria come from a saved custom configuration.'
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Agent not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    put:
+      tags: [Analysis]
+      operationId: updateEvaluationCriteria
+      summary: Replace an agent's evaluation criteria
+      description: |
+        Replaces the full list of evaluation criteria of the agent. The new
+        criteria apply to future analyses only. Each criterion needs `id`,
+        `type`, and `question`; `score` criteria also need `min`.
+
+        The caller must own the agent, have the `org_admin` role, or hold
+        `iam:*`, and needs `ai-insights:conversations:write`.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [criteria]
+              properties:
+                criteria:
+                  type: array
+                  items: { $ref: '#/components/schemas/EvaluationCriterion' }
+            example:
+              criteria:
+                - id: resolution
+                  type: boolean
+                  question: Was the user's issue resolved?
+                  weight: 0.4
+                - id: accuracy
+                  type: score
+                  question: Rate the accuracy of information provided
+                  min: 1
+                  max: 5
+                  weight: 0.4
+                - id: tone
+                  type: category
+                  question: How would you describe the agent's tone?
+                  options: [formal, friendly, curt]
+                  weight: 0.2
+      responses:
+        '200':
+          description: Criteria saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  agent_id: { type: string }
+                  criteria:
+                    type: array
+                    items: { $ref: '#/components/schemas/EvaluationCriterion' }
+                  message: { type: string }
+        '400':
+          description: One or more criteria are invalid.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, example: Validation failed }
+                  validation_errors:
+                    type: array
+                    items: { type: string }
+                    example: [Score criterion accuracy missing min]
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Agent not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ──────────────────────────────────────────────────────────────────
+  # Feedback
+  # ──────────────────────────────────────────────────────────────────
+  /v1/feedback:
+    post:
+      tags: [Feedback]
+      operationId: submitFeedback
+      summary: Submit feedback on an agent message
+      description: |
+        Records a like or dislike on an agent message. There is one feedback
+        per message: submitting again for the same `task_id` + `message_id`
+        replaces the previous vote. A `category` is only accepted on
+        dislikes. Requires `ai-insights:feedback:write`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FeedbackInput' }
+            example:
+              vote: dislike
+              category: incorrect_incomplete
+              comment: The opening hours given are outdated.
+              task_id: task_789
+              message_id: msg_42
+              context_id: ctx_123
+              agent_id: agt_abc
+      responses:
+        '200':
+          description: Feedback recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: Feedback ID, `fb_{task_id}_{message_id}`.
+                  vote: { type: string, enum: [like, dislike] }
+                  category: { $ref: '#/components/schemas/FeedbackCategory' }
+                  updated: { type: boolean }
+        '400':
+          description: |
+            A required field is missing, `vote` is invalid, `category` is
+            set on a like, or `category` is not an allowed value.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ──────────────────────────────────────────────────────────────────
+  # Analytics
+  # ──────────────────────────────────────────────────────────────────
+  /v1/analytics/summary:
+    get:
+      tags: [Analytics]
+      operationId: getAnalyticsSummary
+      summary: Get the organization analytics summary
+      description: |
+        Returns the organization's users, interactions, top agents, quality,
+        and cost over the period, with the change versus the previous period
+        of the same length. Built from the hourly organization aggregates;
+        platform admins can force a refresh with
+        `POST /v1/admin/refresh-org-analytics`. Requires an authenticated user.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+      responses:
+        '200':
+          description: Analytics summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnalyticsSummary' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /v1/analytics/agents:
+    get:
+      tags: [Analytics]
+      operationId: getAgentsAnalytics
+      summary: Get per-agent analytics
+      description: |
+        Aggregates the organization's insights per agent: conversation count,
+        average evaluation score, resolution rate, sentiment distribution, and
+        analysis token usage. Requires `ai-insights:analytics:read`.
+      parameters:
+        - in: query
+          name: from_date
+          schema: { type: string, format: date-time }
+          description: Lower bound (inclusive) on `analyzed_at`, ISO 8601.
+        - in: query
+          name: to_date
+          schema: { type: string, format: date-time }
+          description: Upper bound (inclusive) on `analyzed_at`, ISO 8601.
+        - in: query
+          name: agent_ids
+          schema:
+            type: array
+            items: { type: string }
+          style: form
+          explode: true
+          description: Restrict to these agents. Repeat the parameter for each ID.
+      responses:
+        '200':
+          description: Per-agent analytics and totals.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items: { $ref: '#/components/schemas/AgentAnalytics' }
+                  totals:
+                    type: object
+                    properties:
+                      agents_count: { type: integer }
+                      conversation_count: { type: integer }
+                      token_usage:
+                        type: integer
+                        description: Sum of input and output analysis tokens.
+                  period:
+                    type: object
+                    properties:
+                      from: { type: string, nullable: true }
+                      to: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/analytics/feedback:
+    get:
+      tags: [Analytics]
+      operationId: getFeedbackAnalytics
+      summary: Get feedback analytics
+      description: |
+        Returns the like / dislike distribution, the dislike categories, and a
+        paginated list of feedback entries (most recent first) for the
+        organization over the period. Requires `ai-insights:analytics:read`.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - in: query
+          name: agent_id
+          schema: { type: string }
+          description: Only count feedback for this agent.
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+          description: Page of the `feedbacks` list (1-based).
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20 }
+          description: Items per page of the `feedbacks` list.
+      responses:
+        '200':
+          description: Feedback analytics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FeedbackAnalytics' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/analytics/adoption:
+    get:
+      tags: [Analytics]
+      operationId: getAdoptionAnalytics
+      summary: Get user adoption metrics
+      description: |
+        Returns adoption metrics derived from the personalization users add
+        to agents (instructions and preferences stored as memories).
+
+        The `tiers` breakdown is currently an **estimate**: power, regular,
+        and basic users are computed as fixed shares (12 %, 45 %, 43 %) of
+        the total user count, not from per-user data. Requires
+        `ai-insights:analytics:read`.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+      responses:
+        '200':
+          description: Adoption metrics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdoptionAnalytics' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/analytics/queue-stats:
+    get:
+      tags: [Analytics]
+      operationId: getQueueStats
+      summary: Get analysis queue statistics
+      description: |
+        Returns the state of the analysis queue: items per status, throughput
+        over the last hour, estimated time to drain, and a health status.
+        Counts cover the whole platform queue, not only the caller's
+        organization. Requires `ai-insights:queue:view`.
+
+        `health` is `backlogged` above 100,000 pending items, `busy` above
+        10,000, `degraded` when more than 10 items failed in the last hour,
+        and `healthy` otherwise.
+      responses:
+        '200':
+          description: Queue statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queue_depth:
+                    type: integer
+                    description: Pending items.
+                  processing: { type: integer }
+                  completed_total: { type: integer }
+                  failed_total: { type: integer }
+                  throughput:
+                    type: object
+                    properties:
+                      completed_per_hour: { type: integer }
+                      failed_per_hour: { type: integer }
+                  estimated_completion_hours:
+                    type: integer
+                    description: Hours to drain the pending items at the current rate, or `-1` when nothing completed in the last hour.
+                  health:
+                    type: string
+                    enum: [healthy, busy, backlogged, degraded]
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/analytics/capacity:
+    get:
+      tags: [Analytics]
+      operationId: getCapacity
+      summary: Get analysis capacity
+      description: |
+        Lightweight variant of `queue-stats` for capacity monitoring. Counts
+        cover the whole platform queue. `status` is `backlogged` above
+        100,000 pending items, `busy` above 10,000, and `healthy` otherwise.
+        Requires `ai-insights:analytics:read`.
+      responses:
+        '200':
+          description: Capacity metrics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queue_depth: { type: integer }
+                  processing: { type: integer }
+                  processing_rate_per_hour: { type: integer }
+                  failed_last_hour: { type: integer }
+                  estimated_completion_hours:
+                    type: integer
+                    description: '`-1` when nothing completed in the last hour.'
+                  status:
+                    type: string
+                    enum: [healthy, busy, backlogged]
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ──────────────────────────────────────────────────────────────────
+  # Memories
+  # ──────────────────────────────────────────────────────────────────
+  /v1/analytics/memories:
+    get:
+      tags: [Memories]
+      operationId: getMemoriesAnalytics
+      summary: Get memory analytics summary
+      description: |
+        Returns how many memories were created over the period, broken down
+        by type (`fact`, `preference`, `relationship`, `instruction`), with a
+        daily series and the change versus the previous period. Requires
+        `ai-insights:analytics:read`.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - in: query
+          name: agent_id
+          schema: { type: string }
+          description: Only count memories for this agent.
+      responses:
+        '200':
+          description: Memory analytics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemoriesAnalytics' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/analytics/memories/trends:
+    get:
+      tags: [Memories]
+      operationId: getMemoryTrends
+      summary: Get memory trends over time
+      description: |
+        Returns a time series of memory creation, hourly or daily, with
+        summary statistics. `direction` is `up` or `down` when the last point
+        differs from the first by more than 10 %. Requires
+        `ai-insights:analytics:read`.
+      parameters:
+        - in: query
+          name: period
+          schema: { type: string, enum: ['24h', 7d, 30d], default: 7d }
+          description: Time window.
+        - in: query
+          name: granularity
+          schema: { type: string, enum: [hourly, daily], default: daily }
+          description: Size of each point in the series.
+        - in: query
+          name: type
+          schema: { $ref: '#/components/schemas/MemoryType' }
+          description: When set, each point also carries `filtered_value`, the count for this memory type.
+      responses:
+        '200':
+          description: Memory trend series.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemoryTrends' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/analytics/memories/topics:
+    get:
+      tags: [Memories]
+      operationId: getMemoryTopics
+      summary: Get memory topic clusters
+      description: |
+        Returns the topics memories are clustered into, with their size,
+        type breakdown, and trend. Requires `ai-insights:analytics:read`.
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20 }
+          description: Max topics to return.
+        - in: query
+          name: sort_by
+          schema: { type: string, enum: [count, trend], default: count }
+          description: '`count` sorts by memory count, `trend` by trend percentage (both descending).'
+        - in: query
+          name: trend_filter
+          schema: { type: string, enum: [up, down, stable] }
+          description: Only return topics with this trend.
+      responses:
+        '200':
+          description: Memory topics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  topics:
+                    type: array
+                    items: { $ref: '#/components/schemas/MemoryTopic' }
+                  summary:
+                    type: object
+                    properties:
+                      total_topics: { type: integer }
+                      total_memories: { type: integer }
+                      trending_up: { type: integer }
+                      trending_down: { type: integer }
+                  metadata:
+                    type: object
+                    properties:
+                      orgSlug: { type: string }
+                      sort_by: { type: string }
+                      trend_filter: { type: string, nullable: true }
+                      limit: { type: integer }
+                      generated_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/analytics/memories/gaps:
+    get:
+      tags: [Memories]
+      operationId: getTrainingGaps
+      summary: Detect training gaps
+      description: |
+        Flags memory topics where users mostly store **facts** (more than
+        60 % of the topic's memories), a sign that agents lack this knowledge
+        and users have to teach it. Severity is `high` above 50 memories,
+        `medium` above 20, `low` otherwise. Gaps are sorted by occurrence
+        count. Requires `ai-insights:analytics:read`.
+      parameters:
+        - in: query
+          name: min_occurrences
+          schema: { type: integer, default: 5 }
+          description: Minimum number of memories for a topic to be considered.
+      responses:
+        '200':
+          description: Detected training gaps.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrainingGaps' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ──────────────────────────────────────────────────────────────────
+  # Graph
+  # ──────────────────────────────────────────────────────────────────
+  /v1/graph/agents:
+    get:
+      tags: [Graph]
+      operationId: getAgentGraph
+      summary: Get the agent relationship graph
+      description: |
+        Returns the organization's agents as a graph: an `organization` node,
+        one node per agent, tool, and category, and the edges between them
+        (`belongs_to`, `uses`, `similar`). Two agents get a `similar` edge
+        when their similarity (tools Jaccard index and shared tags) reaches
+        `similarity_threshold`.
+
+        The graph is cached for 5 minutes. A cached response has
+        `stats.cached: true` and only carries `total_nodes`, `total_edges`,
+        and `cache_age_seconds` in `stats`. Requires
+        `ai-insights:analytics:read`.
+      parameters:
+        - in: query
+          name: include_tools
+          schema: { type: boolean, default: true }
+          description: Include tool nodes and `uses` edges.
+        - in: query
+          name: include_categories
+          schema: { type: boolean, default: true }
+          description: Include category nodes and agent-to-category edges.
+        - in: query
+          name: similarity_threshold
+          schema: { type: number, minimum: 0, maximum: 1, default: 0.3 }
+          description: Minimum similarity score for a `similar` edge.
+        - in: query
+          name: use_cache
+          schema: { type: boolean, default: true }
+          description: Set to `false` to recompute the graph.
+      responses:
+        '200':
+          description: Agent graph.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentGraph' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/graph/agents/clusters:
+    get:
+      tags: [Graph]
+      operationId: getAgentClusters
+      summary: Get agent clusters
+      description: |
+        Groups agents connected by `similar` edges whose score reaches
+        `similarity_threshold`. Clusters smaller than `min_cluster_size` are
+        dropped; agents with no similar neighbor are listed in
+        `isolated_agents`. Clusters are sorted by size, largest first.
+        Requires `ai-insights:analytics:read`.
+      parameters:
+        - in: query
+          name: similarity_threshold
+          schema: { type: number, minimum: 0, maximum: 1, default: 0.5 }
+          description: Minimum similarity for two agents to share a cluster.
+        - in: query
+          name: min_cluster_size
+          schema: { type: integer, default: 2 }
+          description: Minimum number of agents per cluster.
+      responses:
+        '200':
+          description: Agent clusters.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentClusters' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/graph/similar/{agent_id}:
+    get:
+      tags: [Graph]
+      operationId: getSimilarAgents
+      summary: Get agents similar to an agent
+      description: |
+        Returns the agents most similar to the given agent, highest score
+        first. Uses the cached graph when available, otherwise computes
+        similarity on the fly. Requires `ai-insights:analytics:read`.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - in: query
+          name: limit
+          schema: { type: integer, default: 10 }
+          description: Max similar agents to return.
+        - in: query
+          name: min_score
+          schema: { type: number, minimum: 0, maximum: 1, default: 0.1 }
+          description: Minimum similarity score.
+      responses:
+        '200':
+          description: Similar agents.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent_id: { type: string }
+                  agent_name: { type: string }
+                  similar_agents:
+                    type: array
+                    items: { $ref: '#/components/schemas/SimilarAgent' }
+                  total: { type: integer }
+                  cached: { type: boolean }
+                  metadata:
+                    type: object
+                    properties:
+                      orgSlug: { type: string }
+                      min_score: { type: number }
+                      limit: { type: integer }
+                      generated_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Agent not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/graph/tools:
+    get:
+      tags: [Graph]
+      operationId: getToolsGraph
+      summary: Get tools and the agents using them
+      description: |
+        Lists every tool used by the organization's agents, with the agents
+        that use it, sorted by usage count. Requires
+        `ai-insights:analytics:read`.
+      responses:
+        '200':
+          description: Tools with their agents.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tools:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        type: { type: string }
+                        usage_count:
+                          type: integer
+                          description: Number of agents using the tool.
+                        agents:
+                          type: array
+                          items: { type: string }
+                          description: IDs of the agents using the tool.
+                  total: { type: integer }
+                  cached: { type: boolean }
+                  metadata:
+                    type: object
+                    properties:
+                      orgSlug: { type: string }
+                      generated_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/graph/relationships:
+    get:
+      tags: [Graph]
+      operationId: getRelationshipGraph
+      summary: Get the organizational relationship graph
+      description: |
+        Builds a graph of entities (people, teams, systems…) from the
+        keywords of memory topics that contain `relationship` memories.
+        Keywords of a same topic are linked by `related` edges. This is a
+        simplified extraction based on topic keywords, not on the full
+        memory content. Requires `ai-insights:analytics:read`.
+      responses:
+        '200':
+          description: Relationship graph.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  graph:
+                    type: object
+                    properties:
+                      nodes:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string, example: entity_finance }
+                            type: { type: string, enum: [entity] }
+                            label: { type: string }
+                            mention_count: { type: integer }
+                      edges:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            source: { type: string }
+                            target: { type: string }
+                            type: { type: string, enum: [related] }
+                  relationship_topics:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        label: { type: string }
+                        keywords: { type: array, items: { type: string } }
+                        count:
+                          type: integer
+                          description: Number of relationship memories in the topic.
+                        examples: { type: array, items: { type: string } }
+                  stats:
+                    type: object
+                    properties:
+                      total_entities: { type: integer }
+                      total_edges: { type: integer }
+                      total_relationship_memories: { type: integer }
+                  metadata:
+                    type: object
+                    properties:
+                      orgSlug: { type: string }
+                      generated_at: { type: string, format: date-time }
+                      note: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ──────────────────────────────────────────────────────────────────
+  # Admin
+  # ──────────────────────────────────────────────────────────────────
+  /v1/admin/refresh-org-analytics:
+    post:
+      tags: [Admin]
+      operationId: refreshOrgAnalytics
+      summary: Refresh organization analytics
+      description: |
+        Runs the hourly organization analytics aggregation immediately,
+        instead of waiting for the next scheduled run. Feeds
+        `GET /v1/analytics/summary`. Platform admins only (`superadmin` or
+        `root` platform role).
+      responses:
+        '200':
+          description: Aggregation completed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [refreshed] }
+                  details:
+                    type: object
+                    additionalProperties: true
+                    description: Output of the aggregation job.
+        '401':
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: UNAUTHORIZED, message: Authentication required }
+        '403':
+          description: Caller is not a platform admin.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: FORBIDDEN, message: Platform admin access required }
+        '405':
+          description: Method other than POST.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        User-bound credential carrying an identity: either a session JWT
+        or a user access token (`at:*`) generated from the user settings UI.
+        Send as `Authorization: Bearer <token>`. The organization and the
+        permissions applied are those of this user.
+
+  parameters:
+    AgentId:
+      in: path
+      name: agent_id
+      required: true
+      schema: { type: string }
+      description: Agent ID (as returned by the Agent Creator API).
+    Period:
+      in: query
+      name: period
+      schema: { type: string, enum: [7d, 30d, 90d], default: 30d }
+      description: Time window, ending now.
+
+  responses:
+    Unauthenticated:
+      description: Missing or invalid credentials.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: Authentication required }
+    Forbidden:
+      description: The caller lacks the required permission or access to the agent.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: 'Permission denied: ai-insights:analytics:read' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Error message, or error code on admin endpoints (e.g. `FORBIDDEN`).
+        message:
+          type: string
+          description: Human-readable message, returned alongside an error code.
+
+    # ──────────────────────────────────────────────────────────────────
+    # Insights
+    # ──────────────────────────────────────────────────────────────────
+    Insight:
+      type: object
+      description: Analysis result of one conversation.
+      properties:
+        id: { type: string }
+        conversation_id: { type: string }
+        agent_id: { type: string }
+        user_id: { type: string }
+        orgSlug: { type: string, nullable: true }
+        summary:
+          type: string
+          nullable: true
+          description: AI-generated summary of the conversation.
+        topics:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              topic: { type: string }
+              confidence: { type: number }
+        sentiment:
+          type: object
+          nullable: true
+          properties:
+            overall: { type: string, enum: [positive, neutral, negative] }
+            score: { type: number }
+            progression:
+              type: array
+              items: {}
+              description: Sentiment turn by turn.
+        resolved:
+          type: boolean
+          nullable: true
+          description: Whether the user's issue was resolved.
+        key_moments:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              turn: { type: integer }
+              type: { type: string }
+              description: { type: string }
+        custom_evaluations:
+          type: array
+          nullable: true
+          description: One answer per evaluation criterion.
+          items:
+            type: object
+            properties:
+              criterion_id: { type: string }
+              value:
+                description: '`true`/`false`, a number, or a category depending on the criterion type.'
+              reasoning: { type: string }
+        evaluation_score:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 100
+          description: Weighted aggregate of the criteria answers.
+        analyzed_at: { type: string, format: date-time }
+        analysis_model: { type: string, nullable: true }
+        analysis_version: { type: string, nullable: true }
+        cost_tracking:
+          type: object
+          nullable: true
+          description: Token usage of the analysis itself.
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
+            model: { type: string }
+            cost: { type: number }
+        anonymized_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When personal data was anonymized (GDPR retention).
+        retention_policy_id: { type: string, nullable: true }
+
+    ConversationStatus:
+      type: object
+      properties:
+        conversation_id: { type: string }
+        status:
+          type: string
+          enum: [none, pending, processing, analyzed, failed]
+        insight_id:
+          type: string
+          nullable: true
+          description: Set once the conversation is analyzed.
+        score:
+          type: number
+          nullable: true
+          description: Evaluation score (0-100) once analyzed.
+        queued_at: { type: string, format: date-time, nullable: true }
+        analyzed_at: { type: string, format: date-time, nullable: true }
+        error:
+          type: string
+          nullable: true
+          description: Failure reason when `status` is `failed`.
+
+    # ──────────────────────────────────────────────────────────────────
+    # Analysis
+    # ──────────────────────────────────────────────────────────────────
+    AnalyzeInput:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [batch, realtime]
+          default: batch
+        conversation_ids:
+          type: array
+          items: { type: string }
+          description: Conversations to analyze. Required for `realtime`.
+        model:
+          type: string
+          description: LLM used for the analysis. Defaults to the workspace's analysis model.
+        force:
+          type: boolean
+          description: Realtime only - re-analyze conversations that already have an insight.
+
+    AnalyzeQueuedResponse:
+      type: object
+      properties:
+        status: { type: string, enum: [queued] }
+        queue_id: { type: string, example: aq_8f2c1e }
+        mode: { type: string, enum: [batch] }
+        message: { type: string, example: Analysis queued for processing }
+
+    AnalyzeCompletedResponse:
+      type: object
+      properties:
+        status: { type: string, enum: [completed] }
+        analyzed_count:
+          type: integer
+          description: Number of conversations analyzed successfully.
+        mode: { type: string, enum: [realtime] }
+
+    EvaluationCriterion:
+      type: object
+      required: [id, type, question]
+      properties:
+        id:
+          type: string
+          description: |
+            Criterion identifier. The `resolution` boolean criterion drives the
+            insight's `resolved` field.
+        type:
+          type: string
+          enum: [boolean, score, category]
+        question:
+          type: string
+          description: Question the LLM answers for each conversation.
+        weight:
+          type: number
+          description: Weight of the criterion in `evaluation_score`.
+        min:
+          type: number
+          description: Lowest score. Required for `score` criteria.
+        max:
+          type: number
+          description: Highest score, for `score` criteria.
+        options:
+          type: array
+          items: { type: string }
+          description: Allowed answers, for `category` criteria.
+
+    # ──────────────────────────────────────────────────────────────────
+    # Feedback
+    # ──────────────────────────────────────────────────────────────────
+    FeedbackCategory:
+      type: string
+      nullable: true
+      enum:
+        - incorrect_incomplete
+        - not_what_i_asked
+        - slow_buggy
+        - style_tone
+        - safety_legal
+        - other
+      description: Reason for a dislike.
+
+    FeedbackInput:
+      type: object
+      required: [vote, task_id, message_id, context_id, agent_id]
+      properties:
+        vote: { type: string, enum: [like, dislike] }
+        category:
+          allOf:
+            - $ref: '#/components/schemas/FeedbackCategory'
+          description: Dislikes only. Rejected on likes.
+        comment:
+          type: string
+          description: Free-text comment.
+        task_id: { type: string }
+        message_id:
+          type: string
+          description: Agent message the feedback applies to.
+        context_id:
+          type: string
+          description: Conversation the message belongs to.
+        agent_id: { type: string }
+
+    FeedbackAnalytics:
+      type: object
+      properties:
+        distribution:
+          type: object
+          properties:
+            likes: { type: integer }
+            dislikes: { type: integer }
+            total: { type: integer }
+            like_rate:
+              type: number
+              description: Percentage of likes (0-100).
+        categories:
+          type: object
+          description: Number of dislikes per category.
+          properties:
+            incorrect_incomplete: { type: integer }
+            not_what_i_asked: { type: integer }
+            slow_buggy: { type: integer }
+            style_tone: { type: integer }
+            safety_legal: { type: integer }
+            other: { type: integer }
+        feedbacks:
+          type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string }
+                  vote: { type: string, enum: [like, dislike] }
+                  category: { $ref: '#/components/schemas/FeedbackCategory' }
+                  comment: { type: string, nullable: true }
+                  agent_id: { type: string }
+                  context_id: { type: string }
+                  createdAt: { type: string, format: date-time }
+            total: { type: integer }
+            page: { type: integer }
+            limit: { type: integer }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Analytics
+    # ──────────────────────────────────────────────────────────────────
+    AnalyticsSummary:
+      type: object
+      properties:
+        meta:
+          type: object
+          properties:
+            period: { type: string }
+            period_start: { type: string, format: date-time }
+            generated_at: { type: string, format: date-time }
+            cache_ttl:
+              type: integer
+              description: Suggested client cache duration, in seconds.
+        users:
+          type: object
+          properties:
+            active: { type: integer }
+            new: { type: integer }
+            dau:
+              type: integer
+              description: Average daily active users.
+            change_vs_previous:
+              type: number
+              description: Percentage change versus the previous period.
+        interactions:
+          type: object
+          properties:
+            total:
+              type: integer
+              description: Messages over the period.
+            conversations: { type: integer }
+            per_day: { type: integer }
+            per_user: { type: number }
+            change_vs_previous: { type: number }
+        agents:
+          type: object
+          properties:
+            top:
+              type: array
+              items:
+                type: object
+                properties:
+                  agent_id: { type: string }
+                  count: { type: integer }
+        quality:
+          type: object
+          properties:
+            avg_rating: { type: number }
+            total_ratings: { type: integer }
+        cost:
+          type: object
+          properties:
+            total: { type: number }
+            total_tokens: { type: integer }
+            carbon_kgco2: { type: number }
+            change_vs_previous: { type: number }
+
+    AgentAnalytics:
+      type: object
+      properties:
+        agent_id: { type: string }
+        conversation_count:
+          type: integer
+          description: Analyzed conversations.
+        avg_evaluation_score: { type: number }
+        resolution_rate:
+          type: number
+          description: Percentage of resolved conversations (0-100).
+        sentiment_distribution:
+          type: object
+          properties:
+            positive: { type: integer }
+            neutral: { type: integer }
+            negative: { type: integer }
+        token_usage:
+          type: object
+          description: Tokens consumed by the analyses.
+          properties:
+            input: { type: integer }
+            output: { type: integer }
+
+    AdoptionTier:
+      type: object
+      properties:
+        count: { type: integer }
+        percentage: { type: number }
+        description: { type: string }
+
+    AdoptionAnalytics:
+      type: object
+      properties:
+        adoption:
+          type: object
+          properties:
+            total_users:
+              type: integer
+              description: Peak daily unique users over the period.
+            tiers:
+              type: object
+              properties:
+                power_users: { $ref: '#/components/schemas/AdoptionTier' }
+                regular_users: { $ref: '#/components/schemas/AdoptionTier' }
+                basic_users: { $ref: '#/components/schemas/AdoptionTier' }
+        personalization:
+          type: object
+          properties:
+            total_instructions: { type: integer }
+            total_preferences: { type: integer }
+            avg_per_user: { type: number }
+        common_patterns:
+          type: array
+          description: Top memory topics containing instructions.
+          items:
+            type: object
+            properties:
+              pattern: { type: string }
+              instruction_count: { type: integer }
+        recommendations:
+          type: array
+          items:
+            type: object
+            properties:
+              target: { type: string }
+              action: { type: string }
+        metadata:
+          type: object
+          properties:
+            orgSlug: { type: string }
+            period: { type: string, nullable: true }
+            generated_at: { type: string, format: date-time }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Memories
+    # ──────────────────────────────────────────────────────────────────
+    MemoryType:
+      type: string
+      enum: [fact, preference, relationship, instruction]
+
+    MemoryCounts:
+      type: object
+      properties:
+        total: { type: integer }
+        fact: { type: integer }
+        preference: { type: integer }
+        relationship: { type: integer }
+        instruction: { type: integer }
+        unique_users: { type: integer }
+
+    MemoriesAnalytics:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            total_memories: { type: integer }
+            avg_daily: { type: number }
+            change_vs_previous:
+              type: number
+              description: Percentage change versus the previous period.
+        type_breakdown:
+          type: object
+          description: Count and percentage per memory type.
+          additionalProperties:
+            type: object
+            properties:
+              count: { type: integer }
+              pct: { type: number }
+        daily_series:
+          type: array
+          items:
+            allOf:
+              - type: object
+                properties:
+                  date: { type: string }
+              - $ref: '#/components/schemas/MemoryCounts'
+        metadata:
+          type: object
+          properties:
+            orgSlug: { type: string }
+            agent_id: { type: string, nullable: true }
+            period: { type: string, nullable: true }
+            start_date: { type: string }
+            end_date: { type: string }
+            generated_at: { type: string, format: date-time }
+
+    MemoryTrends:
+      type: object
+      properties:
+        trends:
+          type: array
+          items:
+            allOf:
+              - type: object
+                properties:
+                  timestamp: { type: string }
+                  filtered_value:
+                    type: integer
+                    description: Count for the requested `type`, when set.
+              - $ref: '#/components/schemas/MemoryCounts'
+        statistics:
+          type: object
+          properties:
+            min: { type: integer }
+            max: { type: integer }
+            avg: { type: number }
+            total: { type: integer }
+            direction: { type: string, enum: [up, down, stable] }
+            change_pct:
+              type: number
+              description: Change between the first and last points, in percent.
+        metadata:
+          type: object
+          properties:
+            orgSlug: { type: string }
+            granularity: { type: string }
+            period: { type: string, nullable: true }
+            type_filter: { type: string, nullable: true }
+            start_time: { type: string }
+            end_time: { type: string }
+            generated_at: { type: string, format: date-time }
+
+    MemoryTopic:
+      type: object
+      properties:
+        id: { type: string }
+        label: { type: string }
+        keywords: { type: array, items: { type: string } }
+        memory_count: { type: integer }
+        user_count: { type: integer }
+        agent_count: { type: integer }
+        type_breakdown:
+          type: object
+          description: Number of memories per type in the topic.
+          additionalProperties: { type: integer }
+        trend: { type: string, enum: [up, down, stable] }
+        trend_pct: { type: number }
+        examples: { type: array, items: { type: string } }
+        last_updated: { type: string, format: date-time }
+
+    TrainingGaps:
+      type: object
+      properties:
+        gaps:
+          type: array
+          items:
+            type: object
+            properties:
+              topic: { type: string }
+              keywords: { type: array, items: { type: string } }
+              occurrence_count: { type: integer }
+              user_count: { type: integer }
+              fact_percentage: { type: number }
+              severity: { type: string, enum: [high, medium, low] }
+              trend: { type: string, enum: [up, down, stable] }
+              trend_pct: { type: number }
+              examples: { type: array, items: { type: string } }
+              suggested_action: { type: string }
+        summary:
+          type: object
+          properties:
+            total_gaps: { type: integer }
+            high_priority: { type: integer }
+            medium_priority: { type: integer }
+            low_priority: { type: integer }
+            estimated_affected_users:
+              type: integer
+              description: Sum of the gaps' user counts (a user may be counted in several gaps).
+        recommendations:
+          type: array
+          items:
+            type: object
+            properties:
+              priority: { type: string }
+              action: { type: string }
+        metadata:
+          type: object
+          properties:
+            orgSlug: { type: string }
+            min_occurrences: { type: integer }
+            generated_at: { type: string, format: date-time }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Graph
+    # ──────────────────────────────────────────────────────────────────
+    GraphNode:
+      type: object
+      properties:
+        id:
+          type: string
+          description: '`org_{orgSlug}`, `agent_{id}`, `tool_{name}`, or `category_{name}`.'
+        type: { type: string, enum: [organization, agent, tool, category] }
+        orgSlug: { type: string }
+        name: { type: string }
+        agent_id: { type: string, description: Agent nodes. }
+        description: { type: string, description: Agent nodes. }
+        category: { type: string, description: Agent nodes. }
+        tools: { type: array, items: { type: string }, description: Agent nodes. }
+        tags: { type: array, items: { type: string }, description: Agent nodes. }
+        tools_count: { type: integer, description: Agent nodes. }
+        conversations_count: { type: integer, description: Agent nodes. }
+        avg_score: { type: number, description: Agent nodes. }
+        resolved_count: { type: integer, description: Agent nodes. }
+        tool_type: { type: string, description: Tool nodes. }
+        usage_count: { type: integer, description: Tool nodes - number of agents using it. }
+        agent_count: { type: integer, description: Organization and category nodes. }
+        computed_at: { type: string, format: date-time }
+
+    GraphEdge:
+      type: object
+      properties:
+        id: { type: string }
+        orgSlug: { type: string }
+        source: { type: string }
+        target: { type: string }
+        type: { type: string, enum: [belongs_to, uses, similar] }
+        score:
+          type: number
+          description: Similarity score (0-1), `similar` edges only.
+        shared_tools: { type: array, items: { type: string } }
+        shared_tags: { type: array, items: { type: string } }
+        similarity_breakdown:
+          type: object
+          properties:
+            tools_jaccard: { type: number }
+            tags_overlap: { type: number }
+        computed_at: { type: string, format: date-time }
+
+    AgentGraph:
+      type: object
+      properties:
+        graph:
+          type: object
+          properties:
+            nodes:
+              type: array
+              items: { $ref: '#/components/schemas/GraphNode' }
+            edges:
+              type: array
+              items: { $ref: '#/components/schemas/GraphEdge' }
+        stats:
+          type: object
+          properties:
+            total_nodes: { type: integer }
+            total_edges: { type: integer }
+            agent_count: { type: integer }
+            tool_count: { type: integer }
+            category_count: { type: integer }
+            similarity_connections: { type: integer }
+            cached: { type: boolean }
+            cache_age_seconds:
+              type: integer
+              description: Only on cached responses.
+        metadata:
+          type: object
+          properties:
+            orgSlug: { type: string }
+            generated_at: { type: string, format: date-time }
+            options:
+              type: object
+              description: Options applied. Absent on cached responses.
+              properties:
+                include_tools: { type: boolean }
+                include_categories: { type: boolean }
+                similarity_threshold: { type: number }
+
+    ClusterAgent:
+      type: object
+      properties:
+        agent_id: { type: string }
+        name: { type: string }
+        category: { type: string, nullable: true }
+        tools_count: { type: integer }
+        conversations_count: { type: integer }
+        avg_score: { type: number }
+
+    AgentClusters:
+      type: object
+      properties:
+        clusters:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              label:
+                type: string
+                description: Categories of the cluster's agents joined with " & ", or "Cluster N".
+              agents:
+                type: array
+                items: { $ref: '#/components/schemas/ClusterAgent' }
+              tools: { type: array, items: { type: string } }
+              categories: { type: array, items: { type: string } }
+              avg_score: { type: number }
+              total_conversations: { type: integer }
+              internal_similarity:
+                type: number
+                description: Average score of the similarity edges inside the cluster.
+              internal_edges: { type: integer }
+        isolated_agents:
+          type: array
+          items: { $ref: '#/components/schemas/ClusterAgent' }
+        stats:
+          type: object
+          properties:
+            total_clusters: { type: integer }
+            total_clustered_agents: { type: integer }
+            total_isolated_agents: { type: integer }
+            total_agents: { type: integer }
+        metadata:
+          type: object
+          properties:
+            orgSlug: { type: string }
+            similarity_threshold: { type: number }
+            min_cluster_size: { type: integer }
+            generated_at: { type: string, format: date-time }
+
+    SimilarAgent:
+      type: object
+      properties:
+        agent_id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        category: { type: string, nullable: true }
+        tools_count: { type: integer }
+        similarity_score: { type: number, minimum: 0, maximum: 1 }
+        shared_tools: { type: array, items: { type: string } }
+        shared_tags: { type: array, items: { type: string } }
+        breakdown:
+          type: object
+          properties:
+            tools_jaccard: { type: number }
+            tags_overlap: { type: number }
