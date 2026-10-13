@@ -285,14 +285,14 @@ Permissions follow a hierarchical `product:resource:action` pattern with wildcar
 | LLM | `llm` | `llm:completions:use`, `llm:embeddings:use`, `llm:governance:manage` |
 | LLM Gateway | `llm-gateway` | `llm-gateway:models:read`, `llm-gateway:models:chat-completions`, `llm-gateway:models:audio-transcriptions` |
 | Tools | `tools` | `tools:web_search`, `tools:knowledge_search`, `tools:code_execution`, `tools:api_call` |
-| Agents | `agent-factory` | `agent-factory:agents:read`, `agent-factory:agents:write`, `agent-factory:agents:delete`, `agent-factory:agents:publish`, `agent-factory:agents:share`, `agent-factory:agents:explore`, `agent-factory:traces:read`, `agent-factory:sharing:cross-org` |
-| Storage / Knowledge | `storage` | `storage:vector_stores:read/write/share/delete`, `storage:files:read/write/delete`, `storage:skills:read/write/delete` |
+| Agents | `agent-factory` | `agent-factory:agents:read`, `agent-factory:agents:write`, `agent-factory:agents:delete`, `agent-factory:agents:publish`, `agent-factory:agents:share`, `agent-factory:agents:explore`, `agent-factory:traces:read`, `agent-factory:sharing:cross-org`, `agent-factory:apikeys:read/create/delete` |
+| Storage / Knowledge | `storage` | `storage:vector_stores:read/write/share/delete`, `storage:files:read/write/delete`, `storage:skills:read/write/delete`, `storage:apikeys:read/create/delete` |
 | Chat | `secure-chat` | `secure-chat:*` |
 | Builder | `builder` | `builder:*` |
 | Governe | `ai-governance-v2` | `ai-governance-v2:observability:read`, `ai-governance-v2:observability_platform:read`, `ai-governance-v2:announcements:write` |
 | Insights | `insights` | `insights:*` |
 | Engage | `engage` | `engage:*` |
-| Collections | `collections` | `collections:*` |
+| AI Collection | `ai-collection-v3` | `ai-collection-v3:collections:read/write/share/delete`, `ai-collection-v3:apikeys:read/create/delete` |
 
 Wildcards are supported at any level: `orgs:members:*` grants all member actions, `storage:*` grants all storage permissions, `*` grants everything.
 
@@ -303,6 +303,25 @@ Wildcards are supported at any level: `orgs:members:*` grants all member actions
 <Note>
   `agent-factory:sharing:cross-org` gates [sharing an agent beyond its own organization](/products/agent-factory/settings#the-cross-org-sharing-permission) — with a specific other organization the sharer belongs to, or with **all authenticated users** ("All"). Same pattern as `traces:read`: its own `sharing` resource, **not** covered by `agent-factory:agents:*`, so editing agents never silently implies exposing them outside the organization. Owners hold it through `*`, Admins through `agent-factory:*`; every other role must receive it explicitly in the role editor ("Share Agents Across Organizations").
 </Note>
+
+<Note>
+  The `apikeys` resource of each product (`agent-factory`, `storage`, `ai-collection-v3`) controls the API keys of its agents, knowledge bases or collections, on top of the `share` permission on that resource, **resource owner included**:
+
+  | Action | Permission |
+  |--------|------------|
+  | List the keys | `<product>:apikeys:read` |
+  | Create a key, rotate a key | `<product>:apikeys:create` |
+  | Revoke a key | `<product>:apikeys:delete` |
+
+  Like `traces:read`, `apikeys` is its own resource, **not** covered by `agent-factory:agents:*`: an administrator can let a role share agents without letting it manage keys that bill the organization. Owners hold it through `*`, Admins through their product wildcards, and the **Agent Maker** and **Builder** roles receive `agent-factory:apikeys:*` (they already hold `storage:*`). Keep `delete` wherever keys can be created, so a leaked key can always be revoked.
+</Note>
+
+<Warning>
+**After upgrading, some roles and keys lose access to the API keys of agents, knowledge bases and collections** until an administrator grants the new permissions:
+- custom roles, and system roles your organization has already edited (their saved version replaces the system definition): check the **API Keys** permissions under the product in the role editor;
+- roles declared through `ORG_ADDITIONAL_SYSTEM_ROLES` on self-hosted deployments: add the permissions to the variable (`<product>:apikeys:*` grants them all);
+- [organization API keys](#api-keys) and service accounts whose scopes are limited to resources of the product (for example `agent-factory:agents:*` or `storage:vector_stores:*`), including app instances configured with such a key: they can no longer create, rotate or revoke keys until they get the `<product>:apikeys:*` scope **and** the matching permissions.
+</Warning>
 
 `llm-gateway:models:audio-transcriptions` lets a member use speech-to-text, which powers [chat dictation](/products/ai-securechat/dictation). The system **Member**, **Agent Maker** and **Builder** roles grant it by default; remove it from a role to hide the microphone button for its holders. Which transcription model they can use still follows the organization's [allowed models](/products/ai-governance/model-governance#transcription-model-for-dictation).
 
@@ -349,9 +368,9 @@ Organizations come with system roles that cannot be deleted:
 | Role | Slug | Permissions | Scopes | Description |
 |------|------|------------|--------|-------------|
 | **Owner** | `org:owner` | `*` | `*` | Full organization management. Cannot be overridden. |
-| **Admin** | `org:admin` | `orgs:roles:read`, `orgs:members:manage`, `orgs:groups:manage`, `orgs:branding:manage`, `orgs:navigation:manage`, `orgs:invites:manage`, `orgs:join-rules:manage`, `orgs:apikeys:manage`, `users:manage`, `secure-chat:*`, `agent-factory:*`, `builder:*`, `engage:*`, `storage:*`, `collections:*`, `insights:*`, `ai-governance-v2:*` | `*` | Organization administration |
+| **Admin** | `org:admin` | `orgs:roles:read`, `orgs:members:manage`, `orgs:groups:manage`, `orgs:branding:manage`, `orgs:navigation:manage`, `orgs:invites:manage`, `orgs:join-rules:manage`, `orgs:apikeys:manage`, `users:manage`, `secure-chat:*`, `agent-factory:*`, `builder:*`, `engage:*`, `storage:*`, `ai-collection-v3:*`, `insights:*`, `ai-governance-v2:*` | `*` | Organization administration |
 | **Member** | `org:member` | `orgs:roles:read`, `users:read`, `orgs:groups:read`, `orgs:members:read`, `agent-factory:agents:read`, `agent-factory:agents:explore`, `storage:vector_stores:read`, `storage:files:read`, `storage:skills:read`, `secure-chat:*`, `llm-gateway:models:audio-transcriptions` | - | Basic organization member |
-| **Agent Maker** | `agent-maker` | Member base + `agent-factory:*`, `storage:*`, `knowledge:*` | `*` | Full agent-factory & knowledge access |
+| **Agent Maker** | `agent-maker` | Member base + `agent-factory:agents:*`, `agent-factory:apikeys:*`, `storage:*` | `*` | Full agent-factory & knowledge access |
 | **Builder** | `builder` | Agent Maker + `builder:*` | `*` | Builder + agent-factory + knowledge access |
 | **Agent Standard** | `agent-standard` | `llm:*`, `tools:*` | - | Default agent role (for service accounts) |
 
