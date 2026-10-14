@@ -212,7 +212,7 @@ https://graph.microsoft.com/User.Read
     Whichever option you pick, wiring the capability is not enough: the agent must know the MCP exists and when to use it. Copy-pasteable starter:
 
     ```text
-    You have access to the SharePoint MCP server (tools: sites, drives, items, search, permissions, lists, directory, workbook, documents). Each tool takes an `action` argument. Use it whenever the user asks about SharePoint sites, document libraries, files and folders, SharePoint lists, sharing permissions, or who can access a document. To read a file, list its drive's children, then use the @microsoft.graph.downloadUrl the item exposes (content is not returned inline); for an Excel `.xlsx` file use the `workbook` tool and for a Word `.docx` file use the `documents` tool to read content natively. Prefer calling a tool over guessing, and confirm with the user before any write or destructive action (create, update/move, copy, delete, invite, create link, add/create worksheet or table).
+    You have access to the SharePoint MCP server (tools: sites, drives, items, search, permissions, lists, directory, workbook, documents). Each tool takes an `action` argument. Use it whenever the user asks about SharePoint sites, document libraries, files and folders, SharePoint lists, sharing permissions, or who can access a document. To read a file, pick the tool by format: a Word `.docx` file with the `documents` tool, an Excel `.xlsx` file with the `workbook` tool, a text file (`.txt`, `.csv`, `.md`, `.json`) with `items` `getContent`, and any other file (PDF, PowerPoint, images) with `items` `attachToChat`, which asks the user to attach it to the conversation. Never try to decode file bytes yourself. Prefer calling a tool over guessing, and confirm with the user before any write or destructive action (create, update/move, copy, delete, invite, create link, add/create worksheet or table).
     ```
 
     <Note>
@@ -220,7 +220,7 @@ https://graph.microsoft.com/User.Read
     </Note>
 
     <Note>
-      **Restricting to read-only (least privilege).** SharePoint tools cover both reads and writes (upload, create, move). The connector already requests **read-only** Graph scopes by default (`Sites.Read.All`, `Files.Read.All`); writes are only possible if you widen the **Scopes** field in the configuration app to `Sites.ReadWrite.All` / `Files.ReadWrite.All`. To keep the connector read-only, simply leave the default read scopes:
+      **Restricting to read-only (least privilege).** SharePoint tools cover both reads and writes (create folders, rename, move, copy, delete, share, edit list items and Excel cells; the connector never uploads file content). The default scopes depend on the OAuth client: with your own Microsoft Entra app, the connector requests **read-only** scopes (`Sites.Read.All`, `Files.Read.All`) unless you widen the **Scopes** field; with the platform's central client, it requests `Sites.ReadWrite.All` and `Files.ReadWrite.All`. To keep the connector read-only, set the read scopes (the **Read-only preset** of the configuration app):
 
       ```text
       offline_access https://graph.microsoft.com/Sites.Read.All https://graph.microsoft.com/Files.Read.All https://graph.microsoft.com/User.Read
@@ -237,7 +237,7 @@ https://graph.microsoft.com/User.Read
     |------|-------------|
     | `sites` | SharePoint sites discovery. Actions: `search`, `get`, `getRoot`, `listSubsites`. |
     | `drives` | Document libraries (drives) of sites and OneDrive. Actions: `listForSite`, `getSiteDefault`, `get`, `getMine`, `listMine`. |
-    | `items` | Files & folders (driveItems). `get` / `listChildren` return a `@microsoft.graph.downloadUrl` (~1h pre-signed); content is not inline. Actions: `listChildren`, `listRootChildren`, `get`, `createFolder`, `update`, `delete`, `copy`, `thumbnails`, `versions`. |
+    | `items` | Files & folders (driveItems): browse, read text files, offer any other file for attachment to the conversation. Actions: `listMyRootChildren`, `listMyChildrenByPath`, `listChildren`, `listRootChildren`, `changes`, `get`, `getContent`, `attachToChat`, `createFolder`, `update`, `delete`, `copy`, `thumbnails`, `versions`. |
     | `search` | Microsoft Search across SharePoint / OneDrive. Action: `query`. |
     | `permissions` | Sharing & permissions on driveItems (access-aware RAG). Actions: `list`, `get`, `invite`, `createLink`, `delete`. |
     | `lists` | SharePoint lists and list items. Actions: `listForSite`, `get`, `listItems`, `getItem`, `createItem`, `updateItemFields`, `deleteItem`. |
@@ -310,16 +310,33 @@ https://graph.microsoft.com/User.Read
 
     | Parameter | Required | Description |
     |-----------|----------|-------------|
-    | `action` | Yes | One of `listChildren`, `listRootChildren`, `get`, `createFolder`, `update`, `delete`, `copy`, `thumbnails`, `versions`. |
-    | `driveId` | Yes | Drive id (required for all item actions). |
-    | `itemId` | For get/update/delete/copy/thumbnails/versions/listChildren | DriveItem id. |
+    | `action` | Yes | One of `listMyRootChildren`, `listMyChildrenByPath`, `listChildren`, `listRootChildren`, `changes`, `get`, `getContent`, `attachToChat`, `createFolder`, `update`, `delete`, `copy`, `thumbnails`, `versions`. |
+    | `driveId` | All actions except `listMyRootChildren`, `listMyChildrenByPath`, and `attachToChat` by `path` | Drive id. |
+    | `itemId` | For get/getContent/attachToChat/update/delete/copy/thumbnails/versions/listChildren | DriveItem id. |
+    | `path` | For listMyChildrenByPath; optional for attachToChat | Path in the signed-in user's own OneDrive, without a leading slash (for example `Documents/Reports`). OAuth modes only. |
     | `parentItemId` | For createFolder | Parent folder item id. |
     | `top` / `select` / `orderby` / `expand` / `skiptoken` | No | OData query options and pagination. |
     | `body` | For createFolder/update/copy | JSON body, e.g. `createFolder` → `{ name, folder: {}, "@microsoft.graph.conflictBehavior" }`; `copy` → `{ parentReference, name }`. |
 
     ### items: reading a file's content
 
-    `get` and `listChildren` return each file's `@microsoft.graph.downloadUrl`, a ~1-hour pre-signed link. Fetch that URL out-of-band to read the bytes; the MCP response never embeds file content inline.
+    Pick the reading path by file format:
+
+    | Format | Tool and action | What the agent receives |
+    |---|---|---|
+    | Word `.docx` | `documents` `getText` (or `getStructure`) | The full plain text, capped at about 200 KB |
+    | Excel `.xlsx` | `workbook` (`listWorksheets`, then `usedRange` or `getRange`) | Cell values as structured data |
+    | Text (`.txt`, `.csv`, `.md`, `.json`, `.html`, `.xml`…) | `items` `getContent` | The decoded text, capped at about 200 KB |
+    | PDF, PowerPoint, images, other binaries | `items` `attachToChat` | An attachment offer that the user approves in the chat |
+
+    `getContent` decides from the file's metadata before downloading anything: a text file comes back as text, and any other file comes back as the same attachment offer as `attachToChat`, never as raw bytes.
+
+    `attachToChat` never downloads the file. It returns a standard MCP `resource_link` whose `uri` is the file's SharePoint web link. Agent Creator then asks the user to approve the attachment; once approved, the file is fetched server-side from its pre-signed download link and indexed in the conversation, exactly like a file the user dropped in the chat. The agent then searches it like any conversation document. Size limits:
+
+    - PDF, PowerPoint and other documents: up to the chat upload limit (`attachment_direct_max_bytes`, 100 MB by default).
+    - Images: 4 MB by default (`attachment_fetch_max_bytes`), because an image is copied into the conversation before the model reads it.
+
+    Above the limit, the attachment is refused and the agent should share the file's SharePoint link (`webUrl`, from `items` `get`) instead. A folder cannot be attached.
 
     ### lists
 
@@ -733,13 +750,13 @@ The answers that hold for every connector (agent access, shared knowledge bases,
 | Authentication family | Delegated OAuth (Microsoft Entra, authorization code with PKCE): each user connects their own Microsoft 365 account. An app-only mode (`clientCredentials`) also exists. |
 | Production modes | `oauthCentral` or `oauth` |
 | Modes to avoid in production | `accessToken` (testing only, and a Graph access token expires after about an hour). `clientCredentials` acts as the application, not as the user: avoid it when per-user permissions are required. |
-| Read-only scopes | `offline_access`, `User.Read`, `Sites.Read.All`, `Files.Read.All` (the **Read-only preset** of the configuration app). The default scopes include `Sites.ReadWrite.All` and `Files.ReadWrite.All`. |
+| Read-only scopes | `offline_access`, `User.Read`, `Sites.Read.All`, `Files.Read.All` (the **Read-only preset** of the configuration app). These are the default with your own Microsoft Entra app; the platform's central client requests `Sites.ReadWrite.All` and `Files.ReadWrite.All` by default. |
 | Agent allowlist | Yes, on the tenant endpoint (empty at installation). The global endpoint accepts every agent. |
 | Per-reader access control on knowledge bases | Yes: each file is checked against the reader's own Microsoft 365 connection, even when the base is synchronized in `clientCredentials` mode. |
-| Outbound hosts | `graph.microsoft.com`, `login.microsoftonline.com` {/* REVIEW: attachDriveItemToChat hands the pre-signed `@microsoft.graph.downloadUrl` (a SharePoint host) to the chat; confirm whether the platform fetches it server-side, which would add the tenant's SharePoint host to egress */} |
+| Outbound hosts | `graph.microsoft.com`, `login.microsoftonline.com`, and your tenant's SharePoint hosts (for example `contoso.sharepoint.com`, and `contoso-my.sharepoint.com` for OneDrive files): when a user approves an attachment, the platform fetches the file server-side from its pre-signed download link. |
 | Audit events | None specific to this connector |
 
-With the read-only scopes, Microsoft refuses every upload, copy, delete, sharing link and list item change. `Sites.Read.All` and `Files.Read.All` still reach every site and file the user can open: the configuration app offers no scope that limits the connector to chosen sites. In `clientCredentials` mode, the application permissions apply to every site of the tenant, whoever calls the agent.
+With the read-only scopes, Microsoft refuses every folder creation, rename, move, copy, delete, sharing link, list item change and Excel cell write. `Sites.Read.All` and `Files.Read.All` still reach every site and file the user can open: the configuration app offers no scope that limits the connector to chosen sites. In `clientCredentials` mode, the application permissions apply to every site of the tenant, whoever calls the agent.
 
 ---
 
