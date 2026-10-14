@@ -1,0 +1,117 @@
+---
+title: 'Read and produce Office files with an agent'
+description: 'Agent builder: set up one agent that reads Word, Excel, text, PDF, PowerPoint and image files from SharePoint or OneDrive, and drafts documents and presentations in the canvas.'
+---
+
+Use this procedure to give one agent access to the Office files of your SharePoint sites and OneDrive, whatever their format. When it succeeds, the agent answers questions about a Word, Excel, PDF or PowerPoint file, edits Excel workbooks in place, and drafts new documents and presentations in the canvas, ready to export.
+
+## How the agent handles each format
+
+The agent reads every format through the [SharePoint connector](/apps-store/marketplace/connectors/sharepoint), but not the same way:
+
+| Format | How the agent reads it | How the agent produces or changes it |
+|---|---|---|
+| Word `.docx` | Full text, read directly | Drafts the document in the canvas; the user exports it as DOCX or PDF |
+| Excel `.xlsx` | Cell values, read directly | **Edits the workbook in place** (cells, table rows, sheets), after the user confirms |
+| Text (`.txt`, `.csv`, `.md`, `.json`) | Full text, read directly | Drafts the content in the canvas |
+| PDF | Attached to the conversation, once the user approves | Drafts the document in the canvas; the user exports it as PDF |
+| PowerPoint `.pptx` | Attached to the conversation, once the user approves | With [Deck Designer](/products/agent-factory/slides): builds the deck in the canvas; the user exports it as PPTX or PDF |
+| Images | Attached to the conversation, once the user approves, and passed to the model as an image | — |
+
+**Attaching a file** works like a file the user drops in the chat: the agent offers the file, the user clicks **Approve**, and the platform fetches it from SharePoint server-side and indexes it in the conversation. The agent then searches it for the passages it needs. PDF and PowerPoint files are accepted up to 100 MB, images up to 4 MB.
+
+**Producing a file** goes through the [canvas](/products/ai-securechat/canvas): the agent drafts the document (or, with [Deck Designer](/products/agent-factory/slides), the deck), the user reviews it, exports it, and saves it to SharePoint. The connector does not upload file content, so only Excel workbooks are changed in place. Changing an existing Word document means reading it, then drafting the full new version in the canvas: the original styles and images are not carried over.
+
+## Before you begin
+
+- **Who:** an agent builder with access to Agent Creator, and a workspace builder (or workspace owner) of the workspace that runs the SharePoint connector.
+- **Where:** Agent Creator, and the SharePoint connector's configuration app.
+- **Requires:** the SharePoint connector installed and configured in a workspace, with an authentication mode and Graph scopes chosen (see [SharePoint: Workspace builder](/apps-store/marketplace/connectors/sharepoint)). For Excel edits, the scopes must include `Sites.ReadWrite.All` and `Files.ReadWrite.All`.
+- **Impact:** with the per-user OAuth modes, each user only reaches the files they can already open in SharePoint. With `clientCredentials`, the agent reaches every site the application is allowed to read, whoever talks to it.
+
+## Set up the agent
+
+<Steps>
+  <Step title="Create the agent">
+    In **Agent Creator**, create an agent with the **agent_light** profile or higher: **Simple** makes no tool calls, and **Workflow** is capped at 10 tool calls. Pick a model that handles tool calls well and is allowed in your organization.
+  </Step>
+  <Step title="Add the SharePoint capability">
+    Open **Capabilities** and add **Sharepoint Next** from the catalog, or point a capability at your SharePoint workspace's MCP endpoint with the scope `context_id,agent_id,user_id` (see [SharePoint: Agent builder](/apps-store/marketplace/connectors/sharepoint)).
+  </Step>
+  <Step title="Turn on the canvas">
+    In the agent settings, make sure **Canvas enabled** is on. Without it, the agent cannot draft documents or decks for export.
+  </Step>
+  <Step title="Raise the token budget">
+    In **Settings → General → Advanced**, set **Message Token Budget** to 200,000: the SharePoint tools return large results, and a find → read → draft sequence can exceed the `agent_light` default (100,000). Leave **Max Turns** at its default.
+
+    The tool call budget (15 on `agent_light`) is not editable in Agent Creator. If a request needs more calls, set `tool_call_budget` on the agent through the [Agent Creator API](/agent-factory/agents/update-an-agent-partial-update), or use the **agent_full** profile.
+  </Step>
+  <Step title="Brief the agent">
+    Add these instructions to the agent's [instructions](/products/agent-factory/instructions), and adapt them to your sites:
+
+    ```text
+    You help the user find, read and produce Office documents stored in SharePoint and OneDrive, through the SharePoint tools (search, sites, drives, items, documents, workbook), each driven by its `action` argument.
+
+    To find a file, use `search` (action `query`), or browse with `sites`, `drives` and `items`. Keep the file's `driveId` and `itemId`, and quote its web link in your answer.
+
+    To read a file, pick the tool by format:
+    - Word .docx: `documents` (action `getText`).
+    - Excel .xlsx: `workbook` (action `listWorksheets`, then `usedRange` or `getRange`).
+    - Text (.txt, .csv, .md, .json): `items` (action `getContent`).
+    - PDF, PowerPoint and images: `items` (action `attachToChat`). Tell the user they will be asked to approve the attachment; once approved, read the file from the conversation documents.
+    Never try to decode file bytes yourself. If an attachment is refused as too large, share the file's web link.
+
+    You cannot write a Word, PowerPoint, PDF or text file to SharePoint. To create or change one, draft it in the canvas and tell the user to export it and save it to SharePoint. To change an existing document, read it first, then draft the full new version.
+
+    You can edit Excel workbooks in place with `workbook` (`updateRange`, `addTableRow`, `addWorksheet`, `createTable`). Before writing, state the sheet, range and values, and wait for the user's confirmation. Ask for confirmation before any rename, move, delete or sharing change too.
+    ```
+
+    To build PowerPoint decks, also add [Deck Designer](/products/agent-factory/slides) and the Slides MCP server: the default canvas has no slide format, so without them the agent can only draft text documents. Deck Designer must first be published in your organization's catalog.
+  </Step>
+  <Step title="Allowlist the agent in the connector">
+    If the capability points at the SharePoint endpoint of your own workspace, open **Authorized agents** in the connector's configuration app, tick your agent (or turn on **Allow all agents**), and save. Until you do, that endpoint refuses the agent. A capability published from the connector's own core workspace accepts every agent.
+  </Step>
+  <Step title="Publish the agent">
+    Publish the agent so that users can open it in the chat.
+  </Step>
+</Steps>
+
+## Verify the result
+
+Open the agent in the chat, with a Microsoft account that can open a few test files:
+
+1. Ask *"Find a PDF, a PowerPoint, a Word file and an Excel workbook in SharePoint."* With a per-user OAuth mode, the first request shows a **Connect** button: sign in, and the request resumes on its own. Confirm that the agent lists files with their location.
+2. Ask the agent to summarize a Word file, then an Excel workbook. Confirm that both answers reflect the files' content.
+3. Ask it to summarize a PDF. Confirm that an attachment approval appears, and that after **Approve** the summary reflects the document's content.
+4. Ask for a one-page summary of the Word file. Confirm that it opens in the canvas and can be exported.
+5. If you added Deck Designer, ask for a three-slide presentation based on the Word file. Confirm that the deck opens in the canvas with **PPTX** and **PDF** export options.
+
+## Troubleshooting
+
+### The agent answers that the file exceeds the attachment limit
+
+**Cause:** the file is larger than the attachment limit: 100 MB for documents (`attachment_direct_max_bytes`), 4 MB for images (`attachment_fetch_max_bytes`).
+
+**Owner:** platform administrator, for the limits.
+
+**Resolution:** share the file's SharePoint link, or use a smaller version of the file. The limits are platform defaults of the Agent Creator workspace.
+
+### `This agent is not authorized to use this connector`
+
+**Cause:** the capability points at a workspace's own SharePoint endpoint, and the agent is not ticked in that connector's **Authorized agents** list.
+
+**Owner:** the workspace builder of the SharePoint connector.
+
+**Resolution:** open the configuration app → **Authorized agents**, tick the agent, save, and ask the question again.
+
+### The agent returns unreadable content for a PDF or PowerPoint file
+
+**Cause:** the agent's instructions do not route these formats to `attachToChat`, or the platform version predates attachment offers from `getContent`.
+
+**Owner:** the agent builder.
+
+**Resolution:** add the format rules of the briefing above to the agent's instructions, publish the agent, and retry in a new conversation.
+
+## Undo the change
+
+Remove the SharePoint capability from the agent, untick the agent in **Authorized agents**, and publish the agent again. Files attached in past conversations stay in those conversations until their [document retention](/products/agent-factory/settings) expires.
