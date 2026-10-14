@@ -319,6 +319,37 @@ https://API_URL/v2/login/saml/<ProviderName>/metadata
 
 Give this URL, or the XML it returns, to your IdP administrator instead of entering each value by hand. The endpoint is public: it only contains what the IdP needs to know about Prisme.ai, and tells whether a SAML provider slug exists. It is rate-limited per source IP (`RATE_LIMIT_SAML_METADATA`, default **30/min**).
 
+### Request binding
+
+The binding is how the browser carries the authentication request (AuthnRequest) to the IdP. It is set with `authnRequestBinding`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `HTTP-POST` (default) | Prisme.ai returns a page that submits the request to the IdP in a form (`SAMLRequest` in the request body). |
+| `HTTP-Redirect` | Prisme.ai redirects the browser to the IdP with the request in the URL (`?SAMLRequest=…`). |
+
+```yaml
+providers:
+  <ProviderName>:
+    type: saml
+    config:
+      idp_metadata_filepath: "/path/towards/idp-saml-metadata.xml"
+      issuer: "https://API_URL/saml/<ProviderName>"
+      authnRequestBinding: HTTP-Redirect
+```
+
+When the configuration includes the IdP metadata, the IdP SSO URL (`entryPoint`) is the `SingleSignOnService` declared for the chosen binding. An `entryPoint` set explicitly takes precedence.
+
+Switch to `HTTP-Redirect` when the IdP only accepts it, or when something between the browser and the IdP (reverse proxy, WAF, load balancer) answers the POST with a redirect: the browser then follows it with a `GET` without body and the request is lost. A typical symptom is the IdP answering `400` with a message such as *"Request contains insufficient information to determine the protocol binding"*, while the browser shows a `GET` to the IdP SSO URL without `SAMLRequest`.
+
+`HTTP-Redirect` requires the request to be compressed (DEFLATE), so `skipRequestCompression` only applies to `HTTP-POST`: redirected requests are always compressed, whatever its value. With `HTTP-POST`, set `skipRequestCompression: true` if your IdP rejects compressed requests (the SAML standard sends them uncompressed with this binding).
+
+With signing enabled, `HTTP-POST` requests embed an XML signature, while `HTTP-Redirect` requests carry it in the URL (`SigAlg` and `Signature` parameters). The same key and `signatureAlgorithm` are used.
+
+At startup, the api-gateway logs for each SAML provider the IdP SSO URL, the binding, and whether requests are compressed and signed.
+
+From the organization SSO page, the binding is the **Request Binding** field of the SAML provider (see [Request binding](/products/ai-governance/identity-access#request-binding)).
+
 ### Signing authentication requests
 
 Some identity providers require the authentication requests (AuthnRequests) sent by Prisme.ai to be signed: their metadata then contains `WantAuthnRequestsSigned="true"`. Prisme.ai signs them with an RSA key, and the IdP checks the signature with the matching certificate.
@@ -366,7 +397,7 @@ This is independent of `WantAssertionsSigned`, which concerns the assertions the
 | `signAuthnRequests` | Sign AuthnRequests. Requests are signed **only** when it is `true`. From the organization SSO page, enabling it without a key generates a key pair on save; disabling it stops signing but keeps the key. |
 | `privateKey` | PEM RSA private key used to sign. **Write-only**: the API never returns it. Omit it on update to keep the stored key, send `null` to remove it. |
 | `publicCert` | PEM X.509 certificate matching `privateKey`, to register on the IdP. Required with a key you provide. |
-| `signatureAlgorithm` | `sha256` (default) or `sha512`. `sha1` is rejected. |
+| `signatureAlgorithm` | `sha256` (default) or `sha512`, used for both the signature and its digest. `sha1` is rejected. |
 
 <Note>
   The private key is part of the SSO configuration, encrypted at rest only when `SECRETS_MASTER_KEYS` is configured (see [Secrets Encryption](/products/ai-governance/identity-access#secrets-encryption)).
