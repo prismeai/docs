@@ -5,18 +5,23 @@ info:
   description: |
     Public REST API for the Prisme.ai AI Insights workspace - analyzed
     conversations, analysis triggering and status, evaluation criteria,
-    message feedback, organization analytics, memory analytics, and the
-    agent relationship graph.
+    message feedback, organization analytics, LLM consumption, memory
+    analytics, and the agent relationship graph.
 
-    All endpoints are scoped to the caller's organization (resolved from
-    the session). Unless stated otherwise, every endpoint requires an
-    authenticated user and an `ai-insights:*` permission, checked against
-    `user.meta.permissions`. A permission is granted by its exact name, by
-    its family wildcard (e.g. `ai-insights:analytics:*`), by
-    `ai-insights:*`, or by `iam:*`. Users with no explicit permissions get
-    the defaults: `ai-insights:conversations:read`,
-    `ai-insights:conversations:analyze`, `ai-insights:analytics:read`,
-    `ai-insights:gdpr:view`, `ai-insights:feedback:write`.
+    **Organization scope.** Every endpoint reads and writes the data of the
+    caller's organization, taken from the session (or from the org API key).
+    No parameter lets a caller target another organization.
+
+    **Permissions.** Each endpoint checks an organization IAM permission
+    `ai-insights-v2:<resource>` with the action `read` or `write`
+    (`manage` grants both). The resources are `conversations`, `feedback`,
+    `analytics`, and `queue`; each operation states the one it requires.
+    Platform admins and workspace admins are always allowed.
+
+    **Rate limits.** Limits are counted per caller (user, or org API key)
+    and per endpoint, over a sliding window. Depending on the endpoint, an
+    exceeded limit returns one of two 429 bodies; both are documented on
+    each operation.
   contact:
     name: Prisme.ai
     url: https://prisme.ai
@@ -29,21 +34,24 @@ servers:
         description: API host (override for self-hosted or sandbox)
 security:
   - BearerAuth: []
+  - OrgApiKeyAuth: []
 tags:
   - name: Insights
     description: Per-conversation analysis results and analysis status.
-  - name: Analysis
-    description: Trigger conversation analysis and manage evaluation criteria per agent.
+  - name: Agents
+    description: Analysis triggering, evaluation criteria, conversations, and users of one agent.
   - name: Feedback
     description: Like / dislike feedback on agent messages.
   - name: Analytics
-    description: Organization-wide usage, quality, cost, adoption, and queue metrics.
+    description: Organization-wide usage, quality, latency, and adoption metrics.
+  - name: Consumption
+    description: LLM requests, tokens, cost, and carbon footprint, per user and over time.
+  - name: Queue
+    description: State of the conversation analysis queue.
   - name: Memories
     description: Analytics built from the memories users accumulate with agents.
   - name: Graph
-    description: Agent relationship graph - tools, categories, similarity, and clusters.
-  - name: Admin
-    description: Platform administration endpoints.
+    description: Agent relationship graph - tools, categories, delegations, similarity, and clusters.
 paths:
   # ──────────────────────────────────────────────────────────────────
   # Insights
@@ -54,38 +62,35 @@ paths:
       operationId: listInsights
       summary: List analyzed conversations
       description: |
-        Returns the insights (analysis results) of the caller's organization,
-        most recent first (`analyzed_at` descending). Requires
-        `ai-insights:conversations:read`.
+        Returns the insights (analysis results) of the organization, most
+        recent first (`analyzed_at` descending). Date filters apply to the
+        analysis date, not to the conversation date.
+
+        Requires `ai-insights-v2:conversations` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - in: query
           name: agent_id
-          schema: { type: string }
+          schema: { type: string, maxLength: 64 }
           description: Only return insights for this agent.
         - in: query
           name: conversation_id
-          schema: { type: string }
-          description: Only return the insight for this conversation.
+          schema: { type: string, maxLength: 128 }
+          description: Only return the insight of this conversation.
         - in: query
           name: user_id
-          schema: { type: string }
-          description: Only return insights for conversations of this user.
+          schema: { type: string, maxLength: 256 }
+          description: Only return insights whose `user_id` matches.
         - in: query
           name: from_date
-          schema: { type: string, format: date-time }
+          schema: { type: string, format: date-time, maxLength: 64 }
           description: Lower bound (inclusive) on `analyzed_at`, ISO 8601.
         - in: query
           name: to_date
-          schema: { type: string, format: date-time }
+          schema: { type: string, format: date-time, maxLength: 64 }
           description: Upper bound (inclusive) on `analyzed_at`, ISO 8601.
-        - in: query
-          name: limit
-          schema: { type: integer, default: 20 }
-          description: Max items to return.
-        - in: query
-          name: offset
-          schema: { type: integer, default: 0 }
-          description: Number of items to skip.
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
       responses:
         '200':
           description: Paginated list of insights.
@@ -97,14 +102,11 @@ paths:
                   insights:
                     type: array
                     items: { $ref: '#/components/schemas/Insight' }
-                  pagination:
-                    type: object
-                    properties:
-                      total: { type: integer }
-                      limit: { type: integer }
-                      offset: { type: integer }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/insights/status:
     get:
@@ -113,16 +115,19 @@ paths:
       summary: Get the analysis status of conversations
       description: |
         Returns the analysis status of each requested conversation, in the
-        order of `conversation_ids`. Conversations that were never queued or
-        analyzed are returned with `status: none`. Requires
-        `ai-insights:conversations:read`.
+        order of `conversation_ids`. A conversation that was never queued or
+        analyzed, or that belongs to another organization, is returned with
+        `status: none` and no other field.
+
+        Requires `ai-insights-v2:conversations` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - in: query
           name: conversation_ids
           required: true
-          schema: { type: string }
+          schema: { type: string, maxLength: 10000 }
           example: conv_123,conv_456
-          description: Comma-separated list of conversation IDs.
+          description: Comma-separated list of conversation IDs, 100 at most. Do not add spaces.
       responses:
         '200':
           description: One status entry per requested conversation.
@@ -135,34 +140,41 @@ paths:
                     type: array
                     items: { $ref: '#/components/schemas/ConversationStatus' }
         '400':
-          description: '`conversation_ids` is missing.'
+          description: |
+            `conversation_ids` is missing (`conversation_ids query parameter is
+            required`) or holds more than 100 IDs (`Too many conversation IDs
+            (max 100)`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Too many conversation IDs (max 100) }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ──────────────────────────────────────────────────────────────────
-  # Analysis
+  # Agents
   # ──────────────────────────────────────────────────────────────────
   /v1/agents/{agent_id}/analyze:
     post:
-      tags: [Analysis]
+      tags: [Agents]
       operationId: analyzeAgentConversations
       summary: Trigger analysis of an agent's conversations
       description: |
         Analyzes conversations of an agent against its evaluation criteria.
 
-        - **`batch`** (default): the request is queued in the analysis queue
-          and each conversation is marked `pending`. Poll
-          [`GET /v1/insights/status`](#tag/insights) to follow progress.
-        - **`realtime`**: each conversation is analyzed synchronously and the
-          response reports how many analyses succeeded. Only used when
-          `conversation_ids` is provided; otherwise the request falls back to
-          batch mode.
+        - **`batch`** (default): the request is queued and each conversation
+          is marked `pending`. Follow progress with
+          `GET /v1/insights/status`.
+        - **`realtime`**: each conversation in `conversation_ids` is analyzed
+          synchronously, and the response reports how many succeeded. Without
+          `conversation_ids`, the request runs in batch mode.
 
-        The caller must own the agent, have the `org_admin` role, or hold
-        `iam:*`. Requires `ai-insights:conversations:analyze`.
+        Returns 404 when Agent Factory cannot return the agent to the caller
+        (unknown agent or no access to it).
+
+        Requires `ai-insights-v2:conversations` (`write`). Rate limit: 10
+        requests per minute.
       parameters:
         - $ref: '#/components/parameters/AgentId'
       requestBody:
@@ -176,7 +188,7 @@ paths:
                 value:
                   conversation_ids: [conv_123, conv_456]
               realtime:
-                summary: Analyze immediately, re-running existing analyses
+                summary: Analyze now, re-running existing analyses
                 value:
                   mode: realtime
                   conversation_ids: [conv_123]
@@ -190,17 +202,20 @@ paths:
                 oneOf:
                   - $ref: '#/components/schemas/AnalyzeQueuedResponse'
                   - $ref: '#/components/schemas/AnalyzeCompletedResponse'
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404':
-          description: Agent not found or not accessible.
+          description: Agent not found, or not accessible to the caller.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+              example: { error: Agent not found or access denied }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/agents/{agent_id}/evaluation-criteria:
     get:
-      tags: [Analysis]
+      tags: [Agents]
       operationId: getEvaluationCriteria
       summary: Get an agent's evaluation criteria
       description: |
@@ -208,8 +223,8 @@ paths:
         agent's custom criteria if they were set, otherwise the default
         criteria (`resolution`, `clarity`, `accuracy`, `sentiment`).
 
-        The caller must own the agent, have the `org_admin` role, or hold
-        `iam:*`.
+        Requires `ai-insights-v2:conversations` (`write`), for reading as
+        well as updating. Rate limit: 50 requests per minute.
       parameters:
         - $ref: '#/components/parameters/AgentId'
       responses:
@@ -227,24 +242,23 @@ paths:
                   is_custom:
                     type: boolean
                     description: '`true` when the criteria come from a saved custom configuration.'
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '404':
-          description: Agent not found.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/AgentNotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
     put:
-      tags: [Analysis]
+      tags: [Agents]
       operationId: updateEvaluationCriteria
       summary: Replace an agent's evaluation criteria
       description: |
         Replaces the full list of evaluation criteria of the agent. The new
         criteria apply to future analyses only. Each criterion needs `id`,
-        `type`, and `question`; `score` criteria also need `min`.
+        `type`, and `question`; a `score` criterion also needs a non-zero
+        `min` (`min: 0` is rejected).
 
-        The caller must own the agent, have the `org_admin` role, or hold
-        `iam:*`, and needs `ai-insights:conversations:write`.
+        Requires `ai-insights-v2:conversations` (`write`). Rate limit: 50
+        requests per minute.
       parameters:
         - $ref: '#/components/parameters/AgentId'
       requestBody:
@@ -288,7 +302,7 @@ paths:
                   criteria:
                     type: array
                     items: { $ref: '#/components/schemas/EvaluationCriterion' }
-                  message: { type: string }
+                  message: { type: string, example: Evaluation criteria updated }
         '400':
           description: One or more criteria are invalid.
           content:
@@ -303,11 +317,241 @@ paths:
                     example: [Score criterion accuracy missing min]
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '404':
-          description: Agent not found.
+        '404': { $ref: '#/components/responses/AgentNotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/agents/{agent_id}/conversations:
+    get:
+      tags: [Agents]
+      operationId: listAgentConversations
+      summary: List an agent's conversations
+      description: |
+        Lists the conversations of an agent across the organization. The
+        request is forwarded to Agent Factory, which checks that the agent
+        belongs to the caller's organization; the response body is Agent
+        Factory's, returned as is.
+
+        Requires `ai-insights-v2:conversations` (`read`). No rate limit.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1 }
+          description: Page number, forwarded to Agent Factory.
+        - in: query
+          name: limit
+          schema: { type: integer }
+          description: Items per page, forwarded to Agent Factory.
+        - in: query
+          name: from_date
+          schema: { type: string, format: date-time, maxLength: 64 }
+          description: Lower bound on the conversation's last message date.
+        - in: query
+          name: to_date
+          schema: { type: string, format: date-time, maxLength: 64 }
+          description: Upper bound on the conversation's last message date.
+      responses:
+        '200':
+          description: Conversations, as returned by Agent Factory.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400': { $ref: '#/components/responses/InvalidArguments' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/AgentFactoryError' }
+
+  /v1/agents/{agent_id}/conversations/{context_id}:
+    get:
+      tags: [Agents]
+      operationId: getAgentConversation
+      summary: Get a conversation transcript
+      description: |
+        Returns the messages of one conversation of the agent. The request is
+        forwarded to Agent Factory; the response body is Agent Factory's,
+        returned as is. Only `GET` is accepted.
+
+        Requires `ai-insights-v2:conversations` (`read`). No rate limit.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - in: path
+          name: context_id
+          required: true
+          schema: { type: string, maxLength: 64 }
+          description: Conversation ID.
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1 }
+          description: Page of messages, forwarded to Agent Factory.
+        - in: query
+          name: limit
+          schema: { type: integer }
+          description: Messages per page, forwarded to Agent Factory.
+      responses:
+        '200':
+          description: Conversation transcript, as returned by Agent Factory.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400': { $ref: '#/components/responses/InvalidArguments' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405':
+          description: Method other than `GET`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+              example: { error: METHOD_NOT_ALLOWED, message: Only GET is supported on the monitoring proxy }
+        '502': { $ref: '#/components/responses/AgentFactoryError' }
+
+  /v1/agents/{agent_id}/users:
+    get:
+      tags: [Agents]
+      operationId: getAgentUsers
+      summary: Get the users of an agent
+      description: |
+        Returns the users who called the agent over the period, with their
+        LLM usage, cost, and carbon footprint. Up to 200 users are returned,
+        with no pagination; `totals` covers the returned users. If the usage
+        source is unavailable, the response is empty rather than an error.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Users of the agent.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent_id: { type: string }
+                  users:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/Contact'
+                        - type: object
+                          properties:
+                            messages:
+                              type: integer
+                              description: LLM completions made through the agent.
+                            tokens_input: { type: integer }
+                            tokens_output: { type: integer }
+                            cost: { type: number }
+                            carbon:
+                              type: number
+                              description: Carbon footprint, kgCO2e.
+                            last_activity: { type: string, format: date-time }
+                  totals:
+                    type: object
+                    properties:
+                      users_count: { type: integer }
+                      cost: { type: number }
+                      tokens:
+                        type: integer
+                        description: Input and output tokens.
+                      carbon: { type: number }
+                  meta: { $ref: '#/components/schemas/PeriodMeta' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/users/{user_id}:
+    get:
+      tags: [Consumption]
+      operationId: getMyUsage
+      summary: Get your own usage
+      description: |
+        Returns the caller's own LLM usage over the period: totals, a
+        breakdown per agent, and a daily series. The response always describes
+        the authenticated user (`meta.scope: self`), whatever `user_id` is
+        passed; requires a user session.
+
+        Rate limit: 100 requests per minute.
+      parameters:
+        - in: path
+          name: user_id
+          required: true
+          schema: { type: string, maxLength: 128, pattern: '^[a-zA-Z0-9_-]+$' }
+          description: ID of the caller.
+        - $ref: '#/components/parameters/Period'
+      responses:
+        '200':
+          description: The caller's usage.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Contact'
+                  - type: object
+                    properties:
+                      totals:
+                        type: object
+                        properties:
+                          messages:
+                            type: integer
+                            description: Messages sent to agents (first LLM turn of each message).
+                          requests:
+                            type: integer
+                            description: All LLM completions.
+                          tokens_input: { type: integer }
+                          tokens_output: { type: integer }
+                          cost: { type: number }
+                          carbon: { type: number, description: kgCO2e. }
+                      by_agent:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            agent_id: { type: string }
+                            agent_name: { type: string, description: Absent when the agent cannot be resolved. }
+                            messages: { type: integer }
+                            tokens_input: { type: integer }
+                            tokens_output: { type: integer }
+                            cost: { type: number }
+                            carbon: { type: number }
+                            last_activity: { type: string, format: date-time }
+                      daily:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            day: { type: string, format: date }
+                            messages: { type: integer }
+                            tokens_input: { type: integer }
+                            tokens_output: { type: integer }
+                            cost: { type: number }
+                            carbon: { type: number }
+                      meta:
+                        type: object
+                        properties:
+                          period: { type: string }
+                          period_start: { type: string, format: date-time }
+                          scope: { type: string, enum: [self] }
+                          generated_at: { type: string, format: date-time }
+                          cache_ttl:
+                            type: integer
+                            description: Suggested client cache duration, in seconds.
+        '400': { $ref: '#/components/responses/InvalidArguments' }
+        '401':
+          description: Missing credentials, or no user session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: UNAUTHORIZED, message: A user session is required }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   # ──────────────────────────────────────────────────────────────────
   # Feedback
@@ -320,8 +564,11 @@ paths:
       description: |
         Records a like or dislike on an agent message. There is one feedback
         per message: submitting again for the same `task_id` + `message_id`
-        replaces the previous vote. A `category` is only accepted on
-        dislikes. Requires `ai-insights:feedback:write`.
+        replaces the previous vote. `category` is only accepted on dislikes;
+        omit it rather than sending `null`.
+
+        Requires `ai-insights-v2:feedback` (`write`). Rate limit: 50
+        requests per minute.
       requestBody:
         required: true
         content:
@@ -347,17 +594,21 @@ paths:
                     type: string
                     description: Feedback ID, `fb_{task_id}_{message_id}`.
                   vote: { type: string, enum: [like, dislike] }
-                  category: { $ref: '#/components/schemas/FeedbackCategory' }
+                  category:
+                    allOf:
+                      - $ref: '#/components/schemas/FeedbackCategory'
+                    nullable: true
                   updated: { type: boolean }
         '400':
           description: |
-            A required field is missing, `vote` is invalid, `category` is
-            set on a like, or `category` is not an allowed value.
+            Invalid body, or `category` sent on a like
+            (`category is only allowed for dislike votes`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ──────────────────────────────────────────────────────────────────
   # Analytics
@@ -368,20 +619,149 @@ paths:
       operationId: getAnalyticsSummary
       summary: Get the organization analytics summary
       description: |
-        Returns the organization's users, interactions, top agents, quality,
+        Returns the organization's users, messages, agents, latency, quality,
         and cost over the period, with the change versus the previous period
-        of the same length. Built from the hourly organization aggregates;
-        platform admins can force a refresh with
-        `POST /v1/admin/refresh-org-analytics`. Requires an authenticated user.
+        of the same length. Preset periods may be served from a snapshot up
+        to 20 minutes old (`meta.cached`).
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
       responses:
         '200':
           description: Analytics summary.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AnalyticsSummary' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/AnalyticsSourceUnavailable' }
+
+  /v1/analytics/activity:
+    get:
+      tags: [Analytics]
+      operationId: getActivity
+      summary: Get activity over time
+      description: |
+        Returns daily messages and conversations, a day-of-week by hour
+        heatmap of messages, and LLM latency percentiles. Days and hours are
+        UTC; today's figures can lag by up to about 70 minutes. Preset
+        periods may serve the heatmap and latency from a snapshot up to
+        20 minutes old.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Activity.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  daily:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date: { type: string, format: date }
+                        messages: { type: integer }
+                        conversations: { type: integer }
+                  heatmap:
+                    type: object
+                    properties:
+                      cells:
+                        type: array
+                        description: Non-empty cells only.
+                        items:
+                          type: object
+                          properties:
+                            day:
+                              type: integer
+                              minimum: 0
+                              maximum: 6
+                              description: Day of week, `0` = Sunday (UTC).
+                            hour: { type: integer, minimum: 0, maximum: 23 }
+                            messages: { type: integer }
+                  latency: { $ref: '#/components/schemas/Latency' }
+                  meta: { $ref: '#/components/schemas/CachedPeriodMeta' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/AnalyticsSourceUnavailable' }
+
+  /v1/analytics/interactions:
+    get:
+      tags: [Analytics]
+      operationId: getInteractions
+      summary: Get interactions over time
+      description: |
+        Returns daily interactions, where one interaction is one unique
+        request chain (correlation ID) per UTC day. `by_workspace` lists the
+        top workspaces when the caller can see platform observability data,
+        and is `null` otherwise.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Interactions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  daily:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date: { type: string, format: date }
+                        interactions: { type: integer }
+                  totals:
+                    type: object
+                    properties:
+                      period:
+                        type: integer
+                        description: Interactions over the whole period.
+                      d7:
+                        type: integer
+                        description: Interactions over the last 7 days of the period.
+                  by_workspace:
+                    type: array
+                    nullable: true
+                    items:
+                      type: object
+                      additionalProperties: true
+                  meta:
+                    type: object
+                    properties:
+                      period: { type: string }
+                      period_start: { type: string, format: date-time }
+                      definition:
+                        type: string
+                        description: How an interaction is counted.
+                      generated_at: { type: string, format: date-time }
+                      cache_ttl: { type: integer }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/AnalyticsSourceUnavailable' }
 
   /v1/analytics/agents:
     get:
@@ -389,29 +769,32 @@ paths:
       operationId: getAgentsAnalytics
       summary: Get per-agent analytics
       description: |
-        Aggregates the organization's insights per agent: conversation count,
-        average evaluation score, resolution rate, sentiment distribution, and
-        analysis token usage. Requires `ai-insights:analytics:read`.
+        Aggregates analyzed conversations per agent: conversation count,
+        average evaluation score, resolution rate, sentiment, and the tokens
+        spent on analysis, plus each agent's users and last activity.
+
+        Pagination applies to **analyzed conversations**, not to agents: each
+        page reads `limit` conversations and groups them by agent. An agent
+        can therefore appear on several pages with partial counts, and
+        `agents` and `totals` only cover the returned page. `users_count` and
+        `last_activity` cover the whole date range (last 30 days by default).
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - in: query
           name: from_date
           schema: { type: string, format: date-time }
-          description: Lower bound (inclusive) on `analyzed_at`, ISO 8601.
+          description: Lower bound (inclusive) on the analysis date, ISO 8601.
         - in: query
           name: to_date
           schema: { type: string, format: date-time }
-          description: Upper bound (inclusive) on `analyzed_at`, ISO 8601.
-        - in: query
-          name: agent_ids
-          schema:
-            type: array
-            items: { type: string }
-          style: form
-          explode: true
-          description: Restrict to these agents. Repeat the parameter for each ID.
+          description: Upper bound (inclusive) on the analysis date, ISO 8601.
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
       responses:
         '200':
-          description: Per-agent analytics and totals.
+          description: Per-agent analytics for the page.
           content:
             application/json:
               schema:
@@ -427,14 +810,22 @@ paths:
                       conversation_count: { type: integer }
                       token_usage:
                         type: integer
-                        description: Sum of input and output analysis tokens.
-                  period:
+                        description: Input and output analysis tokens.
+                  pagination:
                     type: object
                     properties:
-                      from: { type: string, nullable: true }
-                      to: { type: string, nullable: true }
+                      page: { type: integer }
+                      limit: { type: integer }
+                  period:
+                    type: object
+                    description: The `from_date` / `to_date` sent, when any.
+                    properties:
+                      from: { type: string }
+                      to: { type: string }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/analytics/feedback:
     get:
@@ -442,31 +833,39 @@ paths:
       operationId: getFeedbackAnalytics
       summary: Get feedback analytics
       description: |
-        Returns the like / dislike distribution, the dislike categories, and a
-        paginated list of feedback entries (most recent first) for the
-        organization over the period. Requires `ai-insights:analytics:read`.
+        Returns the like / dislike distribution, the number of dislikes per
+        category, and a paginated list of feedback entries (most recent
+        first) for the period. Counts are computed on the first 5,000
+        entries of the period.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - $ref: '#/components/parameters/Period'
         - in: query
+          name: from_date
+          schema: { type: string, format: date-time, maxLength: 64 }
+          description: Start of a custom range (inclusive), ISO 8601. Used only together with `to_date`, and then takes precedence over `period`.
+        - in: query
+          name: to_date
+          schema: { type: string, format: date-time, maxLength: 64 }
+          description: End of a custom range (inclusive), ISO 8601.
+        - in: query
           name: agent_id
-          schema: { type: string }
+          schema: { type: string, maxLength: 64 }
           description: Only count feedback for this agent.
-        - in: query
-          name: page
-          schema: { type: integer, default: 1 }
-          description: Page of the `feedbacks` list (1-based).
-        - in: query
-          name: limit
-          schema: { type: integer, default: 20 }
-          description: Items per page of the `feedbacks` list.
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
       responses:
         '200':
           description: Feedback analytics.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/FeedbackAnalytics' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/analytics/adoption:
     get:
@@ -474,15 +873,21 @@ paths:
       operationId: getAdoptionAnalytics
       summary: Get user adoption metrics
       description: |
-        Returns adoption metrics derived from the personalization users add
-        to agents (instructions and preferences stored as memories).
+        Returns how users personalize their agents, read from the latest
+        daily adoption snapshot (`metadata.data_freshness`). Each user who
+        created memories over the last 30 days is classified from their own
+        memory counts:
 
-        The `tiers` breakdown is currently an **estimate**: power, regular,
-        and basic users are computed as fixed shares (12 %, 45 %, 43 %) of
-        the total user count, not from per-user data. Requires
-        `ai-insights:analytics:read`.
-      parameters:
-        - $ref: '#/components/parameters/Period'
+        - **Power users**: 5 or more instructions, or 20 or more memories.
+        - **Regular users**: at least 1 instruction, or 5 or more memories.
+        - **Basic users**: everyone else.
+
+        The window is fixed at 30 days; the endpoint takes no parameters.
+        Before the first snapshot, every value is zero and
+        `metadata.data_freshness` is `null`.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       responses:
         '200':
           description: Adoption metrics.
@@ -491,21 +896,291 @@ paths:
               schema: { $ref: '#/components/schemas/AdoptionAnalytics' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
-  /v1/analytics/queue-stats:
+  /v1/analytics/adoption/members:
     get:
       tags: [Analytics]
+      operationId: getAdoptionMembers
+      summary: Get organization members' activity
+      description: |
+        Lists every member of the organization with their activity over the
+        period, including members with no activity. Returns all members, with
+        no pagination.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 50
+        requests per minute.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+      responses:
+        '200':
+          description: Members and their activity.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/Contact'
+                        - type: object
+                          properties:
+                            role: { type: string }
+                            status: { type: string, description: Membership status. }
+                            messages: { type: integer }
+                            requests:
+                              type: integer
+                              description: LLM completions and embeddings.
+                            cost: { type: number }
+                  totals:
+                    type: object
+                    properties:
+                      members_count: { type: integer }
+                      active_count:
+                        type: integer
+                        description: Members with any activity over the period.
+                      adoption_rate:
+                        type: number
+                        description: Share of active members, in percent (0-100).
+                      messages: { type: integer }
+                  meta:
+                    type: object
+                    properties:
+                      period: { type: string }
+                      period_start: { type: string, format: date-time }
+                      generated_at: { type: string, format: date-time }
+                      cache_ttl: { type: integer }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502':
+          description: The organization's members could not be listed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: MEMBERS_UNAVAILABLE, message: Could not list members of org acme }
+
+  # ──────────────────────────────────────────────────────────────────
+  # Consumption
+  # ──────────────────────────────────────────────────────────────────
+  /v1/analytics/users/consumption:
+    get:
+      tags: [Consumption]
+      operationId: getUsersConsumption
+      summary: Get LLM consumption per user
+      description: |
+        Returns the LLM requests, tokens, cost, and carbon footprint of each
+        user of the organization over the period. `totals` always covers the
+        whole organization, whatever the page or search.
+
+        - **Pagination** applies when `page` or `page_size` is sent.
+          Otherwise, every user is returned in one response (up to 10,000;
+          `meta.truncated` is `true` beyond).
+        - **`format=csv`** returns the full list as a `;`-separated CSV file,
+          ignoring pagination.
+
+        The first page sorted by cost, without search, may be served from a
+        snapshot up to 20 minutes old (`meta.cached`).
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 50
+        requests per minute.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: Page number (1-based).
+        - in: query
+          name: page_size
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: Users per page.
+        - in: query
+          name: sort_by
+          schema:
+            type: string
+            enum: [cost, tokens, completions, embeddings, messages, carbon]
+            default: cost
+          description: Sort field. Any other value sorts by `cost`.
+        - in: query
+          name: sort_dir
+          schema: { type: string, enum: [asc, desc], default: desc }
+          description: Sort direction.
+        - in: query
+          name: q
+          schema: { type: string, maxLength: 128 }
+          description: Only return users whose name or email matches. Does not change `totals`.
+        - in: query
+          name: format
+          schema: { type: string, enum: [json, csv], default: json }
+          description: Response format.
+      responses:
+        '200':
+          description: Consumption per user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsersConsumption' }
+            text/csv:
+              schema:
+                type: string
+                description: |
+                  Header row:
+                  `user_id;email;name;requests_completions;requests_embeddings;tokens_input;tokens_output;cost;carbon_kgco2;messages;conversations`.
+                  Sent as an attachment named `users-consumption-<org>-<period>.csv`.
+        '400': { $ref: '#/components/responses/InvalidArguments' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: The member search (`q`) or the usage search failed. Retry later.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: AnalyticsSourceUnavailable, message: 'The LLM usage search failed, try again later' }
+
+  /v1/analytics/llm-requests:
+    get:
+      tags: [Consumption]
+      operationId: getLlmRequests
+      summary: Get LLM requests per day and per user
+      description: |
+        Returns daily LLM completions and embeddings with their cost and
+        tokens, totals over the period, and a per-user breakdown.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - in: query
+          name: by_user
+          schema: { type: boolean, default: true }
+          description: Set to `false` to skip the per-user breakdown (`by_user` is then empty).
+      responses:
+        '200':
+          description: LLM requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  daily:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date: { type: string, format: date }
+                        completions: { type: integer }
+                        embeddings: { type: integer }
+                        cost_completions: { type: number }
+                        cost_embeddings: { type: number }
+                        tokens_completions:
+                          type: integer
+                          description: Input and output tokens.
+                        tokens_embeddings: { type: integer }
+                  totals:
+                    type: object
+                    properties:
+                      completions: { type: integer }
+                      embeddings: { type: integer }
+                      cost_completions: { type: number }
+                      cost_embeddings: { type: number }
+                  by_user:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/Contact'
+                        - type: object
+                          properties:
+                            completions: { type: integer }
+                            embeddings: { type: integer }
+                            tokens:
+                              type: integer
+                              description: Input (including embedding) and output tokens.
+                            cost: { type: number }
+                            carbon: { type: number, description: kgCO2e. }
+                            messages: { type: integer }
+                  meta:
+                    allOf:
+                      - $ref: '#/components/schemas/PeriodMeta'
+                      - type: object
+                        properties:
+                          truncated:
+                            type: boolean
+                            description: '`true` when some users were left out of `by_user`.'
+                          by_user: { type: boolean }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/AnalyticsSourceUnavailable' }
+
+  /v1/analytics/llm-timeseries:
+    get:
+      tags: [Consumption]
+      operationId: getLlmTimeseries
+      summary: Get an LLM usage time series
+      description: |
+        Returns LLM usage per hour or per day, with totals and a per-user
+        breakdown (up to 200 users). Empty buckets are included. If the usage
+        source is unavailable, the response is empty with `meta.degraded`
+        set to `true`.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
+      parameters:
+        - $ref: '#/components/parameters/Period'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - in: query
+          name: granularity
+          schema: { type: string, enum: [hourly, daily] }
+          description: Bucket size. Defaults to `hourly` for ranges of 2 days or less, `daily` otherwise.
+        - in: query
+          name: user_id
+          schema: { type: string, maxLength: 128, pattern: '^[a-zA-Z0-9_-]+$' }
+          description: Only count this user's usage.
+        - in: query
+          name: model
+          schema: { type: string, maxLength: 128, pattern: '^[a-zA-Z0-9._:-]+$' }
+          description: Only count this model's usage.
+        - in: query
+          name: call_type
+          schema: { type: string, maxLength: 40, pattern: '^[a-z_]+$' }
+          description: Only count completions of this call type (e.g. `agent_turn`). Embeddings are then excluded.
+      responses:
+        '200':
+          description: LLM usage time series.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LlmTimeseries' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ──────────────────────────────────────────────────────────────────
+  # Queue
+  # ──────────────────────────────────────────────────────────────────
+  /v1/analytics/queue-stats:
+    get:
+      tags: [Queue]
       operationId: getQueueStats
       summary: Get analysis queue statistics
       description: |
-        Returns the state of the analysis queue: items per status, throughput
-        over the last hour, estimated time to drain, and a health status.
-        Counts cover the whole platform queue, not only the caller's
-        organization. Requires `ai-insights:queue:view`.
+        Returns the organization's analysis queue: items per status,
+        throughput over the last hour, estimated time to drain, and a health
+        status. `health` is `backlogged` above 100,000 pending items, `busy`
+        above 10,000, `degraded` when more than 10 items failed in the last
+        hour, and `healthy` otherwise.
 
-        `health` is `backlogged` above 100,000 pending items, `busy` above
-        10,000, `degraded` when more than 10 items failed in the last hour,
-        and `healthy` otherwise.
+        Requires `ai-insights-v2:queue` (`read`). Rate limit: 100 requests
+        per minute.
       responses:
         '200':
           description: Queue statistics.
@@ -533,17 +1208,20 @@ paths:
                     enum: [healthy, busy, backlogged, degraded]
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/analytics/capacity:
     get:
-      tags: [Analytics]
+      tags: [Queue]
       operationId: getCapacity
       summary: Get analysis capacity
       description: |
-        Lightweight variant of `queue-stats` for capacity monitoring. Counts
-        cover the whole platform queue. `status` is `backlogged` above
-        100,000 pending items, `busy` above 10,000, and `healthy` otherwise.
-        Requires `ai-insights:analytics:read`.
+        Lightweight variant of `queue-stats` for the organization's analysis
+        queue. `status` is `backlogged` above 100,000 pending items, `busy`
+        above 10,000, and `healthy` otherwise.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       responses:
         '200':
           description: Capacity metrics.
@@ -564,6 +1242,7 @@ paths:
                     enum: [healthy, busy, backlogged]
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ──────────────────────────────────────────────────────────────────
   # Memories
@@ -576,22 +1255,25 @@ paths:
       description: |
         Returns how many memories were created over the period, broken down
         by type (`fact`, `preference`, `relationship`, `instruction`), with a
-        daily series and the change versus the previous period. Requires
-        `ai-insights:analytics:read`.
+        daily series (most recent first) and the change versus the previous
+        period of the same length.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - $ref: '#/components/parameters/Period'
-        - in: query
-          name: agent_id
-          schema: { type: string }
-          description: Only count memories for this agent.
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
       responses:
         '200':
           description: Memory analytics.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/MemoriesAnalytics' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/analytics/memories/trends:
     get:
@@ -599,15 +1281,20 @@ paths:
       operationId: getMemoryTrends
       summary: Get memory trends over time
       description: |
-        Returns a time series of memory creation, hourly or daily, with
-        summary statistics. `direction` is `up` or `down` when the last point
-        differs from the first by more than 10 %. Requires
-        `ai-insights:analytics:read`.
+        Returns a time series of memory creation, hourly or daily (oldest
+        first), with summary statistics. `direction` is `up` or `down` when
+        the last point differs from the first by more than 10 %. Hourly
+        series cover at most the last 1,000 hours of the range.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - in: query
           name: period
-          schema: { type: string, enum: ['24h', 7d, 30d], default: 7d }
-          description: Time window.
+          schema: { type: string, enum: ['24h', 7d, 30d, 90d], default: 7d }
+          description: Sliding window ending now. Any other value uses `7d`.
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
         - in: query
           name: granularity
           schema: { type: string, enum: [hourly, daily], default: daily }
@@ -615,15 +1302,17 @@ paths:
         - in: query
           name: type
           schema: { $ref: '#/components/schemas/MemoryType' }
-          description: When set, each point also carries `filtered_value`, the count for this memory type.
+          description: When set, each point also carries `filtered_value`, the count for this memory type. `statistics` always use the total.
       responses:
         '200':
           description: Memory trend series.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/MemoryTrends' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/analytics/memories/topics:
     get:
@@ -632,12 +1321,14 @@ paths:
       summary: Get memory topic clusters
       description: |
         Returns the topics memories are clustered into, with their size,
-        type breakdown, and trend. Requires `ai-insights:analytics:read`.
+        type breakdown, and trend. In `summary`, `total_topics` counts every
+        matching topic; the other counts cover the returned page.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
-        - in: query
-          name: limit
-          schema: { type: integer, default: 20 }
-          description: Max topics to return.
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
         - in: query
           name: sort_by
           schema: { type: string, enum: [count, trend], default: count }
@@ -664,16 +1355,19 @@ paths:
                       total_memories: { type: integer }
                       trending_up: { type: integer }
                       trending_down: { type: integer }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
                   metadata:
                     type: object
                     properties:
                       orgSlug: { type: string }
-                      sort_by: { type: string }
-                      trend_filter: { type: string, nullable: true }
+                      sort_by: { type: string, enum: [count, trend] }
+                      trend_filter: { type: string }
                       limit: { type: integer }
                       generated_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/analytics/memories/gaps:
     get:
@@ -683,9 +1377,12 @@ paths:
       description: |
         Flags memory topics where users mostly store **facts** (more than
         60 % of the topic's memories), a sign that agents lack this knowledge
-        and users have to teach it. Severity is `high` above 50 memories,
-        `medium` above 20, `low` otherwise. Gaps are sorted by occurrence
-        count. Requires `ai-insights:analytics:read`.
+        and users have to teach it. Among the 50 largest topics, severity is
+        `high` above 50 memories, `medium` above 20, and `low` otherwise.
+        Gaps are sorted by occurrence count.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - in: query
           name: min_occurrences
@@ -697,8 +1394,10 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TrainingGaps' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ──────────────────────────────────────────────────────────────────
   # Graph
@@ -709,16 +1408,24 @@ paths:
       operationId: getAgentGraph
       summary: Get the agent relationship graph
       description: |
-        Returns the organization's agents as a graph: an `organization` node,
-        one node per agent, tool, and category, and the edges between them
-        (`belongs_to`, `uses`, `similar`). Two agents get a `similar` edge
-        when their similarity (tools Jaccard index and shared tags) reaches
-        `similarity_threshold`.
+        Returns the organization's published agents (up to 500) as a graph:
+        an `organization` node, one node per agent, tool, and category, and
+        the edges between them.
 
-        The graph is cached for 5 minutes. A cached response has
-        `stats.cached: true` and only carries `total_nodes`, `total_edges`,
-        and `cache_age_seconds` in `stats`. Requires
-        `ai-insights:analytics:read`.
+        Two agents get a `similar` edge when their similarity reaches
+        `similarity_threshold`:
+
+        `similarity = 0.5 × tools_jaccard + 0.2 × tags_overlap + 0.3 × guardrails_jaccard`
+
+        where `tags_overlap` is the number of shared tags divided by the size
+        of the larger tag set.
+
+        The default graph (no option set) is cached for 5 minutes; a cached
+        response has `stats.cached: true` and `stats.cache_age_seconds`.
+        Setting any option, or `use_cache=false`, recomputes the graph.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - in: query
           name: include_tools
@@ -728,6 +1435,10 @@ paths:
           name: include_categories
           schema: { type: boolean, default: true }
           description: Include category nodes and agent-to-category edges.
+        - in: query
+          name: include_delegations
+          schema: { type: boolean, default: true }
+          description: Include `delegates_to` edges between agents and their sub-agents.
         - in: query
           name: similarity_threshold
           schema: { type: number, minimum: 0, maximum: 1, default: 0.3 }
@@ -742,8 +1453,10 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AgentGraph' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/graph/agents/clusters:
     get:
@@ -752,14 +1465,17 @@ paths:
       summary: Get agent clusters
       description: |
         Groups agents connected by `similar` edges whose score reaches
-        `similarity_threshold`. Clusters smaller than `min_cluster_size` are
+        `similarity_threshold` (connected components of the graph from
+        `GET /v1/graph/agents`). Clusters smaller than `min_cluster_size` are
         dropped; agents with no similar neighbor are listed in
         `isolated_agents`. Clusters are sorted by size, largest first.
-        Requires `ai-insights:analytics:read`.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - in: query
           name: similarity_threshold
-          schema: { type: number, minimum: 0, maximum: 1, default: 0.5 }
+          schema: { type: number, minimum: 0, maximum: 1, default: 0.3 }
           description: Minimum similarity for two agents to share a cluster.
         - in: query
           name: min_cluster_size
@@ -771,8 +1487,10 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AgentClusters' }
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/graph/similar/{agent_id}:
     get:
@@ -781,13 +1499,17 @@ paths:
       summary: Get agents similar to an agent
       description: |
         Returns the agents most similar to the given agent, highest score
-        first. Uses the cached graph when available, otherwise computes
-        similarity on the fly. Requires `ai-insights:analytics:read`.
+        first, using the same formula as `GET /v1/graph/agents`. When the
+        graph is cached, results come from it (`cached: true`, pairs below
+        0.3 not included); otherwise they are computed on the fly.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       parameters:
         - $ref: '#/components/parameters/AgentId'
         - in: query
           name: limit
-          schema: { type: integer, default: 10 }
+          schema: { type: integer, default: 10, maximum: 100 }
           description: Max similar agents to return.
         - in: query
           name: min_score
@@ -802,7 +1524,9 @@ paths:
                 type: object
                 properties:
                   agent_id: { type: string }
-                  agent_name: { type: string }
+                  agent_name:
+                    type: string
+                    description: Only on computed (non-cached) responses.
                   similar_agents:
                     type: array
                     items: { $ref: '#/components/schemas/SimilarAgent' }
@@ -814,14 +1538,23 @@ paths:
                       orgSlug: { type: string }
                       min_score: { type: number }
                       limit: { type: integer }
-                      generated_at: { type: string, format: date-time }
+                      generated_at:
+                        type: string
+                        format: date-time
+                        description: Only on computed (non-cached) responses.
+        '400': { $ref: '#/components/responses/InvalidArguments' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404':
           description: Agent not found.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema:
+                type: object
+                properties:
+                  error: { type: string, example: Agent not found }
+                  agent_id: { type: string }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/graph/tools:
     get:
@@ -829,9 +1562,11 @@ paths:
       operationId: getToolsGraph
       summary: Get tools and the agents using them
       description: |
-        Lists every tool used by the organization's agents, with the agents
-        that use it, sorted by usage count. Requires
-        `ai-insights:analytics:read`.
+        Lists every tool used by the organization's published agents (up to
+        500 agents), with the agents that use it, sorted by usage count.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       responses:
         '200':
           description: Tools with their agents.
@@ -863,6 +1598,7 @@ paths:
                       generated_at: { type: string, format: date-time }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/graph/relationships:
     get:
@@ -871,10 +1607,13 @@ paths:
       summary: Get the organizational relationship graph
       description: |
         Builds a graph of entities (people, teams, systems…) from the
-        keywords of memory topics that contain `relationship` memories.
-        Keywords of a same topic are linked by `related` edges. This is a
-        simplified extraction based on topic keywords, not on the full
-        memory content. Requires `ai-insights:analytics:read`.
+        keywords of memory topics that contain `relationship` memories. In
+        each topic, the first keyword is linked to every other keyword by a
+        `related` edge. This is a simplified extraction based on topic
+        keywords, not on the full memory content.
+
+        Requires `ai-insights-v2:analytics` (`read`). Rate limit: 100
+        requests per minute.
       responses:
         '200':
           description: Relationship graph.
@@ -903,6 +1642,12 @@ paths:
                             source: { type: string }
                             target: { type: string }
                             type: { type: string, enum: [related] }
+                            weight:
+                              type: integer
+                              description: Number of relationship memories in the topic.
+                            topic:
+                              type: string
+                              description: Label of the topic linking the two entities.
                   relationship_topics:
                     type: array
                     items:
@@ -913,7 +1658,9 @@ paths:
                         count:
                           type: integer
                           description: Number of relationship memories in the topic.
-                        examples: { type: array, items: { type: string } }
+                        examples:
+                          type: array
+                          items: { $ref: '#/components/schemas/MemoryExample' }
                   stats:
                     type: object
                     properties:
@@ -928,50 +1675,7 @@ paths:
                       note: { type: string }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
-
-  # ──────────────────────────────────────────────────────────────────
-  # Admin
-  # ──────────────────────────────────────────────────────────────────
-  /v1/admin/refresh-org-analytics:
-    post:
-      tags: [Admin]
-      operationId: refreshOrgAnalytics
-      summary: Refresh organization analytics
-      description: |
-        Runs the hourly organization analytics aggregation immediately,
-        instead of waiting for the next scheduled run. Feeds
-        `GET /v1/analytics/summary`. Platform admins only (`superadmin` or
-        `root` platform role).
-      responses:
-        '200':
-          description: Aggregation completed.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status: { type: string, enum: [refreshed] }
-                  details:
-                    type: object
-                    additionalProperties: true
-                    description: Output of the aggregation job.
-        '401':
-          description: Unauthenticated.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-              example: { error: UNAUTHORIZED, message: Authentication required }
-        '403':
-          description: Caller is not a platform admin.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-              example: { error: FORBIDDEN, message: Platform admin access required }
-        '405':
-          description: Method other than POST.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
 components:
   securitySchemes:
@@ -984,33 +1688,110 @@ components:
         or a user access token (`at:*`) generated from the user settings UI.
         Send as `Authorization: Bearer <token>`. The organization and the
         permissions applied are those of this user.
+    OrgApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-prismeai-api-key
+      description: |
+        Organization API key (`iak_{orgSlug}_{uuid}`), managed from the
+        AI Governance UI. It is not tied to a user: its access is defined by
+        the permissions attached to it, and all keys of an organization share
+        the same rate-limit counters. Endpoints that describe "your own"
+        data, such as `GET /v1/users/{user_id}`, need a user credential.
+        Send as `x-prismeai-api-key: iak_...`.
 
   parameters:
     AgentId:
       in: path
       name: agent_id
       required: true
-      schema: { type: string }
+      schema: { type: string, maxLength: 64, pattern: '^[a-zA-Z0-9_-]+$' }
       description: Agent ID (as returned by the Agent Creator API).
     Period:
       in: query
       name: period
       schema: { type: string, enum: [7d, 30d, 90d], default: 30d }
-      description: Time window, ending now.
+      description: Sliding window ending now. Any other value uses `30d`. Ignored when both `from_date` and `to_date` are set.
+    FromDate:
+      in: query
+      name: from_date
+      schema: { type: string, format: date-time, maxLength: 64 }
+      description: Start of a custom range, ISO 8601. Used only together with `to_date`, and then takes precedence over `period` (`period` is returned as `custom`).
+    ToDate:
+      in: query
+      name: to_date
+      schema: { type: string, format: date-time, maxLength: 64 }
+      description: End of a custom range, ISO 8601. Used only together with `from_date`.
+    Page:
+      in: query
+      name: page
+      schema: { type: integer, minimum: 1, default: 1 }
+      description: Page number (1-based).
+    Limit:
+      in: query
+      name: limit
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      description: Items per page. Values above 100 are capped at 100.
 
   responses:
     Unauthenticated:
-      description: Missing or invalid credentials.
+      description: Missing or invalid credentials, or no organization context.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
-          example: { error: Authentication required }
+          example: { error: UNAUTHORIZED, message: Authentication required }
     Forbidden:
-      description: The caller lacks the required permission or access to the agent.
+      description: The caller lacks the permission required by the endpoint.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
-          example: { error: 'Permission denied: ai-insights:analytics:read' }
+          example: { error: FORBIDDEN, message: "Access denied: missing permission 'ai-insights-v2:analytics:read'" }
+    InvalidArguments:
+      description: A parameter does not match its schema (length, pattern, type, or required field).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RuntimeError' }
+          example:
+            error: InvalidArgumentsError
+            message: Invalid arguments
+            details: { errors: [] }
+    TooManyRequests:
+      description: Rate limit exceeded. Retry after the number of seconds given in the `Retry-After` header.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RuntimeError' }
+          example:
+            error: TooManyRequests
+            message: "Too many requests for 'Insights'"
+            details: { name: Insights, ok: false, retryAfter: 42.5, limit: 100, window: 60, remaining: 0 }
+    RateLimited:
+      description: Rate limit exceeded. Retry later.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: RATE_LIMITED, message: Rate limit exceeded }
+    AgentNotFound:
+      description: Agent not found, or not accessible to the caller.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: Agent not found }
+    AgentFactoryError:
+      description: Agent Factory returned an error, including when the agent or conversation does not exist.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: AGENT_FACTORY_ERROR, message: 'Agent Factory API error: Agent not found' }
+    AnalyticsSourceUnavailable:
+      description: An analytics data source is temporarily unavailable. Retry in a minute.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: AnalyticsSourceUnavailable, message: 'Analytics are temporarily unavailable, try again in a minute' }
 
   schemas:
     Error:
@@ -1019,10 +1800,73 @@ components:
       properties:
         error:
           type: string
-          description: Error message, or error code on admin endpoints (e.g. `FORBIDDEN`).
+          description: Error code (e.g. `FORBIDDEN`), or error message on some validation errors.
         message:
           type: string
-          description: Human-readable message, returned alongside an error code.
+          description: Human-readable message.
+
+    RuntimeError:
+      type: object
+      description: Error raised by the Prisme.ai runtime before the endpoint logic runs.
+      required: [error, message]
+      properties:
+        error: { type: string }
+        message: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+
+    Pagination:
+      type: object
+      properties:
+        total: { type: integer }
+        limit: { type: integer }
+        page: { type: integer }
+        total_pages: { type: integer }
+
+    Contact:
+      type: object
+      properties:
+        user_id: { type: string }
+        name:
+          type: string
+          description: First and last name. Absent when the user cannot be resolved.
+        email:
+          type: string
+          description: Absent when the user cannot be resolved.
+
+    PeriodMeta:
+      type: object
+      properties:
+        period:
+          type: string
+          description: The `period` sent (or `30d`), or `custom` for a `from_date` / `to_date` range.
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time }
+        generated_at: { type: string, format: date-time }
+        cache_ttl:
+          type: integer
+          description: Suggested client cache duration, in seconds.
+
+    CachedPeriodMeta:
+      allOf:
+        - $ref: '#/components/schemas/PeriodMeta'
+        - type: object
+          properties:
+            cached:
+              type: boolean
+              description: '`true` when served from a snapshot.'
+            cached_at:
+              type: string
+              format: date-time
+              description: When the snapshot was computed. Only when `cached` is `true`.
+
+    Latency:
+      type: object
+      description: LLM call duration percentiles, in milliseconds. `0` when there is no data.
+      properties:
+        p50_ms: { type: integer }
+        p95_ms: { type: integer }
 
     # ──────────────────────────────────────────────────────────────────
     # Insights
@@ -1031,7 +1875,9 @@ components:
       type: object
       description: Analysis result of one conversation.
       properties:
-        id: { type: string }
+        id:
+          type: string
+          description: '`ins_{conversation_id}`.'
         conversation_id: { type: string }
         agent_id: { type: string }
         user_id: { type: string }
@@ -1094,12 +1940,11 @@ components:
         cost_tracking:
           type: object
           nullable: true
-          description: Token usage of the analysis itself.
+          description: Tokens spent on the analysis itself.
           properties:
             input_tokens: { type: integer }
             output_tokens: { type: integer }
             model: { type: string }
-            cost: { type: number }
         anonymized_at:
           type: string
           format: date-time
@@ -1122,15 +1967,10 @@ components:
           type: number
           nullable: true
           description: Evaluation score (0-100) once analyzed.
-        queued_at: { type: string, format: date-time, nullable: true }
         analyzed_at: { type: string, format: date-time, nullable: true }
-        error:
-          type: string
-          nullable: true
-          description: Failure reason when `status` is `failed`.
 
     # ──────────────────────────────────────────────────────────────────
-    # Analysis
+    # Agents
     # ──────────────────────────────────────────────────────────────────
     AnalyzeInput:
       type: object
@@ -1139,13 +1979,15 @@ components:
           type: string
           enum: [batch, realtime]
           default: batch
+          maxLength: 16
         conversation_ids:
           type: array
           items: { type: string }
           description: Conversations to analyze. Required for `realtime`.
         model:
           type: string
-          description: LLM used for the analysis. Defaults to the workspace's analysis model.
+          maxLength: 64
+          description: LLM used for the analysis. Defaults to the agent's model.
         force:
           type: boolean
           description: Realtime only - re-analyze conversations that already have an insight.
@@ -1182,12 +2024,15 @@ components:
         question:
           type: string
           description: Question the LLM answers for each conversation.
+        context:
+          type: string
+          description: Extra guidance given to the LLM.
         weight:
           type: number
           description: Weight of the criterion in `evaluation_score`.
         min:
           type: number
-          description: Lowest score. Required for `score` criteria.
+          description: Lowest score. Required and non-zero for `score` criteria.
         max:
           type: number
           description: Highest score, for `score` criteria.
@@ -1201,7 +2046,6 @@ components:
     # ──────────────────────────────────────────────────────────────────
     FeedbackCategory:
       type: string
-      nullable: true
       enum:
         - incorrect_incomplete
         - not_what_i_asked
@@ -1219,22 +2063,32 @@ components:
         category:
           allOf:
             - $ref: '#/components/schemas/FeedbackCategory'
-          description: Dislikes only. Rejected on likes.
+          description: Dislikes only. Omit it on likes.
         comment:
           type: string
+          maxLength: 4096
           description: Free-text comment.
-        task_id: { type: string }
+        task_id: { type: string, maxLength: 128 }
         message_id:
           type: string
+          maxLength: 128
           description: Agent message the feedback applies to.
         context_id:
           type: string
+          maxLength: 128
           description: Conversation the message belongs to.
-        agent_id: { type: string }
+        agent_id: { type: string, maxLength: 64 }
 
     FeedbackAnalytics:
       type: object
       properties:
+        meta:
+          type: object
+          properties:
+            period: { type: string }
+            period_start: { type: string, format: date-time }
+            period_end: { type: string, format: date-time }
+            generated_at: { type: string, format: date-time }
         distribution:
           type: object
           properties:
@@ -1243,7 +2097,7 @@ components:
             total: { type: integer }
             like_rate:
               type: number
-              description: Percentage of likes (0-100).
+              description: Share of likes, in percent (0-100).
         categories:
           type: object
           description: Number of dislikes per category.
@@ -1264,12 +2118,21 @@ components:
                 properties:
                   id: { type: string }
                   vote: { type: string, enum: [like, dislike] }
-                  category: { $ref: '#/components/schemas/FeedbackCategory' }
+                  category:
+                    allOf:
+                      - $ref: '#/components/schemas/FeedbackCategory'
+                    nullable: true
                   comment: { type: string, nullable: true }
                   agent_id: { type: string }
+                  agent_name:
+                    type: string
+                    description: Absent when the agent cannot be resolved.
                   context_id: { type: string }
+                  message_id: { type: string }
                   createdAt: { type: string, format: date-time }
-            total: { type: integer }
+            total:
+              type: integer
+              description: Same as `distribution.total`.
             page: { type: integer }
             limit: { type: integer }
 
@@ -1278,47 +2141,58 @@ components:
     # ──────────────────────────────────────────────────────────────────
     AnalyticsSummary:
       type: object
+      description: Every `change_vs_previous` field is a percentage, `0` when the previous period is empty.
       properties:
         meta:
-          type: object
-          properties:
-            period: { type: string }
-            period_start: { type: string, format: date-time }
-            generated_at: { type: string, format: date-time }
-            cache_ttl:
-              type: integer
-              description: Suggested client cache duration, in seconds.
+          allOf:
+            - $ref: '#/components/schemas/CachedPeriodMeta'
         users:
           type: object
           properties:
-            active: { type: integer }
-            new: { type: integer }
+            active:
+              type: integer
+              description: Distinct users who talked to an agent.
+            active_sessions: { type: integer }
+            new:
+              type: integer
+              description: Users who signed up during the period.
             dau:
               type: integer
-              description: Average daily active users.
-            change_vs_previous:
-              type: number
-              description: Percentage change versus the previous period.
-        interactions:
+              description: Average daily active users (`active` divided by the number of days).
+            change_vs_previous: { type: number }
+            sessions_change_vs_previous: { type: number }
+        messages:
           type: object
           properties:
             total:
               type: integer
-              description: Messages over the period.
+              description: Messages sent by users to agents.
             conversations: { type: integer }
             per_day: { type: integer }
             per_user: { type: number }
+            llm_requests:
+              type: integer
+              description: All LLM completion calls.
+            llm_requests_per_message: { type: number }
             change_vs_previous: { type: number }
         agents:
           type: object
           properties:
+            active:
+              type: integer
+              description: Distinct agents used during the period.
             top:
               type: array
+              description: Up to 10 agents, by number of messages.
               items:
                 type: object
                 properties:
                   agent_id: { type: string }
+                  name:
+                    type: string
+                    description: Absent when the agent cannot be resolved.
                   count: { type: integer }
+        latency: { $ref: '#/components/schemas/Latency' }
         quality:
           type: object
           properties:
@@ -1327,22 +2201,39 @@ components:
         cost:
           type: object
           properties:
-            total: { type: number }
+            total:
+              type: number
+              description: Completions and embeddings cost.
             total_tokens: { type: integer }
-            carbon_kgco2: { type: number }
+            carbon_kgco2:
+              type: number
+              description: Carbon footprint of completions, kgCO2e.
             change_vs_previous: { type: number }
 
     AgentAnalytics:
       type: object
       properties:
         agent_id: { type: string }
+        name: { type: string, description: Absent when the agent cannot be resolved. }
+        owner_id: { type: string }
+        model: { type: string }
+        status: { type: string }
+        users_count:
+          type: integer
+          description: Distinct users of the agent over the date range.
+        last_activity:
+          type: string
+          format: date-time
+          description: Last LLM call of the agent over the date range.
         conversation_count:
           type: integer
-          description: Analyzed conversations.
-        avg_evaluation_score: { type: number }
+          description: Analyzed conversations on this page.
+        avg_evaluation_score:
+          type: number
+          description: Average evaluation score (0-100).
         resolution_rate:
           type: number
-          description: Percentage of resolved conversations (0-100).
+          description: Share of resolved conversations, in percent (0-100).
         sentiment_distribution:
           type: object
           properties:
@@ -1351,7 +2242,7 @@ components:
             negative: { type: integer }
         token_usage:
           type: object
-          description: Tokens consumed by the analyses.
+          description: Tokens spent analyzing the conversations (not the agent's own usage).
           properties:
             input: { type: integer }
             output: { type: integer }
@@ -1360,7 +2251,10 @@ components:
       type: object
       properties:
         count: { type: integer }
-        percentage: { type: number }
+        percentage:
+          type: number
+          description: Share of users, in percent (0-100).
+        user_ids: { type: array, items: { type: string } }
         description: { type: string }
 
     AdoptionAnalytics:
@@ -1371,40 +2265,200 @@ components:
           properties:
             total_users:
               type: integer
-              description: Peak daily unique users over the period.
+              description: Distinct users who created memories over the last 30 days.
             tiers:
               type: object
               properties:
                 power_users: { $ref: '#/components/schemas/AdoptionTier' }
                 regular_users: { $ref: '#/components/schemas/AdoptionTier' }
                 basic_users: { $ref: '#/components/schemas/AdoptionTier' }
-        personalization:
-          type: object
-          properties:
-            total_instructions: { type: integer }
-            total_preferences: { type: integer }
-            avg_per_user: { type: number }
-        common_patterns:
+            personalization:
+              type: object
+              properties:
+                total_instructions: { type: integer }
+                total_preferences: { type: integer }
+                total_memories: { type: integer }
+                avg_per_user:
+                  type: number
+                  description: Memories per user.
+                type_breakdown:
+                  type: object
+                  properties:
+                    fact: { type: integer }
+                    preference: { type: integer }
+                    instruction: { type: integer }
+                    relationship: { type: integer }
+            quality:
+              type: object
+              properties:
+                avg_evaluation_score:
+                  type: number
+                  description: Average evaluation score (0-100).
+                resolution_rate:
+                  type: number
+                  description: Share of resolved conversations, as a ratio (0-1).
+                sentiment:
+                  type: object
+                  properties:
+                    positive: { type: integer }
+                    neutral: { type: integer }
+                    negative: { type: integer }
+                feedback_like_rate:
+                  type: number
+                  description: Share of likes, as a ratio (0-1).
+            common_patterns:
+              type: array
+              description: Largest memory topics containing instructions.
+              items:
+                type: object
+                properties:
+                  pattern: { type: string }
+                  instruction_count: { type: integer }
+                  user_count: { type: integer, nullable: true }
+            recommendations:
+              type: array
+              items:
+                type: object
+                properties:
+                  priority: { type: string, enum: [high, medium] }
+                  target: { type: string }
+                  action: { type: string }
+                  metric: { type: string }
+                  value: { type: number }
+            trends:
+              type: object
+              description: Change over the last 15 days.
+              properties:
+                users_change:
+                  type: number
+                  description: Percentage change in users.
+                memories_change:
+                  type: number
+                  description: Percentage change in memories.
+                quality_change:
+                  type: number
+                  description: Change in average evaluation score, in points.
+            metadata:
+              type: object
+              properties:
+                orgSlug: { type: string }
+                period: { type: string, enum: [30d] }
+                data_freshness:
+                  type: string
+                  format: date-time
+                  nullable: true
+                  description: When the snapshot was computed.
+                generated_at: { type: string, format: date-time }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Consumption
+    # ──────────────────────────────────────────────────────────────────
+    UsersConsumption:
+      type: object
+      properties:
+        users:
           type: array
-          description: Top memory topics containing instructions.
+          items:
+            allOf:
+              - $ref: '#/components/schemas/Contact'
+              - type: object
+                properties:
+                  completions: { type: integer }
+                  embeddings: { type: integer }
+                  tokens_input:
+                    type: integer
+                    description: Completion input and embedding tokens.
+                  tokens_output: { type: integer }
+                  tokens: { type: integer }
+                  cost: { type: number }
+                  carbon_kgco2: { type: number }
+                  carbon:
+                    type: number
+                    description: Same as `carbon_kgco2`.
+                  messages: { type: integer }
+                  conversations: { type: integer }
+        totals:
+          type: object
+          description: Whole organization over the period.
+          properties:
+            cost: { type: number }
+            tokens: { type: integer }
+            carbon_kgco2: { type: number }
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/CachedPeriodMeta'
+            - type: object
+              properties:
+                total:
+                  type: integer
+                  description: Number of users with usage (approximate on very large organizations).
+                page: { type: integer }
+                page_size: { type: integer }
+                sort_by: { type: string }
+                sort_dir: { type: string }
+                q: { type: string }
+                truncated:
+                  type: boolean
+                  description: '`true` when more users exist than could be returned.'
+
+    LlmTimeseries:
+      type: object
+      properties:
+        series:
+          type: array
           items:
             type: object
             properties:
-              pattern: { type: string }
-              instruction_count: { type: integer }
-        recommendations:
+              date:
+                type: string
+                format: date-time
+                description: Start of the bucket.
+              completions: { type: integer }
+              embeddings: { type: integer }
+              cost_completions: { type: number }
+              cost_embeddings: { type: number }
+              tokens_completions: { type: integer }
+              tokens_embeddings: { type: integer }
+              carbon: { type: number, description: kgCO2e. }
+        by_user:
           type: array
           items:
-            type: object
-            properties:
-              target: { type: string }
-              action: { type: string }
-        metadata:
+            allOf:
+              - $ref: '#/components/schemas/Contact'
+              - type: object
+                properties:
+                  completions: { type: integer }
+                  embeddings: { type: integer }
+                  tokens_input: { type: integer }
+                  tokens_output: { type: integer }
+                  cost: { type: number }
+                  carbon_kgco2: { type: number }
+                  messages: { type: integer }
+        totals:
           type: object
           properties:
-            orgSlug: { type: string }
-            period: { type: string, nullable: true }
-            generated_at: { type: string, format: date-time }
+            completions: { type: integer }
+            embeddings: { type: integer }
+            cost_completions: { type: number }
+            cost_embeddings: { type: number }
+            tokens_completions: { type: integer }
+            tokens_embeddings: { type: integer }
+            carbon: { type: number }
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/PeriodMeta'
+            - type: object
+              properties:
+                granularity: { type: string, enum: [hourly, daily] }
+                user_id: { type: string }
+                call_type: { type: string }
+                model: { type: string }
+                degraded:
+                  type: boolean
+                  description: '`true` when the usage source failed; the series is then empty.'
+                truncated:
+                  type: boolean
+                  description: '`true` when some users were left out of `by_user`.'
 
     # ──────────────────────────────────────────────────────────────────
     # Memories
@@ -1412,6 +2466,12 @@ components:
     MemoryType:
       type: string
       enum: [fact, preference, relationship, instruction]
+
+    MemoryExample:
+      type: object
+      properties:
+        content: { type: string }
+        type: { $ref: '#/components/schemas/MemoryType' }
 
     MemoryCounts:
       type: object
@@ -1421,7 +2481,7 @@ components:
         preference: { type: integer }
         relationship: { type: integer }
         instruction: { type: integer }
-        unique_users: { type: integer }
+        unique_users: { type: integer, nullable: true }
 
     MemoriesAnalytics:
       type: object
@@ -1448,16 +2508,17 @@ components:
             allOf:
               - type: object
                 properties:
-                  date: { type: string }
+                  date: { type: string, format: date-time }
               - $ref: '#/components/schemas/MemoryCounts'
         metadata:
           type: object
           properties:
             orgSlug: { type: string }
-            agent_id: { type: string, nullable: true }
-            period: { type: string, nullable: true }
-            start_date: { type: string }
-            end_date: { type: string }
+            period:
+              type: string
+              description: The `period` sent (or `30d`), or `custom`.
+            start_date: { type: string, format: date-time }
+            end_date: { type: string, format: date-time }
             generated_at: { type: string, format: date-time }
 
     MemoryTrends:
@@ -1469,7 +2530,7 @@ components:
             allOf:
               - type: object
                 properties:
-                  timestamp: { type: string }
+                  timestamp: { type: string, format: date-time }
                   filtered_value:
                     type: integer
                     description: Count for the requested `type`, when set.
@@ -1489,11 +2550,13 @@ components:
           type: object
           properties:
             orgSlug: { type: string }
-            granularity: { type: string }
-            period: { type: string, nullable: true }
-            type_filter: { type: string, nullable: true }
-            start_time: { type: string }
-            end_time: { type: string }
+            granularity: { type: string, enum: [hourly, daily] }
+            period:
+              type: string
+              description: The `period` sent (or `7d`), or `custom`.
+            type_filter: { type: string }
+            start_time: { type: string, format: date-time }
+            end_time: { type: string, format: date-time }
             generated_at: { type: string, format: date-time }
 
     MemoryTopic:
@@ -1503,15 +2566,20 @@ components:
         label: { type: string }
         keywords: { type: array, items: { type: string } }
         memory_count: { type: integer }
-        user_count: { type: integer }
-        agent_count: { type: integer }
+        user_count: { type: integer, nullable: true }
+        agent_count: { type: integer, nullable: true }
         type_breakdown:
           type: object
+          nullable: true
           description: Number of memories per type in the topic.
           additionalProperties: { type: integer }
-        trend: { type: string, enum: [up, down, stable] }
-        trend_pct: { type: number }
-        examples: { type: array, items: { type: string } }
+        trend: { type: string, enum: [up, down, stable], nullable: true }
+        trend_pct: { type: number, nullable: true }
+        examples:
+          type: array
+          nullable: true
+          maxItems: 3
+          items: { $ref: '#/components/schemas/MemoryExample' }
         last_updated: { type: string, format: date-time }
 
     TrainingGaps:
@@ -1525,12 +2593,15 @@ components:
               topic: { type: string }
               keywords: { type: array, items: { type: string } }
               occurrence_count: { type: integer }
-              user_count: { type: integer }
+              user_count: { type: integer, nullable: true }
               fact_percentage: { type: number }
               severity: { type: string, enum: [high, medium, low] }
-              trend: { type: string, enum: [up, down, stable] }
-              trend_pct: { type: number }
-              examples: { type: array, items: { type: string } }
+              trend: { type: string, nullable: true }
+              trend_pct: { type: number, nullable: true }
+              examples:
+                type: array
+                nullable: true
+                items: { $ref: '#/components/schemas/MemoryExample' }
               suggested_action: { type: string }
         summary:
           type: object
@@ -1547,7 +2618,7 @@ components:
           items:
             type: object
             properties:
-              priority: { type: string }
+              priority: { type: string, enum: [high, medium, low] }
               action: { type: string }
         metadata:
           type: object
@@ -1559,28 +2630,55 @@ components:
     # ──────────────────────────────────────────────────────────────────
     # Graph
     # ──────────────────────────────────────────────────────────────────
+    GraphStats:
+      type: object
+      properties:
+        total_nodes: { type: integer }
+        total_edges: { type: integer }
+        agent_count: { type: integer }
+        tool_count: { type: integer }
+        category_count: { type: integer }
+        similarity_connections: { type: integer }
+        delegation_connections: { type: integer }
+
     GraphNode:
       type: object
       properties:
         id:
           type: string
-          description: '`org_{orgSlug}`, `agent_{id}`, `tool_{name}`, or `category_{name}`.'
+          description: '`org_{orgSlug}`, `agent_{agent_id}`, `tool_{orgSlug}_{name}`, or `category_{orgSlug}_{name}`.'
         type: { type: string, enum: [organization, agent, tool, category] }
         orgSlug: { type: string }
         name: { type: string }
+        computed_at: { type: string, format: date-time }
+        agent_count: { type: integer, description: Organization and category nodes. }
+        stats:
+          allOf:
+            - $ref: '#/components/schemas/GraphStats'
+          description: Organization node.
         agent_id: { type: string, description: Agent nodes. }
         description: { type: string, description: Agent nodes. }
         category: { type: string, description: Agent nodes. }
         tools: { type: array, items: { type: string }, description: Agent nodes. }
-        tags: { type: array, items: { type: string }, description: Agent nodes. }
         tools_count: { type: integer, description: Agent nodes. }
-        conversations_count: { type: integer, description: Agent nodes. }
-        avg_score: { type: number, description: Agent nodes. }
-        resolved_count: { type: integer, description: Agent nodes. }
+        tags: { type: array, items: { type: string }, description: Agent nodes. }
+        guardrails: { type: array, items: { type: string }, description: Agent nodes - guardrail IDs. }
+        guardrail_types: { type: array, items: { type: string }, description: Agent nodes. }
+        has_input_guardrail: { type: boolean, description: Agent nodes. }
+        has_output_guardrail: { type: boolean, description: Agent nodes. }
+        has_action_guardrail: { type: boolean, description: Agent nodes. }
+        analyzed_conversations: { type: integer, description: Agent nodes - analyzed conversations. }
+        avg_score: { type: number, description: Agent nodes - average evaluation score (0-100). }
+        resolved_count: { type: integer, description: Agent nodes - resolved conversations. }
         tool_type: { type: string, description: Tool nodes. }
-        usage_count: { type: integer, description: Tool nodes - number of agents using it. }
-        agent_count: { type: integer, description: Organization and category nodes. }
-        computed_at: { type: string, format: date-time }
+        usage_count: { type: integer, description: Tool nodes - number of agents using the tool. }
+
+    SimilarityBreakdown:
+      type: object
+      properties:
+        tools_jaccard: { type: number }
+        tags_overlap: { type: number }
+        guardrails_jaccard: { type: number }
 
     GraphEdge:
       type: object
@@ -1589,17 +2687,24 @@ components:
         orgSlug: { type: string }
         source: { type: string }
         target: { type: string }
-        type: { type: string, enum: [belongs_to, uses, similar] }
+        type:
+          type: string
+          enum: [belongs_to, uses, delegates_to, similar]
+          description: |
+            `belongs_to` links the organization to an agent, or an agent to its
+            category; `uses` an agent to a tool; `delegates_to` an agent to a
+            sub-agent; `similar` two similar agents.
+        sub_agent_name: { type: string, description: '`delegates_to` edges.' }
         score:
           type: number
-          description: Similarity score (0-1), `similar` edges only.
-        shared_tools: { type: array, items: { type: string } }
-        shared_tags: { type: array, items: { type: string } }
+          description: Similarity score (0-1), `similar` edges.
+        shared_tools: { type: array, items: { type: string }, description: '`similar` edges.' }
+        shared_tags: { type: array, items: { type: string }, description: '`similar` edges.' }
+        shared_guardrails: { type: array, items: { type: string }, description: '`similar` edges.' }
         similarity_breakdown:
-          type: object
-          properties:
-            tools_jaccard: { type: number }
-            tags_overlap: { type: number }
+          allOf:
+            - $ref: '#/components/schemas/SimilarityBreakdown'
+          description: '`similar` edges.'
         computed_at: { type: string, format: date-time }
 
     AgentGraph:
@@ -1615,29 +2720,28 @@ components:
               type: array
               items: { $ref: '#/components/schemas/GraphEdge' }
         stats:
-          type: object
-          properties:
-            total_nodes: { type: integer }
-            total_edges: { type: integer }
-            agent_count: { type: integer }
-            tool_count: { type: integer }
-            category_count: { type: integer }
-            similarity_connections: { type: integer }
-            cached: { type: boolean }
-            cache_age_seconds:
-              type: integer
-              description: Only on cached responses.
+          allOf:
+            - $ref: '#/components/schemas/GraphStats'
+            - type: object
+              properties:
+                cached: { type: boolean }
+                cache_age_seconds:
+                  type: integer
+                  description: Only on cached responses.
         metadata:
           type: object
           properties:
             orgSlug: { type: string }
-            generated_at: { type: string, format: date-time }
+            generated_at:
+              type: string
+              format: date-time
+              description: When the graph was computed.
             options:
               type: object
-              description: Options applied. Absent on cached responses.
               properties:
                 include_tools: { type: boolean }
                 include_categories: { type: boolean }
+                include_delegations: { type: boolean }
                 similarity_threshold: { type: number }
 
     ClusterAgent:
@@ -1647,7 +2751,6 @@ components:
         name: { type: string }
         category: { type: string, nullable: true }
         tools_count: { type: integer }
-        conversations_count: { type: integer }
         avg_score: { type: number }
 
     AgentClusters:
@@ -1668,7 +2771,6 @@ components:
               tools: { type: array, items: { type: string } }
               categories: { type: array, items: { type: string } }
               avg_score: { type: number }
-              total_conversations: { type: integer }
               internal_similarity:
                 type: number
                 description: Average score of the similarity edges inside the cluster.
@@ -1702,8 +2804,5 @@ components:
         similarity_score: { type: number, minimum: 0, maximum: 1 }
         shared_tools: { type: array, items: { type: string } }
         shared_tags: { type: array, items: { type: string } }
-        breakdown:
-          type: object
-          properties:
-            tools_jaccard: { type: number }
-            tags_overlap: { type: number }
+        shared_guardrails: { type: array, items: { type: string } }
+        breakdown: { $ref: '#/components/schemas/SimilarityBreakdown' }
