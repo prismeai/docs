@@ -795,6 +795,189 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /v1/models/catalog:
+    get:
+      tags: [Models]
+      operationId: getModelCatalog
+      summary: Read the Prisme.ai reference model catalogue
+      description: |
+        Static reference catalogue shipped with the gateway: per known model, its
+        `key`, `aliases`, recommended metrics (`suggested`), indicative
+        `reference_pricing` and factual `spec` (type, capabilities, context,
+        `max_output_tokens`, `end_of_life`, request handling). Read-only; never
+        changes the environment.
+      responses:
+        '200':
+          description: The catalogue.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  methodology_version:
+                    type: string
+                  source:
+                    type: string
+                  verified_at:
+                    type: string
+                  models:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      properties:
+                        key:
+                          type: string
+                        display_name:
+                          type: string
+                        brand:
+                          type: string
+                        aliases:
+                          type: array
+                          items:
+                            type: string
+                        suggested:
+                          type: object
+                          additionalProperties: true
+                        reference_pricing:
+                          type: object
+                          additionalProperties: true
+                        spec:
+                          type: object
+                          additionalProperties: true
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/models/catalog/sync:
+    post:
+      tags: [Models]
+      operationId: syncModelCatalog
+      summary: Align the environment's models with the catalogue
+      description: |
+        Back-fills `catalog_id` by name once, then applies the catalogue to the
+        linked models: recommended metrics, `end_of_life`, the forced
+        tool_choice refusal, `exclude_params` / `rename_params` (filled only when
+        empty, else reported as `divergent`), and replaces an empty or unknown
+        `region` with the provider's. `limits.response_tokens` is never synced.
+        Dry-run by default. Requires write access to models.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dry_run:
+                  type: boolean
+                  default: true
+                model_ids:
+                  type: array
+                  items:
+                    type: string
+                fields:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: What was (or would be) changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  dry_run:
+                    type: boolean
+                  fields:
+                    type: array
+                    items:
+                      type: string
+                  summary:
+                    type: object
+                    additionalProperties: true
+                  backfilled:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  patched:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  unmatched:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  divergent:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Write access to models required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/models/unregistered:
+    get:
+      tags: [Models]
+      operationId: listUnregisteredModels
+      summary: List provider ids declared but not registered
+      description: |
+        Model ids declared in the gateway's provider configuration with no row in
+        the models collection yet, with their provider and suggested carbon
+        `region`. Ids only, never credentials. Requires write access to models.
+      responses:
+        '200':
+          description: Declared, unregistered ids.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  models:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        model_id:
+                          type: string
+                        provider:
+                          type: string
+                        region:
+                          type: string
+                          nullable: true
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Write access to models required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /v1/models/regions:
     get:
       tags: [Models]
@@ -1056,6 +1239,76 @@ paths:
                 $ref: '#/components/schemas/Error'
         '405':
           description: Method not allowed (only `POST` accepted).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/test/capabilities:
+    post:
+      tags: [Test]
+      operationId: probeModelCapabilities
+      summary: Probe which optional request features a model accepts
+      description: |
+        Real calls through the saved model entry to probe optional features
+        (e.g. `supports_forced_tool_choice`), in parallel. `supported: null`
+        means inconclusive (rate limit, timeout…). Requires write access to
+        models; each probe costs real tokens.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [modelId]
+              properties:
+                modelId:
+                  type: string
+                  maxLength: 256
+                options:
+                  type: array
+                  maxItems: 16
+                  items:
+                    type: string
+                    maxLength: 64
+                    pattern: ^[a-z0-9_]+$
+      responses:
+        '200':
+          description: Probe results per option.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  results:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      additionalProperties: true
+                      properties:
+                        supported:
+                          type: boolean
+                          nullable: true
+                        reason:
+                          type: string
+                        message:
+                          type: string
+        '400':
+          description: Invalid body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Write access to models required.
           content:
             application/json:
               schema:
