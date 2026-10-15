@@ -595,7 +595,7 @@ The LLM Gateway abstracts multiple providers behind a unified API:
 | Azure OpenAI | GPT-5, GPT-4o, embeddings, Claude (via Azure AI) | Multiple resource configs |
 | OpenAI-compatible | Gemini, DeepSeek, Mistral, Cerebras, OVH, Linagora | Via `openailike` provider type |
 | Anthropic | Claude Sonnet 4.5, Claude 3.7 Sonnet, Claude 3.5 Sonnet | Native API; optional custom `endpoint` + selectable `auth_scheme` for self-hosted / compatible / non-standard Azure hosts |
-| Google Vertex AI | Gemini 2.5/3, Imagen 4.0, text-embedding-005 | Via model aliases + service account. Tool calling is supported on Gemini 3.x models |
+| Google Vertex AI | Gemini 2.5/3, Claude, Imagen 4.0, text-embedding-005 | Via model aliases + service account. Tool calling is supported on Gemini 3.x models. Accounts, formats and Claude: see [Google Vertex AI](#google-vertex-ai) |
 | AWS Bedrock | Claude, Titan, Cohere, Nova, Llama | Multiple region/credential sets |
 
 All providers are normalized to the OpenAI API format for chat completions and streaming (SSE).
@@ -964,6 +964,60 @@ anthropic:
 - **Selectable auth scheme**: set `auth_scheme` to control how the key is sent: `x-api-key` (default, the standard Anthropic header), `api-key`, or `bearer` (sends `Authorization: Bearer <api_key>` and omits `x-api-key`). The key or token always goes in `api_key`. Omit `auth_scheme` to keep the default `x-api-key` behavior. For richer needs (multiple auth headers, gateway subscription keys, request tagging), use [`options.headers`](#headers); it overrides anything set by `auth_scheme`.
 - **Include the full path**: the value is taken as-is; append `/v1/messages` (or whatever path the host exposes).
 - **vs Azure OpenAI `format: anthropic`**: if the URL fits `https://{resource}.{domain}/anthropic/v1/messages`, configure it as an `azure_openai.resources` entry with `format: anthropic` (you get URL forging and can co-locate GPT + Claude on one resource). Use `anthropic.endpoint` when the URL does **not** fit that scheme.
+
+### Google Vertex AI
+
+Each entry of `providers.vertex` is an account: a service account, a `host`, a `format`, and the `models` it serves. Vertex models are reached through **Model Aliases**: the model id your users see maps to the full Vertex path of the model.
+
+The **format** applies to every model of the account and decides which Vertex API is called:
+
+| Format | For | Vertex API |
+|---|---|---|
+| Default (unset) | Gemini chat models, embeddings, Imagen | `generateContent` for chat, `predict` for embeddings and Imagen |
+| `gemini` | Gemini image models, e.g. nano-banana | `generateContent`, image generation included |
+| `anthropic` | Claude | `rawPredict` / `streamRawPredict` (Anthropic Messages format) |
+
+Group models by format: a model listed in an account of the wrong format fails. In **Govern → Models → Providers**, the format is the **format** selector of each **Google Vertex** account (v27.7.2 and later); on an earlier version, set `format` in the LLM Gateway configuration, as in the example below.
+
+#### Claude on Google Vertex AI
+
+Before you start, enable the Claude model in the Model Garden of your Google Cloud project, check that it is offered in the location you will call it from, and give the account's service account the **Vertex AI User** role on that project.
+
+1. **Add a Vertex account.** In **Govern → Models → Providers**, under **Google Vertex**, click **Add account**, set the service account, and set **format** to `anthropic`. The format selector exists from v27.7.2: on an earlier version, set `format: anthropic` in the LLM Gateway configuration (example below).
+2. **Set the host from the location.** The host must serve the location named in the model path:
+
+   | Location in the path | `host` |
+   |---|---|
+   | `global` | `aiplatform.googleapis.com` |
+   | a region, e.g. `us-east5` or `europe-west1` | `<region>-aiplatform.googleapis.com`, e.g. `us-east5-aiplatform.googleapis.com` |
+
+3. **Alias the model.** In **Model Aliases**, map the model id your users will see to the full Vertex path of the model: `projects/<project>/locations/<location>/publishers/anthropic/models/<model>`, for example `vertex-claude-haiku-5-5` → `projects/my-project/locations/global/publishers/anthropic/models/claude-haiku-5-5`. Keep `publishers/anthropic/` in the path: the gateway calls Vertex with that path as is.
+4. **List the alias in the account.** Add the alias (`vertex-claude-haiku-5-5`), not the path, to the **models** of the account from step 1.
+5. **Register the model.** Add it in **Govern → Models**, from **Update from catalogue → Add models** or by hand, set its prices (see [Model pricing](#model-pricing)), then click **Test**.
+
+The same configuration in the LLM Gateway workspace (`workspaces/llm-gateway/index.yml`, under `config.value`):
+
+```yaml
+model_aliases:
+  vertex-claude-haiku-5-5: projects/my-project/locations/global/publishers/anthropic/models/claude-haiku-5-5
+providers:
+  vertex:
+    - credentials:
+        service_account: '{{secret.vertexServiceAccount}}'
+      host: aiplatform.googleapis.com     # matches locations/global
+      format: anthropic
+      models:
+        - vertex-claude-haiku-5-5
+```
+
+**Notes**:
+- Keep Claude models out of a `gemini` account: it sends them to `generateContent`, which does not serve Claude.
+- Recent versions of the Google Vertex AI app also send a model whose path contains `publishers/anthropic/` to `rawPredict` when its account is left on **Default**. Older versions send it to `generateContent`. Setting `anthropic` works with every version.
+- A model served from a dedicated endpoint (`projects/<project>/locations/<location>/endpoints/<id>`) has no publisher in its path: only an account set to `anthropic` reaches it as Claude.
+
+**Troubleshooting**:
+- *`<model> is not supported in the generateContent API`*: the call went to the Gemini API, because the account listing the model is on **Default** (with a version of the Google Vertex AI app that does not read the path) or on `gemini`. Set the account's format to `anthropic`, which fixes it on every version, then check that the alias path contains `publishers/anthropic/`.
+- *404 `NOT_FOUND`*: the model is not enabled on the project or not offered in that location, or the host does not match the location of the path.
 
 ## Best Practices
 
