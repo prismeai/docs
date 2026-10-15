@@ -4,8 +4,9 @@ info:
   title: LLM Gateway API
   description: |
     Public REST API for the Prisme.ai LLM Gateway - OpenAI-compatible
-    chat completions and embeddings, plus a managed model catalogue
-    with governance overrides per organization.
+    chat completions, embeddings and image generation/editing, a standard
+    rerank endpoint, a managed model catalogue with governance overrides
+    per organization, and quota status for users and organizations.
 
     The gateway abstracts multi-provider LLM access (OpenAI, Azure OpenAI,
     Anthropic, Google Vertex, AWS Bedrock, OpenAI-compatible providers) behind
@@ -36,10 +37,14 @@ tags:
     description: OpenAI-compatible text embeddings.
   - name: Rerank
     description: Rerank documents by relevance to a query (standard rerank contract, LLM-as-reranker backend).
-  - name: Audio
-    description: OpenAI-compatible speech-to-text (audio transcriptions).
+  - name: Images
+    description: OpenAI-compatible image generation and image editing.
   - name: Models
     description: Model catalogue (CRUD + bulk replace + governance-aware listing).
+  - name: Audio
+    description: OpenAI-compatible speech-to-text (audio transcriptions).
+  - name: Quotas
+    description: Effective LLM quota limits and current usage, per user and per organization.
   - name: Defaults
     description: Resolved default models for completions / embeddings / image generation / transcription / file parsing.
   - name: Test
@@ -56,11 +61,27 @@ paths:
         Bedrock, OpenAI-compatible) based on the resolved model spec.
 
         **Streaming.** When `stream: true`, the response is a `text/event-stream`
-        of OpenAI-compatible delta chunks (`ChatCompletionChunk`) terminated by
-        a literal `data: [DONE]` payload. Provider-native stream shapes
+        of OpenAI-compatible delta chunks (`ChatCompletionChunk`) followed by a
+        literal `data: [DONE]` payload, then one final `chat.completion` frame
+        (same shape as `ChatCompletionResponse`) carrying the assembled message,
+        `finish_reason` and `usage`. Provider-native stream shapes
         (Anthropic, Bedrock, Vertex) are normalised to OpenAI deltas before
         being forwarded. Provider errors mid-stream are emitted as a synthetic
-        chunk with a `content` message followed by `[DONE]`.
+        chunk carrying an `error` object and a `content` fallback message,
+        followed by `[DONE]`.
+
+        **Failover.** When the requested model was attempted and failed, and a
+        fallback answered instead (governance failover mapping merged with
+        `fallback_models`), the switch is reported as
+        `failover: { from_model, to_model }` on the response body, or on the
+        first forwarded chunk when streaming.
+
+        **Thinking blocks.** Anthropic thinking blocks are never streamed. They
+        are returned on the assistant message as `reasoning_details`, tagged
+        with `reasoning_model` (the model that answered). Send both back
+        verbatim when replaying the turn: the gateway forwards the blocks only
+        to that same model, drops them for any other, and never sends the
+        `reasoning_model` tag to a provider.
 
         When `stream: false` (default), the response is a single JSON
         `ChatCompletionResponse`. The non-streaming response is enriched with
@@ -72,6 +93,9 @@ paths:
         - `analytics_context` - caller-supplied context (`orgSlug`, `agent_id`,
           `user_id`, `context_id`, `agent_allowed_models`, `call_type`,
           `message_turn`) used to enrich `analytics.llm.completion` events.
+        - `fallback_models` - ordered models tried when the requested model
+          fails, merged with the governance failover mapping; each one is
+          checked against the caller's access like the primary.
 
         **Rate limiting.** 100 requests per 60 seconds per consumer
         (`auth.user_id` or `session.id`).
@@ -93,7 +117,7 @@ paths:
             Successful completion. Content type depends on `request.stream`:
             - `application/json`: non-streaming `ChatCompletionResponse`.
             - `text/event-stream`: SSE stream of `ChatCompletionChunk` payloads
-              terminated by `data: [DONE]`.
+              followed by `data: [DONE]` and a final `chat.completion` frame.
           content:
             application/json:
               schema:
@@ -102,8 +126,9 @@ paths:
               schema:
                 description: |
                   Server-Sent Events stream. Each `data:` line carries a JSON
-                  `ChatCompletionChunk` (delta), and the final `data:` line is
-                  the literal string `[DONE]`. The schema below describes the
+                  `ChatCompletionChunk` (delta), then a literal `[DONE]` line,
+                  then one final `chat.completion` frame shaped like
+                  `ChatCompletionResponse`. The schema below describes the
                   per-chunk JSON payload.
                 allOf:
                   - $ref: '#/components/schemas/ChatCompletionChunk'
@@ -123,8 +148,8 @@ paths:
           description: |
             Refused by a governance overlay. The machine-readable code is
             typically `MODEL_NOT_ALLOWED`, or `HEADER_POLICY_VIOLATION` when a
-            required upstream identity header would reach the provider empty —
-            `details.missing` then lists the header names.
+            required upstream identity header would reach the provider empty
+            (`details.missing` then lists the header names).
           content:
             application/json:
               schema:
@@ -184,7 +209,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Model not allowed for this caller (governance overlay).
+          description: |
+            Refused by a governance overlay: `MODEL_NOT_ALLOWED`, or
+            `HEADER_POLICY_VIOLATION` when a required upstream identity header
+            would reach the provider empty.
           content:
             application/json:
               schema:
@@ -284,68 +312,139 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /v1/images/generations:
+    post:
+      tags: [Images]
+      operationId: createImage
+      summary: Generate images
+      description: |
+        OpenAI-compatible image generation. The gateway resolves the model
+        (request `model`, else the org governance default, else the platform
+        default `config.defaults.image_generation`) and routes the call to the
+        provider (OpenAI, Azure OpenAI, Google Vertex Imagen).
+
+        **Size resolution.** Pass an abstract `aspect` + `tier`, or an explicit
+        pixel `size`. The gateway snaps it to a size listed in the model's
+        `capabilities.supported_sizes`; an exact supported `size` is kept as is.
+        Without a supported-sizes list, `size` is passed through (default
+        `1024x1024`). The size actually used is returned in `size`.
+
+        **Images are always returned as URLs.** When the provider only returns
+        base64 data, the gateway uploads it to Prisme.ai file storage and
+        returns a tokenised `url` instead, so `data[].b64_json` is never
+        present in the response.
+
+        **Governance.** Requires the `image-generation` model permission. A
+        model not allowed for the organization is either downgraded to the
+        governance fallback model (`soft_downgrade` quota policy) or refused
+        with `403 MODEL_NOT_ALLOWED`. A required upstream identity header that
+        would reach the provider empty is refused with
+        `403 HEADER_POLICY_VIOLATION`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageGenerationRequest'
+      responses:
+        '200':
+          description: Generated images.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagesResponse'
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            Missing `image-generation` permission (`FORBIDDEN`), model refused by
+            the organization governance (`MODEL_NOT_ALLOWED`), or header-policy
+            refusal (`HEADER_POLICY_VIOLATION`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        default:
+          description: |
+            Provider error, forwarded with the provider's HTTP status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/images/edits:
+    post:
+      tags: [Images]
+      operationId: editImage
+      summary: Edit an image
+      description: |
+        Edits an existing image from a prompt. Same model resolution,
+        governance and size resolution as `POST /v1/images/generations`
+        (the `image-generation` model permission applies).
+
+        The source image is passed as `image_url`, a URL the gateway can fetch
+        (for example a short-lived tokenised Prisme.ai file URL). The gateway
+        downloads it and sends it to the provider (multipart `images/edits`
+        for OpenAI / Azure `gpt-image` models, reference image for Vertex
+        Imagen). As for generation, results are always returned as URLs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageEditRequest'
+      responses:
+        '200':
+          description: Edited images.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagesResponse'
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            Missing `image-generation` permission (`FORBIDDEN`), model refused by
+            the organization governance (`MODEL_NOT_ALLOWED`), or header-policy
+            refusal (`HEADER_POLICY_VIOLATION`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        default:
+          description: |
+            Provider error, forwarded with the provider's HTTP status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /v1/audio/transcriptions:
     post:
       tags: [Audio]
       operationId: createTranscription
       summary: Transcribe audio into text
       description: |
-        OpenAI-compatible speech-to-text endpoint. An official OpenAI SDK
-        pointed at the gateway calls it unchanged
-        (`client.audio.transcriptions.create(...)`): set the SDK base URL to
-        `https://{host}/v2/workspaces/slug:llm-gateway/webhooks/v1` and pass a
-        user access token as the API key. This is the endpoint behind chat
-        dictation.
+        OpenAI-compatible speech-to-text endpoint: an OpenAI SDK pointed at
+        this gateway calls it unchanged. The audio is sent as a multipart
+        `file` part, held in memory only and never stored.
 
-        The audio is sent as a multipart `file` part. It is processed in
-        memory and never stored: it is not written to storage, to the
-        activity feed, or to logs.
+        `model` defaults to the organization's transcription model, then to
+        the platform default. `srt` and `vtt` response formats are not
+        supported; `text` is answered as `text/plain`, ended by a newline like
+        OpenAI (a silent recording is `"\n"`). A file sent with a generic MIME
+        type (`application/octet-stream`) is named after its original extension.
 
-        **Model resolution.** When `model` is omitted, the gateway uses the
-        organization's default transcription model, then the platform default
-        transcription model. A model not declared on any provider is answered
-        with `400`.
-
-        **Response formats.** `json` (default) and `verbose_json` return JSON,
-        `text` returns `text/plain`. `srt` and `vtt` are refused with
-        `400 UNSUPPORTED_RESPONSE_FORMAT`.
-
-        **Permission.** Requires `llm-gateway:models:audio-transcriptions`,
-        granted by default to the system Member role.
-
-        **Governance.** The organization's allowed models apply: a model
-        outside the allowlist is refused with `403 MODEL_NOT_ALLOWED`, or,
-        under a `soft_downgrade` quota policy, replaced by the default
-        transcription model.
-
-        **Analytics.** Each successful call emits an
-        `analytics.llm.transcription` event, so usage appears in analytics.
-      x-codeSamples:
-        - lang: bash
-          label: curl
-          source: |
-            curl https://{host}/v2/workspaces/slug:llm-gateway/webhooks/v1/audio/transcriptions \
-              -H "Authorization: Bearer $PRISME_TOKEN" \
-              -F file=@meeting-notes.m4a \
-              -F language=fr
-        - lang: python
-          label: Python (OpenAI SDK)
-          source: |
-            from openai import OpenAI
-
-            client = OpenAI(
-                base_url="https://{host}/v2/workspaces/slug:llm-gateway/webhooks/v1",
-                api_key="<your user access token>",
-            )
-
-            with open("meeting-notes.m4a", "rb") as audio:
-                transcript = client.audio.transcriptions.create(
-                    model="gpt-4o-transcribe",
-                    file=audio,
-                    language="fr",
-                )
-
-            print(transcript.text)
+        Requires the `llm-gateway:models:audio-transcriptions` permission.
+        Governance overlays may reject the model (403 `MODEL_NOT_ALLOWED`).
       requestBody:
         required: true
         content:
@@ -357,39 +456,25 @@ paths:
                 file:
                   type: string
                   format: binary
-                  description: |
-                    Audio file to transcribe, 25 MB maximum by default. Supported
-                    formats: `flac`, `m4a`, `mp3`, `mp4`, `mpeg`, `mpga`, `oga`,
-                    `ogg`, `wav`, `webm`.
+                  description: Audio file (webm, mp4, m4a, mp3, ogg, wav, flac), 25 MB max by default.
                 model:
                   type: string
                   maxLength: 256
-                  description: |
-                    Transcription model id, for example `gpt-4o-transcribe`.
-                    Defaults to the organization's default transcription
-                    model, then to the platform default.
                 language:
                   type: string
-                  description: |
-                    ISO-639-1 language of the audio, for example `fr`. Improves
-                    accuracy on short recordings. Detected by the model when
-                    omitted.
+                  description: ISO-639-1 language of the audio (e.g. `fr`). Detected when omitted.
                 prompt:
                   type: string
-                  description: Text that guides the transcription, such as expected vocabulary or the previous segment.
+                  description: Text to guide the transcription (vocabulary, previous segment).
                 temperature:
                   type: number
-                  description: Sampling temperature, passed to the provider.
                 response_format:
                   type: string
                   enum: [json, text, verbose_json]
                   default: json
-                  description: '`srt` and `vtt` are not supported.'
       responses:
         '200':
-          description: |
-            Transcribed text. `application/json` for `json` and
-            `verbose_json`, `text/plain` for `text`.
+          description: Transcribed text.
           content:
             application/json:
               schema:
@@ -398,20 +483,18 @@ paths:
                 properties:
                   text:
                     type: string
-                    description: Transcribed text.
                   usage:
                     type: object
-                    description: Provider usage, when the provider reports it.
-                    additionalProperties: true
+                    description: Provider usage, when reported.
             text/plain:
               schema:
                 type: string
         '400':
           description: |
-            Invalid request: no `file` part (`FILE_REQUIRED`), `srt` or `vtt`
-            requested (`UNSUPPORTED_RESPONSE_FORMAT`), no transcription model
-            configured for the organization or the platform
-            (`NO_TRANSCRIPTION_MODEL`), or a `model` declared on no provider.
+            Invalid request: missing file (`FILE_REQUIRED`), unsupported
+            `response_format`, no transcription model configured
+            (`NO_TRANSCRIPTION_MODEL`) or model declared on no provider
+            (`UnknownModel`).
           content:
             application/json:
               schema:
@@ -423,16 +506,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: |
-            Missing `llm-gateway:models:audio-transcriptions` permission, or
-            model not allowed for this caller by the organization's governance
-            (`MODEL_NOT_ALLOWED`).
+          description: Missing permission, or model not allowed for this caller (governance overlay).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '413':
-          description: Audio file larger than the size limit, 25 MB by default (`FILE_TOO_LARGE`).
+          description: Audio file larger than the configured limit (`FILE_TOO_LARGE`).
           content:
             application/json:
               schema:
@@ -619,14 +699,22 @@ paths:
       operationId: replaceModels
       summary: Bulk-replace the entire model catalogue
       description: |
-        **Destructive.** Deletes the entire models collection and inserts the
-        provided list. Used by the platform Models page "Import" flow.
+        Reconciles the models collection to the provided list. Used by the
+        platform Models page "Import" flow.
+
+        **Non-destructive reconcile.** Every incoming model is upserted
+        (keyed on `model_id`) in a single bulk write, then the models absent
+        from the list are pruned. The catalogue is never emptied mid-flight:
+        a failure returns `500 BULK_REPLACE_FAILED` and leaves the previous
+        catalogue in place (plus any rows already upserted).
 
         - Body must be `{ "models": [...] }` (max 500 items). Each item must
           carry at least `model_id` and `type`.
-        - Per-key cache (`global.models_cache`) is fully invalidated.
+        - An empty list clears the whole catalogue, and is refused with
+          `400 CONFIRMATION_REQUIRED` unless `confirm_clear_all: true` is sent.
+        - Cache (`global.models_cache`) is fully invalidated.
         - Emits a `model.bulk_replaced` audit event.
-        - Rate-limited: 5 calls per 3600 seconds per consumer
+        - Rate-limited: 2 calls per 60 seconds per consumer
           (`ModelsBulkReplace`).
       requestBody:
         required: true
@@ -642,6 +730,11 @@ paths:
                   maxItems: 500
                   items:
                     $ref: '#/components/schemas/ModelCreateInput'
+                confirm_clear_all:
+                  type: boolean
+                  description: |
+                    Required (`true`) when `models` is empty, to confirm wiping
+                    the entire catalogue. Ignored otherwise.
       responses:
         '200':
           description: Bulk replace summary.
@@ -649,20 +742,28 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [deleted, inserted]
+                required: [upserted, pruned, inserted, deleted]
                 properties:
-                  deleted:
+                  upserted:
                     type: integer
-                    description: Number of documents removed before the insert.
+                    description: Number of models inserted or updated (the full incoming list).
+                  pruned:
+                    type: integer
+                    description: Number of stale models removed (absent from the new list).
                   inserted:
                     type: integer
-                    description: Number of documents inserted.
+                    description: Backward-compatible alias for `upserted`.
+                  deleted:
+                    type: integer
+                    description: Backward-compatible alias for `pruned`.
         '400':
           description: |
             Validation error. Codes: `INVALID_BODY` (missing or non-array
             `models`), `INVALID_ITEMS` (one or more items missing `model_id` or
             `type` - `details` lists the offending entries),
-            `PAYLOAD_TOO_LARGE` (more than 500 items).
+            `PAYLOAD_TOO_LARGE` (more than 500 items). An empty `models` list
+            without `confirm_clear_all: true` is refused with
+            `error: CONFIRMATION_REQUIRED`.
           content:
             application/json:
               schema:
@@ -680,7 +781,48 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
-          description: 'Rate limit exceeded (`code: RATE_LIMITED`, 5 req / 3600 s per consumer).'
+          description: 'Rate limit exceeded (`code: RATE_LIMITED`, 2 req / 60 s per consumer).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: |
+            The reconcile failed (`code: BULK_REPLACE_FAILED`). Nothing is
+            pruned (no partial wipe); `details` carries the underlying error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/models/regions:
+    get:
+      tags: [Models]
+      operationId: getModelRegions
+      summary: List carbon-footprint regions
+      description: |
+        Regions a model can declare in `region` (each with its grid emission
+        factor, kg CO2eq/kWh), plus the region suggested for `model_id` from
+        the provider configuration: the provider's `carbon_region`, else the
+        Bedrock AWS region mapped to its carbon region. `suggested` and
+        `source` are null without `model_id` or when nothing can be inferred.
+      parameters:
+        - name: model_id
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 256
+          description: Model id to suggest a region for.
+      responses:
+        '200':
+          description: Regions and suggestion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelRegions'
+        '401':
+          description: Missing or invalid authentication.
           content:
             application/json:
               schema:
@@ -810,6 +952,66 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /v1/providers/{type}/{index}/models:
+    get:
+      tags: [Models]
+      operationId: listProviderModels
+      summary: List the models available at one provider entry
+      description: |
+        Calls the provider's own model listing for ONE entry of the saved
+        gateway configuration (OpenAI and OpenAI-compatible `/models`, Azure
+        OpenAI deployments, Anthropic `/v1/models`, Vertex Model Garden
+        publisher models, Bedrock foundation models and inference profiles).
+        Credentials stay server-side. Each model keeps the provider's own
+        fields as-is, plus a standardized `id` (the value to declare in the
+        entry), `declared` and `registered`. Requires write access to models.
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [openai, azure_openai, openailike, anthropic, vertex, bedrock]
+          description: Provider type, a key of the gateway `providers` configuration.
+        - name: index
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+          description: Position of the entry in `providers.<type>` (`providers.azure_openai.resources` for Azure); 0 for the single-object providers.
+      responses:
+        '200':
+          description: Models available at the provider entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderModels'
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Write access to models required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No such entry in the saved configuration (`PROVIDER_NOT_FOUND`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: The provider refused or failed the listing (credentials, permissions, unsupported endpoint).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /v1/test:
     post:
       tags: [Test]
@@ -824,9 +1026,6 @@ paths:
         - `type: "completions"` (default) → calls `OpenAI.chat-completion` with
           a single-turn user message and a `get_weather` tool definition,
           returns `{ ok, response }`.
-        - `type: "transcription"` → sends 0.1 second of silent WAV audio to
-          `/v1/audio/transcriptions` and returns `{ ok, response }`. An empty
-          transcript is a pass. The test call is not counted as usage.
 
         On error, the call is wrapped in a `try`/`catch` and returns
         `{ ok: false, response: <error> }`.
@@ -857,6 +1056,99 @@ paths:
                 $ref: '#/components/schemas/Error'
         '405':
           description: Method not allowed (only `POST` accepted).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/quotas/me:
+    get:
+      tags: [Quotas]
+      operationId: getMyQuotas
+      summary: Get the caller's effective quotas
+      description: |
+        Effective LLM quota status for the calling user in their active
+        organization: the per-user rate limits (`llm.rpm`, `llm.tpm`) and the
+        organization monthly budgets (`llm.monthly_tokens`, `llm.monthly_cost`)
+        with current usage. Only limits that are actually configured are
+        returned as gauges.
+
+        The per-user limit is the most specific one configured: user override,
+        then per-role limit, then the plan's per-user default.
+
+        Usage figures are snapshots: rate gauges are refreshed on each LLM
+        request (`as_of` = time of the last request, and a sliding window means
+        the live value can only be lower), monthly usage is aggregated hourly.
+
+        **Requires a user session**: calls without a user identity (for
+        example an org API key) get `401 UNAUTHORIZED`. When the caller has no
+        active organization, the response carries an empty `gauges` list.
+
+        **Rate limiting.** 60 requests per 60 seconds per user.
+      responses:
+        '200':
+          description: Quota status for the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyQuotasResponse'
+        '401':
+          description: Missing authentication or no user session (`UNAUTHORIZED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: 'Rate limit exceeded (`error: RATE_LIMITED`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/quotas/usage:
+    get:
+      tags: [Quotas]
+      operationId: getOrgQuotasUsage
+      summary: Get the organization's quota usage
+      description: |
+        Organization-level quota status: the enforced LLM limits of the plan
+        (`llm.rpm`, `llm.tpm`, `llm.monthly_tokens`, `llm.monthly_cost`) with
+        current usage, the quota policy, the plan's contractual `included`
+        limits, the per-user defaults and the org's per-user quota settings.
+
+        Only what the gateway enforces carries usage; the `included` counters
+        (members, agents, interactions, storage) are returned as configured in
+        the plan, without usage.
+
+        Requires the `models:read` permission. **Rate limiting.** 60 requests
+        per 60 seconds per consumer.
+      responses:
+        '200':
+          description: Organization quota status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrgQuotasUsageResponse'
+        '400':
+          description: 'The caller has no active organization (`error: NO_ORG_CONTEXT`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid authentication.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Missing `models:read` permission.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: 'Rate limit exceeded (`error: RATE_LIMITED`).'
           content:
             application/json:
               schema:
@@ -909,6 +1201,7 @@ components:
             `RATE_LIMITED`, `MODEL_NOT_ALLOWED`, `HEADER_POLICY_VIOLATION`,
             `MODEL_NOT_FOUND`,
             `MODEL_EXISTS`, `MISSING_MODEL_ID`, `MISSING_TYPE`, `INVALID_BODY`,
+            `BULK_REPLACE_FAILED`,
             `INVALID_ITEMS`, `INVALID_DIMENSIONS`, `PAYLOAD_TOO_LARGE`,
             `METHOD_NOT_ALLOWED`, `PROVIDER_ERROR`, `PROVIDER_NO_RESPONSE`.
         details:
@@ -960,6 +1253,32 @@ components:
           description: Tool calls emitted by an assistant message.
           items:
             $ref: '#/components/schemas/ToolCall'
+        reasoning_details:
+          type: array
+          description: |
+            Anthropic thinking blocks produced with this assistant message
+            (`thinking` blocks carry `thinking` and `signature`,
+            `redacted_thinking` blocks carry `data`). Returned by the gateway
+            and meant to be sent back verbatim when the turn is replayed.
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              type:
+                type: string
+                enum: [thinking, redacted_thinking]
+              thinking:
+                type: string
+              signature:
+                type: string
+              data:
+                type: string
+        reasoning_model:
+          type: string
+          description: |
+            Gateway model id that produced `reasoning_details`. On replay the
+            blocks are forwarded only when this matches the model being
+            called; the tag itself is never sent to a provider.
 
     ToolCall:
       type: object
@@ -987,7 +1306,7 @@ components:
 
     ChatCompletionRequest:
       type: object
-      required: [model, messages]
+      required: [messages]
       description: |
         OpenAI-compatible chat completion request. Only the fields actually
         accepted by the gateway are documented here.
@@ -998,14 +1317,15 @@ components:
           description: |
             Model id from the catalogue (e.g. `gpt-4o`,
             `eu.anthropic.claude-sonnet-4-20250514-v1:0`,
-            `vertex-gemini-2.5-flash`).
+            `vertex-gemini-2.5-flash`). Defaults to the gateway's
+            `defaults.completions` model when omitted.
         messages:
           type: array
           description: Conversation history (system + user/assistant/tool turns).
           items:
             $ref: '#/components/schemas/ChatMessage'
         temperature:
-          description: Sampling temperature (provider-dependent range, typically 0–2).
+          description: Sampling temperature (provider-dependent range, typically 0 to 2).
         max_tokens:
           description: Max tokens to generate.
         top_p:
@@ -1041,6 +1361,16 @@ components:
           additionalProperties: true
         seed:
           description: Provider seed for reproducible sampling (where supported).
+        fallback_models:
+          type: array
+          maxItems: 5
+          items:
+            type: string
+          description: |
+            **Prisme.ai extension.** Ordered fallback models tried when the
+            requested model fails (merged with the governance failover
+            mapping). Each one is checked against the caller's access like
+            the primary.
         task_id:
           type: string
           maxLength: 128
@@ -1123,24 +1453,53 @@ components:
                 type: string
                 description: |
                   `stop`, `length`, `tool_calls`, `content_filter`, or another
-                  provider-specific value.
+                  provider-specific value. Anthropic and Bedrock stop reasons
+                  are normalised: unfinished answers (`max_tokens`,
+                  `model_context_window_exceeded`, `pause_turn`) become
+                  `length`, refusals (`refusal`, `guardrail_intervened`,
+                  `content_filtered`) become `content_filter`, any other
+                  present value becomes `stop`.
         usage:
           type: object
           description: Token, cost, and carbon accounting.
           properties:
             prompt_tokens:
               type: integer
+              description: Total input tokens, cached context included.
             completion_tokens:
               type: integer
+              description: |
+                Total output tokens, reasoning **included**. Providers that report
+                thinking separately (Gemini's `thoughtsTokenCount`) have it folded
+                in by their adapter, so the figure is comparable across providers.
+                `cost` is computed from it.
+            completion_tokens_details:
+              type: object
+              description: |
+                Breakdown of `completion_tokens`. Present when the provider reports
+                one (OpenAI reasoning models, Gemini/Vertex). Absent otherwise:
+                Anthropic and Bedrock do reason but publish no separate count, so
+                the thinking stays inside `completion_tokens`.
+              properties:
+                reasoning_tokens:
+                  type: integer
+            cache_read_input_tokens:
+              type: integer
+              description: Cached input tokens re-read on this call (0 when caching is off).
+            cache_write_input_tokens:
+              type: integer
+              description: Input tokens written to the provider cache (0 when caching is off or unbilled).
             total_tokens:
               type: integer
             cost:
               type: number
               format: double
               description: |
-                **Prisme.ai extension.** Estimated USD cost computed from
-                `pricing.input_per_1m_tokens` / `pricing.output_per_1m_tokens`
-                on the model document.
+                **Prisme.ai extension.** Estimated USD cost computed from the
+                model document's `pricing`. Prompt-cache tokens are priced at
+                `pricing.cache_read_per_1m_tokens` / `pricing.cache_write_per_1m_tokens`
+                (default: a provider ratio of the input price), the rest of the
+                prompt at `input_per_1m_tokens`, the completion at `output_per_1m_tokens`.
             duration_ms:
               type: integer
               description: '**Prisme.ai extension.** Wall-clock duration of the call.'
@@ -1150,13 +1509,16 @@ components:
                 **Prisme.ai extension.** Carbon-footprint estimate produced by
                 `_compute-carbon-footprint`.
               additionalProperties: true
+        failover:
+          $ref: '#/components/schemas/FailoverInfo'
 
     ChatCompletionChunk:
       type: object
       description: |
         Single chunk in a streaming chat completion. Forwarded as the JSON
-        payload of an SSE `data:` line. The final SSE payload of a stream is
-        the literal string `[DONE]` (not JSON).
+        payload of an SSE `data:` line. A literal `[DONE]` payload (not JSON)
+        closes the delta sequence, followed by one final `chat.completion`
+        frame shaped like `ChatCompletionResponse`.
       properties:
         id:
           type: string
@@ -1189,9 +1551,49 @@ components:
                       additionalProperties: true
               finish_reason:
                 type: string
+        failover:
+          allOf:
+            - $ref: '#/components/schemas/FailoverInfo'
+          description: Present on the first forwarded chunk when the gateway switched model.
+        error:
+          type: object
+          description: |
+            Present on the synthetic chunk emitted when the provider fails
+            mid-stream. `choices[0].delta.content` then carries the same
+            message for consumers that only read deltas.
+          properties:
+            message:
+              type: string
+            code:
+              type: string
+            provider:
+              type: string
+            model:
+              type: string
+            details:
+              type: object
+              additionalProperties: true
         usage:
           type: object
+          description: |
+            Present on the final chunk. Same fields as the non-streaming
+            `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`,
+            `completion_tokens_details.reasoning_tokens`,
+            `cache_read_input_tokens`, `cache_write_input_tokens`).
           additionalProperties: true
+
+    FailoverInfo:
+      type: object
+      description: |
+        Reported when the requested model was attempted, failed, and a
+        fallback answered instead. Absent when no switch happened.
+      properties:
+        from_model:
+          type: string
+          description: Model requested by the caller.
+        to_model:
+          type: string
+          description: Model that actually answered.
 
     EmbeddingRequest:
       type: object
@@ -1342,6 +1744,226 @@ components:
                 output_tokens:
                   type: integer
 
+    ImageGenerationRequest:
+      type: object
+      properties:
+        model:
+          type: string
+          maxLength: 256
+          description: Image model id. Defaults to the org governance default, then the platform default.
+        prompt:
+          type: string
+          description: Text description of the image to generate.
+        size:
+          type: string
+          description: Explicit `WxH` pixel size. Kept as is when the model supports it, otherwise snapped (see `aspect` / `tier`).
+          example: 1024x1024
+        aspect:
+          type: string
+          enum: [square, portrait, landscape]
+          description: '**Prisme.ai extension.** Abstract orientation, snapped to a size the model supports.'
+        tier:
+          type: string
+          enum: [small, medium, large]
+          description: '**Prisme.ai extension.** Size tier within the orientation (default `medium`).'
+        style:
+          type: string
+          description: Provider style hint, forwarded to the provider when set.
+        'n':
+          type: number
+          description: Number of images to generate (default 1).
+        response_format:
+          type: string
+          enum: [url, b64_json]
+          description: |
+            Format requested from the provider (default `url`). The response
+            always carries URLs: base64 results are uploaded and replaced by a
+            `url`.
+        analytics_context:
+          type: object
+          description: '**Prisme.ai extension.** Caller-supplied analytics context (`orgSlug`, `agent_id`, `user_id`, `context_id`, `agent_allowed_models`).'
+          additionalProperties: true
+
+    ImageEditRequest:
+      type: object
+      properties:
+        model:
+          type: string
+          maxLength: 256
+          description: Image model id. Defaults to the org governance default, then the platform default.
+        prompt:
+          type: string
+          description: Instruction describing the edit.
+        image_url:
+          type: string
+          description: URL of the source image, fetched by the gateway.
+        size:
+          type: string
+          description: Explicit `WxH` pixel size (same resolution rules as generation).
+        aspect:
+          type: string
+          enum: [square, portrait, landscape]
+          description: '**Prisme.ai extension.** Abstract orientation.'
+        tier:
+          type: string
+          enum: [small, medium, large]
+          description: '**Prisme.ai extension.** Size tier (default `medium`).'
+        'n':
+          type: number
+          description: Number of images to return (default 1).
+        analytics_context:
+          type: object
+          description: '**Prisme.ai extension.** Caller-supplied analytics context.'
+          additionalProperties: true
+
+    ImagesResponse:
+      type: object
+      properties:
+        created:
+          type: integer
+          description: Unix timestamp of the generation.
+        model:
+          type: string
+          description: Model that produced the images (after governance resolution).
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              url:
+                type: string
+                description: URL of the image (a tokenised Prisme.ai file URL when the provider returned base64).
+        size:
+          type: string
+          description: '**Prisme.ai extension.** Size actually used after resolution.'
+      example:
+        created: 1767225600
+        model: gpt-image-1
+        size: 1024x1024
+        data:
+          - url: https://api.studio.prisme.ai/v2/files/file-abc.png?token=token-123
+
+    QuotaGauge:
+      type: object
+      required: [key, scope, window, limit, used, percent]
+      properties:
+        key:
+          type: string
+          enum: [llm.rpm, llm.tpm, llm.monthly_tokens, llm.monthly_cost]
+        scope:
+          type: string
+          enum: [user, org]
+        window:
+          type: string
+          enum: [minute, month]
+        limit:
+          type: number
+          description: Configured limit (requests, tokens or cost depending on `key`).
+        used:
+          type: number
+          description: Current usage in the window (0 until a first request is recorded).
+        percent:
+          type: number
+          description: '`used / limit` as a rounded percentage.'
+        as_of:
+          type: string
+          format: date-time
+          description: Time of the last recorded request (rate gauges only).
+
+    MyQuotasResponse:
+      type: object
+      required: [computed_at, policy, gauges]
+      properties:
+        computed_at:
+          type: string
+          format: date-time
+        policy:
+          type: string
+          description: Organization quota policy (`hard_block` by default, or `soft_downgrade`).
+          example: hard_block
+        display:
+          type: object
+          description: Organization display settings for the quota gauges (`settings.quotas.display`), when configured.
+          additionalProperties: true
+        gauges:
+          type: array
+          description: Configured limits only. Per-user gauges have `scope` `user`, monthly budgets `org`.
+          items:
+            $ref: '#/components/schemas/QuotaGauge'
+      example:
+        computed_at: '2026-01-15T10:00:00.000Z'
+        policy: hard_block
+        gauges:
+          - key: llm.rpm
+            scope: user
+            window: minute
+            limit: 20
+            used: 9
+            percent: 45
+            as_of: '2026-01-15T09:59:40.000Z'
+          - key: llm.monthly_tokens
+            scope: org
+            window: month
+            limit: 10000000
+            used: 6400000
+            percent: 64
+
+    OrgQuotasUsageResponse:
+      type: object
+      required: [orgSlug, computed_at, policy, enforced]
+      properties:
+        orgSlug:
+          type: string
+        computed_at:
+          type: string
+          format: date-time
+        usage_refreshed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Last refresh of the monthly usage aggregate (null when none this month).
+        policy:
+          type: string
+          description: Organization quota policy (`hard_block` by default, or `soft_downgrade`).
+        enforced:
+          type: array
+          description: Plan limits enforced by the gateway (`scope` `org`, `source` `plan`).
+          items:
+            allOf:
+              - $ref: '#/components/schemas/QuotaGauge'
+              - type: object
+                properties:
+                  source:
+                    type: string
+                    enum: [plan]
+        included:
+          description: Contractual limits included in the plan, as configured (no usage).
+          additionalProperties: true
+        per_user_defaults:
+          type: object
+          description: Plan default per-user limits (`rpm`, `tpm`).
+          additionalProperties: true
+        org_user_quotas:
+          type: object
+          description: Organization per-user quota settings (`overrides` by user, `by_role`).
+          additionalProperties: true
+      example:
+        orgSlug: acme-corp
+        computed_at: '2026-01-15T10:00:00.000Z'
+        usage_refreshed_at: '2026-01-15T09:00:00.000Z'
+        policy: hard_block
+        enforced:
+          - key: llm.monthly_tokens
+            scope: org
+            window: month
+            limit: 10000000
+            used: 6400000
+            percent: 64
+            source: plan
+        per_user_defaults:
+          rpm: 20
+          tpm: 20000
+
     Model:
       type: object
       description: |
@@ -1391,7 +2013,17 @@ components:
         region:
           type: string
           maxLength: 64
-          description: Hosting region (free-text).
+          enum: [world, eu-west, eu-north, us-east, us-west, asia]
+          description: |
+            Carbon-footprint region: sets the grid emission factor of the
+            carbon footprint, no effect on routing. Rows written before this
+            field was constrained may still hold free text; such values count
+            as `world`.
+        end_of_life:
+          type: string
+          format: date
+          nullable: true
+          description: Announced end-of-life date of the model (`YYYY-MM-DD`). Informational, routing continues.
         dimensions:
           description: Default embedding dimensionality (embeddings models only).
         supported_dimensions:
@@ -1405,6 +2037,17 @@ components:
           type: object
           description: Provider-specific configuration (batch size, parallelism, …).
           additionalProperties: true
+          properties:
+            exclude_params:
+              type: array
+              items:
+                type: string
+              description: Request-body parameters dropped for this model (on top of the provider's own exclusions), e.g. `temperature` on a reasoning model.
+            rename_params:
+              type: object
+              additionalProperties:
+                type: string
+              description: 'Request-body parameters renamed for this model, e.g. `{"max_tokens": "max_completion_tokens"}`.'
         pricing:
           type: object
           description: Cost configuration used to compute `usage.cost`.
@@ -1415,6 +2058,20 @@ components:
             output_per_1m_tokens:
               type: number
               format: double
+            cache_read_per_1m_tokens:
+              type: number
+              format: double
+              description: |
+                Price of 1M input tokens read from the provider's prompt cache
+                (0 = free). Optional: defaults to the input price × the provider ratio
+                (claude 0.1, gpt-4o 0.5, gpt-4.1/o3/o4 0.25, others 0.1).
+            cache_write_per_1m_tokens:
+              type: number
+              format: double
+              description: |
+                Price of 1M input tokens written to the provider's prompt cache
+                (Anthropic, 0 = free). Optional: defaults to the input price × 1.25 for
+                claude, × 1 otherwise.
         tags:
           type: array
           description: Free-form tags used by the search/filter UI.
@@ -1436,7 +2093,9 @@ components:
       type: object
       description: |
         Write-shape for `POST /v1/models` and each item of `PUT /v1/models`.
-        `model_id` and `type` are required.
+        `model_id` and `type` are required. On `POST`, an omitted `region`
+        is resolved from the provider configuration (else `world`) and an
+        unknown one is refused with 400 `INVALID_REGION`.
       required: [model_id, type]
       properties:
         model_id:
@@ -1458,6 +2117,11 @@ components:
         region:
           type: string
           maxLength: 64
+          enum: [world, eu-west, eu-north, us-east, us-west, asia]
+        end_of_life:
+          type: string
+          format: date
+          nullable: true
         dimensions: {}
         supported_dimensions: {}
         metrics: {}
@@ -1472,7 +2136,8 @@ components:
       description: |
         Partial-update shape for `PATCH /v1/models/{modelId}`. Only fields
         present in the body are applied. `model_id` is taken from the path,
-        not the body.
+        not the body. A `region` present in the body must be a known region
+        (400 `MISSING_REGION` / `INVALID_REGION`).
       properties:
         type:
           type: string
@@ -1490,6 +2155,11 @@ components:
         region:
           type: string
           maxLength: 64
+          enum: [world, eu-west, eu-north, us-east, us-west, asia]
+        end_of_life:
+          type: string
+          format: date
+          nullable: true
         dimensions: {}
         supported_dimensions: {}
         metrics: {}
@@ -1498,6 +2168,90 @@ components:
         tags: {}
         org_slugs: {}
         enabled: {}
+
+    ModelRegions:
+      type: object
+      properties:
+        regions:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                enum: [world, eu-west, eu-north, us-east, us-west, asia]
+              label:
+                type: object
+                properties:
+                  fr:
+                    type: string
+                  en:
+                    type: string
+              emission_factor:
+                type: number
+                format: double
+                description: Grid emission factor, kg CO2eq/kWh.
+        suggested:
+          type: string
+          nullable: true
+          description: Suggested region id for `model_id`.
+        source:
+          type: string
+          nullable: true
+          description: Where the suggestion comes from — `provider`, or `bedrock:<aws region>`.
+
+    ProviderModels:
+      type: object
+      properties:
+        provider:
+          type: string
+        index:
+          type: integer
+        entry:
+          type: object
+          description: Non-secret identity of the entry, to check it is the expected one.
+          properties:
+            endpoint:
+              type: string
+              nullable: true
+            resource:
+              type: string
+              nullable: true
+            region:
+              type: string
+              nullable: true
+            host:
+              type: string
+              nullable: true
+            carbon_region:
+              type: string
+              nullable: true
+            suggested_region:
+              type: string
+              nullable: true
+              description: Carbon region to give a model registered from this entry (entry carbon_region, else the Bedrock AWS region mapped).
+        total:
+          type: integer
+        models:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            required: [id]
+            properties:
+              id:
+                type: string
+                description: Value to declare in the entry's model list (Azure deployment name, Bedrock model or inference profile id, Vertex resource path…).
+              declared:
+                type: boolean
+                description: Already listed in the entry, directly or through a `model_aliases` alias.
+              declared_as:
+                type: string
+                nullable: true
+                description: The public id the entry declares for this model (the id itself, or its alias).
+              registered:
+                type: boolean
+                description: Already registered in the models collection.
 
     ModelsListResponse:
       type: object
@@ -1553,8 +2307,8 @@ components:
           type: object
           description: |
             Speech-to-text model used by chat dictation. An empty `model_id`
-            means no transcription model is configured, or the caller is not
-            allowed to use it.
+            means no transcription model is configured, or that the caller may
+            not use it.
           properties:
             model_id:
               type: string
@@ -1589,9 +2343,11 @@ components:
         type:
           type: string
           maxLength: 32
-          enum: [embeddings, completions, transcription]
+          enum: [embeddings, completions, image_generation]
           description: |
             Kind of test to run. Defaults to `completions` when omitted.
+            `image_generation` generates one test image (image models cannot be
+            reached through chat completions).
 
     TestResponse:
       type: object
