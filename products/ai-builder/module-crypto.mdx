@@ -1,9 +1,9 @@
 ---
 title: "Crypto Module"
-description: "Hashing, HMAC, base64 and secure random for automations"
+description: "Hashing, HMAC, base64, secure random and JWT signing for automations"
 ---
 
-Runtime modules are the built-in capabilities you call from automations on the foundation, and the **crypto** module is one of them. It provides cryptographic helpers built on Node's `crypto`, with no external dependencies. Typical uses: **OAuth PKCE**, **webhook signature verification** (HMAC), and content fingerprints.
+Runtime modules are the built-in capabilities you call from automations on the foundation, and the **crypto** module is one of them. It provides cryptographic helpers built on Node's `crypto`, with no external dependencies. Typical uses: **OAuth PKCE**, **webhook signature verification** (HMAC), **signed JWT client assertions**, and content fingerprints.
 
 ## sha256 / sha512 / md5
 
@@ -110,6 +110,64 @@ Generate a canonical random UUID v4 (with dashes).
 ```
 
 Takes no parameters. For a dash-free UUID inline in an expression, the `uuid()` helper is also available.
+
+## signJwt
+
+Sign a JWT with a private key you supply, for example an OAuth `client_assertion` (RFC 7523) for certificate-based client authentication.
+
+```yaml
+- run:
+    module: crypto
+    function: signJwt
+    parameters:
+      payload:
+        aud: "https://login.example.com/oauth2/token"
+        iss: "{{config.clientId}}"
+        sub: "{{config.clientId}}"
+        jti: "{{jti}}"
+      key: "{{privateKey}}"
+      algorithm: PS256
+      expiresIn: 300
+    output: signed
+- conditions:
+    '{{signed.error}}':
+      - break:
+          scope: automation
+          payload:
+            error: "{{signed.error}}"
+# signed.jwt → "eyJhbGciOiJQUzI1NiIsInR5cCI6IkpXVCIsIng1dCNTMjU2Ijoi..."
+```
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| payload | object | yes | | Claims, signed as given. Serialized size at most 16 KB. |
+| key | string | yes | | Private key in PEM (PKCS#8, PKCS#1 or SEC1), or the base64 of that PEM. May be bundled with certificates. At most 64 KB. Encrypted keys are not supported. |
+| algorithm | string | yes | | `RS256`, `PS256` (RSA-PSS) or `ES256` (P-256). Nothing else is accepted. |
+| expiresIn | number | no | | Lifetime in seconds (positive integer). Sets `iat` and `nbf` to now and `exp` to now + `expiresIn`, overriding the same claims in `payload`. |
+| header | object | no | | Extra header fields such as `kid`. `alg` and `typ` cannot be overridden. At most 4 KB. |
+
+RSA keys must be 2048 to 4096 bits.
+
+When `key` also contains certificates (in any order, a CA certificate included), the one whose public key matches the private key is used: it must be within its validity period, and its SHA-256 thumbprint is added to the header as `x5t#S256`. Certificates are only parsed — no chain or trust verification.
+
+Returns `{ jwt }` on success. On any input problem it returns `{ error }` instead of failing the instruction, with one of these codes:
+
+| Error | Meaning |
+|---|---|
+| `invalid_payload` | `payload` is not an object, or `expiresIn` is not a positive integer. |
+| `payload_too_large` | Serialized payload exceeds 16 KB. |
+| `invalid_header` | `header` is not an object, or exceeds 4 KB. |
+| `unsupported_algorithm` | `algorithm` is not `RS256`, `PS256` or `ES256`. |
+| `invalid_key` | No usable private key, an encrypted key, or a key that does not fit the algorithm (RSA for `RS256`/`PS256`, P-256 for `ES256`). |
+| `key_too_large` | Key input exceeds 64 KB, or the RSA key is larger than 4096 bits. |
+| `key_too_small` | RSA key smaller than 2048 bits. |
+| `certificate_mismatch` | Certificates are present but none matches the private key. |
+| `certificate_expired` | The matching certificate is past its validity period. |
+| `certificate_not_yet_valid` | The matching certificate is not valid yet. |
+
+<Note>
+Pass the private key into the calling automation through an argument declared with `secret: true`, so its value is masked in runtime events (see [Protecting sensitive fields](/products/ai-builder/automations#protecting-sensitive-fields)). The result never contains the key.
+</Note>
 
 ## OAuth PKCE example
 
