@@ -294,7 +294,7 @@ For each model, an entry carries:
 | `aliases` | Known deployment ids for the same model, e.g. `vertex-claude-sonnet-4-6` |
 | `suggested` | Recommended `eco_score`, `cost_tier`, `energy_per_token`, `pue_profile` (completion models only) |
 | `reference_pricing` | Indicative provider list price, in USD. **Never written** to your models: see [Prices are environment data](#prices-are-environment-data-not-a-platform-default) |
-| `spec` | Type, context window, maximum output tokens (`max_output_tokens`), end-of-life date (`end_of_life`), capabilities, embedding dimensions, and request handling (`provider_config`: forced tool choice, `exclude_params`, `rename_params`) |
+| `spec` | Type, context window, maximum response tokens (`max_response_tokens`), end-of-life date (`end_of_life`), capabilities, embedding dimensions, and request handling (`provider_config`: forced tool choice, `exclude_params`, `rename_params`) |
 
 The response also states its `methodology_version`, `source` and `verified_at` date. `energy_per_token` follows the method described in [Carbon Footprint](/products/ai-governance/carbon-footprint); `eco_score` and `cost_tier` are tiers derived from energy and from the reference price.
 
@@ -340,7 +340,7 @@ In Govern, it is the **Catalogue model** select of the model form. By API, set i
 1. **Back-fill `catalog_id`** when the model has none. The model id is matched against catalogue keys and aliases, ignoring case and separators (`-`, `.`, `_`, `:`, spaces), then again after stripping common deployment prefixes (`az-`, `azure-`, `vertex-`, `gcp-`, `bedrock-`, `aws-`, `openai-`, `oai-`, `ovh-`). An exact match always wins over a looser one.
 2. **Apply the recommended metrics** of the entry found by `catalog_id`. Only the selected `metrics` fields are updated; pricing and every other field are left as they are. Embedding entries carry no recommended metrics, so embedding models only get their `catalog_id`.
 3. **Uncheck Accepts forced tool choice** on completion models that the catalogue measured as refusing a forced `tool_choice`, when the model has no value yet. This sets `provider_config.supports_forced_tool_choice` to `false` and keeps the rest of the Provider Config. A model left unset already accepts forced tool choice, so models the catalogue measured as accepting are not changed. A value already set on the model is never overwritten. If it differs from the catalogue, the model is listed under `divergent`.
-4. **Apply the spec fields.** `end_of_life` follows the catalogue: it is updated whenever the catalogue date differs, since providers move their retirement dates. `provider_config.exclude_params` and `provider_config.rename_params` are only filled when the model has none: a value you set is kept, and listed under `divergent` when it differs from the catalogue. **Max response tokens** (`limits.response_tokens`) is never synced: it is your environment's default output per call — the `max_tokens` the gateway sends when the caller sets none, and the share of the context window agents keep for the answer — not the model's maximum. The Models form caps it to the catalogue's maximum (`max_output_tokens`), shown in the field's info tooltip.
+4. **Apply the spec fields.** `end_of_life` and `limits.max_response_tokens` follow the catalogue: they are updated whenever the catalogue differs (providers move their retirement dates; the maximum is a fact about the model). `provider_config.exclude_params` and `provider_config.rename_params` are only filled when the model has none: a value you set is kept, and listed under `divergent` when it differs from the catalogue. **Max response tokens** (`limits.response_tokens`) is never synced: it is your environment's default output per call — the `max_tokens` the gateway sends when the caller sets none, and the share of the context window agents without their own limit keep for the answer.
 5. **Fix the carbon region.** A model whose `region` is empty or not one of the [supported regions](/products/ai-governance/carbon-footprint#setting-the-region) (for example a free-text `eu-west-3` entered before the field became a list) gets the region of its provider, else `world`. This step does not depend on the catalogue, so it also applies to models without a catalogue entry. A valid region is never changed.
 
 ```http
@@ -359,7 +359,7 @@ POST {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/catalog/sync
 |---|---|---|
 | `dry_run` | `true` | Report what would change, write nothing. Send `false` to apply. |
 | `model_ids` | all models | Restrict the sync to these models. |
-| `fields` | the four metrics, `supports_forced_tool_choice`, `end_of_life`, `exclude_params`, `rename_params` and `region` | Restrict which fields are updated. |
+| `fields` | the four metrics, `supports_forced_tool_choice`, `end_of_life`, `max_response_tokens`, `exclude_params`, `rename_params` and `region` | Restrict which fields are updated. |
 
 The response lists what was (or would be) done:
 
@@ -548,6 +548,17 @@ In the context of Model Governance:
 - Link service accounts to specific agents
 - Track which service accounts consume LLM resources
 - Control model access per service account
+
+## Response length: default and maximum
+
+Two model fields bound the length of an answer:
+
+| Field | Role | From the catalogue |
+|---|---|---|
+| **Max response tokens** (`limits.response_tokens`) | Default per call: sent as `max_tokens` when the caller (agent or API) sets none; agents without their own limit also keep this share of the context window for the answer | Never pre-filled nor synced |
+| **Max response tokens — maximum** (`limits.max_response_tokens`) | The model's capacity: the gateway caps every call to it, whoever set the limit (caller, agent or the default above) | Pre-filled and kept in sync |
+
+An agent's own **Max tokens** (Agent Creator) always wins over the model default, and is capped by the maximum like any other call. The default stays small on purpose: setting it to the model's maximum would make every agent without its own limit reserve that much of its context window, and shorten the conversation history it keeps.
 
 ## Model identity and display
 
