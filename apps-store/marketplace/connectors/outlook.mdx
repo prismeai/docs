@@ -53,7 +53,7 @@ This connector is used by four different roles. Jump to the section that matches
 ## Prerequisites (Microsoft side)
 
 - A **Microsoft 365** account, and an **Azure / Microsoft Entra ID** tenant where you can register an application (or a maintainer who already did).
-- An **app registration** in [Microsoft Entra ID](https://entra.microsoft.com) (Azure portal → **App registrations**), with a **client secret** created under **Certificates & secrets**.
+- An **app registration** in [Microsoft Entra ID](https://entra.microsoft.com) (Azure portal → **App registrations**), with a **client secret** created under **Certificates & secrets**, or a certificate (see *Certificate instead of a client secret*).
 - **Microsoft Graph delegated permissions** granted on the app (for the per-user OAuth modes), covering the resources you intend to use:
   - Mail: `Mail.ReadWrite`, `Mail.Send`
   - Calendar: `Calendars.ReadWrite`
@@ -100,6 +100,64 @@ https://graph.microsoft.com/User.Read
       Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**.
     </Step>
   </Steps>
+
+  ### Certificate instead of a client secret
+
+  Microsoft recommends certificate credentials over client secrets: a secret expires after at most 24 months and is easy to copy. In certificate mode the connector signs each token request with a private key (a `client_assertion` JWT, PS256). The key never goes through Prisme.ai's database or UI: the platform operator injects it into the runtime from your key store, as an environment variable.
+
+  <Steps>
+    <Step title="Upload the certificate to Entra">
+      In the app registration → **Certificates & secrets > Certificates**, upload the public certificate (`.cer`, `.pem` or `.crt`).
+    </Step>
+    <Step title="Inject the private key into the runtime">
+      The value is a PEM bundle, the **unencrypted** private key followed by the certificate uploaded to Entra, base64-encoded on one line. The connector reads the certificate's thumbprint from the bundle, so key and certificate always change together. Azure Key Vault's PEM export already has this layout.
+
+      ```bash
+      cat key.pem cert.pem | openssl base64 -A
+      ```
+
+      Expose it to the `prismeai-runtime` pods under this exact name:
+
+      | Profile | Environment variable |
+      |---|---|
+      | Central client (this section) | `WORKSPACE_SECRET_outlook-next_outlookNextCentralCertKey` |
+      | A workspace's own client (`oauth` or `clientCredentials` mode) | `WORKSPACE_SECRET_<workspace-slug>_outlookNextCertKey` |
+
+      The configuration app shows the exact name to use. The workspace slug is kept as is, dashes included. Restart the runtime pods after setting or changing the variable.
+
+      For example, with the [External Secrets Operator](https://external-secrets.io) reading from your KMS:
+
+      ```yaml
+      apiVersion: external-secrets.io/v1beta1
+      kind: ExternalSecret
+      metadata:
+        name: outlook-next-cert
+      spec:
+        secretStoreRef:
+          name: my-kms-store
+          kind: ClusterSecretStore
+        target:
+          name: outlook-next-cert
+        data:
+          - secretKey: WORKSPACE_SECRET_outlook-next_outlookNextCentralCertKey
+            remoteRef:
+              key: outlook-next/central-cert-key-b64
+      ```
+
+      Then add `outlook-next-cert` to the runtime deployment's `envFrom`.
+
+      <Warning>
+        Never create a workspace secret with the same name (`outlookNextCentralCertKey` / `outlookNextCertKey`): a stored secret hides the environment variable. Never use an `APP_SECRET_…` variable either, as it would hand the key to every instance of the connector on the platform.
+      </Warning>
+    </Step>
+    <Step title="Switch the connector to certificate mode">
+      In the configuration app, set **Client authentication** to **Certificate**. The central client is configured from the maintainer view; a workspace's own client from its own configuration app. If the key cannot be read, connecting or **Test connection** names the missing variable.
+
+      A workspace that installed the connector before certificate support must save its connector instance configuration once, which wires the key to the instance.
+    </Step>
+  </Steps>
+
+  **Rotation:** upload the new certificate to Entra next to the old one, replace the bundle in your KMS, restart the runtime pods, then delete the old certificate in Entra.
 
   ## 2. Declare the capability in AI Governance
 
