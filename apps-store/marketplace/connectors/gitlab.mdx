@@ -17,6 +17,7 @@ The GitLab connector exposes the [GitLab](https://gitlab.com) DevOps platform (R
 - **Per-user OAuth2, central client** (`oauthCentral`, recommended): one GitLab OAuth application is registered once by the platform maintainer; every end user signs in with their own GitLab account. Nothing to register per workspace: each one just installs the app and clicks *Connect*.
 - **Per-user OAuth2, tenant client** (`oauth`): paste your own GitLab OAuth client ID/secret in the connector config app. Each user signs in with their own account against your client (authorization-code flow).
 - **Direct access token** (`accessToken`): a caller-managed GitLab token (e.g. a Personal Access Token with the `api` scope), used as-is with no exchange.
+- **Self-hosted GitLab** (`oauthSelfHosted`, `accessTokenSelfHosted`): the same per-user OAuth2 or direct access token, against your own GitLab instance. You enter the instance URL once; every operation, sign-in and sign-out then goes to that instance instead of gitlab.com.
 
 <CardGroup cols={3}>
   <Card title="Project Management" icon="diagram-project">
@@ -26,7 +27,7 @@ The GitLab connector exposes the [GitLab](https://gitlab.com) DevOps platform (R
     Pipelines, jobs, environments, CI variables, deploy keys and webhooks
   </Card>
   <Card title="Per-user auth" icon="key">
-    Per-user OAuth (central or tenant client) resolved server-side, or a direct access token
+    Per-user OAuth (central or tenant client) resolved server-side, or a direct access token, on gitlab.com or a self-hosted instance
   </Card>
 </CardGroup>
 
@@ -49,9 +50,9 @@ This connector is used by three different roles. Jump to the section that matche
 ## Prerequisites
 
 - A **GitLab** account (gitlab.com or a self-hosted instance).
-- For the **OAuth modes**: a GitLab OAuth application created at **User Settings > Applications** (`https://gitlab.com/-/user_settings/applications`) with the `api` scope (or `read_api` for read-only agents); copy its Application ID and Secret. The platform maintainer registers one app for the central mode; a workspace can also register its own for the tenant mode.
-- For the **access-token mode**: a Personal Access Token created at **User Settings > Access Tokens** (`https://gitlab.com/-/user_settings/personal_access_tokens`) with the `api` scope.
-- Base URL: `https://gitlab.com/api/v4`.
+- For the **OAuth modes**: a GitLab OAuth application created at **User Settings > Applications** (`https://gitlab.com/-/user_settings/applications`, or `<instance-url>/-/user_settings/applications` on a self-hosted instance) with the `api` scope (or `read_api` for read-only agents); copy its Application ID and Secret. The platform maintainer registers one app for the central mode; a workspace can also register its own for the tenant mode.
+- For the **access-token modes**: a Personal Access Token created at **User Settings > Access Tokens** (`https://gitlab.com/-/user_settings/personal_access_tokens`, or the same page on your instance) with the `api` scope.
+- Base URL: `https://gitlab.com/api/v4`, or `<instance-url>/api/v4` in the self-hosted modes. A self-hosted instance must be reachable from the platform over HTTPS; an instance served from a subdirectory (`https://intranet.example.com/gitlab`) is supported.
 
 <Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
   **Goal:** two one-time tasks: (1) configure the shared **central OAuth client** so every workspace lets its users sign in with their own GitLab account, and (2) optionally expose GitLab as a reusable **capability** in AI Governance so agent builders can pick it without pasting endpoint URLs. Throughout, `<api-url>` is your environment's API URL (`https://api.studio.prisme.ai/v2` on production).
@@ -63,16 +64,19 @@ This connector is used by three different roles. Jump to the section that matche
       Open `https://gitlab.com/-/user_settings/applications` and click **Add new application**. Set the single authorized redirect URI (callback URL) to the **core workspace** callback:
 
       ```text
-      <api-url>/workspaces/slug:gitlab/webhooks/oauthCallback
+      <api-url>/workspaces/slug%3Agitlab/webhooks/oauthCallback
       ```
 
-      (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug:gitlab/webhooks/oauthCallback` on production). Add the `api` scope (or `read_api` for read-only). Save and copy the **Application ID** and **Secret** (the secret is shown only once).
+      (e.g. `https://api.studio.prisme.ai/v2/workspaces/slug%3Agitlab/webhooks/oauthCallback` on production). Keep the `%3A` as is: GitLab compares the registered URI with the one it receives character for character, and a literal `:` makes every sign-in fail with a redirect URI mismatch. The maintainer view of the configuration app shows the exact URI to copy. Add the `api` scope (or `read_api` for read-only). Save and copy the **Application ID** and **Secret** (the secret is shown only once).
     </Step>
     <Step title="Enter the credentials through the configuration app">
       Open the central `gitlab` workspace and launch its **Configuration app** at `<studio>/apps/gitlab` (e.g. `https://studio.prisme.ai/apps/gitlab`). Loaded from the core workspace, the app shows the **maintainer view** (org owner / editor / admin only); paste the **Application ID** and **Secret** there and Save; the app stores them in the core workspace's secrets for you. Do not edit Studio's raw Secrets by hand. These credentials stay in the `gitlab` workspace and are never exposed to tenants or end users; token exchange is proxied through the core `centralTokenExchange` webhook so the client secret never leaves the core workspace.
     </Step>
     <Step title="Tell workspaces to use the central client">
       Each consuming workspace selects auth mode **`oauthCentral`** in the connector configuration app (no client id/secret to enter on their side). Their users then just click **Connect**.
+    </Step>
+    <Step title="(Optional) Add a central client for a self-hosted instance">
+      The gitlab.com client cannot sign users in to another instance. To spare the workspaces that use a self-hosted instance from declaring their own OAuth application, declare one on that instance with the same core redirect URI (`<api-url>/workspaces/slug%3Agitlab/webhooks/oauthCallback`). Then, in the maintainer view, set **Host** to **Your own instance…**, enter the instance URL, the **Application ID** and **Secret**, and click **Save this instance**. Workspaces in `oauthSelfHosted` mode on that instance can then leave the Application ID and Secret empty. Repeat for each instance.
     </Step>
     <Step title="(Optional) Publish to the Capabilities catalog">
       From that same maintainer view, the **Add to catalog** button publishes GitLab to the org-wide **Capabilities catalog** in one click (org owner / admin only; it stays disabled until the central client is saved). Once published, every agent builder in the org can enable GitLab from the catalog without pasting an endpoint; see *Option A* in the *Agent builder* tab.
@@ -401,8 +405,12 @@ This connector is used by three different roles. Jump to the section that matche
     | Auth mode | What you provide | Best for |
     |-----------|------------------|----------|
     | `oauthCentral` | Nothing; just click **Connect** | Workspaces on a platform where the maintainer set up the central GitLab client |
-    | `oauth` | Your own GitLab **Application ID + Secret** (redirect URI shown in the config app: `<api-url>/workspaces/slug:<your-workspace>/webhooks/<app-instance>.oauthCallback`) | You manage your own GitLab OAuth app |
+    | `oauth` | Your own GitLab **Application ID + Secret** (redirect URI shown in the config app: `<api-url>/workspaces/slug%3A<your-workspace>/webhooks/<app-instance>.oauthCallback`, `%3A` included) | You manage your own GitLab OAuth app |
     | `accessToken` | A pre-minted GitLab **access token** / Personal Access Token with the `api` scope | Short-lived or caller-managed tokens, service-account / non-interactive automations |
+    | `oauthSelfHosted` | The **GitLab instance URL**, plus the **Application ID + Secret** of an OAuth app declared on that instance with the redirect URI shown in the config app. Leave both empty if the platform maintainer declared a central client for this instance. | Per-user sign-in on a self-hosted GitLab |
+    | `accessTokenSelfHosted` | The **GitLab instance URL** and a Personal Access Token issued by that instance, with the `api` scope | Testing a self-hosted instance; every caller acts as the token's owner |
+
+    The instance URL is normalized when you save: `https://` is added when missing and a trailing `/` is dropped. Anything other than an `https` URL is refused. Switching back to a gitlab.com mode discards the instance URL, so a gitlab.com credential is never sent to another host.
 
     <Note>
       Credentials are stored in the workspace's Secrets (`gitlabAuth`) and resolved server-side. The agent allowlist (**Authorized agents**, secret `gitlabAuthorizedAgents`) gates which Agent Creator agents may call the MCP endpoint; see the *Agent builder* tab. Builder automations calling `GitLab.op:` instructions resolve the same workspace credentials.
