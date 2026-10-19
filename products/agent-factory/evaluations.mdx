@@ -178,6 +178,69 @@ Export evaluation data for reporting:
 2. Click Export
 3. Download as JSON or CSV
 
+## Runs without a user
+
+An evaluation run started from the **Evaluate** page or the API executes as the user who started it: calls to the agent and to the judge model authenticate as that user, and quota and cost are charged to that user's organization. Two background jobs start or resume runs that have no user:
+
+- The stalled-run job checks every 2 minutes for runs that are still running but have stored nothing for more than 3 minutes (and for less than 24 hours). It resumes each of them from the first case that has no result.
+- The nightly evaluation batch runs the test cases of every agent that has some. It ships disabled.
+
+These runs authenticate to Agent Factory and to the LLM Gateway with an organization API key stored in the `AGENT_FACTORY_API_KEY` secret of the **Agent Evaluations** workspace. This section is for platform administrators, including operators of self-hosted deployments. Configure the key on every environment where agents are evaluated: without it, a stalled run is failed instead of resumed.
+
+### Configure the organization API key
+
+Before you begin, make sure that you have:
+
+- The `orgs:apikeys:create` permission in the organization that owns the evaluated agents.
+- Access to the secrets of the **Agent Evaluations** workspace in Builder. By default, only workspace owners can manage secrets.
+
+To create the key and store it:
+
+1. In Governance, start [creating an API key](/products/ai-governance/identity-access#creating-an-api-key) in the organization that owns the evaluated agents.
+2. In the permission tree, grant `agent-factory:agents:read` and `llm-gateway:models:chat-completions`. Sending a message to an agent is authorized as a read of that agent, so the key needs no write permission.
+3. Set the [scopes](/products/ai-governance/identity-access#scopes) `agent-factory:agents:*` and `llm-gateway:models:*`. To restrict the key further, list the ids of the evaluated agents and of the models they and the judge use instead of the wildcards.
+4. Create the key and copy its value. The value starts with `iak_` and is displayed only once.
+5. In Builder, open the **Agent Evaluations** workspace, then open **Settings** and select **Secrets**.
+6. In the [Additional Secrets form](/products/ai-builder/module-secrets#additional-secrets-form), enter `AGENT_FACTORY_API_KEY` in **New key** and the key value in **New value**, then select **+**.
+7. Select **Save Secrets**.
+
+For self-hosted deployments that inject workspace secrets from [environment variables](/products/ai-builder/workspaces#environment-variables), you can set `WORKSPACE_SECRET_agent-evaluations_AGENT_FACTORY_API_KEY` instead. A secret saved in the workspace takes precedence over the environment variable.
+
+When you [rotate the key](/products/ai-governance/identity-access#rotating-keys), the previous value stops working immediately: save the new value in `AGENT_FACTORY_API_KEY` right away.
+
+### Verify runs without a user
+
+Saving the secret does not start a run. Check the result the next time the stalled-run job resumes a run:
+
+1. In Builder, open the [Activity](/products/ai-builder/activity) feed of the **Agent Evaluations** workspace.
+2. Search for `EVAL_AUTH_NOT_CONFIGURED`. No `error` event with this code after the time you saved the secret means that the jobs found a usable key.
+3. On the **Evaluate** page of an agent whose run was resumed, open **Run History**. The resumed run finishes, and its cases have results instead of `AGENT_ERROR` or `JUDGE_AUTH` errors.
+
+### Limits of the organization API key
+
+The key changes the identity that the agent, the judge, and the agent's tools see. Plan for these limits:
+
+- **One organization**: Agent Factory grants the key only the agents of the key's organization. A run without a user on an agent of another organization fails with `403 Access denied`, stored as `AGENT_ERROR` on each case.
+- **Nightly batch across organizations**: the nightly batch evaluates every agent that has test cases, whatever its organization. Before you enable it, restrict it to the agents of the key's organization. Otherwise the agents of every other organization fail with `403` each night.
+- **Identity change on resume**: a run started by a user and resumed by the stalled-run job changes identity during the run. Cases run before the stall used the user's identity, and cases run after it use the key. Quota and cost of the resumed cases are charged to the key's organization. If the user's organization is not the key's organization, the resumed cases fail with `403` (`AGENT_ERROR`).
+- **Tools**: the capabilities and tools that the agent calls receive the key's scopes, not a user session. A tool that requires a user session may fail in a run without a user.
+
+### Troubleshoot runs without a user
+
+#### `EVAL_AUTH_NOT_CONFIGURED`
+
+- **Symptom**: the Activity feed of the **Agent Evaluations** workspace shows an `error` event `EVAL_AUTH_NOT_CONFIGURED`. A run has the status `failed`, with an error that starts with `EVAL_AUTH_NOT_CONFIGURED:`.
+- **Cause**: the `AGENT_FACTORY_API_KEY` secret is missing, or its value is not an organization API key (it does not start with `iak_`). The jobs launch no case that would fail: the stalled-run job fails each run that still has cases to run, without writing any result, and the nightly batch stops before it creates any batch, run, or result.
+- **Fix (platform administrator)**: [configure the organization API key](#configure-the-organization-api-key). A failed run is not resumed: start the evaluation again from the **Evaluate** page.
+- **Verify**: [check that no new `EVAL_AUTH_NOT_CONFIGURED` event appears](#verify-runs-without-a-user).
+
+#### Cases fail with `AGENT_ERROR` or `JUDGE_AUTH` in a resumed run
+
+- **Symptom**: in a run resumed without a user, cases fail with `AGENT_ERROR` (agent call) or `JUDGE_AUTH` (judge call).
+- **Cause**: if the error message names the `AGENT_FACTORY_API_KEY` secret, the secret was removed while the run was in progress. A `401` without this message means that the platform refused the key, for example because it expired or was rotated without updating the secret. A `403` means that the agent, or the user who started the run, belongs to another organization than the key (see [Limits of the organization API key](#limits-of-the-organization-api-key)).
+- **Fix (platform administrator)**: save a valid key in `AGENT_FACTORY_API_KEY`, or rotate the key and save the new value. Then run the evaluation again from the **Evaluate** page.
+- **Verify**: [check the next resumed run](#verify-runs-without-a-user).
+
 ## Best Practices
 
 <AccordionGroup>
