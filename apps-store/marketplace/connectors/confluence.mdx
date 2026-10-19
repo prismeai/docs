@@ -169,8 +169,8 @@ offline_access
       <Step title="Add the Confluence capability">
         Browse the capability catalog, select **Confluence**, and enable it. The MCP endpoint URL and the *Scope* (`context_id,agent_id,user_id`) are already wired by the admin: nothing to paste, and the shared instance accepts every agent, so there is no allowlist step on your side.
       </Step>
-      <Step title="Connect an Atlassian account (OAuth modes)">
-        On the first tool call, an unconnected user is prompted to sign in; Agent Creator surfaces a `connect_url`. The `apiToken` and `accessToken` modes need no per-user sign-in.
+      <Step title="Connect an account (per-user modes)">
+        On the first tool call, an unconnected user gets a **Connect** card in the conversation. In the OAuth modes it opens the Atlassian sign-in. In the Data Center `personalAccessToken` mode it opens a dedicated window where the user pastes their own Personal Access Token (see *Connect with a personal access token* below). The `apiToken` and `accessToken` modes need no per-user sign-in.
       </Step>
     </Steps>
 
@@ -202,10 +202,28 @@ offline_access
 
         The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "agent could not be identified" message. This *Scope* is separate from the Atlassian OAuth scopes.
       </Step>
-      <Step title="Connect an Atlassian account (OAuth modes)">
-        On the first tool call, the user is prompted to sign in (or uses **Connect** in the config app).
+      <Step title="Connect an account (per-user modes)">
+        On the first tool call, the user gets the **Connect** card (or uses **Connect** in the config app): Atlassian sign-in in the OAuth modes, the token window in the `personalAccessToken` mode.
       </Step>
     </Steps>
+
+    ## Connect with a personal access token (Data Center)
+
+    In the `personalAccessToken` mode, each user of a shared agent connects with their own Confluence Data Center token. Nobody needs a workspace of their own, and the token never goes through the conversation.
+
+    <Steps>
+      <Step title="Create the token in Confluence">
+        In Confluence Data Center, open your profile picture → **Settings** → **Personal Access Tokens** → **Create token**. Set an expiry date. The token carries all your Confluence permissions.
+      </Step>
+      <Step title="Paste it in the Connect window">
+        Click **Connect** on the card the agent shows. A dedicated window opens: paste the token and confirm. Confluence checks it first (`/rest/api/user/current` must return a signed-in user). A refused token shows an error, nothing is stored, and a token stored earlier is kept.
+      </Step>
+      <Step title="Use the agent">
+        The token is stored in your own user secrets, readable by no other user. It is not in the messages, the model's context, the conversation history or the activity feed. Every tool call made on your behalf uses it.
+      </Step>
+    </Steps>
+
+    To change or remove your token, use **Disconnect** from the agent's tools menu, then **Connect** again. When Confluence answers `401` with its own error body (token expired or revoked), the stored token is deleted and the **Connect** card comes back on the next call. A `401` from a proxy or SSO page, or a `403`, keeps the token.
 
     ## Brief the agent in its system prompt
 
@@ -370,14 +388,15 @@ offline_access
     |-------|-------------|
     | **Configuration app** | Auto-populated on install. Open this link to configure authentication (mode + credentials), connect an Atlassian account (OAuth modes), and manage the authorized-agents allowlist. |
 
-    The configuration app drives everything; the app instance itself has no per-field credential form. From it you pick one of:
+    The configuration app drives everything; the app instance itself has no per-field credential form. First pick the **Deployment**: *Atlassian Cloud*, or *Atlassian Data Center* with its **base URL** (e.g. `https://wiki.example.net/confluence`). Then pick one of:
 
-    | Auth mode | What you provide | Best for |
-    |-----------|------------------|----------|
-    | `oauthCentral` | Nothing, just click **Connect** | Workspaces on a platform where the admin set up the central Atlassian client |
-    | `oauth` | Your own Atlassian **Client ID + Secret** (callback URI `<api-url>/workspaces/slug:confluence-next/webhooks/oauthCallback`) + **Scopes** | You manage your own Atlassian OAuth app |
-    | `apiToken` | Atlassian **account email** + **API token** + **site** (`yoursite.atlassian.net`) | A single shared service identity, no interactive sign-in |
-    | `accessToken` | A pre-minted Atlassian **access token** | Short-lived / caller-managed tokens |
+    | Auth mode | Deployment | What you provide | Best for |
+    |-----------|------------|------------------|----------|
+    | `oauthCentral` | Cloud | Nothing, just click **Connect** | Workspaces on a platform where the admin set up the central Atlassian client |
+    | `oauth` | Cloud | Your own Atlassian **Client ID + Secret** (callback URI shown in the config app: `<api-url>/workspaces/slug:<your-workspace>/webhooks/<app-instance>.oauthCallback`) + **Scopes** | You manage your own Atlassian OAuth app |
+    | `apiToken` | Cloud, Data Center | Atlassian **account email** + **API token** (+ **site** `yoursite.atlassian.net` on Cloud) | A single shared service identity, no interactive sign-in |
+    | `accessToken` | Cloud, Data Center | A pre-minted **access token** (on Cloud, + `cloudId` or site); on Data Center, a service account's Personal Access Token | Short-lived / caller-managed tokens, or Data Center scheduled knowledge sync with one service account |
+    | `personalAccessToken` | Data Center | Nothing in the config app: each user pastes their own Personal Access Token through **Connect** (see the *Agent builder* tab) | Shared agents on Data Center where each user acts with their own Confluence permissions |
 
     <Note>
       Credentials are provisioned into the workspace's Secrets by the `onInstall` flow and resolved server-side. The agent allowlist (**Authorized agents**) gates which Agent Creator agents may call the MCP endpoint; see the *Agent builder* tab. The OAuth **Scopes** field is what the connector actually requests (default granular scopes; see *Prerequisites*); set a read-only list there to restrict writes.
@@ -539,7 +558,7 @@ With the read-only scopes, Atlassian itself refuses every create, update and del
 | HTTP code | Meaning |
 |-----------|---------|
 | `400` | Bad request: malformed CQL, invalid body, or a missing required field. |
-| `401` | Unauthorized: the Atlassian token is missing, expired or revoked. The user must reconnect (OAuth modes). |
+| `401` | Unauthorized: the Atlassian token is missing, expired or revoked. The user must reconnect (OAuth modes) or connect a new personal access token (`personalAccessToken` mode). |
 | `403` | Forbidden: insufficient OAuth scope (e.g. a write with read-only scopes, or a missing granular scope), or the account lacks permission on the space. |
 | `404` | Not found: the page, space, comment or attachment id does not exist or is not visible to the account. |
 | `409` | Conflict: the page `version.number` is stale; re-read the page and update with the current version + 1. |
@@ -552,7 +571,9 @@ With the read-only scopes, Atlassian itself refuses every create, update and del
 
 **"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability, then allow the agent in the config app.
 
-**"Confluence is not connected for this user"**: No per-user OAuth token. Open the configuration app (OAuth mode) and click **Connect**, or use the agent's connect flow.
+**"Confluence is not connected for this user"**: No per-user OAuth token or personal access token stored for this user. Open the configuration app and click **Connect**, or use the agent's **Connect** card.
+
+**The Connect window refuses my personal access token**: Confluence did not resolve a signed-in user with it. Check that the token is not expired or revoked, and that the Data Center base URL set in the configuration app is the one you created the token on.
 
 **"token refresh failed … must reconnect"**: The stored refresh token was revoked or expired (Atlassian invalidated it). The connection is dropped automatically; the user must reconnect from the config app.
 
