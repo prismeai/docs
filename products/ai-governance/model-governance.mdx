@@ -294,7 +294,7 @@ For each model, an entry carries:
 | `aliases` | Known deployment ids for the same model, e.g. `vertex-claude-sonnet-4-6` |
 | `suggested` | Recommended `eco_score`, `cost_tier`, `energy_per_token`, `pue_profile` (completion models only) |
 | `reference_pricing` | Indicative provider list price, in USD. **Never written** to your models: see [Prices are environment data](#prices-are-environment-data-not-a-platform-default) |
-| `spec` | Type, context window, capabilities, and embedding dimensions |
+| `spec` | Type, context window, maximum response tokens (`max_response_tokens`), end-of-life date (`end_of_life`), capabilities, embedding dimensions, and request handling (`provider_config`: forced tool choice, `exclude_params`, `rename_params`) |
 
 The response also states its `methodology_version`, `source` and `verified_at` date. `energy_per_token` follows the method described in [Carbon Footprint](/products/ai-governance/carbon-footprint); `eco_score` and `cost_tier` are tiers derived from energy and from the reference price.
 
@@ -312,14 +312,15 @@ Reserved to platform superadmins, in **Govern → Models**.
 
 - The **Catalogue model** select (**Modèle catalogue** in the French interface), at the top of the form, links the model to a catalogue entry. When it is empty, it is pre-selected by matching the model id, and re-matched as you type the id, until you pick an entry yourself. Choose **None** to unlink the model.
 - Next to each metric (Eco score, Cost tier, Energy/Token, PUE profile), the training date and the context window, a **Prisme.ai suggestion** badge shows the recommended value when yours differs. **Apply** copies it into the field. A suggestion bar does the same for capabilities, listing only the flags that differ.
-- On a new model, the fields you have not touched are pre-filled from the linked entry.
+- On a new model, the fields you have not touched are pre-filled from the linked entry, including the **end-of-life date** and the parameters to exclude or rename (see [Per-model exclusions and renames](#per-model-exclusions-and-renames)).
 - An info icon on the **Pricing** heading shows the entry's reference price. It is indicative only and is never copied into your prices.
 
 Nothing is saved until you save the model.
 
-**From the ⋮ menu, Update from catalogue** (**Mettre à jour depuis le catalogue**) opens a window with two sections:
+**From the ⋮ menu, Update from catalogue** (**Mettre à jour depuis le catalogue**) opens a window with three tabs, each with its own **Apply all** that only acts on that tab:
 
 - **To update** runs the [sync](#aligning-an-environment-with-the-catalogue) as a dry run and lists, per model, each metric that differs, as old value → recommended value, along with the models about to be linked to an entry. **Apply** on a row applies that model only; **Apply all** applies every row.
+- **Kept values** lists what the sync deliberately does not overwrite (see `divergent` below): values set on your models that differ from the catalogue, such as excluded or renamed parameters or the forced tool choice flag, which can depend on the host serving the model. **Apply** replaces them with the catalogue value, model by model.
 - **Add models** lists the [model ids declared but not registered](#models-declared-but-not-registered). Pick the catalogue entry for each (one is pre-selected by matching) and add the model in one click: it is created with the entry's spec and recommended metrics. Set its prices afterwards — they are not filled in (see [Model pricing](#model-pricing)).
 
 <Warning>
@@ -334,11 +335,13 @@ In Govern, it is the **Catalogue model** select of the model form. By API, set i
 
 ### Aligning an environment with the catalogue
 
-`POST /v1/models/catalog/sync` brings the Metrics block of the environment's models in line with the catalogue. It is what the **To update** section of **Update from catalogue** runs. It works in two steps per model:
+`POST /v1/models/catalog/sync` brings the environment's models in line with the catalogue. It is what the **To update** section of **Update from catalogue** runs. Per model:
 
 1. **Back-fill `catalog_id`** when the model has none. The model id is matched against catalogue keys and aliases, ignoring case and separators (`-`, `.`, `_`, `:`, spaces), then again after stripping common deployment prefixes (`az-`, `azure-`, `vertex-`, `gcp-`, `bedrock-`, `aws-`, `openai-`, `oai-`, `ovh-`). An exact match always wins over a looser one.
 2. **Apply the recommended metrics** of the entry found by `catalog_id`. Only the selected `metrics` fields are updated; pricing and every other field are left as they are. Embedding entries carry no recommended metrics, so embedding models only get their `catalog_id`.
 3. **Uncheck Accepts forced tool choice** on completion models that the catalogue measured as refusing a forced `tool_choice`, when the model has no value yet. This sets `provider_config.supports_forced_tool_choice` to `false` and keeps the rest of the Provider Config. A model left unset already accepts forced tool choice, so models the catalogue measured as accepting are not changed. A value already set on the model is never overwritten. If it differs from the catalogue, the model is listed under `divergent`.
+4. **Apply the spec fields.** `end_of_life` and `limits.max_response_tokens` follow the catalogue: they are updated whenever the catalogue differs (providers move their retirement dates; the maximum is a fact about the model). `provider_config.exclude_params` and `provider_config.rename_params` are only filled when the model has none: a value you set is kept, and listed under `divergent` when it differs from the catalogue. **Max response tokens** (`limits.response_tokens`) is never synced: it is your environment's default output per call — the `max_tokens` the gateway sends when the caller sets none, and the share of the context window agents without their own limit keep for the answer.
+5. **Release carbon regions that change nothing.** On every model, with or without a catalogue entry: a stored carbon region equal to what its provider entry gives (or to World when the provider gives none), or not one of the six regions, is cleared so the model follows its provider again. Earlier versions required a region and filled it once from the provider, so such a value was rarely a deliberate choice. A region that differs from the provider is an override and is kept.
 
 ```http
 POST {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/catalog/sync
@@ -356,7 +359,7 @@ POST {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/catalog/sync
 |---|---|---|
 | `dry_run` | `true` | Report what would change, write nothing. Send `false` to apply. |
 | `model_ids` | all models | Restrict the sync to these models. |
-| `fields` | the four metrics and `supports_forced_tool_choice` | Restrict which fields are updated. |
+| `fields` | the four metrics, `supports_forced_tool_choice`, `end_of_life`, `max_response_tokens`, `exclude_params`, `rename_params` and `region` | Restrict which fields are updated. |
 
 The response lists what was (or would be) done:
 
@@ -381,7 +384,7 @@ The response lists what was (or would be) done:
 }
 ```
 
-`match` tells how the back-fill resolved the id: `exact`, `alias`, `strong` (after prefix stripping) or `strong_alias`. A model listed in `unmatched` has no catalogue entry; set its metrics by hand. An entry of `divergent` (`{model_id, catalog_id, field, current, catalog}`) is a model whose forced tool choice flag differs from the catalogue. The sync leaves it alone. Run the Test button probe on that model to decide which value is right for your environment. A model your environment serves differently from the provider's own API may accept forced tool choice even though the catalogue says it refuses it: if the dry run proposes `supports_forced_tool_choice` for such a model, leave it out with `model_ids` or `fields`.
+`match` tells how the back-fill resolved the id: `exact`, `alias`, `strong` (after prefix stripping) or `strong_alias`. A model listed in `unmatched` has no catalogue entry; set its metrics by hand. An entry of `divergent` (`{model_id, catalog_id, field, current, catalog}`) is a model whose forced tool choice flag, `exclude_params` or `rename_params` differs from the catalogue. The sync leaves it alone. `before` and `after` only carry the fields that change. Run the Test button probe on that model to decide which value is right for your environment. A model your environment serves differently from the provider's own API may accept forced tool choice even though the catalogue says it refuses it: if the dry run proposes `supports_forced_tool_choice` for such a model, leave it out with `model_ids` or `fields`.
 
 <Warning>
 **Run a dry run first, and read it.** With `"dry_run": false`, the sync overwrites the selected metrics on every matched model, including values you set on purpose. Use `fields` and `model_ids` to keep it to what you mean to change. The model cache is flushed for each updated model, so the new values apply to the next call.
@@ -392,6 +395,33 @@ The response lists what was (or would be) done:
 `GET /v1/models/unregistered` lists the model ids declared in the gateway's provider configuration that are not yet registered as models in your environment, each with its provider (`openai`, `azure`, `openailike`, `anthropic`, `vertex`, `bedrock`). It feeds the **Add models** section of **Update from catalogue**. Only the ids are returned, never the provider credentials.
 
 The sync and the unregistered list require write access to models; reading the reference catalogue requires read access.
+
+### Adding models from a provider
+
+In **Govern → Providers**, each provider entry has an **Add models** button. It lists the models the provider itself exposes for that entry, so you can declare them in one click instead of typing their ids:
+
+| Provider | What is listed |
+|---|---|
+| OpenAI, OpenAI-compatible | The endpoint's `/models` |
+| Azure OpenAI | The resource's deployments |
+| Anthropic | `/v1/models` |
+| Vertex AI | Model Garden publisher models (Google, Anthropic, Mistral, Meta), as full resource paths |
+| AWS Bedrock | The region's foundation models and system inference profiles (`eu.*`, `us.*`, `global.*` cross-region ids) |
+
+Models already declared in the entry, directly or through an alias, are marked **Configured**. For the others, each row takes two optional choices:
+
+- **Alias**: the public id to declare instead of the provider's own id (Vertex resource paths, Bedrock ids…). It is added to the entry's list and mapped to the provider id in `model_aliases`; agents and API callers use the alias.
+- **Catalogue model**: the model is also registered, pre-filled from that catalogue entry. Its carbon region comes from the provider entry (see [Setting the region](/products/ai-governance/carbon-footprint#setting-the-region)).
+
+Nothing is written until you **save** the providers configuration: the configuration is saved first, then the models are registered. A registration that fails is listed and kept for the next save. Without a catalogue model, register the model afterwards, for instance from **Update from catalogue → Add models**.
+
+The list is read from the **saved** configuration, with the entry's own credentials, which never reach the browser: save a new or modified entry before listing its models. By API:
+
+```http
+GET {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/providers/{type}/{index}/models
+```
+
+`type` is a key of the providers configuration (`openai`, `azure_openai`, `openailike`, `anthropic`, `vertex`, `bedrock`) and `index` the entry's position (0 for `openai` and `anthropic`). Each model keeps the fields returned by the provider, plus `id` (the value to declare), `declared` and `registered`. A provider error comes back as a 502 (`code: PROVIDER_LIST_FAILED`) with its message; the provider's raw details go to an `error` event (`ProviderListModelsFailed`), not to the caller. An unknown entry returns a 404 (`PROVIDER_NOT_FOUND`). The credentials need the listing permission on the provider side, for instance `bedrock:ListFoundationModels` and `bedrock:ListInferenceProfiles` on AWS.
 
 ## Prompt caching
 
@@ -519,6 +549,33 @@ In the context of Model Governance:
 - Track which service accounts consume LLM resources
 - Control model access per service account
 
+## Response length: default and maximum
+
+Two model fields bound the length of an answer:
+
+| Field | Role | From the catalogue |
+|---|---|---|
+| **Max response tokens** (`limits.response_tokens`) | Default per call: sent as `max_tokens` when the caller (agent or API) sets none; agents without their own limit also keep this share of the context window for the answer | Never pre-filled nor synced |
+| **Max response tokens — maximum** (`limits.max_response_tokens`) | The model's capacity: the gateway caps every call to it, whoever set the limit (caller, agent or the default above) | Pre-filled and kept in sync |
+
+An agent's own **Max tokens** (Agent Creator) always wins over the model default, and is capped by the maximum like any other call. The default stays small on purpose: setting it to the model's maximum would make every agent without its own limit reserve that much of its context window, and shorten the conversation history it keeps.
+
+## Model identity and display
+
+### Changing a model id
+
+A model's id cannot be edited. It is the reference stored by agents, organization defaults and allowlists, failover chains and the usage and cost history: renaming it would break those references silently and split the history in two.
+
+To move to another id — typically the `eu.` id of a Bedrock cross-region inference profile — **duplicate the model** (⋮ → **Duplicate**). The copy keeps the whole configuration, and its id is editable until it is created; the form proposes the other known ids of the same catalogue entry. Then point your agents and defaults to the new model, and disable the old one.
+
+### Brand logo
+
+The model picker shows the logo of the model's brand (`display.brand`: Anthropic, OpenAI, Google, Mistral, Meta, Amazon, DeepSeek, Qwen). The logos ship with the platform, so they also display on environments without internet access. Set **Icon URL** (`display.icon`) only to override it; an unknown brand shows its initial.
+
+### End-of-life date
+
+`end_of_life` (`YYYY-MM-DD`) records the date a provider announced it will retire the model. The model picker and the Models list show an orange **End of life** badge with the date, red once the date has passed. It is informational: the gateway keeps routing the model until you disable it, and the provider's own shutdown is what makes calls fail. The date is pre-filled from the reference catalogue and kept up to date by the [catalogue sync](#aligning-an-environment-with-the-catalogue); you can also set it yourself, for instance for a deployment that expires before the model.
+
 ## Model Lifecycle: Hidden vs Disabled
 
 A platform administrator can manage a model's availability at three levels of severity. Each level has a different effect on what the LLM Gateway accepts, what surfaces in UI pickers, and whether the model is auto-pruned from organization allowlists.  
@@ -618,7 +675,7 @@ Provider options are configured **per-provider** in the workspace that owns the 
 
 #### `parameterAliases`
 
-Each entry is a `{ from, to }` pair. When a key matching `from` is present in the request body, it is renamed to `to` (the value is preserved, the old key is dropped). Typical use: a provider exposes the OpenAI Chat Completions surface but renamed `max_tokens` to `max_completion_tokens`.
+Each entry is a `{ from, to }` pair. When a key matching `from` is present in the request body, it is renamed to `to` (the value is preserved, the old key is dropped). If the body already carries `to`, that explicit value wins: `from` is dropped without overwriting it. Typical use: a provider exposes the OpenAI Chat Completions surface but renamed `max_tokens` to `max_completion_tokens`.
 
 ```yaml
 options:
@@ -645,6 +702,17 @@ options:
   excludeParameters:
     - stream
 ```
+
+#### Per-model exclusions and renames
+
+Provider options apply to every model of the provider. When only some of its models reject a parameter — `temperature` on a reasoning model, `max_tokens` replaced by `max_completion_tokens` on recent OpenAI models — set it on the model instead, in **Govern → Models → Provider Config**:
+
+| Model field | Provider counterpart | Example |
+|---|---|---|
+| `provider_config.exclude_params` | `options.excludeParameters` | `["temperature", "top_p"]` |
+| `provider_config.rename_params` | `options.parameterAliases` | `{"max_tokens": "max_completion_tokens"}` |
+
+Both are applied together with the provider's options, the model's entries first. They are pre-filled from the reference catalogue for known models, and `GET /v1/models/{model_id}` reports the combined exclusions as `excluded_params`. They apply to chat completions, including the Models page **Test** button.
 
 #### `headers`
 

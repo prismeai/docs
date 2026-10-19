@@ -19,7 +19,7 @@ The estimate is driven by three fields you declare per model, in the **Metrics**
 |---|---|---|
 | **Energy/Token** (`energy_per_token`) | GPU energy | Energy drawn per output token, in **kWh/token**. Required — without it, no carbon estimate is produced (only pricing). |
 | **PUE Profile** (`pue_profile`) | Datacenter overhead | `efficient`, `average` (default) or `inefficient`. |
-| **Region** (`region`) | Emission factor | Grid carbon intensity of where the model runs. Defaults to `world`. |
+| **Region** | Emission factor | Grid carbon intensity of where the model runs — from the provider entry that serves it, unless overridden on the model: see [Setting the region](#setting-the-region). |
 | **Eco Score**, **Cost Tier**, **Training Date** | Display only | Not used in the calculation. |
 
 Prisme.ai publishes recommended values for these fields per model in its [reference catalogue](/products/ai-governance/model-governance#reference-catalogue-recommended-metrics), and can apply them to your models in bulk.
@@ -65,7 +65,7 @@ total_energy = (gpu_energy + server_energy) × PUE   [kWh]
 
 ### 4. CO₂eq emissions
 
-The energy is converted with the grid emission factor of the model's region:
+The energy is converted with the grid emission factor of the region the model runs in:
 
 ```
 gwp = total_energy × emission_factor                [kg CO₂eq]
@@ -79,6 +79,21 @@ gwp = total_energy × emission_factor                [kg CO₂eq]
 | `us-east` | 0.389 |
 | `us-west` | 0.352 |
 | `asia` | 0.638 |
+
+### Setting the region
+
+The region only sets the emission factor above; it has no effect on routing. By default a model takes it **from the provider entry that serves it**, resolved at every call, so moving a model to another provider entry or region updates its footprint immediately:
+
+- a provider entry can declare its region in **Govern → Providers** (`carbon_region`) — set it for providers without a region of their own (OpenAI, Azure OpenAI, Anthropic, OpenAI-compatible);
+- otherwise, for **AWS Bedrock**:
+  - a **cross-region inference profile** (model id starting with `global.`, `eu.`, `us.`, `us-gov.`, `apac.`, `jp.`, `au.`) can run in any region of its geography, whatever the entry's region: `global.` → `world`, `eu.` → `eu-west`, `us.` and `us-gov.` → `us-east`, `apac.`, `jp.` and `au.` → `asia`. The prefix is read on the id actually sent to AWS, so a model declared under an alias (`model_aliases`) follows its target;
+  - any other model id uses the entry's AWS region: `eu-north-*` → `eu-north`; any other `eu-*` → `eu-west`; `us-east-*` and `ca-*` → `us-east`; `us-west-*` → `us-west`; `ap-*` → `asia`; anything else → `world`;
+- for **Vertex AI**, the location of the entry's host (`europe-west9-aiplatform.googleapis.com` → `europe-west9`; no prefix means `global`): `europe-north1` / `europe-north2` → `eu-north`; any other `europe-*` → `eu-west`; `us-west*` → `us-west`; `us-central1`, `us-east*`, `us-south1` and `northamerica-*` → `us-east`; `asia-*` and `australia-*` → `asia`; `global` and anything else → `world`;
+- with nothing from the provider, the region is `world`.
+
+The **Region** field of a model shows this as **From the provider (…)**, its default. Pick a region there only for a model that runs elsewhere: it then overrides the provider for that model. When a region is selected, the form tells whether it differs from the provider or is the same (and can then be removed with **Use the provider**). A region set on a model by an earlier version keeps working as an override; a value that is not one of the six regions is ignored. Run **Update from catalogue** (⋮ menu of **Govern → Models**) to clear, in one go, the stored regions that are identical to the provider's (dry run first).
+
+**Through the API**, `region` on `POST /v1/models` and `PATCH /v1/models/{model_id}` is optional: `null` or absent means "from the provider", one of the six ids is an override, and any other value is refused with `400 INVALID_REGION`. `GET /v1/models/regions?model_id=…` returns the six regions, the default (`world`) and what the provider gives that model (`suggested`, `source`).
 
 ### 5. Uncertainty range
 
@@ -108,13 +123,15 @@ Each call returns:
 {
   "energy": { "value": 0.000573, "min": 0.000459, "max": 0.000688, "unit": "kWh" },
   "gwp":    { "value": 0.000202, "min": 0.000161, "max": 0.000242, "unit": "kgCO2eq" },
-  "details": { "gpu_energy": 0.000359, "server_energy": 0.0000038, "pue": 1.58, "emission_factor": 0.352, "region": "us-west" }
+  "details": { "gpu_energy": 0.000359, "server_energy": 0.0000038, "pue": 1.58, "emission_factor": 0.352, "region": "us-west", "region_source": "bedrock:us-west-2" }
 }
 ```
 
 <Note>
-The constants (0.33 input factor, 0.1 kW server draw, 0.02 s/token, PUE multipliers and regional emission factors, ±20% band) are fixed in the gateway. Only `energy_per_token`, `pue_profile` and `region` are per-model. A model with no `energy_per_token` reports pricing only and no footprint.
+The constants (0.33 input factor, 0.1 kW server draw, 0.02 s/token, PUE multipliers and regional emission factors, ±20% band) are fixed in the gateway. Only `energy_per_token` and `pue_profile` are per-model, plus the optional `region` override; the region otherwise comes from the provider entry. A model with no `energy_per_token` reports pricing only and no footprint.
 </Note>
+
+`details.region_source` tells which rule picked the region: `model` (the model's override), `provider` (the provider entry's carbon region), `bedrock-profile:<prefix>` (a Bedrock cross-region profile such as `eu.`), `bedrock:<AWS region>`, `vertex:<location>`, or `default` (world). The same object is returned in `usage.carbon` of the chat completion and sent with the `analytics.llm.completion` event (`carbon`), so you can check which region each call was counted in.
 
 ## Related
 
