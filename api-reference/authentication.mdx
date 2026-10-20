@@ -359,12 +359,34 @@ Authentication is part of what makes the platform governed by design: the same i
 
 ### Active Organization
 
-Every authenticated user has an **active organization** that scopes permissions and resources. It is resolved on each request:
-1. URL path (`/v2/orgs/:orgSlug/...`) takes priority
-2. Then the session-persisted `activeOrgSlug`
-3. Falls back to the user's first organization membership
+Every authenticated request runs in the context of one **active organization**, which scopes permissions and resources (`{{session.org}}` in automations). It is resolved on each request, by priority:
 
-Switch organizations with `PUT /v2/user/active-org`.
+1. The organization in the URL path (`/v2/orgs/:orgSlug/...`)
+2. The organization of an organization API key (`iak_...`)
+3. The `x-prismeai-org-slug` request header
+4. The user's default organization: the one stored in the session, else the first membership
+
+Send `x-prismeai-org-slug` with each request to choose the organization explicitly. The choice only applies to that request: nothing is stored server-side, so two browser tabs, or two clients sharing a session, can work on two organizations at the same time. The Prisme.ai web app sends it on every call, each tab keeping its own organization.
+
+```bash
+curl https://api.studio.prisme.ai/v2/me \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-prismeai-org-slug: my-other-org"
+```
+
+- **Allowed organizations**: the user must be a member of the organization, and the organization must be active. Platform super admins may target any active organization.
+- **Refusal**: any other value (unknown, suspended or non-member organization, malformed slug) is refused with `403 ForbiddenError`. The request never falls back to another organization.
+- **Response**: responses carry the organization the request was resolved against in the `x-prismeai-org-slug` response header (exposed to browsers through CORS).
+- **WebSockets**: browsers cannot set headers on a WebSocket. Pass the organization in the socket.io handshake instead: `auth: { extraHeaders: { 'x-prismeai-org-slug': 'my-other-org' } }`. The `@prisme.ai/sdk` does it when `api.orgSlug` is set.
+- **Automations**: a `fetch` from an automation to the Prisme.ai API, made with the identity of the user who triggered the run, carries the organization of the run, unless the automation sets `x-prismeai-org-slug` itself.
+
+<Note>
+On a bare `/v2/orgs/:orgSlug` path (no sub-path), permissions are evaluated against the active organization. Send `x-prismeai-org-slug: :orgSlug` along to read or update an organization other than your default one.
+</Note>
+
+<Warning>
+`PUT /v2/user/active-org` is **deprecated**. It changes the default organization of the whole session, shared by every tab and device using it, and its responses carry a `Deprecation: true` header. Send `x-prismeai-org-slug` with each request instead. The endpoint will be removed in a future version.
+</Warning>
 
 ## Authentication Flow
 
@@ -387,7 +409,7 @@ When building automations, the following context variables are available from th
 | Variable | Description |
 |----------|-------------|
 | `{{session.id}}` | Session ID |
-| `{{session.org.slug}}` | Active organization slug |
+| `{{session.org.slug}}` | Active organization slug (see [Active Organization](#active-organization)) |
 | `{{session.org.name}}` | Organization name |
 | `{{session.org.role.slug}}` | User's role slug in the active org |
 | `{{session.org.role.permissions}}` | Role permission strings (array) |
