@@ -426,6 +426,13 @@ https://graph.microsoft.com/OnlineMeetingArtifact.Read.All
     | `sendChatMessage` | Post a message to a chat; `body` = `{ body: { contentType, content } }`. | The created chatMessage. |
     | `listChatMembers` | List the participants of a chat. | `{ value: [ conversationMember ] }` |
 
+    ### Message content
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `getMessageHostedContent` | The bytes of an image pasted inline into a message, by `hostedContentId` (the `{id}` in the `hostedContents/{id}/$value` image URL of the message body). | `{ hostedContentId, name, mimeType, size, base64 }` |
+    | `getMessageAttachmentContent` | The bytes of a file attached to a message, by `attachmentId` (from the message's `attachments[]`, `contentType: reference` only). Needs `Files.Read.All` or `Sites.Read.All`. | `{ attachmentId, name, mimeType, size, base64, webUrl }` |
+
     ### Meetings
 
     | Instruction | Description | Returns |
@@ -450,6 +457,26 @@ https://graph.microsoft.com/OnlineMeetingArtifact.Read.All
     <Note>
       `Returns` shows the shape of the operation output (the underlying Microsoft Graph resource). `getMeetingTranscriptContent` is the exception: it returns WebVTT text, because Graph serves transcripts as text rather than JSON.
     </Note>
+
+    ### Reading message images and files
+
+    Message instructions return Graph's JSON, where an inline image is only a URL that needs the token and an attached file is only a link into OneDrive or SharePoint. `getMessageHostedContent` and `getMessageAttachmentContent` return the bytes themselves, as standard base64. Both are App-mode instructions only, not MCP tools.
+
+    Both address the message the same way: `chatId` for a chat message, or `teamId` + `channelId` for a channel message, plus `messageId`, and `replyId` for a reply in a channel thread (`messageId` is then the root message). Ids are checked before any Graph call.
+
+    | Topic | Behavior |
+    |---|---|
+    | Output | `getMessageHostedContent`: `{ hostedContentId, name, mimeType, size, base64 }`, where `mimeType` is the Content-Type Graph answers with (`application/octet-stream` when absent) and `name` is always `null`. `getMessageAttachmentContent`: `{ attachmentId, name, mimeType, size, base64, webUrl }`. |
+    | Activity feed | The output is redacted: the base64 body never appears in the workspace activity feed. |
+    | Size limit | 4 MB (4,194,304 bytes) by default, which is also the maximum. Pass `maxBytes` to lower it; a larger value is capped at 4 MB. |
+    | When the size is checked | `getMessageHostedContent`: after the download, because Graph declares no size for an inline image. `getMessageAttachmentContent`: before the download, from the file's declared size in OneDrive or SharePoint; the downloaded body must then match that size exactly. |
+    | Errors | `{ error, reason?, status? }`. `reason` is `invalid_id` for missing or malformed ids, `too_large` above the limit, or `read_failed` when a file does not match its declared size; `status` is the HTTP status of a failed Graph call. Cards and other non-file attachments are refused. |
+
+    <Warning>
+      `getMessageAttachmentContent` needs the Microsoft Graph permission **Files.Read.All** (or **Sites.Read.All**) to read the file in OneDrive or SharePoint: delegated for the OAuth modes, application for `clientCredentials`. Neither the read-only preset nor the default scopes include it. Add it to the **Scopes** field of the configuration app (and grant admin consent where your tenant requires it), then disconnect and reconnect so Microsoft issues a new token. Without it, the call fails with `status: 403`.
+    </Warning>
+
+    The file is downloaded from the pre-signed URL that Graph returns, without the Authorization header; that URL is never returned to the caller. Meeting recordings are not covered.
 
     ## DSUL Examples
 
@@ -678,7 +705,7 @@ The answers that hold for every connector (agent access, shared knowledge bases,
 | Read-only scopes | `offline_access`, `User.Read`, `Team.ReadBasic.All`, `Channel.ReadBasic.All`, `TeamMember.Read.All`, `ChannelMember.Read.All`, `ChannelMessage.Read.All`, `Chat.Read`, `ChatMessage.Read`, `Calendars.Read`, `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All`, `OnlineMeetingArtifact.Read.All` (the **Read-only preset**, also the default of the configuration app). When neither the workspace nor the platform maintainer sets scopes, the central OAuth client also requests `ChannelMessage.Send`, `Chat.ReadWrite` and `OnlineMeetings.ReadWrite`. |
 | Agent allowlist | Yes, on the tenant endpoint (empty at installation). The global endpoint accepts every agent. |
 | Per-reader access control on knowledge bases | Yes: each channel message is checked against the reader's own Microsoft 365 connection. |
-| Outbound hosts | `graph.microsoft.com`, `login.microsoftonline.com`. With the chat connector, also `login.botframework.com` and the Bot Connector address carried by each incoming message, accepted only when its host ends with `.botframework.com`, `.trafficmanager.net` or `.botframework.azure.us` (default list). |
+| Outbound hosts | `graph.microsoft.com`, `login.microsoftonline.com`. With `getMessageAttachmentContent`, also the pre-signed OneDrive or SharePoint download URL that Graph returns for the file (no token is sent to it). With the chat connector, also `login.botframework.com` and the Bot Connector address carried by each incoming message, accepted only when its host ends with `.botframework.com`, `.trafficmanager.net` or `.botframework.azure.us` (default list). |
 | Audit events | None specific to this connector |
 
 With `oauthCentral`, set the read-only scopes explicitly in the configuration app rather than relying on the central default. The chat connector verifies the Bot Framework signature of every incoming message and refuses to send its bot token to a host outside the list above.
