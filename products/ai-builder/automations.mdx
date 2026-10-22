@@ -886,9 +886,9 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
         ```
       </Tab>
       <Tab title="HTTP SSE (Server Side Events)">
-        By default, HTTP responses indicating a `content-type: text/event-stream` header will force their **responseMode** to `detailed_response`, and their `{{output.body}}` will be a stream that can be read in real time from the calling automation.
+        By default, a successful HTTP response with a `content-type: text/event-stream` header forces its `outputMode` to `detailed_response`, and its `{{output.body}}` is a stream that can be read in real time from the calling automation.
 
-        An error response (status 400 or above) is never a stream, whatever its content-type: its body is read whole, as JSON when it looks like JSON. Some providers (Google Vertex AI) label their JSON errors `text/event-stream`. Read `{{output.body}}` as a stream only when `{{output.stream}}` is true :
+        An error response (status 400 or above) is never a stream, whatever its content-type: its body is read whole, as JSON when it starts with `{` or `[`, otherwise according to its content-type. It is not forced to `detailed_response` either: set `outputMode: detailed_response` to read its status. Some providers (Google Vertex AI) label their JSON errors `text/event-stream`. Read `{{output.body}}` as a stream only when `{{output.stream}}` is true :
 
         ```yaml
         - fetch:
@@ -1286,11 +1286,11 @@ Calls an HTTP endpoint.
 | `auth.awsv4` | object | - | AWS SigV4 signing. See the Fetch accordion above. |
 | `outputMode` | `body` \| `detailed_response` \| `base64` \| `data_url` | `body` | Shape of the value left in `output`. |
 | `stream` | object | - | Emit each SSE chunk as an event instead of buffering. See the Fetch accordion above. |
-| `emitErrors` | boolean | `false` | When `true`, HTTP errors are caught and emitted as `prismeai.fetch.error` events instead of aborting the run. |
+| `emitErrors` | boolean | `true` | When `true`, a 4xx/5xx status or a network failure emits a `runtime.fetch.failed` event, request and response included. The run continues either way and `output` receives the response. |
 | `timeout` | number (ms) | `FETCH_HEADERS_TIMEOUT` / `FETCH_BODY_TIMEOUT` (300000) | Inactivity bound, applied both while waiting for the response headers and between two body chunks. It is not a total duration cap: a response that keeps sending is never interrupted, so a long LLM completion is left intact. |
 | `output` | string | - | Variable name receiving the response. |
 
-**Output:** the response body, or `{ body, headers, status }` if `outputMode: detailed_response`. A body is parsed when it is JSON (`application/json` or any `application/*+json`), and an error body whenever it looks like JSON. **Raises:** network errors, timeout, non-2xx HTTP (unless `emitErrors`). **Often chained with:** `set`, `conditions`, `repeat` (for streams).
+**Output:** the response body, or `{ body, headers, status }` if `outputMode: detailed_response`. The body is decoded from its content-type: `application/json` and `application/*+json` are parsed (a `+json` body that is not one JSON document, such as NDJSON, stays binary), other `application/*`, `image/*` and `audio/*` bodies are binary, anything else is text. An error body (status 400 or above) is parsed whenever it starts with `{` or `[`. **Raises:** only when the instruction itself is invalid (forbidden host, malformed URL…): an HTTP error or a network failure is returned in `output`, not raised. **Often chained with:** `set`, `conditions`, `repeat` (for streams).
 
 <Note>
 **Bounding a server that never answers.** Without `timeout`, a host that accepts the connection and then stays silent holds the automation for the underlying 300s default: the tool stays "running", the task stays in the working status and no error is raised. Set `timeout` on calls to endpoints you do not control, such as remote MCP servers, so a silent peer fails fast instead of freezing the run. Self-hosters can change the platform-wide defaults with `FETCH_HEADERS_TIMEOUT` and `FETCH_BODY_TIMEOUT`, see [Environment Variables](/self-hosting/kubernetes/environment-variables).
