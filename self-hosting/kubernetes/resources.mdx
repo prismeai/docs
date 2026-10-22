@@ -14,7 +14,7 @@ We ship two sets of resource defaults. Treat them as the **recommended lower and
 | Variant | Use when |
 |---------|----------|
 | **Balanced** *(chart default)* | Up to a few hundred concurrent users, budget-sensitive. Each pod is sized for typical load, with HPA absorbing spikes. |
-| **Performance** | Thousands of concurrent users, max throughput per pod. Requests are sized at the maximum each service can actually use. |
+| **Performance** | Thousands of concurrent users, max throughput per pod. Requests are sized at the maximum each service can usefully consume on a 4 vCPU node; going higher on these nodes brings no gain. |
 
 <Info>
   **Start at Balanced.** `Balanced` is now the chart default and the right starting point for a fresh install: high enough to run a real workload comfortably, low enough to avoid over-paying before you know your traffic shape. Move toward `Performance` (or somewhere in between) once you've observed your actual usage.
@@ -25,7 +25,7 @@ We ship two sets of resource defaults. Treat them as the **recommended lower and
 - **High requests** → fewer pods per node → idle CPU/RAM is wasted when pods aren't busy.
 - **Low requests** → more pods per node → risk of a node being unable to provide CPU/RAM under load spikes.
 
-Pick **Balanced** if your traffic is mostly steady and budget matters. Pick **Performance** if you need each pod to absorb large bursts on its own. Most production deployments end up at an intermediate point; there is no reason to copy either column verbatim once you have real data.
+Pick **Balanced** if your traffic is mostly steady and budget matters. Pick **Performance** if you need each pod to absorb large bursts on its own. Most production deployments end up at an intermediate point: **any value between Balanced and Performance is valid**, service by service, and there is no reason to copy either column verbatim once you have real data. You don't need Performance requests on day one if your user base will grow progressively.
 
 ### Right-sizing from observed usage
 
@@ -40,14 +40,41 @@ Iterate: re-measure after a few weeks of steady traffic and after any major usag
 
 ### Cluster size baseline
 
-The requests / limits below add up to the following node count when scheduled on **16 GB RAM, 4 vCPU** worker nodes (a common cloud baseline like AWS `m6i.xlarge`, GCP `n2-standard-4`, Azure `D4s_v5`):
+Our reference node is **4 vCPU / 16 GB RAM** (a common cloud baseline like AWS `m6i.xlarge`, GCP `n2-standard-4`, Azure `D4s_v5`). Once the cloud provider's reservations and the usual DaemonSets are subtracted, such a node leaves roughly **3.6–3.8 vCPU and ~14 GB** for Prisme.ai pods (see [Fitting the runtime on a node](#fitting-the-runtime-on-a-node)).
 
-| Variant | Starting nodes | Notes |
-|---------|----------------|-------|
-| **Balanced** | **5 nodes** (16 GB / 4 vCPU each) | Covers ~8 vCPU / ~14 GB of steady-state requests for `core` + `apps`, with HPA headroom up to ~20 vCPU / ~40 GB at max replicas. |
-| **Performance** | **10 nodes minimum, 12 recommended** (16 GB / 4 vCPU each) | Larger per-pod requests + higher HPA ceilings. The HPA minimums alone request ~31 vCPU, so 10 nodes is the floor once system pods and daemonsets are counted; 12 nodes is the validated production sizing. Enable the cluster autoscaler so the pool grows past 12 under sustained spikes. |
+Scheduling the requests / limits below on these nodes gives:
 
-These are starting points; the actual node count depends on your HPA targets, the database pods you co-locate, and any extra workloads. Rely on the cluster autoscaler in both cases.
+| Variant | At HPA min | At HPA max | Recommended starting pool |
+|---------|------------|------------|---------------------------|
+| **Balanced** | ~8.4 vCPU requests / ~13 GB memory limits → 3 nodes | ~21.6 vCPU / ~41 GB → **6 nodes** | **5 nodes**, cluster autoscaler allowed to grow to 6+ |
+| **Performance** | ~30.5 vCPU / ~29 GB → 10 nodes with perfect packing, no spare room | ~76 vCPU / ~72 GB → ~24 nodes | **12 nodes minimum**, cluster autoscaler enabled |
+
+How to read this table:
+
+- **CPU is counted on requests, memory on limits.** CPU is compressible: the scheduler places pods on their requests and a busy pod is only slowed down. Memory is not: a pod exceeding its limit is killed, and a node whose pods together exceed its RAM evicts them. Plan node memory on the sum of the limits so you never overcommit it.
+- **CPU is the constraint in both variants**; memory never is on 16 GB nodes.
+- **Performance needs 12 nodes, not 10.** A Performance `runtime` pod takes almost a whole 4 vCPU node. 10 nodes only host the HPA minimums if every pod is packed perfectly, and leave no room for a rolling update or a scale-out. In practice the Kubernetes scheduler spreads pods across the least loaded nodes, which scatters small pods over empty nodes and leaves fewer whole nodes free for `runtime` and `crawler`. Start with 12 nodes and keep the cluster autoscaler enabled: it adds a node whenever a large pod finds no room.
+- **The starting pool is deliberately smaller than what HPA max needs.** Provisioning every node HPA could ever ask for would waste capacity most of the time; the **cluster autoscaler** adds nodes as HPA scales out and removes them afterwards. It is required in both variants. The `HPA max` values are themselves yours to raise (see [HPA](#horizontal-pod-autoscaling-hpa)), so no fixed node count can cover them.
+
+These are starting points; the actual node count depends on your HPA targets, the database pods you co-locate, and any extra workloads. Pick the **node size** and the **pod IP range** from your expected scale up front: those two are the hardest settings to change later. Requests and HPA bounds can then be tuned at any time from your monitoring.
+
+<Warning>
+  **Large pods need a whole free node to roll out.** A rolling update (`helm upgrade`) or a node drain starts the new pod *before* stopping the old one. With Performance `runtime` and `crawler` on 4 vCPU nodes, the new pod needs a nearly empty node: if none is free, it stays `Pending` until the cluster autoscaler provisions one, which takes a few minutes. Without the cluster autoscaler, or with its maximum reached, the rollout stays blocked. The same applies to every `runtime` scale-out.
+</Warning>
+
+### Alternative: 8 vCPU nodes for Performance
+
+On **8 vCPU / 32 GB** nodes (AWS `m6i.2xlarge`, GCP `n2-standard-8`, Azure `D8s_v5`), or compute-optimized **8 vCPU / 16 GB** nodes (Performance needs roughly 1 GB of memory limit per vCPU of request), the Performance variant fits in **5 nodes at HPA min and ~11 at HPA max**. A `runtime` pod then shares its node with other pods, so you can raise its CPU request to **4–4.5 vCPU** (the technical ceiling of 4 workers, see [Scaling `prismeai-runtime` workers](#scaling-prismeai-runtime-workers)).
+
+| | 4 vCPU nodes *(reference)* | 8 vCPU nodes *(alternative)* |
+|---|---|---|
+| `runtime` Performance request | 3500m, one pod per node | 4000–4500m, shares the node |
+| Bin-packing | Fragmented: leftover slivers per node | Better: fewer, larger nodes |
+| Scale-out / rolling update | Each new `runtime` pod waits for a new node | Usually fits on an existing node |
+| Cost of adding a node | Small increments | Larger increments; more idle capacity, especially for Balanced |
+| Availability | Every cloud and most on-premise setups | Not always available on premise |
+
+Both are supported. 4 vCPU nodes remain the reference, and Performance runs fine on them; 8 vCPU nodes are a comfort option for large, bursty loads, not a prerequisite.
 
 ---
 
@@ -69,9 +96,13 @@ These are starting points; the actual node count depends on your HPA targets, th
 |--------------------------|-------------|----------------|--------------|---------------|
 | api-gateway              | 2000m       | 600Mi          | 600Mi        | 2 / 5         |
 | workspaces               | 1250m       | 500Mi          | 500Mi        | 2 / 5         |
-| runtime *(4 workers)*    | 3800m       | 4000Mi         | 4Gi          | 2 / 5         |
+| runtime *(4 workers)*    | 3500m       | 4000Mi         | 4Gi          | 2 / 5         |
 | events                   | 1500m       | 600Mi          | 600Mi        | 2 / 5         |
 | console                  | 1000m       | 300Mi          | 300Mi        | 2 / 5         |
+
+<Note>
+  The Performance `runtime` request (3500m) is the largest value that still fits a 4 vCPU node on the major clouds once their reservations and DaemonSets are subtracted. Check it against your own nodes before applying it: see [Fitting the runtime on a node](#fitting-the-runtime-on-a-node).
+</Note>
 
 ---
 
@@ -162,7 +193,37 @@ In practice you have two equivalent ways to think about it:
 - **Top-down**: keep `limits.memory` fixed and lower `maxWorkers`; each worker's heap rises proportionally.
 - **Bottom-up**: target a per-worker heap and raise `limits.memory` to fit `maxWorkers` of them, plus the 25% main-thread overhead.
 
-Example: aiming for 4 workers at ~750 MiB heap each → `limits.memory ≈ 4 GiB`, `maxWorkers: 4` (this is the Performance default). For CPU, budget at least one core per worker plus a small share for the main thread (e.g. `requests.cpu: "4.5"` for 4 workers).
+Example: aiming for 4 workers at ~750 MiB heap each → `limits.memory ≈ 4 GiB`, `maxWorkers: 4` (this is the Performance default).
+
+### CPU per worker
+
+A worker (i.e. a Node.js thread) can use **at most one core**, and the main thread a small share on top. So **one core per worker plus ~0.5 for the main thread is the ceiling** a runtime pod can consume: about `4.5` vCPU for 4 workers. A request above that is wasted.
+
+It is a ceiling, not a minimum. Automations spend much of their time waiting on I/O (LLM calls, HTTP fetches, databases), so workers rarely all burn a full core at once, and a request below one core per worker is normal: Balanced runs 3 workers on 2 vCPU. Size the request from the observed P95 usage, like any other service.
+
+On a **4 vCPU node**, the 4.5 vCPU ceiling can't be requested: keep `maxWorkers: 4` and request what the node can actually give (3500m in the Performance table). Because Prisme.ai sets no CPU limit and a Performance `runtime` pod is alone on its node, a lower request doesn't take CPU away from the workers: they still use all the CPU the node has free. Dropping to 3 workers caps automation execution at 3 cores, whatever the node has free. With 4 workers, the pod also uses the remaining 0.5–0.7 vCPU of requestable CPU, and usually more: DaemonSets and system pods rarely consume their whole request, and that idle CPU goes to whoever needs it. A 4th worker also limits how much work waits behind a CPU-heavy automation: tasks are dispatched round-robin and each worker runs its automations concurrently on one event loop, so a worker busy with a heavy automation delays every task assigned to it. In return, each worker gets less heap and the pod opens more database connection pools. The 3-worker option pays off when you also lower the request (about `3` vCPU) so that a small pod can share the node.
+
+### Fitting the runtime on a node
+
+A pod is only scheduled if its request fits in what the node has left. On a 4 vCPU node, that is less than 4 vCPU:
+
+```text
+max runtime request = node allocatable CPU − requests of the DaemonSets on the node − requests of the pod's sidecars
+```
+
+- **Allocatable CPU** is the node's capacity minus what the cloud provider reserves for the kubelet and the OS: around 3.85–3.92 vCPU for a 4 vCPU node on AWS, GCP and Azure.
+- **DaemonSets** run on every node: CNI, kube-proxy, CSI drivers, log and monitoring agents, security agents. A bare AWS node requests about 150m (`aws-node` + `kube-proxy`); managed monitoring or security agents can add a few hundred more.
+- **Sidecars** injected in the `runtime` pod (for instance an Istio proxy, typically 100m) count in the pod's own request.
+
+For example, a bare AWS node gives 3920m − 150m = 3770m, or 3670m with an Istio sidecar. The 3500m of the Performance table keeps a margin that fits a 4 vCPU node on the three major clouds. Check your own nodes:
+
+```bash
+kubectl describe node <node>
+# "Allocatable:" → cpu
+# "Non-terminated Pods:" → CPU Requests of every DaemonSet pod on that node
+```
+
+If what is left is clearly below 3.5 vCPU (many agents on every node), either lower the `runtime` request and `maxWorkers` together (see [CPU per worker](#cpu-per-worker)), or move to [8 vCPU nodes](#alternative-8-vcpu-nodes-for-performance).
 
 ### Node.js workers heap is auto-sized
 
@@ -177,7 +238,7 @@ maxOldSpaceSize = floor( memory_limit_in_Mi / maxWorkers × 0.75 )
 
 ## Resource Quotas and Limit Ranges
 
-Apply quotas at the namespace level to prevent runaway consumption.
+Apply quotas at the namespace level to prevent runaway consumption. The example below fits the **Balanced** `core` namespace at HPA max (~13 vCPU requests and ~16 GiB memory limits, or ~16 vCPU during a rollout). Size yours on your own HPA max, plus one extra pod per deployment for rolling updates: a quota that's too tight blocks scale-outs and rollouts. The Performance `core` namespace, for instance, requests ~18.5 vCPU at HPA min and ~46 vCPU / ~30 GiB of memory limits at HPA max, so it needs a `requests.cpu` of about `"56"` once rollouts are counted.
 
 ```yaml
 apiVersion: v1
@@ -221,6 +282,7 @@ kubectl describe pod <pod> -n <namespace> | tail -30
 kubectl describe nodes | grep -A 5 "Allocated resources"
 ```
 - "0/N nodes available: Insufficient cpu/memory" → reduce requests, increase node size, or scale the node pool.
+- `runtime` (or another large pod) `Pending` on every node, even an empty one → its request exceeds what a node can offer after DaemonSets; see [Fitting the runtime on a node](#fitting-the-runtime-on-a-node).
 - "node(s) didn't match Pod's node affinity/selector" → check `tolerations` and `nodeSelector` against your node pool labels.
 </Accordion>
 
@@ -266,7 +328,7 @@ kubectl get events -n <namespace> --sort-by=.lastTimestamp | tail -30
 ```
 - Failing readiness probe right after rollout → check service dependencies (DB reachable, secrets mounted).
 - Crash loop → `kubectl logs <pod> -n <namespace> --previous`.
-- If the regression is in a new chart version, roll back: `helm rollback <release> <revision> -n <namespace>`; see [Helm install: Upgrade, rollback, uninstall](/self-hosting/kubernetes/helm#8-upgrade-rollback-uninstall).
+- If the regression is in a new chart version, roll back: `helm rollback <release> <revision> -n <namespace>`; see [Helm install: Upgrade, rollback, uninstall](/self-hosting/kubernetes/helm#9-upgrade-rollback-uninstall).
 </Accordion>
 
 <Accordion title="Volume node affinity conflict">
