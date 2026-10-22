@@ -47,19 +47,19 @@ Scheduling the requests / limits below on these nodes gives:
 | Variant | At HPA min | At HPA max | Recommended starting pool |
 |---------|------------|------------|---------------------------|
 | **Balanced** | ~8.4 vCPU requests / ~13 GB memory limits → 3 nodes | ~21.6 vCPU / ~41 GB → **6 nodes** | **5 nodes**, cluster autoscaler allowed to grow to 6+ |
-| **Performance** | ~30.5 vCPU / ~29 GB → **10 nodes, with no spare room** | ~76 vCPU / ~72 GB → ~24 nodes | **12 nodes**, cluster autoscaler enabled |
+| **Performance** | ~30.5 vCPU / ~29 GB → 10 nodes with perfect packing, no spare room | ~76 vCPU / ~72 GB → ~24 nodes | **12 nodes minimum**, cluster autoscaler enabled |
 
 How to read this table:
 
 - **CPU is counted on requests, memory on limits.** CPU is compressible: the scheduler places pods on their requests and a busy pod is only slowed down. Memory is not: a pod exceeding its limit is killed, and a node whose pods together exceed its RAM evicts them. Plan node memory on the sum of the limits so you never overcommit it.
 - **CPU is the constraint in both variants**; memory never is on 16 GB nodes.
-- **Performance at HPA min fills 10 nodes exactly.** A Performance `runtime` pod takes almost a whole 4 vCPU node, and the remaining pods don't pack perfectly, so the leftover capacity is split into slivers too small to host another pod. 12 nodes leave room for two scale-outs (one extra `runtime` replica needs one free node) or a rolling update.
+- **Performance needs 12 nodes, not 10.** A Performance `runtime` pod takes almost a whole 4 vCPU node. 10 nodes only host the HPA minimums if every pod is packed perfectly, and leave no room for a rolling update or a scale-out. In practice the Kubernetes scheduler spreads pods across the least loaded nodes, which scatters small pods over empty nodes and leaves fewer whole nodes free for `runtime` and `crawler`. Start with 12 nodes and keep the cluster autoscaler enabled: it adds a node whenever a large pod finds no room.
 - **The starting pool is deliberately smaller than what HPA max needs.** Provisioning every node HPA could ever ask for would waste capacity most of the time; the **cluster autoscaler** adds nodes as HPA scales out and removes them afterwards. It is required in both variants. The `HPA max` values are themselves yours to raise (see [HPA](#horizontal-pod-autoscaling-hpa)), so no fixed node count can cover them.
 
 These are starting points; the actual node count depends on your HPA targets, the database pods you co-locate, and any extra workloads. Pick the **node size** and the **pod IP range** from your expected scale up front: those two are the hardest settings to change later. Requests and HPA bounds can then be tuned at any time from your monitoring.
 
 <Warning>
-  **Keep at least one free node when a pod takes almost a whole node.** A rolling update (`helm upgrade`, `maxSurge`) or a node drain needs room for the new pod *before* the old one goes away. With Performance `runtime` (and, to a lesser extent, `crawler`) on 4 vCPU nodes, that room is a full empty node: without it, the new pod stays `Pending` until the cluster autoscaler provisions one, which takes a few minutes. The same delay applies to every `runtime` scale-out.
+  **Large pods need a whole free node to roll out.** A rolling update (`helm upgrade`) or a node drain starts the new pod *before* stopping the old one. With Performance `runtime` and `crawler` on 4 vCPU nodes, the new pod needs a nearly empty node: if none is free, it stays `Pending` until the cluster autoscaler provisions one, which takes a few minutes. Without the cluster autoscaler, or with its maximum reached, the rollout stays blocked. The same applies to every `runtime` scale-out.
 </Warning>
 
 ### Alternative: 8 vCPU nodes for Performance
