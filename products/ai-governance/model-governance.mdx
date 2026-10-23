@@ -586,79 +586,64 @@ analytics as `tokens.cache_read` / `tokens.cache_write` on the
 
 ### System messages sent mid-conversation
 
-A `system` message sent after the first message of another role, such as the
-notices agents inject between tool calls, stays where it was sent. The
-prompt cache is a prefix: moving the message into the provider's system
-prompt would rewrite the prompt ahead of the whole history, and the cache
-would read nothing back. A `developer` message counts as a system message on
-OpenAI-compatible APIs only; Claude, Bedrock and Gemini receive it as plain
-user text.
+During a conversation, agents add short instructions as `system` messages, for
+example a reminder after several failed tool calls. The gateway leaves them
+where they are: moving them into the system prompt at the top would change the
+start of the prompt on every turn, and the provider could no longer reuse its
+cache.
 
-By default, the gateway sends these messages as native system messages. On a
-model where **Accepts system messages mid-conversation** is unchecked
-(`provider_config.supports_mid_conversation_system: false`), it sends them as
-user text wrapped in `<system-reminder>…</system-reminder>` instead, joined to
-the user message next to them when there is one: still in place, so the cache
-holds as well.
+Each model has a setting for these messages, **Accepts system messages
+mid-conversation**: in **Govern → Models**, open the model, **Advanced** step,
+**Provider Config** block.
 
-| Provider | By default | Unchecked |
+- **Checked** (the default): they are sent as system messages.
+- **Unchecked**: they are sent as text inside the user message next to them,
+  wrapped in `<system-reminder>…</system-reminder>`. The model still reads
+  them, and the cache still works.
+
+| Provider | Checked | Unchecked |
 |---|---|---|
-| OpenAI Chat Completions, Azure OpenAI, Mistral, DeepSeek and other OpenAI-compatible APIs | Sent as is | The text form |
-| OpenAI Responses API | An `input` item with the same role | The text form |
-| Anthropic, Azure Claude, Vertex Claude | A native `system` message when it follows a user message (tool results included) and is the last message or followed by an assistant message; the text form otherwise | The text form |
-| Amazon Bedrock (Converse), Gemini on Vertex AI | The text form: these APIs have no system role inside the conversation | The text form |
+| OpenAI-compatible APIs (OpenAI, Azure OpenAI, Mistral, self-hosted models…) | System message | Text |
+| Claude (Anthropic, Azure, Vertex AI) | System message where Anthropic allows it, text elsewhere | Text |
+| Amazon Bedrock, Gemini | Text: these APIs have no system message inside the conversation | Text |
 
-A system message between an assistant turn's `tool_calls` and their `tool`
-results is not supported, as on OpenAI: Claude, Bedrock and Gemini reject the
-request. Send it after the last result.
+**Uncheck it** for:
 
-Uncheck it for models that reject or ignore a system message inside the
-conversation: every Claude Sonnet and Haiku model, Claude Opus 4.7 and older
-(Anthropic lists Opus 5, Opus 5.5, Opus 4.8, Fable 5, Fable 5.1, Mythos 5 and
-Mythos 5.1 as supporting it), and self-hosted models whose chat template
-requires the system message first. You rarely do it by hand:
+- **Models you host yourself** (vLLM, Ollama… behind an OpenAI-compatible
+  endpoint), when their chat template accepts a system message only as the
+  first message. The sign: agent requests fail with an error from your model
+  about the system message or the order of the roles.
+- **Claude Sonnet and Haiku models, and Claude Opus 4.7 and older**, which
+  reject these messages. The reference catalogue unchecks it for you.
 
-- The reference catalogue sets it to `false` on the Claude models that need
-  it. A model created from the catalogue gets it prefilled, and
-  [Update from catalogue](#aligning-an-environment-with-the-catalogue) fills
-  it on linked models that have no value yet.
-- On the Models page, when **Test** succeeds, it also probes the model and,
-  when the probe is conclusive, sets the checkbox from the result; the
-  checkbox has its own **Test** button. Bedrock Converse and Gemini are not
-  probed: they always use the text form. Save the model to keep the value.
-  Use it on the models that are not linked to the catalogue.
+**Set it with Test.** On the Models page, **Test** also checks this setting and,
+when it can tell, sets the box from the result: save the model to keep it. Do it each time you
+add a model you host yourself, since the reference catalogue does not cover
+it. For models linked to the catalogue,
+[Update from catalogue](#aligning-an-environment-with-the-catalogue) fills it
+too.
+
+If a Claude model still refuses a system message, the gateway sends the request
+again once as text and emits `llm.mid_conversation_system.downgraded`
+(`model`, `provider`, `reason`): uncheck the setting on that model. Other
+models' refusals are not retried: the request fails with the model's error.
 
 <Note>
-Anthropic does not list mid-conversation system messages as supported on
-Microsoft Foundry. On Foundry, our probe of Claude Opus 5 accepted the native
-message and the model followed it; it is the only Foundry model measured.
-Run **Test** on your Foundry Claude models.
+If you call the API yourself, do not send a system message between an assistant
+message's `tool_calls` and their `tool` results: Claude, Bedrock and Gemini
+reject it, as OpenAI does. Send it after the last result.
 </Note>
 
-If a provider refuses a native system message with a refusal the gateway
-recognises (today, Anthropic's HTTP 400
-`role 'system' is not supported on this model`), the gateway sends the request
-once more to the same model in the text form and emits
-`llm.mid_conversation_system.downgraded` with `model`, `provider` and
-`reason: provider_error`. Uncheck the setting on that model to
-avoid the refused round trip. This retry does not cover every case:
-
-- **Other refusal wordings**, such as a self-hosted chat template's own error:
-  the request fails with the provider's error.
-- **A model that accepts the message and ignores it** returns no error, so
-  nothing is retried.
-
 <Warning>
-After upgrading, update the setting from the catalogue so existing Claude
-models get it. In **Update from catalogue**, use the per-row **Apply** of the
-**To update** tab on the Claude models listed: **Apply all** also overwrites
-the four metrics on every listed model. Or run the sync for this field only
-(below). Run **Test** on the models that are not linked to the catalogue.
+After upgrading, existing Claude models do not have the setting yet. To fill
+only this setting, use the API call below: the **Apply** buttons of **Update
+from catalogue** also apply the other changes they list, metrics included.
 </Warning>
 
 #### Via the API
 
-Run the sync for this field only:
+Fill the setting from the catalogue, on this field only. Run it first with
+`"dry_run": true` to see what would change.
 
 ```http
 POST {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/catalog/sync
@@ -668,14 +653,15 @@ POST {api}/v2/workspaces/slug:llm-gateway/webhooks/v1/models/catalog/sync
 { "dry_run": false, "fields": ["supports_mid_conversation_system"] }
 ```
 
-Set the flag by hand with
-[`PATCH /v1/models/{model_id}`](/llm-gateway/models/update-a-model)
-(`provider_config.supports_mid_conversation_system: false`); the PATCH replaces
-the whole `provider_config`, so send its other keys along. To probe a model,
-`POST /v1/test/capabilities` with
-`{"modelId": "<model_id>", "options": ["supports_mid_conversation_system"]}`:
-`supported` is the value to save, `null` means the probe could not tell or does
-not apply to the model's transport.
+To set it by hand, use
+[`PATCH /v1/models/{model_id}`](/llm-gateway/models/update-a-model) with
+`provider_config.supports_mid_conversation_system: false`. The PATCH replaces
+the whole `provider_config`: send its other keys along.
+
+To check a model, call `POST /v1/test/capabilities` with
+`{"modelId": "<model_id>", "options": ["supports_mid_conversation_system"]}`.
+`supported: true` means leave it checked, `false` means uncheck it, `null`
+means the test could not tell.
 
 ## Per-Agent Model Restrictions
 
