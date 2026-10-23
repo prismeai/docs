@@ -888,11 +888,12 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
       <Tab title="HTTP SSE (Server Side Events)">
         By default, a successful HTTP response with a `content-type: text/event-stream` header forces its `outputMode` to `detailed_response`, and its `{{output.body}}` is a stream that can be read in real time from the calling automation.
 
-        An error response (status 400 or above) is never a stream, whatever its content-type: its body is read whole, as JSON when it starts with `{` or `[`, otherwise according to its content-type. It is not forced to `detailed_response` either: set `outputMode: detailed_response` to read its status. Some providers (Google Vertex AI) label their JSON errors `text/event-stream`. Read `{{output.body}}` as a stream only when `{{output.stream}}` is true :
+        An error response (status 400 or above) is never a stream, even when the provider labels it `text/event-stream` (Google Vertex AI does). Read `{{output.body}}` as a stream only when `{{output.stream}}` is true, and handle the error otherwise (see **Output** in the [fetch reference](#fetch)) :
 
         ```yaml
         - fetch:
             url: "some SSE url (i.e openai /chat-completion endpoint)"
+            outputMode: detailed_response
             output: output
         - conditions:
             '{{output.stream}}':
@@ -902,6 +903,10 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
                     - set:
                         name: test[]
                         value: '{{item}}'
+            default:
+              - set:
+                  name: error
+                  value: '{{output}}'
         ```
 
         Here, the `repeat` instruction will block until all chunks have been processed & the HTTP socket is closed.\
@@ -961,6 +966,8 @@ Once triggered, automations execute a sequence of instructions in order. Here ar
               endChunk:
                 foo: bar
         ```
+
+        An error response emits no chunk and no **endChunk**: the error is only in `output`.
 
         **stream** option also accepts **target** and **options** fields from emit instruction.
       </Tab>
@@ -1286,11 +1293,19 @@ Calls an HTTP endpoint.
 | `auth.awsv4` | object | - | AWS SigV4 signing. See the Fetch accordion above. |
 | `outputMode` | `body` \| `detailed_response` \| `base64` \| `data_url` | `body` | Shape of the value left in `output`. |
 | `stream` | object | - | Emit each SSE chunk as an event instead of buffering. See the Fetch accordion above. |
-| `emitErrors` | boolean | `true` | When `true`, a 4xx/5xx status or a network failure emits a `runtime.fetch.failed` event, request and response included. The run continues either way and `output` receives the response. |
+| `emitErrors` | boolean | `true` | When `true`, an HTTP error (4xx, 5xx) or a network failure emits a `runtime.fetch.failed` event. The run continues either way: the error is returned in `output`. |
 | `timeout` | number (ms) | `FETCH_HEADERS_TIMEOUT` / `FETCH_BODY_TIMEOUT` (300000) | Inactivity bound, applied both while waiting for the response headers and between two body chunks. It is not a total duration cap: a response that keeps sending is never interrupted, so a long LLM completion is left intact. |
 | `output` | string | - | Variable name receiving the response. |
 
-**Output:** the response body, or `{ body, headers, status }` if `outputMode: detailed_response`. The body is decoded from its content-type: `application/json` and `application/*+json` are parsed (a `+json` body that is not one JSON document, such as NDJSON, stays binary), other `application/*`, `image/*` and `audio/*` bodies are binary, anything else is text. An error body (status 400 or above) is parsed whenever it starts with `{` or `[`. **Raises:** only when the instruction itself is invalid (forbidden host, malformed URL…): an HTTP error or a network failure is returned in `output`, not raised. **Often chained with:** `set`, `conditions`, `repeat` (for streams).
+**Output:**
+
+| Response | `output` |
+|---|---|
+| Success (2xx) | The body, decoded from its content-type: JSON is parsed, text stays text, files, images and audio are binary. With `outputMode: detailed_response`: `{ body, headers, status }`. |
+| HTTP error (4xx, 5xx) | The error body, read as JSON when it looks like JSON, never base64-encoded. Add `outputMode: detailed_response` to get its `status` too. |
+| Network failure, or a 429, 502 or 503 (by default) still failing after the automatic retries | `{ error, response }`, whatever the `outputMode`. |
+
+**Raises:** only when the instruction is invalid (empty or malformed URL, forbidden host), or when a successful JSON response is not valid JSON. **Often chained with:** `set`, `conditions`, `repeat` (for streams).
 
 <Note>
 **Bounding a server that never answers.** Without `timeout`, a host that accepts the connection and then stays silent holds the automation for the underlying 300s default: the tool stays "running", the task stays in the working status and no error is raised. Set `timeout` on calls to endpoints you do not control, such as remote MCP servers, so a silent peer fails fast instead of freezing the run. Self-hosters can change the platform-wide defaults with `FETCH_HEADERS_TIMEOUT` and `FETCH_BODY_TIMEOUT`, see [Environment Variables](/self-hosting/kubernetes/environment-variables).
@@ -2394,13 +2409,14 @@ Workspaces can listen to a specific subset of native events:
   </ResponseField>
 
   <ResponseField name="runtime.fetch.failed" type="event">
-    Emitted when a fetch receives a 4xx or 5xx HTTP status
+    Emitted when a fetch with `emitErrors` (the default) receives a 4xx or 5xx HTTP status, or fails on the network after its retries
 
     Payload:
 
     ```json
     {
       "request": "fetchInstructionBody",
+      "error": {},
       "response": {
         "status": 500,
         "body": {},
