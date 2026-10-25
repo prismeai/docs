@@ -380,7 +380,7 @@ The same `user` condition can be written on a role or on a rule:
 | Combined with | `auth`: the role is given to the users that match both its `auth` (an authentication provider, see [Workspace roles](/self-hosting/entreprise/permissions#workspace-roles)) and its `user` | The `role` of the rule, if any: the rule applies to the users of this role that match its `user` |
 | Typical use | Several rules for the same users: the members of a partner organization, the users of an SSO provider in some organizations | A single rule that depends on who calls, such as excluding anonymous sessions |
 
-A role without `auth` nor `user` is only given explicitly, when the workspace is shared with a user. Roles and rules with a `user` condition can't have `events` or `automations` rules: other services evaluate them without the caller identity.
+A role without `auth` nor `user` is only given explicitly, when the workspace is shared with a user.
 
 For example, this role gives the members of the `partner` organization read access to the pages and assets labelled `partners`:
 
@@ -443,7 +443,7 @@ authorizations:
         labels: members
 ```
 
-A `user` condition only narrows the users a rule applies to: it never grants anything by itself. On an inverted rule (`inverted: true`), it narrows the users the denial applies to. It is refused on `events` and `automations` rules, which other services evaluate without this caller information, and a condition that is not a valid query is refused when the security is saved.
+A `user` condition only narrows the users a rule applies to: it never grants anything by itself. On an inverted rule (`inverted: true`), it narrows the users the denial applies to. A condition that is not a valid query is refused when the security is saved.
 
 ## Secure secrets
 
@@ -529,9 +529,67 @@ Anything holding that role can read and overwrite every credential in the family
 
 Two things remain out of reach whatever the role. Secrets of `scope: user` belong to a person, and a run without one is refused before permissions are even consulted. And `owner` cannot be assumed at all, so a developer has to declare a role that states what it opens rather than reaching for everything.
 
+## Control who calls the endpoints and emits events
+
+By default, anyone, even without signing in, can call the endpoints of a workspace and emit events to it, which triggers its automations. The access of the workspace app doesn't change that: the app calls them, it doesn't protect them. **Settings › Security › Access control** restricts both, without writing rules:
+
+| Setting | What it restricts | What it doesn't change |
+|---|---|---|
+| **Endpoints** | Calling an automation exposed as an endpoint (`when.endpoint`) without `authorizations.action` | The endpoints with an action, left to the roles (see [Securing Automations](#securing-automations)). The endpoints with `authorizations.action: public`, always public |
+| **Events** | Emitting an event directly, through the API or a websocket | The events the automations of the workspace emit, and the automations these events trigger |
+
+Each one takes one of these levels:
+
+| Level | Who can |
+|---|---|
+| **Public** | Anyone, even without signing in |
+| **Signed-in users** | Any signed-in user, whatever the organization, never an anonymous session |
+| **Private** | The owners and editors of the workspace, the users of its custom roles (the people the workspace is shared with in **Settings › Sharing**, with a role other than `viewer`), and the organizations and groups added to the access |
+
+The owners and editors can always call the endpoints and emit events. A `viewer` opens the workspace in the Builder, not its app: a private access doesn't let them in.
+
+The settings are stored in the `access` section of the security:
+
+```yaml
+authorizations:
+  access:
+    endpoints: private      # public | authenticated | private
+    events: authenticated
+    bindings:               # who a private access lets in, besides the roles
+      - principalType: org
+        principalId: acme
+      - principalType: group
+        principalId: acme:support
+  roles: …
+  rules: …
+```
+
+`bindings` takes organizations (`principalType: org`, an organization slug, or `*` for the members of any organization) and groups (`principalType: group`, as `organization:group`).
+
+`access` prevails over the `rules` of the security for these two: a rule can neither open nor close an endpoint without action, nor the emission of events, once `access` sets their level. Without a level:
+
+- the endpoints follow the default of the platform, `ENDPOINTS_DEFAULT_ACCESS` (`public` unless the platform administrator changed it, see [Environment variables](/self-hosting/kubernetes/environment-variables));
+- the events stay open as the security rules allow: a new workspace lets anyone emit events.
+
+<Warning>
+  An endpoint called by a third-party service (a webhook from another tool, without a Prisme.ai session) stops answering once the endpoints are not public. Give it `authorizations.action: public` to keep it open to anyone:
+
+  ```yaml
+  slug: incoming-webhook
+  when:
+    endpoint: true
+  authorizations:
+    action: public
+  ```
+</Warning>
+
+When the endpoints or the events are open to anyone, the **Publish** dialog of the page editor warns about it, with a link to these settings.
+
+`access` is part of the security: it is exported, versioned and imported with the workspace, its organizations and groups included. Check them after importing a workspace from an environment with other organizations.
+
 ## Securing Automations
 
-By default, anyone can execute any automation that has an event or endpoint trigger. To restrict access to sensitive automations:
+Beyond who can call them (see [Control who calls the endpoints and emits events](#control-who-calls-the-endpoints-and-emits-events)), the automations of a workspace can each require a role. To restrict access to sensitive automations:
 
 <Steps>
   <Step title="Define Authorization Action">
@@ -841,6 +899,10 @@ authorizations:
     ```
   </Accordion>
   
+  <Accordion title="An endpoint answers 403 after restricting the access">
+    The caller doesn't match the access of the endpoints: an anonymous visitor (or a third-party service) on **Signed-in users**, a user outside the roles, organizations and groups on **Private**. Add their organization or group in **Settings › Security › Access control**, share the workspace with them with a custom role, or give the endpoint `authorizations.action: public` if it must stay open to anyone.
+  </Accordion>
+
   <Accordion title="Too Much Access">
     When users have permissions they shouldn't have:
     
