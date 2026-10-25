@@ -78,10 +78,11 @@ The foundation is governed by design, and RBAC is how that governance reaches in
       roles:
         editor: {}  # Built-in role
         
-        # Custom role for regular users
+        # Example: a custom role given automatically to every user
+        # signed in with a Prisme.ai account (password or passkey)
         user:
           auth:
-            prismeai: {}  # Automatically assigned to all Prisme.ai users
+            prismeai: {}
             
         # Role for API access
         workspace:
@@ -445,6 +446,8 @@ authorizations:
 
 A `user` condition only narrows the users a rule applies to: it never grants anything by itself. On an inverted rule (`inverted: true`), it narrows the users the denial applies to. A condition that is not a valid query is refused when the security is saved.
 
+The caller is fully known on the HTTP calls (endpoints, API) and the websockets. The runs an event starts only know the active organization of the user who emitted it: their `groupIds` and `authProvider` are empty, and a scheduled run has no user at all. Keep the `user` conditions of `automations` rules for the endpoint calls.
+
 ## Secure secrets
 
 Secure secrets store credentials: an OAuth refresh token a member deposits when connecting their account, an API key a connector needs. Two rules describe their lifecycle, and they are deliberately asymmetric.
@@ -531,11 +534,11 @@ Two things remain out of reach whatever the role. Secrets of `scope: user` belon
 
 ## Control who calls the endpoints and emits events
 
-By default, anyone, even without signing in, can call the endpoints of a workspace and emit events to it, which triggers its automations. The access of the workspace app doesn't change that: the app calls them, it doesn't protect them. **Settings › Security › Access control** restricts both, without writing rules:
+By default, anyone, even without signing in, can call the endpoints of a workspace and emit events to it, which triggers its automations. The access of the workspace app doesn't change that: the app calls them, it doesn't protect them. **Settings › Security › Access control** restricts both:
 
 | Setting | What it restricts | What it doesn't change |
 |---|---|---|
-| **Endpoints** | Calling an automation exposed as an endpoint (`when.endpoint`) without `authorizations.action` | The endpoints with an action, left to the roles (see [Securing Automations](#securing-automations)). The endpoints with `authorizations.action: public`, always public |
+| **Endpoints** | The calls to the endpoints (`when.endpoint`) without `authorizations.action` | The endpoints with an action, left to the roles (see [Securing Automations](#securing-automations)). The endpoints with `authorizations.action: public`, always public. The runs of the same automations started by an event, a schedule or another automation |
 | **Events** | Emitting an event directly, through the API or a websocket | The events the automations of the workspace emit, and the automations these events trigger |
 
 Each one takes one of these levels:
@@ -544,32 +547,47 @@ Each one takes one of these levels:
 |---|---|
 | **Public** | Anyone, even without signing in |
 | **Signed-in users** | Any signed-in user, whatever the organization, never an anonymous session |
-| **Private** | The owners and editors of the workspace, the users of its custom roles (the people the workspace is shared with in **Settings › Sharing**, with a role other than `viewer`), and the organizations and groups added to the access |
+| **Private** | The owners and editors of the workspace, and the organizations and groups added to the access |
 
-The owners and editors can always call the endpoints and emit events. A `viewer` opens the workspace in the Builder, not its app: a private access doesn't let them in.
+The owners and editors can always call the endpoints and emit events: no rule of the security restricts them. Everybody else, the viewers and the users of the custom roles included, gets what the level lets in, plus what the `rules` of the security add.
 
-The settings are stored in the `access` section of the security:
+The settings are stored in the `access` section of the security, and the `rules` add exceptions to it:
 
 ```yaml
 authorizations:
   access:
     endpoints: private      # public | authenticated | private
-    events: authenticated
-    bindings:               # who a private access lets in, besides the roles
+    events: private
+    bindings:               # who a private access lets in, besides owners and editors
       - principalType: org
         principalId: acme
       - principalType: group
         principalId: acme:support
-  roles: …
-  rules: …
+  roles:
+    analyst: {}
+  rules:
+    # An exception: the analysts can also call the endpoint `report`…
+    - role: analyst
+      action: execute
+      subject: automations
+      conditions:
+        slug: report
+    # …and emit events
+    - role: analyst
+      action: create
+      subject: events
 ```
 
 `bindings` takes organizations (`principalType: org`, an organization slug, or `*` for the members of any organization) and groups (`principalType: group`, as `organization:group`).
 
-`access` prevails over the `rules` of the security for these two: a rule can neither open nor close an endpoint without action, nor the emission of events, once `access` sets their level. Without a level:
+What applies, from the strongest to the weakest:
 
-- the endpoints follow the default of the platform, `ENDPOINTS_DEFAULT_ACCESS` (`public` unless the platform administrator changed it, see [Environment variables](/self-hosting/kubernetes/environment-variables));
-- the events stay open as the security rules allow: a new workspace lets anyone emit events.
+1. The owners and editors, and the endpoints with `authorizations.action: public`: always allowed.
+2. The `rules` of the security: exceptions, which open (or close) for some roles, users or automations.
+3. `access`: who can call the endpoints without action and emit events.
+4. The defaults of the platform, without `access`: the endpoints follow `ENDPOINTS_DEFAULT_ACCESS` (`public` unless the platform administrator changed it, see [Environment variables](/self-hosting/kubernetes/environment-variables)), the events whatever the rules say.
+
+A rule without `role` nor `user` that opens a surface to anyone reopens it whatever its access: **Access control** then says so. A new workspace lets anyone emit events with `access.events: public`. The rule `Anyone can create any events` that older workspaces have does the same: setting the events in **Access control** replaces it.
 
 <Warning>
   An endpoint called by a third-party service (a webhook from another tool, without a Prisme.ai session) stops answering once the endpoints are not public. Give it `authorizations.action: public` to keep it open to anyone:
@@ -583,7 +601,7 @@ authorizations:
   ```
 </Warning>
 
-When the endpoints or the events are open to anyone, the **Publish** dialog of the page editor warns about it, with a link to these settings.
+When the workspace has endpoints and they, or the events, are open to anyone, the **Publish** dialog of the page editor warns about it, with a link to these settings.
 
 `access` is part of the security: it is exported, versioned and imported with the workspace, its organizations and groups included. Check them after importing a workspace from an environment with other organizations.
 
@@ -900,7 +918,7 @@ authorizations:
   </Accordion>
   
   <Accordion title="An endpoint answers 403 after restricting the access">
-    The caller doesn't match the access of the endpoints: an anonymous visitor (or a third-party service) on **Signed-in users**, a user outside the roles, organizations and groups on **Private**. Add their organization or group in **Settings › Security › Access control**, share the workspace with them with a custom role, or give the endpoint `authorizations.action: public` if it must stay open to anyone.
+    The caller doesn't match the access of the endpoints: an anonymous visitor (or a third-party service) on **Signed-in users**, a user outside the organizations and groups on **Private**. Add their organization or group in **Settings › Security › Access control**, add a rule for their role (see [Control who calls the endpoints and emits events](#control-who-calls-the-endpoints-and-emits-events)), or give the endpoint `authorizations.action: public` if it must stay open to anyone.
   </Accordion>
 
   <Accordion title="Too Much Access">
