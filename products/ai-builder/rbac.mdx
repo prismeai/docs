@@ -368,16 +368,35 @@ RBAC controls access to various resource types through subject and action combin
 
 ## Restrict a rule to some users
 
-A rule applies to every user by default, or to the users of its `role`. Add a `user` condition to apply it only to the users it matches. It is written like `conditions`, with the subset of MongoDB queries, and matched on the signed-in user:
+A rule applies to every user by default, or to the users of its `role`. Add a `user` condition to apply it only to the users it matches. It is written like `conditions`, with the subset of MongoDB queries, and matched on the caller of each request.
+
+### A role with `auth`, or a rule with `user`
+
+Both target users without sharing the workspace with them one by one. They answer different needs:
+
+| | Role with `auth` | Rule with `user` |
+|---|---|---|
+| Targets | The users of an authentication provider, optionally filtered on the data of this provider (see [Workspace roles](/self-hosting/entreprise/permissions#workspace-roles)) | Any caller, on the fields below: user id, sign-in method, organizations, groups, data of the providers |
+| Grants | A role: every rule of this role | Nothing by itself: it narrows the rule it is written on |
+| Typical use | Give the users of an SSO provider a role in the workspace, for example read-only access to some pages | Open some pages or assets to organizations or groups, or exclude anonymous sessions from a rule |
+
+Use a role when the users of an SSO provider should get the same set of rules. Use a `user` condition when a single rule depends on who calls: an organization or a group (a role cannot match them), or the sign-in method of the current session.
+
+### Fields of the user
 
 | Field | Value |
 |---|---|
 | `id` | The user id |
-| `authProvider` | How the session signed in: `prismeai` (password or passkey), the slug of an SSO provider, or `anonymous` (anonymous sessions and callers without any session). Missing for org API keys and service accounts, `apiKey` for workspace API keys. |
-| `orgSlugs` | The slugs of all the organizations of the user |
+| `authProvider` | How the current session signed in: `prismeai` (password or passkey), the slug of an SSO provider, or `anonymous` (anonymous sessions and callers without any session). `apiKey` for workspace API keys. Missing for organization API keys and service accounts. |
+| `orgSlugs` | The slugs of every organization the user is a member of |
 | `groupIds` | The groups of the active organization of the user, as `organization:group` |
+| `authData.<provider>` | The data the provider sent for this user, for example `authData.acme-entra.email`. Only the providers the user signed in with. |
 
-For example, this rule lets the members of the `sales` group of the `acme` organization read the pages labelled `sales`, and nobody else through this rule:
+`authProvider` describes the current session only. To target every user who signed in with an SSO provider once, use a role with `auth`, or match `authData.<provider>`.
+
+### Examples
+
+This rule lets the members of the `sales` group of the `acme` organization read the pages labelled `sales`, and nobody else through this rule:
 
 ```yaml
 authorizations:
@@ -390,9 +409,21 @@ authorizations:
         labels: sales
 ```
 
-To give a role to every user of an SSO provider, assign the role through its `auth` setting instead (see [Workspace roles](/self-hosting/entreprise/permissions#workspace-roles)): it applies to every user that has signed in with this provider once. `authProvider` matches the sign-in method of the current session only, which is mostly useful to exclude anonymous sessions (`authProvider: { $ne: anonymous }`).
+This rule lets any signed-in user read the pages labelled `members`, but never an anonymous session (such as a public chat embed):
 
-A `user` condition only narrows the users a rule applies to: it never grants anything by itself. It is refused on `events` and `automations` rules, which other services evaluate without this caller information, and a condition that is not a valid query is refused when the security is saved.
+```yaml
+authorizations:
+  rules:
+    - action: read
+      subject: pages
+      user:
+        authProvider:
+          $ne: anonymous
+      conditions:
+        labels: members
+```
+
+A `user` condition only narrows the users a rule applies to: it never grants anything by itself. On an inverted rule (`inverted: true`), it narrows the users the denial applies to. It is refused on `events` and `automations` rules, which other services evaluate without this caller information, and a condition that is not a valid query is refused when the security is saved.
 
 ## Secure secrets
 
