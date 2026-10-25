@@ -166,14 +166,9 @@ The foundation is governed by design, and RBAC is how that governance reaches in
         labels:
           $in:
             - public
-            
-    # Allow anyone to create events (for automations)
-    - action: create
-      subject: events
-      conditions:
-        source.serviceTopic: topic:runtime:emit
-      reason: Anyone can create any events
     ```
+
+    To let anyone emit events (for automations), set **Events** to **Public** in **Settings › Security › Access control** (`access.events: public`, see [Control who calls the endpoints and emits events](#control-who-calls-the-endpoints-and-emits-events)).
     
     <Info>
       Rules without a `role` specified apply to everyone, including unauthenticated users.
@@ -446,7 +441,9 @@ authorizations:
 
 A `user` condition only narrows the users a rule applies to: it never grants anything by itself. On an inverted rule (`inverted: true`), it narrows the users the denial applies to. A condition that is not a valid query is refused when the security is saved.
 
-The caller is fully known on the HTTP calls (endpoints, API) and the websockets. The runs an event starts only know the active organization of the user who emitted it: their `groupIds` and `authProvider` are empty, and a scheduled run has no user at all. Keep the `user` conditions of `automations` rules for the endpoint calls.
+The caller is fully known on the HTTP calls (endpoints, API) and the websockets, not on the runs an event or a schedule starts. So a `user` condition on an `automations` rule, or the `automations` rules of a role given from `user`, only apply to the endpoint calls: the events are controlled when they are emitted (see [Control who calls the endpoints and emits events](#control-who-calls-the-endpoints-and-emits-events)).
+
+A user can only target their own organizations and their groups in a `user` condition, with listed values (a value, `$in` or `$eq` on `orgSlugs` or `groupIds`): another organization, or an operator that may reach any organization (`$nin`, `$ne`, `$regex`…), is refused, unless the platform allows cross-organization sharing (`ALLOW_CROSS_ORG_SHARING`). Platform superadmins target any organization. The conditions a security already has, or that a duplicated or imported workspace brings, are kept.
 
 ## Secure secrets
 
@@ -585,9 +582,9 @@ What applies, from the strongest to the weakest:
 1. The `rules` of the security: exceptions, which open (or close) for some roles, users or automations.
 2. The owners and editors, and the endpoints with `authorizations.action: public`: allowed whatever `access` and the defaults say.
 3. `access`: who can call the endpoints without action and emit events.
-4. The defaults of the platform, without `access`: the endpoints follow `ENDPOINTS_DEFAULT_ACCESS` (`public` unless the platform administrator changed it, see [Environment variables](/self-hosting/kubernetes/environment-variables)), the events whatever the rules say.
+4. Without `access`: the endpoints stay public; the events are only open to whom the rules let in, so a workspace without such a rule only lets the owners and editors emit events. **Access control** always sets a level for the events.
 
-A rule without `role` nor `user` that opens a surface to anyone reopens it whatever its access: **Access control** then says so. A new workspace lets anyone emit events with `access.events: public`. The rule `Anyone can create any events` that older workspaces have does the same: setting the events in **Access control** replaces it.
+A rule without `role` nor `user` that opens a surface to anyone reopens it whatever its access: **Access control** then says so. It doesn't detect every widening: a role given automatically to every signed-in user (an `auth` provider without conditions) with a rule opening the events, for example, widens their access without a notice. A new workspace lets anyone emit events with `access.events: public`. The rule `Anyone can create any events` that older workspaces have does the same: setting the events in **Access control** replaces it.
 
 <Warning>
   An endpoint called by a third-party service (a webhook from another tool, without a Prisme.ai session) stops answering once the endpoints are not public. Give it `authorizations.action: public` to keep it open to anyone:
@@ -601,7 +598,7 @@ A rule without `role` nor `user` that opens a surface to anyone reopens it whate
   ```
 </Warning>
 
-When the workspace has endpoints and they, or the events, are open to anyone, the **Publish** dialog of the page editor warns about it, with a link to these settings.
+When the workspace has endpoints and they are open to anyone, the **Publish** dialog of the page editor warns about it, with a link to these settings.
 
 `access` is part of the security: it is exported, versioned and imported with the workspace, its organizations and groups included. Check them after importing a workspace from an environment with other organizations.
 
@@ -752,6 +749,8 @@ Here's a complete example of a typical RBAC configuration:
 <Accordion title="Full RBAC Example">
 ```yaml
 authorizations:
+  access:
+    events: public
   roles:
     editor: {}
     user:
@@ -827,12 +826,7 @@ authorizations:
         type:
           $regex: ^apikeys\.*$
           
-    # Public event access
-    - action: create
-      subject: events
-      reason: Anyone can create any events
-      conditions:
-        source.serviceTopic: topic:runtime:emit
+    # Read the events of one's own session (anyone may emit them: access.events)
     - action: read
       subject: events
       conditions:
