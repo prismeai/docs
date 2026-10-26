@@ -7,7 +7,10 @@ info:
 
     Resource identifiers use the physical prefixes emitted by the implementation (`vs_` knowledge base, `vsf_` document, `seed_` web source, `kb-` API-key slug).
 
-    This spec documents the public REST surface only. Internal helpers (private automations prefixed with `_`) and admin/GDPR lifecycle operations are not part of the public contract.
+    This spec documents the public REST surface only. Internal helpers (private automations prefixed with `_`) and admin/GDPR lifecycle operations are not part of the public contract, except the platform health probe listed under the Admin tag.
+
+    Each knowledge base also exposes a Model Context Protocol endpoint (`POST /v1/knowledge_bases/{knowledgeBaseId}/mcp`, JSON-RPC 2.0) giving agents filesystem-style read access to its content. It is listed under the MCP tag for its URL and auth only; use an MCP client rather than calling it as a REST resource.
+
   contact:
     name: Prisme.ai
     url: https://prisme.ai
@@ -36,10 +39,14 @@ tags:
   description: Per-knowledge-base access bindings (user, group, org, agent principals).
 - name: API Keys
   description: Per-knowledge-base API keys for connector authentication.
+- name: Files
+  description: Files uploaded to the storage workspace, before or after they are attached to a knowledge base.
 - name: Stats
   description: Aggregate dashboard statistics.
 - name: Skills
   description: Prompt/instruction registry entries.
+- name: Admin
+  description: Platform health probe called by the AI Governance Infrastructure page. Requires elevated permissions, a platform administrator session (`platformRole` `superadmin` or `root`).
 paths:
   /v1/knowledge_bases:
     post:
@@ -164,10 +171,8 @@ paths:
         schema:
           type: string
         description: |
-          Case-insensitive substring match on `name` OR `description`
-          (legacy `/vector_stores?search=` parity; takes precedence
-          over `name` when both are sent - added 2026-07-15, SPA
-          migration F1).
+          Case-insensitive substring match on `name` OR `description`.
+          Takes precedence over `name` when both are sent.
       - name: agent_id
         in: query
         required: false
@@ -248,7 +253,7 @@ paths:
         required: false
         schema:
           type: string
-        description: Agent context for agent-owned knowledge bases.
+        description: Reserved for platform services; ignored for other callers.
       responses:
         '200':
           description: The knowledge base.
@@ -288,7 +293,7 @@ paths:
         required: false
         schema:
           type: string
-        description: Agent context for agent-owned knowledge bases.
+        description: Ignored.
       requestBody:
         required: true
         content:
@@ -385,7 +390,7 @@ paths:
         required: false
         schema:
           type: string
-        description: Agent context for agent-owned knowledge bases.
+        description: Ignored.
       responses:
         '202':
           description: Deletion started.
@@ -443,15 +448,25 @@ paths:
         `(knowledge_base_id, source_key)`:
 
         - no existing row → insert, schedule indexing, **201**;
-        - existing row → refresh mutable fields (`fetch_url`, `tags`,
-          `metadata`, `filename`, `mime_type`, `bytes`), schedule a
-          fresh indexing run, **200**.
+        - existing row → refresh mutable fields (`tags`, `metadata`,
+          `filename`, `mime_type`, `bytes`), schedule a fresh indexing
+          run, **200**.
 
-        For `native_file_id` sources no fetch URL is stored; storage
-        mints short-lived ones at fetch time.
+        `fetch_url` is used for the indexing run the call triggers and
+        is never persisted. For `native_file_id` sources storage mints
+        short-lived fetch URLs itself.
+
+        `chunking_strategy` is a per-document override only: omit it
+        and the document follows its knowledge base's setting, read at
+        chunking time. A refresh that omits it keeps any override the
+        document already carries. The reserved value
+        `{"type": "default"}` is rejected here with
+        `400 VALIDATION_ERROR`; release an override through
+        `POST .../documents/{documentId}/reindex` instead.
 
         Connector sync = repeat this call per document per cycle with
-        the same `source_url` and a fresh `fetch_url`.
+        the same `source_url` and a fresh `fetch_url` (or inline
+        `content` when the provider has no fetchable URL).
 
         Requires `editor`+ on the knowledge base.
       security:
@@ -491,9 +506,29 @@ paths:
         '401':
           $ref: '#/components/responses/Error401'
         '403':
-          $ref: '#/components/responses/Error403'
+          description: |
+            No write access to the knowledge base (`FORBIDDEN`), a `before_file_ingest` hook refused the content (`HOOK_REJECTED`), or the request names a native file of the storage workspace (`native_file_id`, or a `source_url` / `fetch_url` pointing at one) that the caller did not upload (`FILE_ACCESS_DENIED`, nothing written, no share link created): only the uploader may add their file.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: FILE_ACCESS_DENIED
+                  message: You can only add files you uploaded
         '404':
           $ref: '#/components/responses/Error404'
+        '415':
+          description: |
+            The file's type is one the parsers do not read (`UNSUPPORTED_FILE_TYPE`). An untyped file (`application/octet-stream` or no type) is first typed by its filename extension. Web pages are not checked. The ingestible formats are listed by `GET /v1/supported_formats`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: UNSUPPORTED_FILE_TYPE
+                  message: 'Unsupported file type: application/zip (export.zip). See GET v1/supported_formats for the formats a knowledge base can ingest.'
         '429':
           $ref: '#/components/responses/Error429'
         '502':
@@ -565,6 +600,13 @@ paths:
         required: false
         schema:
           type: string
+      - name: owner_user_id
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 128
+        description: Only documents uploaded by this user.
       - name: search
         in: query
         required: false
@@ -588,7 +630,7 @@ paths:
         required: false
         schema:
           type: string
-        description: Agent context for agent-owned knowledge bases.
+        description: Reserved for platform services; ignored for other callers.
       responses:
         '200':
           description: Paginated documents.
@@ -663,6 +705,13 @@ paths:
         are immutable - re-keying a source means deleting and
         re-attaching. To refresh `fetch_url` or re-trigger indexing,
         use the POST upsert or `/reindex`. Requires `editor`+.
+
+        Search filters match the tags indexed with each vector, so a
+        changed `tags` object on a `completed` `uploaded_file` or
+        `web_page` document re-indexes it (the response reflects the
+        new indexing status). `remote_file` and `connector_document`
+        tags are refreshed by the producer's next upsert instead. An
+        unchanged `tags` object is a no-op.
       security:
       - BearerAuth: []
       requestBody:
@@ -708,13 +757,27 @@ paths:
       description: |
         Deletes vectors (keyed by `document_id`), chunks, and the document
         row; notifies the crawler to drop `crawler_document_id` when
-        relevant. **Never deletes the native file** - call
-        `DELETE /v2/workspaces/{ws}/files/{id}` separately if the bytes
-        should go too. Requires `editor`+ **and** document ownership - a
+        relevant. The uploaded file goes too when no other document uses
+        it and the document owner is the one who uploaded it; otherwise it
+        is kept.
+        Requires `editor`+ **and** document ownership - a
         non-owner, non-admin editor deleting a document they do not own
         gets `403 FORBIDDEN`.
       security:
       - BearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                delete_file:
+                  type: boolean
+                  default: false
+                  description: |
+                    Accepted and ignored: whether the file goes is decided
+                    by who uploaded it and whether another document uses it.
       responses:
         '200':
           description: Detached.
@@ -776,11 +839,12 @@ paths:
         This is also the **rechunk** operation: pass
         `chunking_strategy` to re-run with new settings. The override
         is persisted on the document (replacing any previous
-        per-document override) so later re-runs reuse it. To rechunk
-        a whole store after changing the store-level
-        `chunking_strategy` (which only affects future runs), iterate
-        `GET /documents` and reindex each entry - there is
-        deliberately no bulk endpoint in v1.
+        per-document override) so later re-runs reuse it. Pass the
+        reserved value `{"type": "default"}` to clear the override so
+        the document follows its knowledge base again; this is the only
+        route that accepts it. Documents without an override pick up the
+        store-level `chunking_strategy` on their next run; to re-run a
+        whole store use `POST /v1/knowledge_bases/{knowledgeBaseId}/reindex`.
 
         For a `web_page` document this also re-fetches its URL through
         the crawler (a single-page refresh).
@@ -791,11 +855,23 @@ paths:
         - `web_page` / `remote_file` - the crawler re-fetches the URL.
         - `connector_document` - its content was fetched through the
           connector with a short-lived signed URL that is never stored,
-          so storage cannot fetch it again: the request is refused with
-          `409 CONNECTOR_RESYNC_REQUIRED` before the document is touched,
-          and only a new synchronization of the connection refreshes it.
+          so storage cannot fetch it again itself. The `parser` /
+          `chunking_strategy` override is saved first, then storage asks
+          the document's connection for a targeted resynchronization of
+          this one document (no listing of the source, no failure
+          backoff). The response is `202` with the document unchanged
+          and a `resync` object; the document switches to `in_progress`
+          within seconds, when the connection re-sends it, and is
+          indexed with the saved override - now and at every later
+          synchronization. Only the connection's owner can trigger it
+          (`409 CONNECTOR_RESYNC_OWNER_ONLY` otherwise; the override
+          stays saved and applies at the next synchronization). While
+          the connection synchronizes, the resynchronization is queued
+          behind it (`resync.queued: true`) rather than refused.
           A connector document materialized as a native file is
-          re-fetched like an `uploaded_file`.
+          re-fetched like an `uploaded_file` while that copy exists; once
+          it has expired, the document is delegated to its connection as
+          above.
 
         Requires `editor`+.
       security:
@@ -814,7 +890,11 @@ paths:
                   additionalProperties: true
                   description: |
                     Rechunk with these settings. Persisted as the
-                    document's `chunking_strategy` override.
+                    document's `chunking_strategy` override. The reserved
+                    value `{"type": "default"}` clears that override, so
+                    the document follows its knowledge base again. This is
+                    the only route that accepts it; the others reject it
+                    with `VALIDATION_ERROR`.
                 parser:
                   type: string
                   description: |
@@ -828,11 +908,30 @@ paths:
                   description: Free-form audit context (e.g. `parser_upgrade`).
       responses:
         '202':
-          description: 'Re-indexing queued; document returned with `status: in_progress`.'
+          description: |
+            Re-indexing queued; document returned with `status: in_progress`.
+            For a connector document, the document is returned as it was,
+            with `resync: {connection_id, sync_id, queued}`: its connection
+            re-sends it and it switches to `in_progress` within seconds, or
+            once the running synchronization ends when `queued` is true.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Document'
+                allOf:
+                - $ref: '#/components/schemas/Document'
+                - type: object
+                  properties:
+                    resync:
+                      type: object
+                      description: Present only for a connector document - the targeted resynchronization requested from its connection.
+                      properties:
+                        connection_id:
+                          type: string
+                        sync_id:
+                          type: string
+                        queued:
+                          type: boolean
+                          description: The connection was synchronizing; the resynchronization waits for it to end.
         '401':
           $ref: '#/components/responses/Error401'
         '403':
@@ -841,23 +940,45 @@ paths:
           $ref: '#/components/responses/Error404'
         '409':
           description: |
-            The document comes from a connector and has no native file:
-            it can only be refreshed by synchronizing its connection
-            again. The document is left unchanged.
+            Connector document that could not be re-synchronized now. The
+            override sent in the request is saved in every case and applies
+            at the connection's next synchronization; the document is not
+            re-dispatched.
+            - `CONNECTOR_RESYNC_OWNER_ONLY` - only the owner of the
+              connection can trigger its synchronization.
+            - `CONNECTOR_RESYNC_IDENTITY_REQUIRED` - no user in an
+              organization session (e.g. an API key) to check ownership
+              against.
+            - `CONNECTOR_SYNC_IN_PROGRESS` - the connection is synchronizing
+              and the resynchronization could not be queued; retry once it
+              has finished.
+            - `CONNECTOR_DELETING` - the connection is being deleted.
+            - `CONNECTOR_NOT_CONFIGURED` - the connection has no selection or
+              no knowledge base linked.
+            - `CONNECTOR_RESYNC_UNAVAILABLE` - the document cannot be traced
+              back to its connection, or the synchronization service refused
+              the request.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
               examples:
-                connector_resync_required:
+                connector_resync_owner_only:
                   value:
                     error:
-                      code: CONNECTOR_RESYNC_REQUIRED
-                      message: This document comes from a connector and can only be refreshed by synchronizing its connection again.
+                      code: CONNECTOR_RESYNC_OWNER_ONLY
+                      message: Only the owner of the connection this document comes from can re-synchronize it now. Your settings were saved and will apply at the connection's next synchronization.
         '429':
           $ref: '#/components/responses/Error429'
         '502':
-          $ref: '#/components/responses/Error502'
+          description: |
+            `CONNECTOR_RESYNC_UNAVAILABLE` - the connector synchronization
+            service could not be reached (the override is saved), or another
+            upstream failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/knowledge_bases/{knowledgeBaseId}/documents/{documentId}/chunks:
     parameters:
     - name: knowledgeBaseId
@@ -1114,8 +1235,9 @@ paths:
         `skipped_connector`: only a synchronization of their connection
         can refresh them.
         Use after a store-level parser or chunking change to roll it out
-        across the whole KB. No request body: per-document overrides stay
-        on `POST /documents/{document_id}/reindex`.
+        across the whole KB. Per-document overrides are kept unless
+        `reset_chunking_overrides` is `true`; they are set and released
+        one document at a time on `POST /documents/{document_id}/reindex`.
 
         **Dispatch-only, by design.** The request does only auth, a
         count, one atomic lease acquire and one internal batch kick, then
@@ -1150,6 +1272,23 @@ paths:
           removed 2026-07-20 as it never discovered pages).
 
         Requires `editor`+.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reset_chunking_overrides:
+                  type: boolean
+                  default: false
+                  description: |
+                    Clear every document's own chunking settings before the
+                    reindex, so all documents are chunked with the knowledge
+                    base's current settings. Documents ingested before a
+                    chunking change may carry a copy of the previous
+                    settings; this is how to bring them back to the base.
+                    Per-document parser overrides are kept.
       security:
       - BearerAuth: []
       - WorkspaceApiKeyAuth: []
@@ -1317,9 +1456,8 @@ paths:
       responses:
         '200':
           description: |
-            Paginated seeds, plus a knowledge-base-level `summary`
-            (§F-5): the unattributed residual (web pages with no seed
-            attribution) and the total web-page count.
+            Paginated seeds, plus a knowledge-base-level `summary`: the
+            unattributed residual (web pages with no seed attribution) and the total web-page count.
           content:
             application/json:
               schema:
@@ -1505,8 +1643,9 @@ paths:
                 limit:
                   type: integer
                   minimum: 1
-                  maximum: 50
+                  maximum: 100
                   default: 10
+                  description: Values above 100 are clamped to 100.
                 min_score:
                   type: number
                   description: Drop hits below this score.
@@ -1551,7 +1690,11 @@ paths:
         '429':
           $ref: '#/components/responses/Error429'
         '502':
-          $ref: '#/components/responses/Error502'
+          description: '`VECTOR_SEARCH_FAILED` - the vector provider returned an error. Never reported as an empty result.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/knowledge_bases/{knowledgeBaseId}/mcp:
     parameters:
     - name: knowledgeBaseId
@@ -1692,7 +1835,11 @@ paths:
       tags:
       - Access
       summary: List access bindings
-      description: Requires `admin`+ (or owner).
+      description: |
+        Requires `admin`+ (or owner) on the knowledge base, or the share
+        permission on it (an organization role carrying
+        `storage:vector_stores:share` qualifies): whoever may grant access
+        may see who already has it.
       security:
       - BearerAuth: []
       parameters:
@@ -1726,7 +1873,9 @@ paths:
       description: |
         Idempotent on `(knowledge_base_id, principal_type,
         principal_id)`: re-granting updates the role (200) instead of
-        duplicating. Requires `admin`+ (or owner).
+        duplicating. Requires the share permission on the knowledge base:
+        `admin`+ (or owner), or an organization role carrying
+        `storage:vector_stores:share`.
       security:
       - BearerAuth: []
       requestBody:
@@ -1800,7 +1949,7 @@ paths:
         - agent
       description: |
         Type of access principal. `agent` is a first-class owner
-        principal for conversation/agent-owned knowledge bases (§F-6);
+        principal for conversation/agent-owned knowledge bases;
         `principal_id` is then the agent id (or its service-account id).
     - name: principalId
       in: path
@@ -2138,6 +2287,110 @@ paths:
           $ref: '#/components/responses/LegacyError401'
         '403':
           $ref: '#/components/responses/LegacyError403'
+  /v1/supported_formats:
+    get:
+      operationId: listSupportedFormats
+      tags:
+      - Formats
+      summary: List the file formats a knowledge base can ingest
+      description: |
+        The single catalog of ingestible formats, the list the upload picker offers, connector syncs follow and the ingestion check applies. Static and identical for every caller, so no authentication is required. Families: `document`, `text`, `data`, `email`, `calendar`, `image`, `audio`, `video`; image, audio and video files are parsed by a language model. Given mime_type and/or filename, the response also carries the ingestion check's verdict for that one file (resolved_mime, ingestible).
+      security: []
+      parameters:
+      - name: mime_type
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 256
+        description: Declared type of one file to check. Parameters (`; charset=...`) are ignored.
+      - name: filename
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 512
+        description: Name of that file. Its extension types the file when mime_type is missing or octet-stream (application/ or binary/); an extension nothing here parses resolves to application/octet-stream, which is not ingestible.
+      responses:
+        '200':
+          description: Supported formats.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupportedFormats'
+  /v1/files/{fileId}:
+    parameters:
+    - name: fileId
+      in: path
+      required: true
+      schema:
+        type: string
+        maxLength: 128
+      description: Id of the file uploaded to the storage workspace (`POST /v2/workspaces/slug:storage/files`).
+    delete:
+      operationId: deleteUploadedFile
+      tags:
+      - Files
+      summary: Delete an uploaded file that no document uses
+      description: |
+        Deletes a file uploaded to the storage workspace, for example one whose
+        attachment to a knowledge base failed. Only the user who uploaded it
+        may delete it, whatever their organization role (platform
+        administrators may delete anyone's upload). A file still used by a
+        document answers `409 FILE_IN_USE`: delete the document instead
+        (`DELETE /v1/knowledge_bases/{knowledgeBaseId}/documents/{documentId}`),
+        which also releases the file.
+      security:
+      - BearerAuth: []
+      responses:
+        '200':
+          description: File deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - deleted
+                properties:
+                  deleted:
+                    type: boolean
+                  file_purged:
+                    type: boolean
+                  purge_reason:
+                    type: string
+                    enum:
+                    - DELETED
+                    - ALREADY_GONE
+        '400':
+          $ref: '#/components/responses/LegacyError400'
+        '401':
+          $ref: '#/components/responses/LegacyError401'
+        '403':
+          $ref: '#/components/responses/LegacyError403'
+        '404':
+          $ref: '#/components/responses/LegacyError404'
+        '409':
+          description: The file is still used by a document (`FILE_IN_USE`).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+        '502':
+          description: The file could not be read or deleted, retry later (`RESOLVE_FAILED`, `DELETE_FAILED`).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
   /v1/skills:
     post:
       operationId: createSkill
@@ -2291,6 +2544,63 @@ paths:
           $ref: '#/components/responses/LegacyError403'
         '404':
           $ref: '#/components/responses/LegacyError404'
+  /v1/test:
+    post:
+      tags:
+      - Admin
+      operationId: runStorageSelfTest
+      summary: Run the storage self-test
+      description: |
+        End-to-end probe of the storage stack: creates an ephemeral knowledge base (which also provisions its crawler), upserts a test vector, searches it, then deletes the knowledge base. Every step is reported; `ok` is `true` only when all steps succeeded. The probe always answers `200` once authorized, even when steps fail.
+
+        Requires a platform administrator session (`platformRole` `superadmin` or `root`); API keys and other users get `403`. The route does not dispatch on the HTTP method; POST is the method the platform UI uses.
+      security:
+      - BearerAuth: []
+      requestBody:
+        required: false
+        description: No field is read. The platform UI sends an empty JSON object.
+        content:
+          application/json:
+            schema:
+              type: object
+              maxProperties: 0
+            example: {}
+      responses:
+        '200':
+          description: Self-test report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SelfTestReport'
+              example:
+                ok: true
+                steps:
+                - name: create_index
+                  ok: true
+                  response:
+                    id: vs_abc123
+                - name: insert_doc
+                  ok: true
+                - name: search
+                  ok: true
+                - name: cleanup
+                  ok: true
+                  response:
+                    status: deleting
+        '403':
+          description: The caller is not a platform administrator.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SelfTestReport'
+              example:
+                ok: false
+                steps:
+                - name: forbidden
+                  ok: false
+                  error:
+                    code: FORBIDDEN
+                    message: This endpoint is reserved to platform superadmins.
 components:
   securitySchemes:
     BearerAuth:
@@ -2347,6 +2657,41 @@ components:
               additionalProperties: true
       required:
       - error
+    SelfTestReport:
+      type: object
+      required:
+      - ok
+      - steps
+      properties:
+        ok:
+          type: boolean
+          description: '`true` when every step succeeded.'
+        steps:
+          type: array
+          items:
+            type: object
+            required:
+            - name
+            - ok
+            properties:
+              name:
+                type: string
+                enum:
+                - create_index
+                - insert_doc
+                - search
+                - cleanup
+                - forbidden
+              ok:
+                type: boolean
+              error:
+                type: object
+                description: Error raised by the step.
+                additionalProperties: true
+              response:
+                type: object
+                description: Raw response of the step (created knowledge base, vector router result, delete acknowledgement).
+                additionalProperties: true
     Pagination:
       type: object
       description: |
@@ -2504,7 +2849,7 @@ components:
           - type
           - id
           description: |
-            First-class owner principal (§F-6). For agent-owned
+            First-class owner principal. For agent-owned
             (conversation-scope) stores `type: agent` and `id` is the
             agent id - represented as a `principalType: agent` binding
             in the platform-managed `product_bindings` store, NOT a
@@ -2543,6 +2888,20 @@ components:
             Caller's effective role, computed at read time from access
             bindings. Null on cross-workspace (`workspace_jwt`) reads.
           nullable: true
+        permissions:
+          type: array
+          description: |
+            Actions the resolved `role` grants on this knowledge base
+            (`owner`: read, write, share, delete; `admin`: read, write,
+            share; `editor`: read, write; `reader`: read). Empty when
+            `role` is null.
+          items:
+            type: string
+            enum:
+            - read
+            - write
+            - share
+            - delete
         access_reason:
           type: string
           enum:
@@ -2716,8 +3075,7 @@ components:
             type: string
             pattern: ^seed_[A-Za-z0-9-]+$
           description: |
-            All seeds whose crawl scope covers this page
-            (multi-attribution, §F-5). Backs per-seed page counts and
+            All seeds whose crawl scope covers this page. Backs per-seed page counts and
             seed cascade-delete: deleting a seed removes it from this
             array and drops the row only when the array empties AND
             `origin: web_source`. Empty/absent ⇒ unattributed (counted
@@ -2738,14 +3096,17 @@ components:
           description: |
             Authoritative indexing status. Transitions are guarded by
             `index_generation` - stale or duplicate callbacks are
-            ignored. `fetch_expired` is connector-facing: the stored
-            ephemeral `fetch_url` no longer works and the owning
+            ignored. `fetch_expired` is connector-facing: the
+            ephemeral fetch URL no longer works and the owning
             connector must refresh it via the upsert (`POST
             /documents` with the same `source_url`); it is never a
             user-actionable error and never occurs for
-            `uploaded_file` sources. `rejected` means an external hook
-            (`before_file_ingest` / `after_file_parse`) blocked the
-            content - see `rejection_reason` / `rejected_by`.
+            `uploaded_file` sources. `rejected` means a
+            `before_file_ingest` hook blocked the content (an
+            `after_file_parse` block is `failed` with
+            `last_error.code: HookRejected`) - see `rejected_by`, and
+            `public_rejection_reason` for the only reason that may be
+            shown to an end user.
         index_generation:
           type: integer
           minimum: 1
@@ -2867,9 +3228,26 @@ components:
         rejection_reason:
           type: string
           description: |
-            Set when `status: rejected`. Why an external hook blocked
-            the content. Surfaced to the user only when the resolved
-            hook config sets `expose_reason: true`.
+            Why an external hook blocked the content, as the hook gave
+            it, kept whether or not the hook config sets
+            `expose_reason`, so it is for the knowledge base's
+            administrators: never relay it to an end user, and returned
+            only to the base's owners and storage / platform admins
+            (null for any other reader). Set when
+            `status: rejected` (`before_file_ingest`) and on a document
+            `failed` with `last_error.code: HookRejected`
+            (`after_file_parse`). With `public_rejection_reason` and
+            `rejected_by`, it is the trace of the last refusal: a
+            reindex keeps it and the next failure resets it, so it is
+            meaningful only while the document is `rejected` or
+            `failed` with `last_error.code: HookRejected`.
+          nullable: true
+        public_rejection_reason:
+          type: string
+          description: |
+            The part of `rejection_reason` the hook allowed to be shown
+            (`expose_reason: true`); empty otherwise. The only refusal
+            reason a client or an agent may relay to the end user.
           nullable: true
         rejected_by:
           type: string
@@ -2945,7 +3323,8 @@ components:
           type: string
           description: |
             Platform-native file id. `404 FILE_NOT_FOUND` if the
-            referenced native file cannot be resolved. Content access is
+            referenced native file cannot be resolved, `403 FILE_ACCESS_DENIED`
+            if the caller did not upload it. Content access is
             governed by the knowledge base's ACL. Storage resolves
             `filename`, `mime_type`, `bytes` from the native API unless
             supplied inline.
@@ -2967,13 +3346,24 @@ components:
           description: |
             Operational URL used to retrieve bytes at index time. May
             be temporary, signed, tokenized. Write-only - never
-            returned by any response. Ignored for
+            returned by any response and never persisted: it only
+            serves the indexing run this call triggers. Ignored for
             `source_type: uploaded_file` (storage mints its own).
-            Refreshed on every upsert (200 path); connectors send a
-            fresh one on each sync.
+            Connectors send a fresh one on each sync.
+          maxLength: 2048
+        content:
+          type: string
+          maxLength: 2000000
+          writeOnly: true
+          description: |
+            Inline document content for `source_type: connector_document`
+            when the provider exposes no fetchable URL. Plain text, or a
+            `data:` URL for binary bytes. Takes precedence over
+            `fetch_url`; storage copies it into its own files registry
+            before indexing. Write-only, never returned.
         filename:
           type: string
-          maxLength: 255
+          maxLength: 512
         mime_type:
           type: string
         bytes:
@@ -2982,6 +3372,12 @@ components:
         chunking_strategy:
           type: object
           additionalProperties: true
+          description: |
+            Per-document override of the knowledge base chunking. Omit
+            to follow the knowledge base. `type` is one of `auto`,
+            `fixed`, `sentence`, `paragraph` (`static` is an alias of
+            `paragraph`) or `semantic`. The reserved `{"type": "default"}`
+            is rejected here (`400 VALIDATION_ERROR`).
         model:
           type: string
           maxLength: 256
@@ -3019,9 +3415,11 @@ components:
             agent-factory). Merged with the server-resolved
             platform/org/agent hook config. A `before_file_ingest` or
             `after_file_parse` hook may transform or block the content;
-            a block yields `403 HOOK_REJECTED` (sync) or a document in
-            `status: rejected` (async), with `rejection_reason` /
-            `rejected_by` set. Write-only; never returned.
+            a block yields `403 HOOK_REJECTED` (sync) or a document
+            `failed` with `last_error.code: HookRejected` (async), with
+            `rejected_by` and `public_rejection_reason` set (the latter
+            only when the hook sets `expose_reason`). Write-only; never
+            returned.
           items:
             type: object
             additionalProperties: true
@@ -3194,8 +3592,8 @@ components:
           type: object
           description: |
             Per-seed page counts, DB-derived from documents attributed
-            to this seed via `parent_web_source_ids` (multi-attribution,
-            §F-5). Independent of crawler reachability - these are
+            to this seed via `parent_web_source_ids` (multi-attribution).
+            Independent of crawler reachability - these are
             always available even when the crawler is unreachable.
           properties:
             pages_total:
@@ -3377,6 +3775,16 @@ components:
             (`GET .../documents/{document_id}/source_url`) or batch
             (`POST .../source_urls`) resolver.
           nullable: true
+        citation_url:
+          type: string
+          format: uri
+          description: |
+            Openable page URL recorded in the document's
+            `metadata.citation_url` (set by connector syncs). Prefer it
+            over `source_url` for display: on a synced document
+            `source_url` is a synthetic identity URL, not a link.
+            Absent when the document has none.
+          nullable: true
         native_file_id:
           type: string
           description: |
@@ -3424,13 +3832,31 @@ components:
             conversation_id:
               type: string
               nullable: true
+        tags:
+          type: object
+          description: |
+            The document's public tags (what `filter` matches on) plus
+            the two canonical connector tags, so a caller can run its
+            own per-user access check without re-reading each
+            document. Both connector keys are empty for non-connector
+            documents. Platform bookkeeping keys (`task_id`,
+            `file_name`, `capability_id`, `revision`, `sp_scope`,
+            `legacy_source_url`) are never exposed here.
+          additionalProperties: true
+          properties:
+            connection_id:
+              type: string
+              nullable: true
+            resource_uri:
+              type: string
+              nullable: true
     AccessBinding:
       type: object
       description: |
         Per-knowledge-base access binding, persisted in the
         platform-managed `product_bindings` store (storage owns no
         bindings collection). Principals: `user`, `group`, `org`, and
-        `agent` - agent ownership is first-class (§F-6). The owner
+        `agent` - agent ownership is first-class. The owner
         appears as an explicit `role: owner` binding; `admin` / `editor`
         / `reader` are grantable via the API (owner is not).
       required:
@@ -3482,7 +3908,7 @@ components:
     Processing:
       type: object
       description: |
-        Knowledge-base processing / parser-backend health (§F-5). The
+        Knowledge-base processing / parser-backend health. The
         crawler is the universal parse/fetch backend for EVERY document
         (uploads, single pages, web crawl), so this is present whenever
         the knowledge base has documents - even with zero web sources.
@@ -3625,6 +4051,62 @@ components:
             description: |
               The full API key, returned ONCE at mint and on rotate.
               Never retrievable afterwards - store it securely.
+    SupportedFormats:
+      type: object
+      properties:
+        object:
+          type: string
+          enum:
+          - list
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              mime:
+                type: string
+                example: message/rfc822
+              extensions:
+                type: array
+                description: Bare, lowercase extensions (no dot).
+                items:
+                  type: string
+                example:
+                - eml
+              family:
+                type: string
+                enum:
+                - document
+                - text
+                - data
+                - email
+                - calendar
+                - image
+                - audio
+                - video
+        mime_types:
+          type: array
+          items:
+            type: string
+        extensions:
+          type: array
+          items:
+            type: string
+        extension_mime_types:
+          type: object
+          description: Each extension mapped to its canonical mime type.
+          additionalProperties:
+            type: string
+          example:
+            eml: message/rfc822
+            msg: application/vnd.ms-outlook
+        resolved_mime:
+          type: string
+          description: Only with mime_type or filename. The type the ingestion check applies - the declared one, or the extension's when the declared one is missing or octet-stream (application/ or binary/). Empty when the file has neither a type nor an extension (such a file is ingestible).
+          example: message/rfc822
+        ingestible:
+          type: boolean
+          description: Only with mime_type or filename. False when the ingestion check would refuse the file (UNSUPPORTED_FILE_TYPE).
     Stats:
       type: object
       description: |
@@ -3660,8 +4142,7 @@ components:
           type: integer
           minimum: 0
           description: |
-            Real aggregate. (The legacy `stats.storageUsedBytes` was
-            dead code returning 0 - see `09` §B2 - fixed when porting.)
+            Total bytes stored in the knowledge base.
     Skill:
       type: object
       description: |
@@ -3759,10 +4240,11 @@ components:
               value:
                 error:
                   code: HOOK_REJECTED
-                  message: Content was rejected by a compliance hook.
+                  message: Rejected by policy.
                   details:
-                    rejected_by: hook_pii_filter
-                    rejection_reason: detected_unmasked_pii
+                    document_id: vsf_0123456789abcdef
+                    blocked_by: hook_pii_filter
+                    public_rejection_reason: ''
     Error404:
       description: Resource does not exist or is not visible to the caller.
       content:
@@ -3829,9 +4311,10 @@ components:
             type: object
             description: |
               Legacy **flat** error envelope emitted by the not-yet-migrated
-              `/v1/skills*`, `/v1/stats`, `/v1/cleanup/*` and
-              `/v1/export/by-user` routes (all other routes use the nested
-              `Error` envelope). The shape varies by route: `skills`/`stats`
+              `/v1/skills*`, `/v1/stats`, `DELETE /v1/files/{fileId}`,
+              `/v1/cleanup/*` and `/v1/export/by-user` routes (all other routes
+              use the nested `Error` envelope). The shape varies by route:
+              `skills`/`stats`/`files`
               return `{ error: <message>, code: <CODE> }`; `cleanup`/`export`
               return `{ error: <CODE>, message: <message> }`. Same information,
               different field placement. These routes will migrate to the
@@ -3852,9 +4335,10 @@ components:
             type: object
             description: |
               Legacy **flat** error envelope emitted by the not-yet-migrated
-              `/v1/skills*`, `/v1/stats`, `/v1/cleanup/*` and
-              `/v1/export/by-user` routes (all other routes use the nested
-              `Error` envelope). The shape varies by route: `skills`/`stats`
+              `/v1/skills*`, `/v1/stats`, `DELETE /v1/files/{fileId}`,
+              `/v1/cleanup/*` and `/v1/export/by-user` routes (all other routes
+              use the nested `Error` envelope). The shape varies by route:
+              `skills`/`stats`/`files`
               return `{ error: <message>, code: <CODE> }`; `cleanup`/`export`
               return `{ error: <CODE>, message: <message> }`. Same information,
               different field placement. These routes will migrate to the
@@ -3875,9 +4359,10 @@ components:
             type: object
             description: |
               Legacy **flat** error envelope emitted by the not-yet-migrated
-              `/v1/skills*`, `/v1/stats`, `/v1/cleanup/*` and
-              `/v1/export/by-user` routes (all other routes use the nested
-              `Error` envelope). The shape varies by route: `skills`/`stats`
+              `/v1/skills*`, `/v1/stats`, `DELETE /v1/files/{fileId}`,
+              `/v1/cleanup/*` and `/v1/export/by-user` routes (all other routes
+              use the nested `Error` envelope). The shape varies by route:
+              `skills`/`stats`/`files`
               return `{ error: <message>, code: <CODE> }`; `cleanup`/`export`
               return `{ error: <CODE>, message: <message> }`. Same information,
               different field placement. These routes will migrate to the
@@ -3898,9 +4383,10 @@ components:
             type: object
             description: |
               Legacy **flat** error envelope emitted by the not-yet-migrated
-              `/v1/skills*`, `/v1/stats`, `/v1/cleanup/*` and
-              `/v1/export/by-user` routes (all other routes use the nested
-              `Error` envelope). The shape varies by route: `skills`/`stats`
+              `/v1/skills*`, `/v1/stats`, `DELETE /v1/files/{fileId}`,
+              `/v1/cleanup/*` and `/v1/export/by-user` routes (all other routes
+              use the nested `Error` envelope). The shape varies by route:
+              `skills`/`stats`/`files`
               return `{ error: <message>, code: <CODE> }`; `cleanup`/`export`
               return `{ error: <CODE>, message: <message> }`. Same information,
               different field placement. These routes will migrate to the
