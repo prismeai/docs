@@ -325,8 +325,11 @@ update:
 | The property was | What happens to existing values |
 | --- | --- |
 | `string` or `text` | JSON objects and arrays are parsed; everything else stays the string it was (`123` stays `"123"`) |
-| `json` already | every value the platform serialized comes back as written (`"abc"` → `abc`, `123` → `123`, objects and arrays parsed); text that is not valid JSON stays a string. **Nothing is converted** if bare numbers, booleans or `null` sit next to such text, see below |
+| `json` already | every value the platform serialized comes back as written (`"abc"` → `abc`, `123` → `123`, objects and arrays parsed); text that is not valid JSON stays a string. See below for collections moved from MongoDB |
 | unknown (no previous schema, not declared, or another type) | **nothing is converted**, see below |
+
+A column that is neither text nor json (a number, a boolean or a date column,
+for instance) is never converted automatically either: see below.
 
 A column that used to be an `array` (text array) is always converted, each
 array becoming the same JSON array.
@@ -337,25 +340,20 @@ array becoming the same JSON array.
   `json` property stored in a text column is read as the raw text.
 </Note>
 
-A text column of a `json` property can also hold plain strings, for instance
-when the collection was moved from MongoDB to PostgreSQL: a field that held only
-strings is then created as text, with the strings as they were. A string such
-as `123`, `true` or `null` could then be a value the platform serialized or a
-plain string, and the two must not be read the same way. So:
+<Warning>
+  **Collections moved from MongoDB to PostgreSQL.** The migration creates a
+  field that held only strings as a text column, with the strings as they
+  were. If the property is declared `json`, a string such as `123`, `true` or
+  `null` in that column is read as a number, a boolean or `null` once the
+  column is converted, like the values the platform serialized itself. The
+  `workspaces.collections.migrated` event counts these values in `retyped`, so
+  you can check whether a collection is affected.
+</Warning>
 
-- if the column holds text that is not valid JSON **and** bare numbers,
-  booleans or `null`, nothing is converted and the event below tells you how
-  many values are ambiguous (`skipped[].ambiguousRows`). Declare the migration
-  with `cast: lenient` to read them as numbers, booleans and `null`, or
-  `cast: auto` to keep them as strings (strings the platform serialized then
-  keep their JSON quotes);
-- if every value is valid JSON, the column is converted, as it always was:
-  `123` becomes a number. The `workspaces.collections.migrated` event counts
-  these values in `retyped`.
-
-When the platform cannot tell, it leaves the column alone and emits a
-`workspaces.collections.notMigrated` event in the activity feed: the column,
-the reason, and the migration to declare (`skipped[].howTo`). The collection
+When the platform cannot tell, or cannot convert the column type, it leaves the
+column alone and emits a `workspaces.collections.notMigrated` event in the
+activity feed: the column, the reason, and the migration to declare
+(`skipped[].howTo`). The collection
 keeps working on its previous schema until you declare it, as described below.
 
 ### Declaring a migration
@@ -407,8 +405,9 @@ migration is skipped.
 </Warning>
 
 The conversion rewrites the table while locking it. If the table stays locked
-by something else for more than 5 seconds, the conversion gives up rather than
-block every request on the collection, and runs again at the next update.
+by something else for more than 5 seconds (`COLLECTIONS_MIGRATION_LOCK_TIMEOUT_MS`
+on a self-hosted runtime), the conversion gives up rather than block every
+request on the collection, and runs again at the next update.
 
 ### Converting to json
 
@@ -433,13 +432,15 @@ column whose values were all written as JSON.
 A migration that actually converts data emits a
 `workspaces.collections.migrated` event in the activity feed, reporting the
 column, the type it had, the type it became, the number of rows rewritten
-(`rows`), how many of them now read as a number, a boolean or `null` instead of
-a string (`retyped`, with `lenient` only) and how long it took. A migration that matches nothing emits nothing.
+(`rows`, an estimate when `rowsEstimated` is true), how many of them now read
+as a number, a boolean or `null` instead of a string (`retyped`, with `lenient`
+only) and how long it took. A migration that matches nothing emits nothing.
 
 If a declared migration fails, the collection keeps working on its previous
 schema and the `workspaces.collections.notMigrated` event tells you which column
 refused and why (`failed`), so the failure is visible immediately instead of
-surfacing weeks later.
+surfacing weeks later. A conversion undone because the rest of the schema update
+failed after it is listed in `rolledBack`.
 
 ## Basic Operations
 
