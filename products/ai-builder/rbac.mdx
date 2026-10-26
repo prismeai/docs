@@ -406,6 +406,8 @@ authorizations:
 | `authProvider` | How the current session signed in: `prismeai` (password or passkey), the slug of an SSO provider, or `anonymous` (anonymous sessions and callers without any session). `apiKey` for workspace API keys. Missing for organization API keys and service accounts. |
 | `orgSlugs` | The slugs of every organization the user is a member of |
 | `groupIds` | The groups of the active organization of the user, as `organization:group` |
+| `org.slug` | The slug of the active organization of the user |
+| `permissions` | The permissions the role of the active organization of the user grants, for example `ws:my-workspace:reports:read` (see [Require a permission of the organization roles](#require-a-permission-of-the-organization-roles)) |
 | `authData.<provider>` | The data the provider sent for this user, for example `authData.acme-entra.email`. Only the providers the user signed in with. |
 
 `authProvider` describes the current session only. To target every user who signed in with an SSO provider once, use `auth` on a role, or match `authData.<provider>`.
@@ -443,7 +445,7 @@ A `user` condition only narrows the users a rule applies to: it never grants any
 
 The caller is fully known on the HTTP calls (endpoints, API) and the websockets, not on the runs an event or a schedule starts. So a `user` condition on an `automations` rule, or the `automations` rules of a role given from `user`, only apply to the endpoint calls: the events are controlled when they are emitted (see [Control who calls the endpoints and emits events](#control-who-calls-the-endpoints-and-emits-events)).
 
-A user can only target their own organizations and their groups in a `user` condition, with listed values (a value, `$in` or `$eq` on `orgSlugs` or `groupIds`): another organization, or an operator that may reach any organization (`$nin`, `$ne`, `$regex`…), is refused, unless the platform allows cross-organization sharing (`ALLOW_CROSS_ORG_SHARING`). Platform superadmins target any organization. The conditions a security already has, or that a duplicated or imported workspace brings, are kept.
+A user can only target their own organizations and their groups in a `user` condition, with listed values (a value, `$in` or `$eq` on `orgSlugs`, `groupIds` or `org.slug`): another organization, another field of the active organization (`org.groups`…), or an operator that may reach any organization (`$nin`, `$ne`, `$regex`…), is refused, unless the platform allows cross-organization sharing (`ALLOW_CROSS_ORG_SHARING`). Platform superadmins target any organization. The conditions a security already has, or that a duplicated or imported workspace brings, are kept.
 
 ## Secure secrets
 
@@ -531,7 +533,7 @@ Two things remain out of reach whatever the role. Secrets of `scope: user` belon
 
 ## Control who calls the endpoints and emits events
 
-By default, anyone, even without signing in, can call the endpoints of a workspace and emit events to it, which triggers its automations. The access of the workspace app doesn't change that: the app calls them, it doesn't protect them. **Settings › Security › Access control** restricts both:
+Calling the endpoints of a workspace and emitting events to it triggers its automations. A new workspace keeps both to its owners and editors (`access.endpoints: private` and `access.events: private`). A workspace created before keeps its access: without `access.endpoints`, anyone, even without signing in, can call its endpoints. The access of the workspace app doesn't change that: the app calls them, it doesn't protect them. **Settings › Security › Access control** sets both:
 
 | Setting | What it restricts | What it doesn't change |
 |---|---|---|
@@ -577,18 +579,41 @@ authorizations:
 
 `bindings` takes organizations (`principalType: org`, an organization slug, or `*` for the members of any organization) and groups (`principalType: group`, as `organization:group`).
 
+### Require a permission of the organization roles
+
+A private access can also require a permission, which the roles of the organizations grant: only the members of the organizations and groups of `bindings` whose role grants it get in. It narrows the bindings, it never opens to anyone else:
+
+```yaml
+authorizations:
+  access:
+    endpoints: private
+    bindings:
+      - principalType: org
+        principalId: acme
+    permission: reports:read   # <subject>:<action>
+```
+
+The workspace names the permission `<subject>:<action>`, and an organization role grants it as `ws:<workspace slug>:<subject>:<action>`: **Access control** shows this full name, to copy into a role of **AI Governance**. `ws:<workspace slug>:<subject>:*`, `ws:<workspace slug>:*`, `ws:*` and `*` grant it too.
+
+- The permission comes from the role of the active organization of the user, and only counts when it is one of the organizations of `bindings` (or the organization of a group of `bindings`): a user granted it by another organization they switched to doesn't get in. The roles of the other organizations can't give it.
+- It requires a private access with bindings, and only applies to the private levels: an `authenticated` endpoint access ignores it.
+- Its subject can't be one of the workspace subjects (`automations`, `assets`, `events`, `pages`…), kept for the permissions of the workspaces themselves.
+- It requires bindings to given organizations and groups: not to every organization (`*`), any of which could grant it.
+- The full name follows the slug of the workspace: once the slug changes, the roles must grant the new name (`ws:<new slug>:…`), and remove the former one, which a workspace taking the former slug would require under the same name. A duplicated or imported workspace requires it under its own slug.
+- In a `user` condition, `permissions` is matched as is: combine it with `org.slug` (an organization of yours), as above, so that the role of another organization can't give it.
+
 What applies, from the strongest to the weakest:
 
 1. The `rules` of the security: exceptions, which open (or close) for some roles, users or automations.
 2. The owners and editors, and the endpoints with `authorizations.action: public`: allowed whatever `access` and the defaults say.
 3. `access`: who can call the endpoints without action and emit events.
-4. Without `access`: the endpoints stay public; the events are only open to whom the rules let in, so a workspace without such a rule only lets the owners and editors emit events. **Access control** always sets a level for the events.
+4. Without `access` (workspaces created before it): the endpoints stay public; the events are only open to whom the rules let in, so a workspace without such a rule only lets the owners and editors emit events. **Access control** always sets a level for the events.
 
 A rule without `role` nor `user` that opens a surface to anyone reopens it whatever its access: **Access control** then says so. It doesn't detect every widening: a role given automatically to every signed-in user (an `auth` provider without conditions) with a rule opening the events, for example, widens their access without a notice. The rule `Anyone can create any events` that older workspaces have opens the events to anyone: setting the events in **Access control** replaces it.
 
 ### Open the events a page emits
 
-A new workspace keeps its events to its owners and editors (`access.events: private`): most events are internal to the workspace, emitted by its automations, and a user emitting them directly could trigger automations that skip the checks of its endpoints. Pages mostly call endpoints, protected by the endpoints access and the actions of the roles.
+A new workspace keeps its endpoints and events to its owners and editors (`access.endpoints: private`, `access.events: private`): open the endpoints its pages call to their users in **Access control** (**Signed-in users**, or **Private** with organizations and groups). Most events are internal to the workspace, emitted by its automations, and a user emitting them directly could trigger automations that skip the checks of its endpoints. Pages mostly call endpoints, protected by the endpoints access and the actions of the roles.
 
 A page that emits events needs a rule for them, for the roles that use it, or for everyone:
 
