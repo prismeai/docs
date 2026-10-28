@@ -1,0 +1,216 @@
+---
+title: 'Workspace security rules reference'
+description: 'Reference for the authorizations block of a Builder workspace: roles, automatic role assignment, rule fields, precedence, conditions and placeholders, subjects and actions, and validation errors.'
+---
+
+Use this page to look up the syntax of workspace security rules and what each subject and action controls. To share a workspace and write its first rules, see [Control access to a workspace](/products/access-control/workspace-roles).
+
+The rules are stored in the workspace security document, edited in Builder from **Settings**, **Security**, and exported as `security.yml` with the workspace.
+
+## Document structure
+
+```yaml
+authorizations:
+  roles:
+    editor: {}
+    reader:
+      description: Reads the internal pages
+      auth:
+        prismeai: {}
+  rules:
+    - role: reader
+      action: read
+      subject: pages
+      conditions:
+        labels:
+          $in:
+            - internal
+```
+
+| Key | Type | Description |
+|---|---|---|
+| `authorizations.roles` | object | The roles the workspace declares, keyed by role name. |
+| `authorizations.rules` | array | The grants and denials, one rule per entry. |
+
+## Roles
+
+Each key of `roles` declares a role. The value is an object, or `{}`.
+
+| Field | Type | Description |
+|---|---|---|
+| `description` | string | Shown next to the role where it can be picked. |
+| `auth` | object | Assigns the role automatically to callers authenticated a given way. See [Automatic assignment](#automatic-assignment). |
+
+These role names are reserved:
+
+| Name | Behavior |
+|---|---|
+| `owner` | Built in. It cannot be declared, and a rule cannot reference it: saving fails with `Reserved role 'owner cannot be overriden !'`. |
+| `editor` | Built in. Declare `editor: {}` to reference it in rules, to extend or restrict what editors can do. |
+| `default` | Implicit. A rule without `role` is attached to it, and it applies to every caller, signed in or not. |
+
+### Automatic assignment
+
+The keys of `auth` name how the caller authenticated. A caller who matches at least one key holds the role for every request on the workspace, without being added in **Sharing**.
+
+| Key | Matches |
+|---|---|
+| `prismeai` | Users signed in with a Prisme.ai account |
+| `<provider name>` | Users signed in through the SSO provider of that name, such as `azure` or the name of a provider configured by your platform administrator |
+| `apiKey` | Turns the role into a workspace API key. See [Create workspace API keys](/products/access-control/workspace-api-keys). |
+
+Each provider key accepts optional `conditions`, matched against the user's authentication data from that provider:
+
+```yaml
+roles:
+  admin:
+    auth:
+      prismeai:
+        conditions:
+          authData.email:
+            $regex: ^.*@example\.com$
+```
+
+## Rules
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `action` | string or array | Yes | The actions the rule allows or denies. See [Subjects and actions](#subjects-and-actions). |
+| `subject` | string or array | Yes | The kinds of resources the rule applies to. |
+| `role` | string or array | No | The roles the rule applies to. Without it, the rule applies to everyone, anonymous visitors included. |
+| `conditions` | object | No | Restricts the rule to resources matching these conditions. Without it, the rule applies to every resource of the subject in this workspace. |
+| `inverted` | boolean | No | `true` turns the rule into a denial. |
+| `reason` | string | No | Free text documenting the rule. |
+
+Every rule is automatically restricted to the workspace that declares it. A rule can never grant access to another workspace's resources.
+
+### Precedence
+
+The built-in `owner` and `editor` grants and the platform defaults are evaluated first. The rules of `authorizations.rules` are evaluated after them, in the order they are written, and the last rule that matches a request decides:
+
+- A denial written below a grant overrides the grant.
+- A grant written below a denial overrides the denial.
+- A workspace rule overrides the built-in grants, including those of `owner`.
+
+Only the `superadmin` platform role is evaluated after every workspace rule.
+
+A caller who holds several roles receives the rules of all of them, and the same ordering applies across roles.
+
+### Conditions
+
+Conditions use a subset of the MongoDB query syntax, as supported by the [CASL library](https://casl.js.org/v6/en/guide/conditions-in-depth#supported-operators): `$eq`, `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$in`, `$nin`, `$all`, `$size`, `$regex`, `$elemMatch`, and `$exists`. A dotted key such as `source.sessionId` reaches a nested field.
+
+Condition values can include placeholders, resolved for each request:
+
+| Placeholder | Resolves to |
+|---|---|
+| `${user.id}` or `{{user.id}}` | The ID of the caller |
+| `{{session.id}}` | The session ID of the caller |
+| `${user.<field>}` | Another field of the caller, such as `${user.email}` |
+
+When a placeholder cannot be resolved, for example `{{user.id}}` for an anonymous visitor, the rule is ignored for that request. Values inserted into a `$regex` are escaped, so a user ID cannot change the meaning of the pattern.
+
+## Subjects and actions
+
+`manage` stands for every action of the subject. These subjects can appear in workspace rules:
+
+### `workspaces`
+
+The workspace itself, its automations, and its configuration. Creating, editing, and deleting automations is controlled by `update` on `workspaces`.
+
+| Action | Allows |
+|---|---|
+| `read` | Reading the workspace, its automations, and its security rules |
+| `update` | Updating the workspace and its automations |
+| `delete` | Deleting the workspace |
+| `manage_security` | Updating the security rules |
+| `manage_permissions` | Sharing the workspace and managing its API keys |
+| `manage_repositories` | Managing the repositories used for versioning |
+| `aggregate_search` | Using the search API on the workspace events |
+| `get_usage` | Using the usage API |
+
+### `pages`
+
+| Action | Allows |
+|---|---|
+| `create`, `read`, `update`, `delete` | Creating, reading, updating, and deleting the workspace pages |
+
+Common condition: `labels`, the labels of the page.
+
+### `files`
+
+| Action | Allows |
+|---|---|
+| `create` | Uploading a file |
+| `read`, `update`, `delete` | Reading, updating, and deleting files |
+
+Common conditions: `mimetype`, and `createdBy`, the ID of the user who uploaded the file. For example, `createdBy: '{{user.id}}'` restricts a rule to the caller's own files.
+
+### `events`
+
+| Action | Allows |
+|---|---|
+| `create` | Emitting an event. Restricted automatically to events emitted through the runtime (`source.serviceTopic: topic:runtime:emit`), so no rule can let a caller forge a platform event. |
+| `read` | Reading events |
+
+Common conditions: `type`, the event type, and `source.sessionId` or `source.userId`, the session or user that emitted it.
+
+### `automations`
+
+| Action | Allows |
+|---|---|
+| `execute` | Triggering an automation through its event or endpoint trigger |
+| `test` | Running the automation's tests |
+
+Common condition: `authorizations.action`, the authorization key an automation declares. See [Restrict who can run an automation](/products/access-control/protect-automations).
+
+### `apps`
+
+The apps this workspace publishes to the App Store.
+
+| Action | Allows |
+|---|---|
+| `create` | Publishing the workspace as an app |
+| `read` | Viewing and installing the app |
+| `update`, `delete` | Updating and deleting the published app |
+| `read_app_dsul` | Reading the source of the app |
+
+### `secure_secrets`
+
+Credentials stored for the workspace, such as the refresh tokens members deposit when they connect a third-party account. Rules on this subject are restricted further:
+
+| Action | Grantable |
+|---|---|
+| `create`, `update` | Yes. On a rule without `role`, the `name` condition must pin the secret to the caller with `${user.id}`. |
+| `read` | Yes, but on a rule without `role` every member would read every other member's credentials. Grant it only to a role that an automation takes on. |
+| `delete` | Only on a rule with `role`. |
+| `manage` | Never. |
+
+Workspace rules never reach secrets of `scope: user` or the reserved `prismeai_` namespace. For the complete procedure and the constraints on the `name` condition, see [Let members deposit their own credentials](/products/access-control/secure-secrets).
+
+### Subjects that rules cannot use
+
+Workspace secrets (`secrets`) and any subject not listed above cannot appear in workspace rules. Secrets are managed by workspace owners from **Settings**, **Secrets**.
+
+## Defaults without any rule
+
+Without any workspace rule:
+
+- Anyone can execute an automation that has an event or endpoint trigger and declares no `authorizations.action`.
+- Anyone can read the published apps of the App Store.
+- Members can manage the secure secrets they own (`scope: user`).
+- Everything else requires the `owner` or `editor` role.
+
+## Validation errors
+
+Saving the security rules fails with one of these errors. The previous rules stay in effect until the YAML is fixed and saved again.
+
+| Error | Cause |
+|---|---|
+| `Unknown custom role '<role>' referenced in a rule` | A rule names a role that `roles` does not declare. Declare it, including `editor: {}` for the built-in editor. |
+| `Reserved role 'owner cannot be overriden !'` | A rule names `owner`. Grant the actions to a custom role instead. |
+| `Forbidden subjectType '<subject>' found in security rules` | A rule names a subject that workspace rules cannot use, such as `secrets`. |
+| `Forbidden actionType '<action>' found in security rules` | A rule names an action that does not exist, or that its subject does not accept, such as `manage` on `secure_secrets`. |
+| `Security rules on 'secure_secrets' must confine 'name' to the acting user: ...` | A rule without `role` writes secure secrets without pinning `name` to `${user.id}`. |
+| `Security rules granting 'read' on 'secure_secrets' to a role must confine 'name' to one family of secrets: ...` | A role-carried rule on secure secrets names no family prefix, or names one that is too short or reserved. |
+| `Can't delete <role> role as it is still assigned to some user in your workspace` | A removed role is still assigned to a member. Change their role in **Sharing** first. |

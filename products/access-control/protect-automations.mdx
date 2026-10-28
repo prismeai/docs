@@ -1,0 +1,96 @@
+---
+title: 'Restrict who can run an automation'
+description: 'Workspace owner: require a workspace role to trigger an automation through its endpoint or event, so that other callers are refused with HTTP 403.'
+---
+
+Use this procedure to make an automation callable only by the workspace roles you choose. When it succeeds, callers who hold one of those roles can trigger the automation, and every other caller, signed in or not, is refused before it runs.
+
+By default, **anyone can execute an automation that has an endpoint or event trigger**, including visitors who are not signed in. Workspace owners and editors can always execute every automation of the workspace.
+
+## Before you begin
+
+- **Who:** an owner of the workspace.
+- **Where:** Builder, in the workspace: the automation editor, and **Settings**, **Security**.
+- **Requires:** the automation to protect, and the custom roles that may call it. To declare roles, see [Control access to a workspace](/products/access-control/workspace-roles).
+- **Impact:** callers without a matching role are refused immediately, including other automations that call this one on their behalf.
+
+## Protect the automation
+
+<Steps>
+  <Step title="Give the automation an authorization key">
+    Open the automation's YAML and add an `authorizations` block with an `action`. The action is a name you choose, such as `admin` or `report`, that links the automation to the roles allowed to run it.
+
+    ```yaml
+    slug: getAnalytics
+    name: 'Admin: Init analytics'
+    when:
+      events:
+        - initAnalytics
+    authorizations:
+      action: admin
+    do:
+      - emit:
+          event: updateAnalytics
+    ```
+
+    Save the automation. From this point, only owners and editors can execute it.
+  </Step>
+  <Step title="Grant the key to a role">
+    In **Settings**, **Security**, add a rule that lets a role execute automations carrying that key. Several automations can share the same key.
+
+    ```yaml
+    authorizations:
+      roles:
+        admin: {}
+      rules:
+        - role: admin
+          action: execute
+          subject: automations
+          conditions:
+            authorizations.action:
+              $in:
+                - admin
+    ```
+
+    Select **Save Rules**.
+  </Step>
+  <Step title="Assign the role">
+    In **Settings**, **Sharing**, give the role to the people who may run the automation, or assign it automatically with an `auth` block. See [Control access to a workspace](/products/access-control/workspace-roles#write-the-security-rules).
+  </Step>
+</Steps>
+
+## Verify the result
+
+Call the automation's endpoint with the session of a signed-in user who does not hold the role:
+
+```bash
+curl -X POST "https://<api-host>/v2/workspaces/slug:<workspace-slug>/webhooks/<automation-slug>" \
+  -H "Authorization: Bearer <access token of a user without the role>" \
+  -H "Content-Type: application/json" -d '{}'
+```
+
+Replace `<api-host>` with the API host of your platform, `<workspace-slug>` and `<automation-slug>` with the slugs of the workspace and automation. The call is refused with HTTP `403` and a `ForbiddenError`. The same call with a user who holds the role runs the automation.
+
+Run this check for every endpoint you protect: the refusal must come from the API, not from an interface that hides a button.
+
+## Troubleshooting
+
+### A user with the role is refused
+
+**Cause:** the rule's `authorizations.action` list does not contain the key the automation declares, or the role is not assigned to the user.
+
+**Owner:** workspace owner.
+
+**Resolution:** compare the key in the automation's `authorizations.action` with the values listed in the rule, then check the user's role in **Settings**, **Sharing**. Save the rules again and repeat the verification.
+
+### Anonymous visitors can still call the endpoint
+
+**Cause:** the automation has no `authorizations.action`, or a rule without `role` grants `execute` on `automations` to everyone.
+
+**Owner:** workspace owner.
+
+**Resolution:** add the `authorizations` block to the automation, and give every `execute` rule on `automations` a `role`.
+
+## Undo the change
+
+Remove the `authorizations` block from the automation and save it. The automation becomes executable by anyone again.

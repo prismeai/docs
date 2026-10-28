@@ -1,0 +1,111 @@
+---
+title: 'Create workspace API keys'
+description: 'Workspace owner: give an external script or the workspace own automations API access to a Builder workspace, limited by security rules.'
+---
+
+Use this procedure to let a program call the Prisme.ai API on a workspace without a user session. A workspace API key carries its own rules, so it can only do what you grant it. There are two kinds:
+
+| Kind | Use it when | How the key is used |
+|---|---|---|
+| [Internal key](#create-an-internal-key-for-automations) | The workspace's own automations call the Prisme.ai API, for example to read pages or files of the workspace | The runtime injects the key into `fetch` calls; nobody sees its value |
+| [External key](#create-an-external-key) | A script or a third-party system calls the workspace API | The caller sends the key in the `x-prismeai-api-key` header |
+
+To give a machine access to organization products such as Agent Factory or Knowledges instead, create an [organization API key](/products/ai-governance/identity-access#api-keys).
+
+## Before you begin
+
+- **Who:** an owner of the workspace.
+- **Where:** Builder, in the workspace, **Settings**, **Security**, for an internal key; the Prisme.ai API for an external key.
+- **Requires:** for an external key, an access token of a workspace owner, and the workspace ID, shown in **Settings**, **General**.
+- **Impact:** a key acts without a user. Anyone or anything holding it can do everything its rules grant, until the key is deleted.
+
+## Create an internal key for automations
+
+<Steps>
+  <Step title="Declare a role bound to an API key">
+    In **Settings**, **Security**, declare a role with `auth: apiKey: {}`. Saving generates the key value, which stays hidden.
+
+    ```yaml
+    authorizations:
+      roles:
+        workspace:
+          auth:
+            apiKey: {}
+    ```
+  </Step>
+  <Step title="Grant the key its permissions">
+    Add rules for that role, limited to what the automations need:
+
+    ```yaml
+      rules:
+        - role: workspace
+          action:
+            - read
+          subject:
+            - pages
+            - files
+    ```
+
+    Select **Save Rules**.
+  </Step>
+  <Step title="Use the key in a fetch">
+    In the automation, name the role in `prismeaiApiKey`. The runtime adds the key to the request.
+
+    ```yaml
+    - fetch:
+        url: '{{global.apiUrl}}/workspaces/{{global.workspaceId}}/pages'
+        method: get
+        prismeaiApiKey:
+          name: workspace
+        output: pages
+    ```
+  </Step>
+</Steps>
+
+The runtime injects the key only into requests to the platform's own API under `/workspaces`, `/apps`, `/pages`, and `/files`. Requests to any other host never receive it. Self-hosted platforms can add URL prefixes with the `AUTHENTICATE_PRISMEAI_URLS` environment variable of the runtime.
+
+<Warning>
+Do not give a role bound to an API key to a person, and do not combine `apiKey` with another `auth` provider on the same role. Roles bound to an API key do not appear in **Sharing**.
+</Warning>
+
+## Create an external key
+
+1. Call the API with an owner's access token, listing the rules the key receives. Replace `<api-host>` with the API host of your platform and `<workspace-id>` with the workspace ID.
+
+   ```bash
+   curl -X POST "https://<api-host>/v2/workspaces/<workspace-id>/security/apikeys" \
+     -H "Authorization: Bearer <owner access token>" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "reporting-script",
+       "rules": [
+         { "action": "create", "subject": "files" },
+         {
+           "action": ["create", "update", "read"],
+           "subject": "pages",
+           "conditions": { "labels": { "$in": ["internal"] } }
+         }
+       ]
+     }'
+   ```
+
+   The response contains the key in `apiKey`. Store it in your secret manager; it is the only credential the script needs.
+
+2. Send the key in the `x-prismeai-api-key` header of each request:
+
+   ```bash
+   curl "https://<api-host>/v2/workspaces/<workspace-id>/pages" \
+     -H "x-prismeai-api-key: <api key>"
+   ```
+
+The rules of an external key follow the same syntax and validation as workspace rules, without `role`. See [Workspace security rules reference](/products/access-control/workspace-rules-reference#rules).
+
+## Verify the result
+
+1. Call an endpoint the key's rules allow, and confirm a `200` response.
+2. Call an endpoint they do not allow, such as deleting a page, and confirm it is refused with HTTP `403`.
+
+## Rotate or revoke a key
+
+- **External key:** list the keys with `GET /v2/workspaces/<workspace-id>/security/apikeys`, change a key's rules with `PUT /v2/workspaces/<workspace-id>/security/apikeys/<api key>`, and revoke it with `DELETE` on the same path. To rotate, create a key, switch the script to it, then delete the old one.
+- **Internal key:** remove the role from `roles`, together with its rules, and select **Save Rules**. The key stops working immediately.
