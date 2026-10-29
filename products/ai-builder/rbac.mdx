@@ -299,6 +299,19 @@ RBAC controls access to various resource types through subject and action combin
     - `manage` : allows all above actions    
   </Accordion>
   
+  <Accordion title="Assets" icon="folder-open">
+    **Subject :** `assets`
+
+    **Actions :**
+    - `create` : allows uploading a new asset
+    - `read` : allows reading and listing assets
+    - `update` : allows replacing an asset, or changing its access, labels, or metadata
+    - `delete` : allows deleting assets
+    - `manage` : allows all above actions
+
+    Without any rule, owners and editors can manage the workspace assets, viewers can read them, and the access level of each asset grants `read` to more users: any signed-in user for `authenticated`, anyone for `public`, and the organizations and groups of its bindings for `private`. Rules can match the `path`, `folder`, `name`, `mimetype`, `sharing`, `bindings`, `labels`, and `metadata` of an asset. See [Workspace assets](/products/ai-builder/assets#open-assets-with-security-rules).
+  </Accordion>
+
   <Accordion title="Events" icon="bell">
     **Subject :** `events` 
 
@@ -352,6 +365,85 @@ RBAC controls access to various resource types through subject and action combin
     - `manage` : allows all above actions    
   </Accordion>
 </AccordionGroup>
+
+## Restrict a rule to some users
+
+A rule applies to every user by default, or to the users of its `role`. Add a `user` condition to apply it only to the users it matches, or to give a role to the users it matches. It is written like `conditions`, with the subset of MongoDB queries, and matched on the caller of each request.
+
+### Give a role, or restrict a single rule
+
+The same `user` condition can be written on a role or on a rule:
+
+| | On a role | On a rule |
+|---|---|---|
+| Effect | Gives the role, and so every rule of this role, to the users it matches | Narrows the users this rule applies to: it never grants anything by itself |
+| Combined with | `auth`: the role is given to the users that match both its `auth` (an authentication provider, see [Workspace roles](/self-hosting/entreprise/permissions#workspace-roles)) and its `user` | The `role` of the rule, if any: the rule applies to the users of this role that match its `user` |
+| Typical use | Several rules for the same users: the members of a partner organization, the users of an SSO provider in some organizations | A single rule that depends on who calls, such as excluding anonymous sessions |
+
+A role without `auth` nor `user` is only given explicitly, when the workspace is shared with a user. Roles and rules with a `user` condition can't have `events` or `automations` rules: other services evaluate them without the caller identity.
+
+For example, this role gives the members of the `partner` organization read access to the pages and assets labelled `partners`:
+
+```yaml
+authorizations:
+  roles:
+    partners:
+      user:
+        orgSlugs:
+          $in:
+            - partner
+  rules:
+    - role: partners
+      action: read
+      subject:
+        - pages
+        - assets
+      conditions:
+        labels: partners
+```
+
+### Fields of the user
+
+| Field | Value |
+|---|---|
+| `id` | The user id |
+| `authProvider` | How the current session signed in: `prismeai` (password or passkey), the slug of an SSO provider, or `anonymous` (anonymous sessions and callers without any session). `apiKey` for workspace API keys. Missing for organization API keys and service accounts. |
+| `orgSlugs` | The slugs of every organization the user is a member of |
+| `groupIds` | The groups of the active organization of the user, as `organization:group` |
+| `authData.<provider>` | The data the provider sent for this user, for example `authData.acme-entra.email`. Only the providers the user signed in with. |
+
+`authProvider` describes the current session only. To target every user who signed in with an SSO provider once, use `auth` on a role, or match `authData.<provider>`.
+
+### Examples
+
+This rule lets the members of the `sales` group of the `acme` organization read the pages labelled `sales`, and nobody else through this rule:
+
+```yaml
+authorizations:
+  rules:
+    - action: read
+      subject: pages
+      user:
+        groupIds: 'acme:sales'
+      conditions:
+        labels: sales
+```
+
+This rule lets any signed-in user read the pages labelled `members`, but never an anonymous session (such as a public chat embed):
+
+```yaml
+authorizations:
+  rules:
+    - action: read
+      subject: pages
+      user:
+        authProvider:
+          $ne: anonymous
+      conditions:
+        labels: members
+```
+
+A `user` condition only narrows the users a rule applies to: it never grants anything by itself. On an inverted rule (`inverted: true`), it narrows the users the denial applies to. It is refused on `events` and `automations` rules, which other services evaluate without this caller information, and a condition that is not a valid query is refused when the security is saved.
 
 ## Secure secrets
 

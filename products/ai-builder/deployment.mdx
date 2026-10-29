@@ -75,33 +75,70 @@ Because everything you build in Builder is versioned as code, agents, automation
   </Tab>
 </Tabs>
 
-## The Deploy Modal
+## Publish pages
 
-Clicking **Deploy** in the Builder header bar opens a modal with two tabs: **Publish** and **Share**.
+<Info>Introduced in v27.9.1.</Info>
+
+Publishing builds the workspace pages into an app and stores the result as [workspace assets](/products/ai-builder/assets), so the published app travels with the workspace into exports, Git, and other environments. Publishing creates no workspace version unless you choose a repository for it in the dialog (step 6); you can also create versions from [Versioning](/products/ai-builder/versioning).
 
 ### Publish tab
 
-The Publish tab turns the current workspace source into a runnable bundle and assigns it a version.
+1. In Builder, open a page in the page editor. The **Publish** button is shown in the editor toolbar, next to **Save**, only when a page is open.
+2. Select **Publish**. The publish dialog opens on its **Publish** tab.
+3. Under **Who can access this app?**, select who can open the published app:
+   - **Private**: workspace collaborators, and the organizations and groups of step 4.
+   - **Signed-in users**: anyone with an account, whatever the organization.
+   - **Public**: anyone, including visitors without a session. The public pages are prerendered and can be indexed by search engines.
+4. For a **Private** app, in **Shared with organizations and groups**, add the organizations and groups that can open it: select **Group** then one of the groups of your active organization, or **Organization** then an organization you can see, or **Every organization**. A first publish proposes your organization.
+5. Optional: change the version number next to **Publish**. It defaults to the last published version with its patch number incremented, and labels this publish only.
+6. Optional: under **Version of the workspace**, select a repository to also version the whole workspace (automations, pages, assets…) once published: the platform storage, or a Git repository configured for the workspace (see [Versioning](/products/ai-builder/versioning)). **No version**, the default, creates none.
+7. Select **Publish**. Builder saves the page sources, builds the app, stores it, then creates the version if a repository is selected. The dialog shows **Published v**`<version>` and opens the **Share** tab.
 
-| Field / control | What it does |
-|---|---|
-| **Version name** | A free-form identifier for this deploy (defaults to an auto-incremented semver after the latest deployed version). Shown in the read-only version dropdown of the header bar once deployed. |
-| **Publish** button | Synchronizes any unsaved source files to the workspace, builds the React/Vite bundle, and registers it as the workspace's current deployed bundle. On success the modal shows the bundle URL and the ready-to-embed snippet. |
+A publish writes these workspace assets and settings:
 
-Every Publish action persists three things:
-- The bundled JavaScript (served at `/builtin-bundles/<slug>.<hash>.js`).
-- The new entry in the workspace `versions` history.
-- A `workspaces.versions.published` event in the workspace Activity feed.
+| Location | Content | Access |
+|---|---|---|
+| `assets/src/` | The page sources | `private` |
+| `assets/dist/app/bundle.js` | The app bundle, replaced in place at every publish | The access selected in step 3, and the organizations and groups of step 4 |
+| `assets/dist/public/` | The prerendered public pages, their hydration script, and `sitemap.xml`. A page is public when it declares `access: 'public'`, or when the app is **Public** and the page does not declare `access: 'private'`. | `public` |
+| `config.value.bundles.<workspace-slug>` | The relative bundle path `assets/dist/app/bundle.js`, the version, and the access | Workspace configuration |
 
-A deployed bundle can be viewed read-only under the **Pages** sidebar entry until a newer version is published or rolled back.
+The organizations and groups of a private app are [bindings](/products/ai-builder/assets#share-a-private-asset-with-organizations-and-groups) of its bundle asset: they belong to the environment, are kept on every publish, and are never replaced by an import into an environment that already has some.
+
+An app published before these access levels keeps its access on its next publish: **Public** stays **Public**, and **Sign-in required** becomes **Signed-in users**, like an app published before both options existed.
+
+A publish also removes from `assets/dist/public/` the prerendered files it did not write, such as the page of a route that was deleted or made private, so that they are no longer served. If some of them can't be removed, the dialog says so: publish again to remove them.
+
+The workspace configuration stores the bundle as a relative path, resolved against the API host of the environment that serves the app, so a workspace imported into another environment serves its own copy of the bundle.
+
+Prerendered pages use CSS and a hydration script served by the platform. When the platform serves a newer version of these files, the **Publish** button shows a badge and the dialog shows `A newer version of the platform files used by your pages is available: publish again to use it.` When the version used by the pages is no longer served, the dialog shows `These pages use a platform file version that is no longer served: publish them again.` In both cases, publish the pages again.
+
+### Prerendered pages and the visitor session
+
+Prerendered pages are served by the API in a sandbox, isolated from the API and from the platform: they never get the session of their visitor. A prerendered page:
+
+- can call a webhook or the API without session, with `fetch()` without credentials or with an HTML form, for example to send a contact form to a public webhook;
+- cannot call a webhook or the API with the session of a signed-in visitor, so it cannot show content specific to this visitor;
+- cannot use `localStorage`, `sessionStorage`, or `document.cookie`, which throw an error in the sandbox.
+
+A page that calls an automation with the session of the visitor, or that reads their data, must be opened through the app: `https://<platform-host>/p/<workspace-slug>/<page-path>` or `https://<platform-host>/apps/<workspace-slug>/<page-path>`. The same page code runs there with the session of the signed-in visitor. To combine both, keep the public content in the prerendered page and link its signed-in actions to the app URL of the page.
 
 ### Share tab
 
-The Share tab generates the public links and embed snippets needed to expose the deployed bundle outside the Builder.
+The **Share** tab is available once the pages are published. It lists two URLs, each with **Open** and **Copy** buttons:
 
-#### Platform URL
+| URL | Form | Who can open it |
+|---|---|---|
+| **In Platform** | `https://<platform-host>/apps/<workspace-slug>` | Signed-in users allowed by the app access, inside the Platform menu |
+| **Standalone** | `https://<platform-host>/p/<workspace-slug>` | Anyone for a **Public** app, signed-in users allowed by the app access otherwise, without the Platform menu |
 
-A copyable URL of the form `https://<platform-host>/apps/<workspace-slug>`. This is the workspace runtime URL: anyone with workspace access can open the deployed app at that address.
+To change who can open the app, select another access on the **Publish** tab and publish again.
+
+#### Embed on another site
+
+{/* REVIEW: platform/public/embed.js mounts the chat widget iframe (`/embed/chat`) and does not read `data-bundle-url`: confirm with the platform team how a published app bundle is embedded before documenting this snippet further. */}
+
+The **Embed on another site** section generates a `<script>` snippet that loads `https://<platform-host>/embed.js`.
 
 #### Embed modes
 
@@ -116,36 +153,15 @@ Four mutually exclusive display modes are exposed. Each one generates a `<script
 
 #### Generated snippet
 
-The Share tab writes the snippet directly into the modal; copy it as-is. Examples for each mode:
+The **Share** tab writes the snippet into the dialog: select **Copy** and paste it as-is. For example, for the **Inline** mode:
 
 ```html
-<!-- Inline: embed inside a container you place on the host page -->
 <div id="prisme-app"></div>
 <script src="https://<platform-host>/embed.js"
-  data-bundle-url="/builtin-bundles/<slug>.<hash>.js"
+  data-container="#prisme-app"
+  data-bundle-url="https://<api-host>/v2/workspaces/<workspace-slug>/assets/dist/app/bundle.js"
   data-workspace-id="<workspace-id>"
   data-mode="inline"
-  data-container="#prisme-app"
-></script>
-```
-
-```html
-<!-- Popover: floating bubble bottom-right, no markup needed on the host page -->
-<script src="https://<platform-host>/embed.js"
-  data-bundle-url="/builtin-bundles/<slug>.<hash>.js"
-  data-workspace-id="<workspace-id>"
-  data-mode="popover"
-></script>
-```
-
-```html
-<!-- Modal / Bottom Sheet: provide a trigger button on the host page -->
-<button id="open-app">Open the assistant</button>
-<script src="https://<platform-host>/embed.js"
-  data-bundle-url="/builtin-bundles/<slug>.<hash>.js"
-  data-workspace-id="<workspace-id>"
-  data-mode="modal"
-  data-trigger="#open-app"
 ></script>
 ```
 
@@ -153,7 +169,7 @@ The Share tab writes the snippet directly into the modal; copy it as-is. Example
 
 | Attribute | Required | Description |
 |---|---|---|
-| `data-bundle-url` | recommended | URL of the deployed bundle. If omitted, `embed.js` fetches `/builtin-bundles/bundle-map.json` and looks up the bundle by app slug. |
+| `data-bundle-url` | recommended | URL of the published app bundle, `https://<api-host>/v2/workspaces/<workspace-slug>/assets/dist/app/bundle.js`. |
 | `data-workspace-id` | yes | The workspace whose runtime context (auth, events, SDK) the app will receive. |
 | `data-mode` | yes | `inline`, `popover`, `modal`, or `bottom-sheet`. Case-sensitive. |
 | `data-container` | inline only | CSS selector of the host element. Defaults to `#prisme-app`. |
@@ -162,9 +178,7 @@ The Share tab writes the snippet directly into the modal; copy it as-is. Example
 | `data-primary-color`, `data-background-color` | no | Override the app's CSS variables for branding. |
 | `data-auth` | no | Pre-supplied authentication strategy (e.g. a JWT) when the host page already knows the user. |
 
-#### Bundle hosting and CORS
-
-The bundle is fetched cross-origin with `mode: 'cors'`, so the server returning `/builtin-bundles/<slug>.<hash>.js` must reply with `Access-Control-Allow-Origin: *` (the platform sets this header by default). If you self-host the bundle behind a CDN or proxy, preserve the header.
+#### Host page requirements
 
 `embed.js` injects its own CSS and loads Tailwind from `cdn.tailwindcss.com`. The host page's CSP must allow:
 - `script-src` for the platform host and `esm.sh`,
@@ -173,7 +187,7 @@ The bundle is fetched cross-origin with `mode: 'cors'`, so the server returning 
 
 #### Update flow
 
-Publish → Share is a single cycle. To roll an embed forward, redeploy from the Publish tab: the bundle URL changes (its hash is content-addressed), so re-copy the snippet into the host page. Hosts that omit `data-bundle-url` will pick up the new version automatically because `bundle-map.json` is updated by every Publish.
+The bundle URL does not change between publishes: publishing again replaces the bundle in place, so pages and snippets that reference it pick up the new version without any change. For a **Public** app, shared caches can keep serving the previous bundle for up to 10 minutes (`s-maxage=600`).
 
 ## Versioning Your Application
 

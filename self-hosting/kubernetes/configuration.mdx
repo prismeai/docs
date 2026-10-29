@@ -179,6 +179,8 @@ By default, the API gateway only accepts cross-origin requests from `CONSOLE_URL
 |---------|---------|-------------|
 | `CORS_ADDITIONAL_ALLOWED_ORIGINS`<br/>Helm: `prismeai-api-gateway.env` | - | Comma-separated list of extra origins accepted for CORS, in addition to `CONSOLE_URL` and workspace custom domains. Each entry must include the scheme (e.g. `https://www.example.com,https://app.partner.com`). Required when embedding the chat widget or calling the API from a third-party site. |
 
+A request from an opaque origin, such as `Origin: null` sent by a sandboxed iframe or a local file, only receives anonymous CORS access (`Access-Control-Allow-Origin: *`, without credentials), whatever the allowlist: the published public pages of a workspace run in such a sandbox and can call public webhooks, but never with the session of their visitor. Any website can make the same anonymous calls by running in a sandbox. Calls that relied on the visitor's cookies from a sandboxed iframe or a `file://` page are refused: send a token in the `Authorization` header, or serve the page from an allowed origin.
+
 ---
 
 ## Exposing several front-end domains
@@ -261,6 +263,29 @@ Adding a new front domain later is then a three-line change: add it to `global.c
 | `UPLOADS_MAX_SIZE`<br/>Helm: `prismeai-api-gateway.env`, `prismeai-workspaces.env`, `prismeai-runtime.env` | `100000000` (100 MB) | Max user upload size in bytes. The chart sets this on all three services; lower it if you want to clamp uploads further. |
 | `UPLOADS_ALLOWED_MIMETYPES`<br/>Helm: `prismeai-workspaces.env` | - | Comma-separated MIME types accepted on upload. Recommended: `image/*,text/*,video/*,audio/*,application/*,font/*,message/rfc822`. |
 | `REQUEST_MAX_SIZE`<br/>Helm: `prismeai-functions.env`, `prismeai-api-gateway.env` | `1mb` | Max request body size accepted by the service. Raise `prismeai-functions` to `20mb` for code-heavy automation payloads. |
+| `UPLOADS_TMP_DIR`<br/>Helm: `prismeai-workspaces.env` | `prismeai-uploads` in the system temporary folder (`/tmp/prismeai-uploads`) | Folder where `prismeai-workspaces` writes uploaded files and imported workspace archives before storing or importing them, so that their size does not count in the service memory. See [Temporary disk for uploads and imports](#temporary-disk-for-uploads-and-imports). Introduced in v27.9.1. |
+| `ASSETS_MAX_SIZE`<br/>Helm: `prismeai-workspaces.env` | `20000000` (20 MB) | Max size in bytes of a [workspace asset](/products/ai-builder/assets), uploaded or imported. Larger imported assets are skipped. Introduced in v27.9.1. |
+| `ASSETS_ALLOWED_MIMETYPES`<br/>Helm: `prismeai-workspaces.env` | `text/*,application/javascript,application/json,application/xml,image/*,font/*` | Comma-separated MIME types accepted for workspace assets. Introduced in v27.9.1. |
+
+### Temporary disk for uploads and imports
+
+<Info>Introduced in v27.9.1.</Info>
+
+`prismeai-workspaces` writes each uploaded file, each imported workspace archive, and each workspace archive nested in a bulk archive to `UPLOADS_TMP_DIR`, and removes it once the upload or the import ends. Its own files left behind by a restart are removed after one day, when the service starts. Use a folder dedicated to `prismeai-workspaces`.
+
+- Size the folder for the concurrent uploads and imports you expect: each one needs up to `UPLOADS_MAX_SIZE` of disk, plus the size of its largest nested workspace archive for a bulk import, at most `IMPORT_NESTED_ARCHIVE_MAX_SIZE` (5 × `UPLOADS_MAX_SIZE` by default). A bulk archive holding a bigger workspace archive is refused.
+- The default folder is writable by any user, including the arbitrary user id of an OpenShift pod. With a read-only root filesystem, mount a writable volume, such as an `emptyDir`, and set `UPLOADS_TMP_DIR` to its path.
+- When the folder cannot be written at all, the service logs a warning and keeps uploads and imports in memory. A writable folder that is too small makes large uploads and imports fail instead, or gets the pod evicted when it exceeds its ephemeral storage limit.
+
+### Serving workspace assets
+
+<Info>Introduced in v27.9.1.</Info>
+
+[Workspace assets](/products/ai-builder/assets) are served by the api-gateway through an `assets` endpoint that accepts requests without a session, so that `public` assets, including published public pages, open without signing in. The `prismeai-core` chart adds this endpoint to the `downloads` pipeline of the api-gateway configuration. If you maintain your own api-gateway configuration, add an `assets` endpoint for `GET /v2/workspaces/:workspaceId/assets/*` to a pipeline with optional authentication, proxied to `workspaces`, such as `downloads`, before the `workspaces` pipeline. Without it, a `public` asset requested without a session is refused.
+
+Uploads of assets go through a dedicated `assetUploads` pipeline (`POST /v2/workspaces/:workspaceId/assets`), placed before the `workspaces` pipeline, with a proxy timeout of 120 seconds. Without it, asset uploads go through the `workspaces` pipeline and its 20-second timeout, which a large publish can exceed. The Builder sends a publish in batches of at most 200 files or 40 MB: keep `UPLOADS_MAX_SIZE` at 40 MB or more.
+
+The `prismeai-core` chart includes the `assets` endpoint and the `assetUploads` pipeline from version 1.13.0.
 
 ---
 
