@@ -325,8 +325,11 @@ update:
 | The property was | What happens to existing values |
 | --- | --- |
 | `string` or `text` | JSON objects and arrays are parsed; everything else stays the string it was (`123` stays `"123"`) |
-| `json` already | every value the platform serialized comes back as written (`"abc"` → `abc`, `123` → `123`, objects and arrays parsed); text that is not valid JSON stays a string |
+| `json` already | every value the platform serialized comes back as written (`"abc"` → `abc`, `123` → `123`, objects and arrays parsed); text that is not valid JSON stays a string. See below for collections moved from MongoDB |
 | unknown (no previous schema, not declared, or another type) | **nothing is converted**, see below |
+
+A column that is neither text nor json (a number, a boolean or a date column,
+for instance) is never converted automatically either: see below.
 
 A column that used to be an `array` (text array) is always converted, each
 array becoming the same JSON array.
@@ -337,9 +340,20 @@ array becoming the same JSON array.
   `json` property stored in a text column is read as the raw text.
 </Note>
 
-When the platform cannot tell, it leaves the column alone and emits a
-`workspaces.collections.notMigrated` event in the activity feed: the column,
-the reason, and the migration to declare (`skipped[].howTo`). The collection
+<Warning>
+  **Collections moved from MongoDB to PostgreSQL.** The migration creates a
+  field that held only strings as a text column, with the strings as they
+  were. If the property is declared `json`, a string such as `123`, `true` or
+  `null` in that column is read as a number, a boolean or `null` once the
+  column is converted, like the values the platform serialized itself. The
+  `workspaces.collections.migrated` event counts these values in `retyped`, so
+  you can check whether a collection is affected.
+</Warning>
+
+When the platform cannot tell, or cannot convert the column type, it leaves the
+column alone and emits a `workspaces.collections.notMigrated` event in the
+activity feed: the column, the reason, and the migration to declare
+(`skipped[].howTo`). The collection
 keeps working on its previous schema until you declare it, as described below.
 
 ### Declaring a migration
@@ -391,8 +405,9 @@ migration is skipped.
 </Warning>
 
 The conversion rewrites the table while locking it. If the table stays locked
-by something else for more than 5 seconds, the conversion gives up rather than
-block every request on the collection, and runs again at the next update.
+by something else for more than 5 seconds (`COLLECTIONS_MIGRATION_LOCK_TIMEOUT_MS`
+on a self-hosted runtime), the conversion gives up rather than block every
+request on the collection, and runs again at the next update.
 
 ### Converting to json
 
@@ -416,13 +431,66 @@ column whose values were all written as JSON.
 
 A migration that actually converts data emits a
 `workspaces.collections.migrated` event in the activity feed, reporting the
-column, the type it had, the type it became, the number of rows rewritten and
-how long it took. A migration that matches nothing emits nothing.
+column, the type it had, the type it became, the number of rows rewritten
+(`rows`, an estimate when `rowsEstimated` is true), how many of them now read
+as a number, a boolean or `null` instead of a string (`retyped`, with `lenient`
+only) and how long it took. A migration that matches nothing emits nothing.
 
 If a declared migration fails, the collection keeps working on its previous
 schema and the `workspaces.collections.notMigrated` event tells you which column
 refused and why (`failed`), so the failure is visible immediately instead of
-surfacing weeks later.
+surfacing weeks later. A conversion undone because the rest of the schema update
+failed after it is listed in `rolledBack`.
+
+### Checking and converting from an automation
+
+Without access to the database, two functions of the
+[collections module](/products/ai-builder/module-collections) let an automation
+of your workspace do the same, on its own collections only:
+
+- `getSchemaDrift` lists the collections whose table no longer matches their
+  configuration: a column of the wrong type, a column that was never created.
+- `runSchemaMigrations` converts the columns of one collection with the
+  migrations you give it, then synchronizes the collection with its
+  configuration, exactly like an update of the Collection instance. With
+  `dryRun: true`, it only tells you what it would convert, and how.
+
+```yaml
+- run:
+    module: collections
+    function: getSchemaDrift
+    output: drift
+# drift.collections[0]: { collection: agents, columns: [{ column: description, from: text, to: jsonb, changes: [type] }, ...] }
+- run:
+    module: collections
+    function: runSchemaMigrations
+    parameters:
+      collection: agents
+      dryRun: true
+      migrations:
+        - op: alterColumnType
+          column: description
+          from: [text, character varying]
+          to: jsonb
+          cast: auto
+    output: plan
+```
+
+Check `plan.planned` (the cast, the number of rows, `retyped`), then run the
+same call without `dryRun`: the conversion emits the same
+`workspaces.collections.migrated` event, and `getSchemaDrift` no longer lists
+the collection. To keep the migration for the instances you have not converted
+yet, declare it in the configuration as well.
+
+A few rules:
+
+- declare the property `json` in the configuration first: only conversions to
+  `jsonb` of `json` properties are accepted, since the synchronization brings
+  every other column back to its declared type;
+- run it once, from a manual or one-shot automation: each call synchronizes the
+  collection, even with nothing to convert, and never take the `migrations`
+  from a request payload;
+- PostgreSQL only: on MongoDB there are no column types, so no drift.
 
 ## Basic Operations
 
