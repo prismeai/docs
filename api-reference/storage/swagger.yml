@@ -2743,9 +2743,12 @@ components:
             connector must refresh it via the upsert (`POST
             /documents` with the same `source_url`); it is never a
             user-actionable error and never occurs for
-            `uploaded_file` sources. `rejected` means an external hook
-            (`before_file_ingest` / `after_file_parse`) blocked the
-            content - see `rejection_reason` / `rejected_by`.
+            `uploaded_file` sources. `rejected` means a
+            `before_file_ingest` hook blocked the content (an
+            `after_file_parse` block is `failed` with
+            `last_error.code: HookRejected`) - see `rejected_by`, and
+            `public_rejection_reason` for the only reason that may be
+            shown to an end user.
         index_generation:
           type: integer
           minimum: 1
@@ -2867,9 +2870,26 @@ components:
         rejection_reason:
           type: string
           description: |
-            Set when `status: rejected`. Why an external hook blocked
-            the content. Surfaced to the user only when the resolved
-            hook config sets `expose_reason: true`.
+            Why an external hook blocked the content, as the hook gave
+            it: kept whether or not the hook config sets
+            `expose_reason`, so it is for the knowledge base's
+            administrators: never relay it to an end user, and returned
+            only to the base's owners and storage / platform admins
+            (null for any other reader). Set when
+            `status: rejected` (`before_file_ingest`) and on a document
+            `failed` with `last_error.code: HookRejected`
+            (`after_file_parse`). With `public_rejection_reason` and
+            `rejected_by`, it is the trace of the last refusal: a
+            reindex keeps it and the next failure resets it, so it is
+            meaningful only while the document is `rejected` or
+            `failed` with `last_error.code: HookRejected`.
+          nullable: true
+        public_rejection_reason:
+          type: string
+          description: |
+            The part of `rejection_reason` the hook allowed to be shown
+            (`expose_reason: true`); empty otherwise. The only refusal
+            reason a client or an agent may relay to the end user.
           nullable: true
         rejected_by:
           type: string
@@ -3019,9 +3039,11 @@ components:
             agent-factory). Merged with the server-resolved
             platform/org/agent hook config. A `before_file_ingest` or
             `after_file_parse` hook may transform or block the content;
-            a block yields `403 HOOK_REJECTED` (sync) or a document in
-            `status: rejected` (async), with `rejection_reason` /
-            `rejected_by` set. Write-only; never returned.
+            a block yields `403 HOOK_REJECTED` (sync) or a document
+            `failed` with `last_error.code: HookRejected` (async), with
+            `rejected_by` and `public_rejection_reason` set (the latter
+            only when the hook sets `expose_reason`). Write-only; never
+            returned.
           items:
             type: object
             additionalProperties: true
@@ -3759,10 +3781,11 @@ components:
               value:
                 error:
                   code: HOOK_REJECTED
-                  message: Content was rejected by a compliance hook.
+                  message: Rejected by policy.
                   details:
-                    rejected_by: hook_pii_filter
-                    rejection_reason: detected_unmasked_pii
+                    document_id: vsf_0123456789abcdef
+                    blocked_by: hook_pii_filter
+                    public_rejection_reason: ''
     Error404:
       description: Resource does not exist or is not visible to the caller.
       content:
