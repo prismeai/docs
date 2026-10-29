@@ -144,6 +144,48 @@ For each test case:
 | **Actual Output** | What the agent actually said |
 | **Feedback** | Explanation of scoring |
 
+### Errored cases
+
+An errored case is a test case that the evaluation could not measure, because the call to your agent or to the judge model failed. A failed case means the judge scored your agent's answer and found it below expectations. An errored case means no judgment was produced, so it says nothing about your agent's quality.
+
+An errored case behaves as follows:
+
+- It has no score. It is excluded from the run score and from regression detection, so an outage or a quota limit never lowers your score.
+- It is counted under **Errored** in the run summary, separately from **Passed** and **Failed**. The **Errored** count appears only when at least one case errored.
+- It is never stored as passed, including a multi-turn case: the conversation stops at the first turn that fails.
+- Its actual output is empty. When the agent call fails, the judge is not called.
+- Its feedback starts with the failure kind, followed by the error message, for example `AGENT_RATE_LIMITED: ...`.
+
+In the per-test results, an errored case shows the same icon and a `0%` score badge as a failed case. Read the feedback to tell them apart.
+
+The failure kind names the cause and tells you whether to act:
+
+| Failure kind | Meaning | What to do |
+|---|---|---|
+| `AGENT_RATE_LIMITED` | Your agent's model hit its requests-per-minute or tokens-per-minute limit, and the case was still throttled after the automatic replays. | Run the case again once the limit resets. If large runs keep hitting it, ask your organization administrator to review the model's rate limits. |
+| `AGENT_UNAVAILABLE` | Agent Factory or the LLM gateway answered HTTP `502`, `503`, or `504` (a temporary outage) and was still unavailable after the automatic replays. | Run the case again later. |
+| `AGENT_QUOTA_EXHAUSTED` | Your agent's monthly token or cost quota is spent (`MONTHLY_TOKENS_EXCEEDED` or `MONTHLY_COST_EXCEEDED`). The case is not replayed. | Ask your organization administrator to raise the quota, or wait for the quota to reset next month. |
+| `AGENT_ERROR` | Any other failed agent call: an HTTP error, a failed agent task, or the platform's nested-call limit. | Read the error message in the feedback, then send the same input in the Playground to reproduce and fix the problem. |
+| `JUDGE_RATE_LIMITED` | Your agent answered, but the judge model was still throttled after the automatic replays. | Run the case again later. |
+| `JUDGE_UNAVAILABLE` | Your agent answered, but the judge model answered HTTP `408`, `502`, or `504` (a timeout or a temporary outage) after the automatic replays. | Run the case again later. |
+| `JUDGE_QUOTA_EXHAUSTED` | The monthly token or cost quota of the judge model is spent. The case is not replayed. | Select a different judge model for the run, or ask your organization administrator to raise the quota. |
+| `JUDGE_CALL_DEPTH` | The judge call reached the platform's nested-call limit. The run first leaves the case aside and resumes it automatically; the case is stored as errored only if it fails again. | If it persists, ask your platform administrator to review the nested-call limit for this agent. |
+| `JUDGE_AUTH` | The evaluation could not authenticate with the LLM gateway (HTTP `401` or `403`). If the message names `AGENT_FACTORY_API_KEY`, the organization API key used for scheduled and resumed runs is not configured. | Ask your platform administrator to configure the API key. |
+| `JUDGE_ERROR` | Any other failure of the judge call. | Read the error message in the feedback, then run the case again. |
+| `JUDGE_UNPARSEABLE` | The judge model answered, but its answer contained no usable judgment. | Run the case again. If it recurs, select a different judge model. |
+| `EXECUTION_ERROR` | The case could not run at all, for example because the test case was deleted during the run. | Check that the test case still exists, then run it again. |
+
+#### Automatic replays
+
+Before a case is stored as errored, temporary failures are replayed automatically:
+
+- **Agent rate limit or outage** (`AGENT_RATE_LIMITED`, `AGENT_UNAVAILABLE`): the whole case is replayed after the delay the LLM gateway asks for, or 5 seconds when the gateway gives none, with each wait capped at 60 seconds. The run replays the case up to 3 times by default (the `config.queue.max_retries` setting of the evaluation service), then stores it as errored. Replays are not counted in the results.
+- **Multi-turn case**: a replay restarts from the first turn in a new conversation, so the turns that had already answered run again and their agent and judge calls are billed again.
+- **Judge rate limit or outage** (`JUDGE_RATE_LIMITED`, `JUDGE_UNAVAILABLE`): only the judge call is replayed, with the answer your agent already gave, so your agent is not called again. The same replay limit applies, within 60 seconds of total waiting per judgment.
+- **Monthly quota exhausted** (`AGENT_QUOTA_EXHAUSTED`, `JUDGE_QUOTA_EXHAUSTED`): never replayed, because a monthly quota does not reset before the next month.
+
+Other failure kinds are not replayed.
+
 ### Regression Detection
 
 When you run multiple evaluations, the system detects:
