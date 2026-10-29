@@ -3,9 +3,12 @@ title: "Workspace Templates"
 description: "Publish a workspace as a starting point others can clone from the Builder"
 ---
 
-A **workspace template** is a workspace that appears as a "Start from template" tile when a user creates a new workspace in [Builder](/products/ai-builder/overview). Picking it duplicates the source workspace (automations, imports, pages, configuration) into a fresh workspace owned by the user.
+A **workspace template** is a workspace that appears as a tile when a user creates a new workspace in [Builder](/products/ai-builder/overview). Picking it duplicates the source workspace (automations, imports, pages, configuration, security rules) into a fresh workspace owned by the user.
 
-Templates are declared at the organization level via the **Menu Editor**, so publishing one is a governance task, while the source workspace itself is built and maintained through Builder's full-code door. In other words, the same unified foundation lets governance publish a reusable starting point that builders then fork and adapt. See [Builder](/products/ai-builder/workspaces) for the source-workspace side.
+Publishing a template takes two independent steps, owned by two different roles:
+
+1. **In Builder**, the owner of the source workspace marks it as a template. This is what makes it *duplicable* by other users.
+2. **In AI Governance**, an organization admin adds a **Template Feature** in the **Menu Editor**. This is what makes it *discoverable*, as a tile in Builder's creation flow.
 
 Use templates to:
 
@@ -15,131 +18,145 @@ Use templates to:
 
 ## How templating works
 
-Templates are declared in **AI Governance** as **Template Features** on a navigation menu item. The Builder reads the platform navigation to populate its "Create new workspace" screen; every Template Feature shows up as a tile.
-
 ```mermaid
 flowchart LR
-  A[Your polished workspace] -->|"templateId"| B[Template Feature<br/>in Govern → Menu Editor]
-  B --> C["Tile in Builder's<br/>'Create new workspace'"]
-  C -->|"user clicks tile"| D[POST /workspaces/&lt;templateId&gt;/<br/>versions/current/duplicate]
-  D --> E[Fresh copy<br/>in the user's account]
+  A["Source workspace<br/>(Make this workspace a template: on)"] -->|"workspace id"| B["Template Feature<br/>in Govern → Menu Editor"]
+  B --> C["Tile in Builder<br/>'In the Builder' tab"]
+  C -->|"user picks the tile,<br/>then clicks Create Workspace"| D["POST /workspaces/&lt;templateId&gt;/<br/>versions/current/duplicate"]
+  D --> E["New workspace<br/>owned by the user"]
 ```
 
-When the user picks a template, the Builder calls `POST /workspaces/<templateId>/versions/current/duplicate`. The duplicate inherits all content but gets a new id, a `- Copie` suffix in its name (which the user can rename in the next step), and is owned by the cloning user.
+The Builder reads the organization's navigation and turns every Template Feature it finds into a tile. When the user confirms the creation wizard, the Builder calls `POST /workspaces/<templateId>/versions/current/duplicate`, then renames the copy with the name and description entered in the wizard.
 
-## Step 1: Polish your source workspace
+## Step 1: Prepare and mark the source workspace
 
 Before publishing, treat your source as a product:
 
-- **Name & description**: both are surfaced to the user during template selection. Be concrete: `RAG agent over a public website` beats `My template`.
-- **Photo / icon**: set one in workspace settings. It's the visual users see in the gallery.
-- **Configuration schema**: if your template needs the cloning user to provide values (an API base URL, a brand name, etc.), declare them in `config.schema`. The Builder will render a form when they instantiate the template.
-- **Secrets schema**: for sensitive values (API keys), declare them in `secrets.schema`. The user is prompted at instantiation and the values land in their workspace's Secrets.
-- **No personal data**: clear out test users, real tokens, hard-coded customer ids. Anything that would embarrass you in someone else's workspace shouldn't be in the template.
+- **Make it work out of the box**: the copy should run without manual fixup, apart from the secrets the user has to provide (see [Configuration and secrets](#configuration-and-secrets)).
+- **No personal data**: clear out test users, real tokens and hard-coded customer ids. Configuration values are copied as-is, so anything that would embarrass you in someone else's workspace shouldn't be in the template.
+- **Document it**: a README page or an automation description goes a long way, since the tile itself only shows a label.
 
-- **Mark it as a template** with the toggle in Builder (workspace settings). This provisions two things together: the `template` label *and* two open-read DSUL security rules (`read` on `workspaces` and `pages`). It's **those security rules — not the label —** that authorize users who don't otherwise have access to the source to duplicate it. Without them, the duplicate call is denied for anyone but the workspace's own collaborators, and the "Start from template" tile fails silently.
-
-Note the **workspace id** (visible in the URL when you open the workspace, e.g. `kFoNvfX`); you'll need it in step 2.
-
-<Info>
-The public-duplication grant is the pair of open-read security rules, not the label itself: they grant `read` on the workspace and its pages to any authenticated user, which is what lets a non-collaborator clone the source. The resulting workspace is still owned by the cloning user, with default security — the source's collaborators and custom roles are **not** inherited, and the open-read rules themselves are stripped from the copy (they carry a `REMOVE_ON_DUPLICATE` marker). Turn off **Mark as template** to remove both the label and the rules, immediately stopping new duplications without touching the source content.
-</Info>
+Then open the workspace in Builder, go to **Settings**, and turn on **Make this workspace a template** (section **Public Template**).
 
 ![Workspace Settings page with Workspace Name, Description, and Slug fields filled in](/images/howto/workspace-templates-settings.png)
 
-## Step 2: Declare it as a Template Feature in AI Governance
+The toggle provisions two things together:
 
-Templates are managed at the **organization** level via the **Menu Editor**. Anyone with admin access to the org navigation can publish a template.
+| What | Purpose |
+|---|---|
+| The reserved `template` label | Marks the workspace as a template. AI Governance checks it before accepting a Template Feature that points to this workspace. |
+| Two open-read security rules (`read` on `workspaces` and `pages`, reason `template:REMOVE_ON_DUPLICATE`) | Let **any signed-in user** read the workspace and its pages, which is what allows someone who isn't a collaborator to duplicate it. |
 
-1. Open the **Govern** product (AI Governance) from the sidebar.
+It's **the security rules, not the label**, that authorize duplication. Without them, the duplicate call is denied for anyone but the workspace's own collaborators.
+
+<Warning>
+A template is readable by every signed-in user of the platform, not only by the people who can see its tile. Hiding the tile (see [Visibility](#visibility)) does not prevent someone who knows the workspace id from duplicating it through the API. Never put confidential logic or data in a template.
+</Warning>
+
+Turning the toggle off removes both the label and the rules: new duplications stop immediately, existing copies and the source content are untouched.
+
+Note the **workspace id** (visible in the Builder URL, e.g. `/builder/kFoNvfX`): you'll need it in step 2.
+
+## Step 2: Declare a Template Feature in AI Governance
+
+Template Features live in the organization's navigation, managed from the **Menu Editor**.
+
+1. Open **Govern** (AI Governance) from the sidebar.
 2. Go to **Menu Editor**.
-3. Open (or create) a menu item where the template should be discoverable. Templates are attached as *features* of menu items; typically you'd attach them under a "Builder" or "Workspaces" entry.
+3. Edit (or create) the menu item the template should be attached to, typically the **Builder** entry. The tile is shown to every user who can see that item (see [Visibility](#visibility)).
 4. Click **Add Feature → Template Feature**.
-5. Fill in the four fields:
+5. Fill in the fields:
 
 | Field | Description |
 |---|---|
-| **Slug** | Short identifier used in URLs and translations (e.g. `custom-rag-template`). Lowercase, hyphens. |
-| **Template ID** | The workspace **id or slug** of the source template (the one from step 1). |
-| **Label** | The display name shown on the tile in Builder. |
-| **Permissions** | Optional. Restricts visibility to roles holding any of the listed permissions. Leave empty to make the template visible to everyone with platform access. |
+| **Template ID** | The **workspace id** of the source workspace from step 1. |
+| **Label** | The name shown on the tile in Builder. Localized: switch the editing language to provide one label per language. |
+| **Permissions** | Stored with the feature, but **not applied to template tiles** today. Restrict the parent menu item instead. |
 
-6. **Save Changes**. The **Template ID** is validated on save: the feature is rejected unless the id references a workspace that **exists**, is **readable by you**, and is **declared as a template** (carries the `template` label). This avoids publishing a tile that would fail at instantiation — or one that only works for you because you can read a workspace others can't.
+The feature's internal slug is generated from the label (with a numeric suffix if another feature already uses it), so there is no Slug field to fill.
 
-Equivalent YAML if you edit the navigation via the API:
+6. **Save**. Every Template ID is checked against the backend before the navigation is saved:
+   - if the workspace doesn't exist, or you can't read it, the editor shows *"This workspace doesn't exist or you don't have access to it."*;
+   - if it exists but isn't marked as a template, the editor shows *"This workspace exists but isn't declared as a template yet. Enable it from the workspace's Settings first."*
+
+   This prevents publishing a tile that would fail for every other user.
+
+![Menu Editor in Govern listing the Use, Create, Monitor and Run categories that compose the platform navigation](/images/howto/workspace-templates-menu-editor.png)
+
+<Tip>
+The tile appears in Builder as soon as the navigation is saved, with no rebuild or cache flush.
+</Tip>
+
+If you edit the navigation through the API, a Template Feature looks like this (the `slug` is required here and must be unique across the whole menu):
 
 ```yaml
 menu:
-  - type: item
-    label: Builder
+  - id: builder
+    type: item
+    label:
+      en: Builder
+      fr: Builder
     icon: hammer
     href: /builder
     features:
       - type: template
         slug: custom-rag-template
         templateId: kFoNvfX
-        label: Custom RAG Template
-        permissions:
-          - builder:workspaces:create
+        label:
+          en: Custom RAG
+          fr: RAG personnalisé
 ```
 
-![Menu Editor in Govern listing the Use, Create, Monitor and Run categories that compose the platform navigation](/images/howto/workspace-templates-menu-editor.png)
+## Step 3: Verify the template
 
-<Tip>
-Adding the Template Feature is reflected immediately in Builder's "Create new workspace" screen, with no rebuild or cache flush.
-</Tip>
+Test with a user who is **not** a collaborator of the source workspace, otherwise a missing security rule would go unnoticed.
 
-## Step 3: (Optional) Add a configuration form
+1. In Builder, click **Create new workspace**.
+2. In the **What do you want to build?** dialog, open the **In the Builder** tab. Your template appears as a tile between **From Scratch** and **Import ZIP**, with your label and the generic description *Create from template*.
+3. Pick the tile. The **Create Workspace** wizard opens with your template preselected on the **Type** step; click **Next**. The **Details** step is prefilled with the template label as name.
+4. Adjust the name and description, then click **Create Workspace**. The duplication runs at this point (*Preparing workspace...*), and you land in the new workspace.
+5. Check that the expected automations, imports, pages and configuration are there, and fill in the secrets.
 
-If your template needs inputs at instantiation, declare them in the source workspace's `config.schema`. The Builder renders a form, and the values become accessible inside the cloned workspace as `{{config.<field>}}`.
+![Create Workspace wizard in Builder showing the From Scratch and Import ZIP tiles; published templates appear here as additional tiles once declared](/images/howto/workspace-templates-new-workspace-modal.png)
 
-```yaml
-# In the source workspace (config tab)
-config:
-  schema:
-    sourceUrl:
-      type: string
-      title: Website to crawl
-      description: The starting URL the RAG agent will index
-      required: true
-    brand:
-      type: string
-      title: Brand name
-      description: Used in the agent's greeting and prompts
-secrets:
-  schema:
-    OPENAI_API_KEY:
-      type: string
-      title: OpenAI API Key
-      description: Required to call the embedding model
-      required: true
-      secret: true
-```
+If the creation fails with *Failed to create workspace from template*, the most common cause is that the source is no longer marked as a template (toggle turned off, or security rules edited by hand).
 
-After filling the form, the user lands in a fully wired workspace where every `{{config.sourceUrl}}` reference resolves to their value.
+## What the copy contains
 
-{/* Screenshot to add: screenshot of the "Create new workspace" wizard in Builder showing the configuration form rendered from the schema above: Website to crawl input, Brand name input, OpenAI API Key field with a key icon. */}
+| Copied from the source | Reset or left out |
+|---|---|
+| Automations, imports (app instances and their configuration), pages | Name and description: replaced by what the user entered in the wizard |
+| Workspace configuration (`config`, including its values), photo, repositories | Slug: a new random slug is generated |
+| Security roles and rules, **except** the template rules (`REMOVE_ON_DUPLICATE`), so the copy isn't itself open to everyone | Members: the user who created the copy is its only owner |
+| Labels, except `template`, `suggestions` and `production:*` | Secret values, files (uploads), collection data, events, custom domains, version history |
 
-## Step 4: Verify the template
+The copy also receives a `fromTemplate:<sourceWorkspaceId>` label, a queryable trace of its origin that isn't shown in the UI. A copy is never a template itself.
 
-1. Open Builder → click **New workspace**.
-2. The first step lets users pick a starting point. Your template should appear alongside **From scratch** and **Import ZIP**.
-3. Click your template tile, fill the configuration form (if any), and complete the wizard.
-4. The new workspace opens in your account; verify it has the expected automations, imports, and config.
+### Configuration and secrets
 
-![Create Workspace modal in Builder showing the From Scratch and Import ZIP tiles; published templates appear here as additional tiles once declared](/images/howto/workspace-templates-new-workspace-modal.png)
+The creation wizard only asks for a name and a description: it does **not** render a configuration form. Anything the user needs to customize happens in the new workspace after creation:
 
-<Note>
-**Visibility & permissions.** Template Features inherit the standard menu-item permission model: if you set `permissions`, the tile is visible only to users holding any of the listed permissions. Leave it empty to expose the template to everyone with access to the parent menu item. See [Permission-Based Visibility](/products/ai-governance/platform-customization#permission-based-visibility) for the full rules.
-</Note>
+- **Configuration**: values declared in the source `config` are copied as-is and resolve as `{{config.<field>}}` in the copy. Ship sensible defaults, and tell users which ones to change.
+- **Secrets**: values are never copied. Secrets declared in the source's configuration schema show up in the copy under **Settings → Secrets → Configuration Secrets**, empty, ready to be filled in.
+
+## Visibility
+
+Template tiles follow the visibility of the menu item that carries them:
+
+- if the user can see the parent menu item, they see all its Template Features;
+- to limit a template to some users, set **Permissions** on the parent menu item (for example on a dedicated item). See [Permission-Based Visibility](/products/ai-governance/platform-customization#permission-based-visibility).
+
+The **Permissions** field of the Template Feature itself is not taken into account for template tiles.
+
+Visibility only controls the tile. Who can actually *duplicate* the template is decided by the source workspace's security rules (step 1).
 
 ## Maintaining a template
 
 A template is just a workspace, so:
 
-- **Update it** like any other workspace; changes are picked up by future "Create new workspace" clicks (existing copies are not modified).
-- **Use [versioning](/products/ai-builder/versioning)** to mark stable releases. Builder always duplicates the `current` version, so pinning your changes through `current` lets you keep iterating on a separate branch.
-- **Retire a template** by removing the corresponding Template Feature from the Menu Editor. The source workspace stays intact.
+- **Update it** like any other workspace. Existing copies are never modified: the link between a copy and its template is one-shot.
+- **Iterate on a separate workspace.** The Builder always duplicates the source's `current` state, not a published version, so every save on the source is visible to the next user who clones it.
+- **Retire a template** by removing its Template Feature from the Menu Editor (the tile disappears) and turning off **Make this workspace a template** (duplication stops, including through the API). The source workspace stays intact.
 
 ## Templates vs publishing as an app
 
@@ -148,23 +165,23 @@ Don't confuse a **template** with **publishing a workspace as a platform app**:
 | | Workspace template | Published app |
 |---|---|---|
 | **Purpose** | Starting point users clone and modify | Live application users open and use |
-| **Where it's declared** | Govern → Menu Editor → Template Feature | "Add to Platform" modal (bundles + route) |
-| **What user gets** | A new workspace in their account | A new entry in the platform navigation |
-| **Where users find it** | "Create new workspace" → tiles | Sidebar / app launcher |
+| **Where it's declared** | Builder Settings toggle + Govern → Menu Editor → Template Feature | "Add to Platform" modal (bundles + route) |
+| **What the user gets** | A new workspace in their account | A new entry in the platform navigation |
+| **Where users find it** | Create new workspace → In the Builder | Sidebar / app launcher |
 
 You can do both: a template that users clone for customization *and* a published app that users open as-is.
 
 ## Related
 
 <CardGroup cols="2">
-  <Card title="Workspaces" icon="briefcase" href="/products/ai-builder/workspaces">
-    Workspace anatomy: configuration, secrets, sharing.
+  <Card title="Workspaces" icon="briefcase" href="/products/ai-builder/workspaces#project-templates">
+    The template flow from the Builder side: creating a workspace from a template.
   </Card>
   <Card title="Menu Editor" icon="bars" href="./platform-customization#menu-editor">
     Where Template Features live, plus the wider menu/navigation model.
   </Card>
   <Card title="Versioning" icon="code-branch" href="/products/ai-builder/versioning">
-    Pin a template to a stable version while you iterate.
+    Export, import and repository sync for the source workspace.
   </Card>
   <Card title="Identity & Access" icon="user-shield" href="./identity-access">
     Permissions model used by the Menu Editor's visibility filters.

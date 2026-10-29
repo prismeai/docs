@@ -70,6 +70,23 @@ This connector is used by four different roles. Jump to the section that matches
   - Sign-in / identity: `openid`, `profile`, `offline_access`
 - For the **application (client-credentials)** mode instead, grant the equivalent **application** permissions (e.g. `Sites.Read.All`, `Files.Read.All`) and have a Global Administrator grant admin consent.
 
+### Restricting the connector to chosen sites (`Sites.Selected`)
+
+`Sites.Read.All` reaches every site of the tenant. To give the connector a handful of sites only, use the `Sites.Selected` **application** permission with the `clientCredentials` mode:
+
+1. On the app registration, grant the `Sites.Selected` application permission (with `Files.Read.All` or `Files.ReadWrite.All` if needed) and have an administrator grant admin consent. On its own, `Sites.Selected` opens no site.
+2. A Microsoft 365 administrator grants the application access **site by site**, with the `read` or `write` role (Microsoft Graph `POST /sites/{site-id}/permissions`, or `Grant-PnPAzureADAppSitePermission`).
+3. In the connector's configuration app, open the **Authorized sites** tab, paste the URL of each granted site, choose its role (read or write), and save. The configuration app resolves each URL and lists, under each line, the sites the service account cannot open.
+
+Once sites are declared:
+
+- The agent only sees the declared sites. Listing sites returns that list, and search runs inside each declared site's default document library.
+- Every call that names a site or a document library outside the list is refused before it reaches Microsoft Graph, with a message naming the authorized sites. A site declared `read` refuses writes; a copy from it into a `write` site is allowed.
+- Microsoft Search (`/search/query`) and the user's personal OneDrive are not available: `Sites.Selected` does not cover them.
+- Search covers the default document library of each site, does not rank results across sites, does not return list items, and returns at most the first 200 hits.
+
+An empty list puts the connector back to the reach of its credential. The declaration also works with a tenant-wide permission, to expose fewer sites than the credential could reach.
+
 The OAuth scopes requested by default are:
 
 ```text
@@ -92,10 +109,8 @@ https://graph.microsoft.com/User.Read
       <api-url>/workspaces/<workspace-id>/webhooks/oauthCallback
       ```
 
-      (e.g. `https://api.studio.prisme.ai/v2/workspaces/7oQvI6Q/webhooks/oauthCallback` on production).
-
       <Warning>
-        Microsoft Entra rejects redirect URIs that contain a colon in the path, so use the **raw workspace id** of the core SharePoint workspace (`<workspace-id>`, e.g. `7oQvI6Q`), **not** the `slug:sharepoint-next` form used by other connectors. Copy the exact URI from the connector's configuration app, which renders it for you.
+        Microsoft Entra rejects redirect URIs that contain a colon in the path, so use the **raw workspace id** of the core SharePoint workspace (`<workspace-id>`), **not** the `slug:sharepoint-next` form used by other connectors. Copy the exact URI from the connector's configuration app, which renders it for you.
       </Warning>
 
       Add the Microsoft Graph **delegated** permissions listed in *Prerequisites*, create a **client secret** under **Certificates & secrets**, and note the **Application (client) ID**, the **secret value**, and the **Directory (tenant) ID** (or use `common` / `organizations` for multi-tenant).
@@ -138,7 +153,7 @@ https://graph.microsoft.com/User.Read
   </Note>
 
   <Warning>
-    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model**: which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). There is also **no OAuth auth-config JSON** to attach in Governance: connect / status / disconnect are handled by the connector's own webhooks, wired automatically.
+    Declaring the capability makes the connector **available**; it does not by itself authorize a specific agent. This connector follows the **tenant-context model**: which agents may actually call it is gated per-workspace by the **authorized-agents allowlist** in the configuration app (see the *Workspace builder* tab). Agents show a **Connect** button only if the catalog entry carries the connector's connect / status / disconnect webhooks in its `auth` block. The configuration app's **Add to catalog** button writes it for you. If you create the entry by hand, paste that block into **Auth Configuration**: the platform adds it later on its own only for a workspace endpoint (ending in `.mcp`), never for the connector's global `/webhooks/mcp` endpoint.
   </Warning>
 </Accordion>
 
@@ -462,7 +477,7 @@ https://graph.microsoft.com/User.Read
     | Auth mode | What you provide | Best for |
     |-----------|------------------|----------|
     | `oauthCentral` | Nothing; just click **Connect** | Workspaces on a platform where the admin set up the central client |
-    | `oauth` | Your own Entra **Application (client) ID + Secret** (+ tenant; redirect URI `<api-url>/workspaces/<your-workspace-id>/webhooks/oauthCallback`) | You manage your own Microsoft Entra OAuth app |
+    | `oauth` | Your own Entra **Application (client) ID + Secret** (+ tenant; redirect URI `<api-url>/workspaces/<your-workspace-id>/webhooks/<app-instance>.oauthCallback`) | You manage your own Microsoft Entra OAuth app |
     | `clientCredentials` | Entra **client ID + secret + tenant** with admin-consented **application** Graph permissions | Server-to-server / back-office, content indexing, no interactive sign-in |
     | `accessToken` | A pre-minted Microsoft Graph **access token** | Short-lived / caller-managed tokens |
 
@@ -753,12 +768,13 @@ The answers that hold for every connector (agent access, shared knowledge bases,
 | Production modes | `oauthCentral` or `oauth` |
 | Modes to avoid in production | `accessToken` (testing only, and a Graph access token expires after about an hour). `clientCredentials` acts as the application, not as the user: avoid it when per-user permissions are required. |
 | Read-only scopes | `offline_access`, `User.Read`, `Sites.Read.All`, `Files.Read.All` (the **Read-only preset** of the configuration app). These are the default with your own Microsoft Entra app; the platform's central client requests `Sites.ReadWrite.All` and `Files.ReadWrite.All` by default. |
+| Site perimeter | Optional list of authorized sites, from the **Authorized sites** tab. Calls outside the list are refused before they reach Microsoft Graph. Pairs with the `Sites.Selected` application permission. |
 | Agent allowlist | Yes, on the tenant endpoint (empty at installation). The global endpoint accepts every agent. |
 | Per-reader access control on knowledge bases | Yes: each file is checked against the reader's own Microsoft 365 connection, even when the base is synchronized in `clientCredentials` mode. |
 | Outbound hosts | `graph.microsoft.com`, `login.microsoftonline.com`, and your tenant's SharePoint hosts (for example `contoso.sharepoint.com`, and `contoso-my.sharepoint.com` for OneDrive files): when a user approves an attachment, the platform fetches the file server-side from its pre-signed download link. |
 | Audit events | None specific to this connector |
 
-With the read-only scopes, Microsoft refuses every folder creation, rename, move, copy, delete, sharing link, list item change and Excel cell write. `Sites.Read.All` and `Files.Read.All` still reach every site and file the user can open: the configuration app offers no scope that limits the connector to chosen sites. In `clientCredentials` mode, the application permissions apply to every site of the tenant, whoever calls the agent.
+With the read-only scopes, Microsoft refuses every folder creation, rename, move, copy, delete, sharing link, list item change and Excel cell write. `Sites.Read.All` and `Files.Read.All` still reach every site and file the user can open: no scope limits them to chosen sites. To do that, declare the authorized sites (see [Restricting the connector to chosen sites](#restricting-the-connector-to-chosen-sites-sites-selected)). In `clientCredentials` mode, the application permissions apply to every site of the tenant, whoever calls the agent.
 
 ---
 
@@ -789,7 +805,7 @@ With the read-only scopes, Microsoft refuses every folder creation, rename, move
 
 **"Site not found"**: The site id format is `hostname,siteCollectionId,siteId`. Use `sites` `search` (or Graph Explorer) to find the correct id.
 
-**Microsoft Entra redirect URI rejected**: Entra rejects a colon in the redirect URI path. Register the redirect URI with the workspace's **raw id** (`/workspaces/<workspace-id>/webhooks/oauthCallback`), not the `slug:` form; copy the exact value from the config app.
+**Microsoft Entra redirect URI rejected**: Entra rejects a colon in the redirect URI path. Register the redirect URI with the workspace's **raw id**, not the `slug:` form: `/workspaces/<core-workspace-id>/webhooks/oauthCallback` for the platform client, `/workspaces/<your-workspace-id>/webhooks/<app-instance>.oauthCallback` for your own Entra app. Copy the exact value from the config app.
 
 ## External Resources
 
