@@ -426,12 +426,26 @@ This connector is used by three different roles. Jump to the section that matche
     |-------------|-------------|---------|
     | `createRecord` | Create a record of `sObjectName`; `body` = Salesforce field API names. | `{ id, success, errors }` |
     | `getRecord` | Fetch one record by `sObjectName` + `recordId`; optional `fields`. | The record `{ Id, attributes, …fields }`. |
-    | `getRecordField` | Fetch a single `fieldName` on a record (incl. blob/document body). | The field value (raw bytes for blob fields). |
+    | `getRecordField` | Fetch a single `fieldName` on a record (incl. blob/document body). Pass `binary: true` (and optionally `maxBytes`) to read a binary blob field such as `Attachment.Body` or `Document.Body`. | The field value, read as text. With `binary: true`: `{ size, base64 }`. |
+    | `getContentVersionData` | Download a Salesforce file (a `ContentVersion`, the files in Files and Libraries) by `contentVersionId`; optional `maxBytes`. | `{ name, mimeType, size, base64, title, fileExtension, fileType, contentVersionId }` |
     | `updateRecord` | Update fields on a record by `sObjectName` + `recordId`; `body` = field map. | Empty (HTTP 204). |
     | `upsertRecord` | Upsert by `externalIdField` + `externalIdValue`; `body` = field map. | `{ id, success, created }` |
     | `deleteRecord` | Delete a record by `sObjectName` + `recordId`. | Empty (HTTP 204). |
     | `getDeletedRecords` | Records deleted in a `start`/`end` window (recycle bin). | `{ deletedRecords: [{ id, deletedDate }], earliestDateAvailable }` |
     | `getUpdatedRecords` | Records updated in a `start`/`end` window. | `{ ids: [...], latestDateCovered }` |
+
+    ### File content
+
+    `getContentVersionData` and `getRecordField` with `binary: true` return file bytes as standard base64. Without `binary: true`, `getRecordField` reads the body as text, which corrupts a binary file (PDF, DOCX, image).
+
+    | Topic | Behavior |
+    |---|---|
+    | Which one to use | `getContentVersionData` for Salesforce Files: it takes a `ContentVersion` id (15 or 18 characters, usually `068…`), not a `ContentDocument` id (`069…`). Find it with SOQL, for example `SELECT Id, Title FROM ContentVersion WHERE ContentDocumentId = '069…' AND IsLatest = true`. `getRecordField` with `binary: true` for other blob fields (`Attachment.Body`, `Document.Body`). |
+    | Output | `getContentVersionData`: `{ name, mimeType, size, base64, title, fileExtension, fileType, contentVersionId }`, where `mimeType` is derived from the file extension (`application/octet-stream` when unknown). `getRecordField` with `binary: true`: `{ size, base64 }`. |
+    | Activity feed | The output is redacted: the base64 body never appears in the workspace activity feed. |
+    | Size limit | 4 MB (4,194,304 bytes) by default, which is also the maximum. Pass `maxBytes` to lower it; a larger value is capped at 4 MB. |
+    | When the size is checked | `getContentVersionData` reads the declared `ContentSize` first and refuses an oversized file before downloading it; the downloaded body must then match that size exactly. `getRecordField` checks after the download, because Salesforce declares no size on that endpoint: read the matching length field first (`BodyLength`, `ContentSize`) when the file may be large. |
+    | Errors | `{ error, reason?, status? }`. `reason` is `invalid_id` for a malformed `contentVersionId`, `too_large` above the limit, or `read_failed` when the download fails or does not match the declared size; `status` is the HTTP status of a failed Salesforce call. |
 
     ### SOQL & SOSL Queries
 
@@ -550,6 +564,18 @@ This connector is used by three different roles. Jump to the section that matche
     - Salesforce.runQuery:
         q: "SELECT Id, Name, AnnualRevenue, Industry FROM Account WHERE AnnualRevenue > 1000000 ORDER BY AnnualRevenue DESC LIMIT 50"
       output: accounts
+    ```
+
+    **Download the latest version of a file:**
+
+    ```yaml
+    - Salesforce.runQuery:
+        q: "SELECT Id FROM ContentVersion WHERE ContentDocumentId = '{{documentId}}' AND IsLatest = true"
+      output: versions
+    - Salesforce.getContentVersionData:
+        contentVersionId: '{{versions.records[0].Id}}'
+      output: file
+    # file.name, file.mimeType and file.base64 hold the file, or file.error and file.reason explain the refusal
     ```
 
     **Create a Lead:**

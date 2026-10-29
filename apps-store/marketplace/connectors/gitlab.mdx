@@ -481,6 +481,7 @@ This connector is used by three different roles. Jump to the section that matche
     | `getCommit` | Get commit `sha` of `id` | `{ id, title, stats, ... }` |
     | `cherryPickCommit` | Cherry-pick `sha` onto `branch` of `id` (+ `dry_run`, `message`) | `{ id, short_id, ... }` |
     | `revertCommit` | Revert `sha` on `branch` of `id` (+ `dry_run`) | `{ id, short_id, ... }` |
+    | `getRepositoryFile` | Get the content of `file_path` at `ref` (branch, tag or commit SHA) in project `id` (+ `maxBytes`) | `{ name, mimeType, size, base64, ref, blobId, filePath }` |
 
     ### Tags & Releases
 
@@ -576,6 +577,19 @@ This connector is used by three different roles. Jump to the section that matche
       `Returns` shows the shape of the operation output (the underlying GitLab API resource).
     </Note>
 
+    ### Repository file content
+
+    `getRepositoryFile` returns a file's bytes as standard base64, so a binary file (PDF, image, archive) comes back intact. `id` is the project ID or path (`42` or `group/project`) and `file_path` the path in the repository (`src/app/main.ts`): the connector percent-encodes both, and refuses a `..` segment.
+
+    | Topic | Behavior |
+    |---|---|
+    | Output | `{ name, mimeType, size, base64, ref, blobId, filePath }`. GitLab declares no MIME type on this route, so `mimeType` is derived from the file extension. |
+    | Activity feed | The output is redacted: the base64 body never appears in the workspace activity feed. |
+    | Size limit | 4 MB (4,194,304 bytes) by default, which is also the maximum. Pass `maxBytes` to lower it; a larger value is capped at 4 MB. |
+    | When the size is checked | Before the download: the connector reads the size GitLab declares (`X-Gitlab-Size`, through a `HEAD` request) and refuses an oversized file without downloading it. The content is checked again once read, and must match the declared size. If a proxy strips the header, only the check after the download applies. |
+    | Git LFS | A file stored in Git LFS is refused (`read_failed`): this API serves only its pointer, not the file. |
+    | Errors | `{ error, reason? }`. `reason` is `invalid_id` when `id`, `file_path` or `ref` is missing or invalid, `too_large` above the limit, or `read_failed` when the download fails or does not match the declared size. |
+
     ## DSUL Examples
 
     ### List the user's own projects
@@ -587,6 +601,16 @@ This connector is used by three different roles. Jump to the section that matche
         sort: desc
         per_page: 20
         output: myProjects
+    ```
+
+    ### Read a file from the default branch
+
+    ```yaml
+    - GitLab.getRepositoryFile:
+        id: 'group/project'
+        file_path: 'docs/architecture.pdf'
+        ref: main
+        output: file
     ```
 
     ### Create an issue with labels and an assignee
