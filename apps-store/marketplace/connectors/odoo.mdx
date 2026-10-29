@@ -1,0 +1,482 @@
+---
+title: 'Odoo'
+description: 'Read-only access to Odoo models, records and server-side aggregates from Agent Creator agents and Builder workflows, with the API key of an Odoo service account'
+---
+
+import OdooTutorial from "/snippets/tutorials/odoo.mdx";
+
+<img
+  src="/images/connectors/odoo.png"
+  alt="Odoo"
+  width="96"
+  height="96"
+  noZoom
+  style={{ float: "left", marginRight: "1.25rem", marginBottom: "0.5rem" }}
+/>
+
+The Odoo app gives **read-only** access to an [Odoo](https://www.odoo.com) instance (Odoo 18) through its [external API](https://www.odoo.com/documentation/18.0/developer/reference/external_api.html), with the API key of a dedicated service account. It is generic: it reads any standard or custom model you allow, from contacts and products to sales orders, stock lots or `x_` models. It can be consumed two ways: as a remote MCP server that **Agent Creator** agents call through six read tools (discover models, describe fields, resolve a name, read records, aggregate, count), or as a Builder app whose instructions you call directly from DSUL. It runs in the **tenant app-instance context**: each workspace enters its own Odoo URL, database, login and API key in the connector's configuration app, resolved server-side and never exposed to the agent. Agents are identified by the capability **Scope** `context_id,agent_id,user_id` and gated by a per-workspace authorized-agents allowlist.
+
+<CardGroup cols={3}>
+  <Card title="Any Odoo model" icon="database">
+    Discover the readable models, list their fields, then read records with an Odoo domain: standard and custom models alike.
+  </Card>
+  <Card title="Server-side aggregates" icon="chart-column">
+    Totals, averages and counts grouped by field or period are computed by Odoo (`read_group`), so the agent never sums thousands of rows itself.
+  </Card>
+  <Card title="Read-only by design" icon="lock">
+    Only read methods are allowed, in code. A model allowlist and the Odoo rights of the service account apply on top.
+  </Card>
+</CardGroup>
+
+## Video tutorial
+
+This two-minute tutorial shows the connector end to end: connecting the Odoo instance and choosing the readable models in the configuration app, authorizing agents, then asking an agent to count records, explore a model, compute a yearly revenue indicator, and refuse a deletion because the connector is read-only.
+
+Use the buttons in the top-right corner of the player to switch the narration language and the subtitles. The sections on the left are clickable. Screens show the English interface; narration and subtitles are available in English and French.
+
+<OdooTutorial />
+
+## Who is this for?
+
+This connector is used by three different roles. Jump to the section that matches yours; each one is self-contained.
+
+<CardGroup cols={3}>
+  <Card title="Agent builder" icon="robot">
+    You build agents in **Agent Creator** and want them to answer questions from Odoo data. → *Agent builder* tab.
+  </Card>
+  <Card title="Platform admin" icon="shield-halved">
+    You run the platform and want to know what to set up once for everyone. → *Platform admin setup* accordion below.
+  </Card>
+  <Card title="Workspace builder" icon="puzzle-piece">
+    You write Builder automations (DSUL) that read Odoo directly. → *Workspace builder* tab.
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- An **Odoo 18** instance (Odoo Online, Odoo.sh or on-premise) whose plan gives access to the external API. On Odoo Online, the external API requires the **Custom** pricing plan.
+- A **dedicated service account** in Odoo (an internal user), with **read rights only** on the data agents may use. The connector applies the Odoo rights of this account as-is.
+- An **API key** for that account: log in as the service account, open **Preferences → Account Security → New API Key**, choose a duration and copy the key (Odoo shows it once). Note its expiry date: the configuration app warns 30 days before it.
+- The **database name**. On Odoo.sh it differs from the sub-domain and is shown on the branch page; on-premise, it is the database selected at login.
+
+<Note>
+  The connector never writes, even if the service account has write rights. A read-only account is still the recommended setup: it keeps the guarantee on the Odoo side too.
+</Note>
+
+<Accordion title="Platform admin (Governance): one-time platform setup" icon="shield-halved">
+  **Goal:** Odoo is a **per-workspace** connector: each workspace enters its own Odoo connection in the connector's configuration app (see the *Workspace builder* tab), so there is **no platform-wide credential to provision** and **no central OAuth client**.
+
+  <Note>
+    There is no shared Odoo credential for this connector. The URL, database, login, API key and readable models always live in the consuming workspace's secrets, written by the connector's configuration app. The platform operator has nothing to register centrally.
+  </Note>
+
+  ## Declare the capability in AI Governance (optional)
+
+  If you want agent builders to pick Odoo from the capability catalog instead of pasting an MCP endpoint URL by hand, expose it as a reusable **capability** in AI Governance, pointing at the MCP endpoint of the workspace that runs the connector.
+
+  <Steps>
+    <Step title="Open AI Governance > Capabilities">
+      Create (or edit) the **Odoo** capability.
+    </Step>
+    <Step title="Point it at the MCP endpoint">
+      Set the capability's MCP server URL to the **MCP endpoint** of the workspace running the connector (shown in the configuration app, **Agents** tab), and set its **Scope** to:
+
+      ```text
+      context_id,agent_id,user_id
+      ```
+
+      The `agent_id` in the scope is what lets the connector identify and authorize the calling agent.
+    </Step>
+    <Step title="Make it available to agent builders">
+      Once created, the capability appears in the capability picker for agent builders in your organization. Access to the catalog follows your organization's existing roles; there is **no per-capability role grant** for this tenant-context connector.
+    </Step>
+  </Steps>
+
+  <Note>
+    The connector's configuration app also offers a one-click **Add to catalog** button (**Agents** tab) that publishes the capability to the organization-wide Capabilities catalog for you. It requires catalog write rights in your organization.
+  </Note>
+
+  <Warning>
+    Declaring the capability makes the connector **available** to agent builders; it does not authorize a specific agent and does not provision any Odoo credential. Per-agent gating remains the config-app **authorized-agents allowlist**, and the Odoo connection still lives in the workspace running the connector. There is **no OAuth auth-config JSON** to attach here: authentication is a server-side Odoo API key, not a per-user OAuth flow.
+  </Warning>
+</Accordion>
+
+---
+
+<Tabs>
+  <Tab title="Agent builder (Agent Creator)">
+    ## Agent builder
+
+    **Goal:** let an agent you build in Agent Creator answer questions from Odoo data through the six read-only MCP tools.
+
+    <Note>
+      Before an agent can call the connector, a *Workspace builder* must have installed and configured the Odoo app in a workspace (see the *Workspace builder* tab), or a *Platform admin* must have published an Odoo capability in AI Governance (see the *Platform admin setup* accordion above).
+    </Note>
+
+    This connector runs in the **tenant app-instance context**: your agent is identified by the `agent_id` that Agent Creator injects through the capability *Scope*, and that agent must appear in the connector's **authorized-agents allowlist** (managed in the configuration app). The Odoo credentials themselves are resolved server-side and never exposed to the agent.
+
+    <Steps>
+      <Step title="Install and configure the connector in your workspace">
+        Follow the *Workspace builder* tab: install **Odoo** in your workspace, open its **Configuration app**, fill the Odoo connection and the readable models in the **Authentication** tab, then click **Test connection**.
+      </Step>
+      <Step title="Allowlist your agent">
+        In the configuration app, open the **Agents** tab and tick your agent under **Authorized agents**, or enable **Allow all agents**.
+      </Step>
+      <Step title="Add the MCP capability to your agent">
+        Next to the ticked agent, click **Install capability**: it adds the Odoo capability to the agent with the right endpoint and Scope. To wire it by hand instead, add a capability pointing at the **MCP endpoint** shown in the same tab, and set its **Scope** to:
+
+        ```text
+        context_id,agent_id,user_id
+        ```
+
+        The `agent_id` is what lets the connector identify and authorize your agent; without it, every call is rejected with an explicit "agent could not be identified" message.
+      </Step>
+      <Step title="Brief the agent">
+        Tell the agent the tools exist and in which order to use them (see *Brief the agent in its system prompt* below).
+      </Step>
+    </Steps>
+
+    <Note>
+      **Org-wide alternative: Add to catalog.** Instead of installing the capability agent by agent, click **Add to catalog** in the **Agents** tab to publish Odoo to the organization-wide Capabilities catalog (see the *Platform admin setup* accordion). Agent builders then enable it from the catalog with the endpoint and Scope already wired; each agent must still be allowlisted.
+    </Note>
+
+    ## Brief the agent in its system prompt
+
+    Odoo model and field names are technical (`sale.order`, `partner_id`, `amount_untaxed`). A short brief avoids the agent guessing them:
+
+    ```text
+    You can read Odoo through the Odoo MCP server. It is read-only: you cannot create, modify or delete anything.
+    - Never guess a model or a field name. Use odoo_list_models to find the model, then odoo_describe_model to get its exact field names.
+    - When the user names a customer, a product or a lot, turn the name into ids with odoo_resolve before filtering on it.
+    - For totals, averages or evolutions, use odoo_aggregate (Odoo computes them). Do not read records to add them up yourself.
+    - Use odoo_count when the volume is unknown, then odoo_search_read with only the fields you need, paging with offset.
+    - If a model is refused, say it is not in the connector allowlist; do not try another model to work around it.
+    ```
+
+    <Note>
+      **Read-only by design.** The connector only calls Odoo read methods (`search_read`, `read`, `read_group`, `search_count`, `fields_get`, `name_search`). This list is in the code, not in the configuration: no setting can open a write, whatever the rights of the service account. Least privilege comes from two further layers you control: the **readable models** allowlist in the configuration app, and the Odoo access rights of the service account. Keep both as narrow as the use case allows.
+    </Note>
+
+    <Note>
+      **Legacy AI Knowledge agents** (no native MCP picker): add the connector under **Advanced > Tools > MCP** and paste the **MCP endpoint** URL. The agent still has to be allowlisted in the configuration app and its identity propagated so the connector can read its `agent_id`.
+    </Note>
+
+    ## Available Tools
+
+    ### Discovery
+
+    | Tool | Description |
+    |------|-------------|
+    | `odoo_list_models` | Find Odoo models the connector may read, by technical name or label (e.g. "sale", "lot", "x_"). Only models in the connector allowlist are returned. |
+    | `odoo_describe_model` | List the fields of an Odoo model (`fields_get`) with their type, label and related model. |
+    | `odoo_resolve` | Find records of a model from a free text, the way Odoo search boxes do (`name_search`). Returns ids and display names. |
+
+    ### Reading
+
+    | Tool | Description |
+    |------|-------------|
+    | `odoo_search_read` | Read records of an Odoo model matching a domain. The list of fields is mandatory; the number of records is capped (default 50, max 200). |
+    | `odoo_aggregate` | Aggregate records on the server (`read_group`): sums, averages, counts grouped by fields or periods. |
+    | `odoo_count` | Count the records of an Odoo model matching a domain, without reading them. |
+
+    ## Output Formats
+
+    Every tool returns its result as JSON text in a standard MCP tool result. On failure, the result is flagged `isError` and its text explains what to fix (see *Error Handling*).
+
+    - **`odoo_list_models`**: `{ models: [{ model, name }], total, truncated }`.
+    - **`odoo_describe_model`**: `{ fields: [{ name, type, label, relation?, required?, stored? }], total, truncated }`, sorted by name, 400 fields at most.
+    - **`odoo_resolve`**: `[{ id, name }]`.
+    - **`odoo_search_read`**: `{ records: [...], count, limit, offset, more }`. Relational fields come as `[id, display name]`, as in Odoo.
+    - **`odoo_aggregate`**: `{ groups: [{ <groupby keys>, <measures>, __count }], count }`.
+    - **`odoo_count`**: `{ count }`.
+
+    Answers are capped at about 20,000 characters. A longer answer is cut, with a hint to narrow the query (fewer fields, a stricter domain, a lower limit).
+
+    ## Tool Details
+
+    ### odoo_search_read
+
+    Read records matching an [Odoo domain](https://www.odoo.com/documentation/18.0/developer/reference/backend/orm.html#search-domains).
+
+    ```json
+    {
+      "name": "odoo_search_read",
+      "arguments": {
+        "model": "sale.order",
+        "domain": [["state", "=", "sale"], ["date_order", ">=", "2026-01-01"]],
+        "fields": ["name", "partner_id", "date_order", "amount_total"],
+        "order": "date_order desc",
+        "limit": 20
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `model` | Yes | Technical model name, e.g. `sale.order`. |
+    | `fields` | Yes | Field names to return (1 to 50). |
+    | `domain` | No | Odoo domain. Empty means every record. |
+    | `limit` | No | Maximum number of records (default 50, max 200). |
+    | `offset` | No | Number of records to skip, for paging. |
+    | `order` | No | Sort order, e.g. `date_order desc`. |
+
+    ### odoo_aggregate
+
+    Let Odoo compute totals, averages and counts, optionally grouped by fields or by date periods (`date:day`, `date:week`, `date:month`, `date:quarter`, `date:year`).
+
+    ```json
+    {
+      "name": "odoo_aggregate",
+      "arguments": {
+        "model": "sale.order",
+        "domain": [["state", "=", "sale"]],
+        "measures": ["amount_untaxed:sum"],
+        "groupby": ["date_order:year"],
+        "orderby": "date_order:year asc"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `model` | Yes | Technical model name, e.g. `sale.report`. |
+    | `measures` | Yes | Aggregates as `field:function`, e.g. `["price_subtotal:sum", "price_unit:avg"]`. |
+    | `domain` | No | Odoo domain restricting the records aggregated. |
+    | `groupby` | No | Grouping fields, with an optional period for dates, e.g. `["date:year", "partner_id"]`. Empty returns one total. |
+    | `orderby` | No | Sort order of the groups, e.g. `date:year asc`. |
+    | `limit` | No | Maximum number of groups (default 100, max 200). |
+
+    ### odoo_resolve
+
+    Turn a name typed by the user into record ids, before filtering on them.
+
+    ```json
+    {
+      "name": "odoo_resolve",
+      "arguments": {
+        "model": "res.partner",
+        "text": "Azure Interior",
+        "domain": [["customer_rank", ">", 0]],
+        "limit": 5
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `model` | Yes | Technical model name, e.g. `res.partner` or `product.product`. |
+    | `text` | Yes | Text to look for in the record name. |
+    | `domain` | No | Extra Odoo domain, e.g. `[["customer_rank", ">", 0]]`. |
+    | `limit` | No | Maximum number of matches (default 10, max 20). |
+
+    ### odoo_describe_model
+
+    List the fields of a model so the agent requests existing field names only.
+
+    ```json
+    {
+      "name": "odoo_describe_model",
+      "arguments": {
+        "model": "sale.order",
+        "query": "partner"
+      }
+    }
+    ```
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `model` | Yes | Technical model name, e.g. `sale.order`. |
+    | `query` | No | Keep only fields whose name or label contains this text, e.g. `date` or `partner`. |
+  </Tab>
+
+  <Tab title="Workspace builder (DSUL)">
+    ## Workspace builder
+
+    **Goal:** install the connector in a workspace, configure the Odoo connection, the readable models and the agent allowlist through its configuration app, and call its instructions from your automations.
+
+    ## Installation
+
+    1. Go to **Apps** in your workspace
+    2. Search for **Odoo** and install it
+    3. Open the **Configuration app** (the link auto-populated on install), fill the Odoo connection and the readable models in the **Authentication** tab, click **Save** then **Test connection**, and allow the agents that may call the connector in the **Agents** tab
+
+    ## Configuration
+
+    | Field | Description |
+    |-------|-------------|
+    | **Configuration app** | Auto-populated on install; open this link to set the Odoo connection and the readable models, and to manage the authorized-agents allowlist. |
+
+    The configuration app drives everything; the app instance itself has no per-field credential form. Each value below is stored as a workspace secret and resolved server-side at call time.
+
+    | Configuration app field | Description |
+    |-------------------------|-------------|
+    | **Odoo URL** | Base URL of the instance, e.g. `https://mycompany.odoo.com`. |
+    | **Database** | Name of the Odoo database. On Odoo.sh it differs from the sub-domain. |
+    | **Service account login** | Login of the Odoo service account. |
+    | **API key** | API key of the service account. Stored as a secret and masked in the activity feed. |
+    | **API key expiry date** | Optional. Used to warn 30 days before the key expires, and to flag an expired key. |
+    | **Readable models** | One model per line (or comma-separated). `stock.*` matches every model whose name starts with `stock.`; `*` allows every model the service account can read. Empty: nothing is readable. |
+    | **Authorized agents** (Agents tab) | The agents allowed to call the MCP endpoint, or **Allow all agents**. |
+
+    This connector uses a single auth mode:
+
+    | Auth mode | What you provide | Best for |
+    |-----------|------------------|----------|
+    | **Service account API key** | Odoo URL, database, login and API key of a dedicated service account | All workspaces; each connects its own Odoo instance; no platform-level setup |
+
+    <Note>
+      **Test connection** checks that Odoo answers at the URL, then authenticates with the saved values and shows the Odoo version and the service account's user id. Only a workspace owner, editor or admin can run it.
+    </Note>
+
+    ## Available Instructions
+
+    Every instruction resolves the Odoo connection from the workspace configuration and enforces the same guards as the MCP tools: read methods only, readable-models allowlist, bounded answers. On failure, an instruction returns `{ error }` instead of raising.
+
+    ### Discovery
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `listModels` | Readable models matching `query` (technical name or label); empty lists every readable model. `limit` default 50, max 200. | `{ models: [{ model, name }], total, truncated }` |
+    | `describeModel` | Fields of `model` (`fields_get`), optionally filtered by `query` on name or label. | `{ fields: [{ name, type, label, relation?, required?, stored? }], total, truncated }` |
+    | `resolve` | Records of `model` whose name matches `text` (`name_search`), with an optional extra `domain`. `limit` default 10, max 20. | `[{ id, name }]` |
+
+    ### Reading
+
+    | Instruction | Description | Returns |
+    |-------------|-------------|---------|
+    | `searchRead` | Records of `model` matching `domain`, with the mandatory `fields` list (1 to 50). `limit` default 50, max 200; `offset` and `order` for paging and sorting. | `{ records: [...], count, limit, offset, more }` |
+    | `aggregate` | Server-side `read_group` on `model`: `measures` as `field:function`, optional `groupby` (with `:year`, `:month`… for dates), `orderby`, `limit` default 100, max 200. | `{ groups: [{ <groupby keys>, <measures>, __count }], count }` |
+    | `count` | Number of records of `model` matching `domain` (`search_count`). | `{ count }` |
+
+    <Note>
+      `Returns` shows the shape of the operation output. The MCP tools wrap the same operations in an MCP tool-result envelope.
+    </Note>
+
+    ## DSUL Examples
+
+    Count the confirmed sales orders of the year:
+
+    ```yaml
+    - Odoo.count:
+        model: sale.order
+        domain:
+          - ['state', '=', 'sale']
+          - ['date_order', '>=', '2026-01-01']
+        output: confirmed
+    ```
+
+    Read the latest orders with only the fields you need:
+
+    ```yaml
+    - Odoo.searchRead:
+        model: sale.order
+        domain:
+          - ['state', '=', 'sale']
+        fields:
+          - name
+          - partner_id
+          - date_order
+          - amount_total
+        order: date_order desc
+        limit: 20
+        output: orders
+    ```
+
+    Untaxed revenue of confirmed orders, per year, computed by Odoo:
+
+    ```yaml
+    - Odoo.aggregate:
+        model: sale.order
+        domain:
+          - ['state', '=', 'sale']
+        measures:
+          - amount_untaxed:sum
+        groupby:
+          - date_order:year
+        orderby: date_order:year asc
+        output: revenue
+    ```
+
+    Resolve a customer by name, then read its open invoices, and branch on errors:
+
+    ```yaml
+    - Odoo.resolve:
+        model: res.partner
+        text: '{{customerName}}'
+        limit: 1
+        output: matches
+    - conditions:
+        '{{matches.error}} or !{{matches[0].id}}':
+          - emit:
+              event: odoo.customer.notFound
+              payload:
+                customerName: '{{customerName}}'
+        default:
+          - Odoo.searchRead:
+              model: account.move
+              domain:
+                - ['partner_id', '=', '{{matches[0].id}}']
+                - ['move_type', '=', 'out_invoice']
+                - ['payment_state', '!=', 'paid']
+              fields:
+                - name
+                - invoice_date_due
+                - amount_residual
+              output: invoices
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Error Handling
+
+The connector does not raise: failures come back as an explicit message, as an `isError` tool result over MCP or as `{ error }` from a DSUL instruction. Odoo tracebacks are never forwarded.
+
+| Message starts with | Typical cause |
+|---------------------|---------------|
+| `The Odoo connection is not configured` | URL, database, login or API key missing in the configuration app |
+| `Odoo refused the connection` | Wrong login, database or API key, or the key expired or was revoked |
+| `Odoo could not be reached at this URL` | Wrong URL (Test connection only) |
+| `Odoo is unreachable right now` | Odoo returned HTTP 5xx or did not answer; transient, try again later |
+| `Model "…" is not in the connector allowlist` | The model is not in **Readable models** |
+| `Method "…" is not allowed: this connector is read-only` | A write was attempted; no setting can allow it |
+| `The Odoo service account is not allowed to read this data` | Odoo `AccessError`: the service account lacks the read right |
+| `Odoo rejected the query` | Unknown field or invalid domain |
+| `Record not found in Odoo` | The record does not exist or was deleted |
+| `fields is required` / `measures is required` / `domain must be an array` | Invalid tool arguments |
+
+### Common Issues
+
+- **"This agent is not authorized to use the Odoo connector"**: The calling agent is not in the allowlist. Open the configuration app → **Agents** → tick this agent under **Authorized agents** (or enable **Allow all agents**).
+- **"The calling agent could not be identified"**: The MCP capability *Scope* does not declare `agent_id`, so Agent Creator never injects the agent identity. Set the Scope to `context_id,agent_id,user_id` on the capability (the **Install capability** button does it), then allow the agent in the configuration app.
+- **"Odoo refused the connection"**: Run **Test connection** in the configuration app. Check the database name first (on Odoo.sh it is not the sub-domain), then the login, then the key. An Odoo API key cannot be read back: if it expired or was lost, generate a new one from the service account's **Preferences → Account Security** and paste it.
+- **"The Odoo service account is not allowed to read this data"**: the model is in the allowlist, but Odoo's own rights refuse it. Grant the service account the matching read access in Odoo (user groups, record rules), or remove the model from **Readable models**.
+- **`odoo_list_models` returns allowlist patterns instead of models**: Odoo restricts the model registry (`ir.model`) to administrators, and a read-only service account usually cannot list it. The connector then answers from the allowlist itself, so a pattern such as `stock.*` appears as is; the agent can still call `odoo_describe_model` on a concrete model such as `stock.lot`.
+- **Service-specific gotcha**: relational fields (`partner_id`, `product_id`…) return the display name of the related record even when the related model is not in the allowlist. This is standard Odoo behaviour: the connector never reads the related record itself, but if a display name is sensitive, restrict the field through the service account's Odoo rights.
+
+## External Resources
+
+<CardGroup cols={2}>
+  <Card
+    title="Odoo External API"
+    icon="book"
+    href="https://www.odoo.com/documentation/18.0/developer/reference/external_api.html"
+  >
+    Odoo 18 external API reference: authentication, API keys and `execute_kw`.
+  </Card>
+  <Card
+    title="Odoo search domains"
+    icon="filter"
+    href="https://www.odoo.com/documentation/18.0/developer/reference/backend/orm.html#search-domains"
+  >
+    Syntax of the domains used by every read tool.
+  </Card>
+  <Card
+    title="Tool Agents"
+    icon="robot"
+    href="/products/agent-factory/capabilities"
+  >
+    How Agent Creator agents consume MCP tools and capabilities.
+  </Card>
+</CardGroup>
