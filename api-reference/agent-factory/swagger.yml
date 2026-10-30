@@ -4038,7 +4038,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Tool'
         '400':
-          description: Validation error (invalid type, bad tool name, missing fields).
+          description: Validation error (invalid type, bad tool name, missing fields, malformed `tool_filter`, unknown `mcp` `catalog_id`). A `tool_filter` on a non-`mcp` tool is ignored here.
           content:
             application/json:
               schema:
@@ -4122,6 +4122,79 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+    patch:
+      tags: [Tools]
+      operationId: updateAgentTool
+      summary: Update a tool attached to an agent
+      description: |
+        Shallow-merges the body into the entry (matched by `id`, or by `name`
+        when it has none). `id`, `type`, `catalog_id`, `auth` and `icon_url`
+        are ignored: they stay as attached. The resulting `tools[]` is checked
+        like `PATCH /v1/agents/{agentId}` (tool names, `tool_filter` shape,
+        knowledge base access). When the agent is published,
+        `has_draft_changes` is set to `true`. Returns the updated entry.
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 64
+        - name: toolId
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolPatchInput'
+      responses:
+        '200':
+          description: Updated tool entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tool'
+        '400':
+          description: Invalid tool name or `tool_filter` (`VALIDATION_ERROR`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden, or a knowledge base the caller cannot read / from another organization.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Tool not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The new `name` is already used by another entry of the agent (`DUPLICATE_NAME`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: The knowledge base check could not reach storage (`KNOWLEDGE_BASE_CHECK_FAILED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     delete:
       tags: [Tools]
       operationId: removeAgentTool
@@ -4182,7 +4255,7 @@ paths:
         Runs the server's `tools/list` and returns each advertised tool with
         the `canonical_name` the model calls it by (the name a
         `tool_permissions` rule must target to reach that tool), plus its
-        `inputSchema` and `annotations` exactly as published. `canonical_name`
+        `title`, `inputSchema` and `annotations` exactly as published. `canonical_name`
         is computed by the runtime's own naming helper: consume it, never
         derive it.
 
@@ -4193,7 +4266,34 @@ paths:
         Only `mcp` entries have capabilities: any other type is a `400`. The
         list is served from the same per-server cache the runtime uses, with
         the same rule: never cached for auth-bearing catalog entries.
+        `refresh=true` skips the cache read (a successful listing still
+        refreshes it); it is honored in the editor view only.
+
+        Tool selection: each item says whether the agent exposes it
+        (`enabled`: passes the organization ceiling, i.e. the `tool_filter` of
+        the entry's capabilities catalog row, AND the entry's own
+        `tool_filter`) and whether the ceiling alone hides it
+        (`org_blocked`). With `x-draft-mode: true` and edit rights, the entry
+        is read from the draft and every item is listed; otherwise it is read
+        from the published configuration (when the agent has one) and only the
+        exposed items are listed. Like `GET /v1/agents/{agentId}`, an agent
+        that was never published answers `404 AGENT_NOT_PUBLISHED` to a caller
+        who can neither edit it nor was granted it by a share.
       parameters:
+        - name: x-draft-mode
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: ['true']
+          description: Resolve the entry as its editor does (draft configuration, every item listed).
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['true']
+          description: Bypass the tools cache and list the server again (editor view only, ignored otherwise).
         - name: agentId
           in: path
           required: true
@@ -4232,7 +4332,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '404':
-          description: Tool not found.
+          description: Tool not found, or `AGENT_NOT_PUBLISHED` (see above).
           content:
             application/json:
               schema:
@@ -6041,7 +6141,7 @@ components:
           additionalProperties: true
         limits:
           type: object
-          description: 'Per-message limits the profile sets by default — `token_budget`, plus `cost_budget_usd` and `max_delegation_depth` on the higher profiles. `max_turns` and the tool call budget are not profile limits (no `tool_calls` key): they are workspace-wide defaults an agent can override.'
+          description: 'Per-message limits the profile sets by default - `token_budget`, plus `cost_budget_usd` and `max_delegation_depth` on the higher profiles. `max_turns` and the tool call budget are not profile limits (no `tool_calls` key): they are workspace-wide defaults an agent can override.'
           additionalProperties: true
         use_cases:
           type: array
@@ -6080,6 +6180,7 @@ components:
           type: string
         catalog_id:
           type: string
+          description: Capabilities catalog entry the tool was added from. Fixed once the tool is attached - a tools array sent back through `PATCH /v1/agents/{agentId}` keeps the stored value - because the organization ceiling of an `mcp` entry is read through it. An `mcp` entry without one (a custom server) has no organization ceiling.
         auth:
           type: object
           additionalProperties: true
@@ -6103,6 +6204,81 @@ components:
           type: object
           additionalProperties: true
           description: JSON Schema describing the function tool's parameters.
+        tool_filter:
+          $ref: '#/components/schemas/ToolFilter'
+    ToolFilter:
+      type: object
+      nullable: true
+      description: |
+        MCP tool selection (`mcp` entries). Names are the server's own tool
+        names (`tools/list` `name`), never the `<parent>__<child>` canonical
+        name. `allow`: only the listed tools are exposed, tools the server adds
+        later stay hidden. `deny`: the listed tools are hidden, the others are
+        exposed. Absent or `null`: every tool is exposed. An organization
+        ceiling (the same shape on the capabilities catalog entry) applies on
+        top; a tool must pass both. On any other tool type it is refused
+        (400), except by `POST /v1/agents/{agentId}/tools`, which ignores it.
+      required: [mode, tools]
+      properties:
+        mode:
+          type: string
+          enum: [allow, deny]
+        tools:
+          type: array
+          items:
+            type: string
+            minLength: 1
+    ToolPatchInput:
+      type: object
+      description: |
+        Fields to merge into a tool entry. `id`, `type`, `catalog_id`, `auth`
+        and `icon_url` are ignored if sent. `null` clears a field (`name` excepted).
+      properties:
+        name:
+          type: string
+          maxLength: 128
+          pattern: '^[a-zA-Z0-9_-]+$'
+        display_name:
+          type: string
+          nullable: true
+          maxLength: 256
+        description:
+          type: string
+          nullable: true
+          maxLength: 4096
+        vector_store_id:
+          type: string
+          nullable: true
+          maxLength: 128
+          description: '`file_search` only. A knowledge base the caller can read, in the agent''s organization (403 otherwise).'
+        max_num_results:
+          type: number
+          nullable: true
+        server:
+          type: string
+          nullable: true
+          maxLength: 2048
+        headers:
+          type: object
+          nullable: true
+          additionalProperties: true
+        scope:
+          type: string
+          nullable: true
+          maxLength: 256
+        allowSelfSignedCert:
+          type: boolean
+          nullable: true
+        url:
+          type: string
+          nullable: true
+          maxLength: 2048
+        parameters:
+          type: object
+          nullable: true
+          additionalProperties: true
+        tool_filter:
+          $ref: '#/components/schemas/ToolFilter'
     ToolAddInput:
       type: object
       required: [type]
@@ -6117,13 +6293,16 @@ components:
           pattern: '^[a-zA-Z0-9_-]+$'
         display_name:
           type: string
+          nullable: true
           maxLength: 256
         description:
           type: string
+          nullable: true
           maxLength: 4096
         catalog_id:
           type: string
           maxLength: 128
+          description: Capabilities catalog entry to add the tool from. For an `mcp` tool it must exist in the catalogue (400 otherwise).
         auth:
           type: object
           additionalProperties: true
@@ -6152,6 +6331,8 @@ components:
           type: object
           additionalProperties: true
           description: JSON Schema describing the function tool's parameters.
+        tool_filter:
+          $ref: '#/components/schemas/ToolFilter'
     ToolListResponse:
       type: object
       properties:
@@ -6169,6 +6350,11 @@ components:
         name:
           type: string
           description: Tool name exactly as the server advertises it (what `tools/call` receives).
+        title:
+          type: string
+          description: |
+            Display name the server gives the tool (MCP `title`), absent when it
+            publishes none. Show `title`, then `annotations.title`, then `name`.
         canonical_name:
           type: string
           pattern: '^[a-zA-Z0-9_-]{1,64}$'
@@ -6193,8 +6379,14 @@ components:
           additionalProperties: true
           description: |
             MCP tool annotations as published (`readOnlyHint`,
-            `destructiveHint`, …), `null` when the server publishes none.
-            Forwarded raw; nothing is derived from them.
+            `destructiveHint`, `title`, …), `null` when the server publishes
+            none. Forwarded raw.
+        enabled:
+          type: boolean
+          description: The agent exposes this tool (it passes the organization ceiling and the entry's `tool_filter`).
+        org_blocked:
+          type: boolean
+          description: The organization ceiling (the catalog entry's `tool_filter`) hides this tool.
     ToolCapabilities:
       type: object
       description: |
@@ -6206,7 +6398,8 @@ components:
           type: string
           enum: [ok, auth_required, unavailable]
           description: |
-            `ok`: `items` is the server's list. `auth_required`: OAuth-gated
+            `ok`: `items` is the server's list (only the tools the agent
+            exposes, outside the editor view). `auth_required`: OAuth-gated
             server the caller is not connected to; `items` is empty.
             `unavailable`: the handshake or `tools/list` failed; `items` is
             empty and `error` carries the message.
