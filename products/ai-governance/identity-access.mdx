@@ -30,8 +30,8 @@ Once a user has a platform account, they can become a member of one or more orga
 |-----------|---------|------|--------|--------------|------------------------------------------------|
 | **Email invite** | Admin invites a user by email; the user accepts on first login or signup | Admin-chosen role | No | No | **Yes**; the invitation prepares the membership for first connection |
 | **Invitation code (link)** | User opens a shared link while authenticated | Code's `roleSlug` | No | No | **No**; the user must already be logged in |
-| **Join rules** | Evaluated on every `/me` call after login, for users who are not yet members | Rule's `role` | Rule's `groups` | When the rules change, to remove members who no longer match. An existing member's role and groups are only updated on demand, by [re-evaluating the rules](#simulating-and-applying-rules) | Either |
-| **SSO auto-join** | SSO login from a domain configured on an organization | The matching join rule's `role`, else `defaultRole` | The matching join rule's `groups` | Once at first login | Either |
+| **Join rules** | Evaluated on every `/me` call after login, for users who are not yet members | Rule's `role` | Rule's `groups` | When the rules change, to remove members who no longer match. An existing member's role and groups are updated on demand, by [re-evaluating the rules](#simulating-and-applying-rules), or at each login when the organization [re-evaluates its members at login](#re-evaluating-members-at-login) | Either |
+| **SSO auto-join** | SSO login from a domain configured on an organization | The matching join rule's `role`, else `defaultRole` | The matching join rule's `groups` | At first login, then updated like members who joined through a join rule (on demand or at each login), but never removed | Either |
 
 ### When to use each mechanism
 
@@ -170,15 +170,40 @@ The Join Rules tab reads and writes its whole ruleset as JSON. **Export** downlo
 
 ### Rule Evaluation
 
-Join rules are evaluated on every `/me` API call (the first call the platform makes after authentication). A per-user version cache ensures rules are only re-evaluated when they change:
+Join rules are evaluated on every `/me` API call (the first call the platform makes after authentication). A per-user cache ensures an organization's rules are only re-evaluated for a user when something they depend on changed:
 
-1. Each org's join rules have a version counter (incremented when rules are updated)
-2. The gateway tracks which version was last evaluated for each user
-3. If the version matches, evaluation is skipped for that org
+1. Each org's join rules have a version counter (incremented when the organization is updated)
+2. The gateway records, for each user, the version last evaluated and the user's values for the fields the rules read (for example their identity-provider groups)
+3. If neither changed, evaluation is skipped for that org
+
+The values are those of the user's last SSO login: a change in the identity provider is seen at the user's next login.
 
 <Note>
-**Join rules grant membership; they do not keep it in sync.** A user who is already a member of the organization is skipped, whatever way they joined. Their role and groups stay as they were, even if their SSO attributes changed since (for example after being added to an identity-provider group). To change an existing member's access, [change their role](#managing-existing-members) from the **Members** list, or [re-evaluate the rules](#simulating-and-applying-rules) on the existing members. For a rule to set the role on arrival, make sure the user's attributes are in place before their first login to the organization.
+**By default, join rules grant membership; they do not keep it in sync.** A user who is already a member of the organization is skipped, whatever way they joined. Their role and groups stay as they were, even if their SSO attributes changed since (for example after being added to an identity-provider group). To change an existing member's access, [change their role](#managing-existing-members) from the **Members** list, [re-evaluate the rules](#simulating-and-applying-rules) on the existing members, or have the organization [re-evaluate its members at login](#re-evaluating-members-at-login).
 </Note>
+
+### Re-evaluating members at login
+
+The **At each login** setting of the **Join Rules** screen (`joinRulesSync` on the organization) applies the saved rules to the member who logs in, as [re-evaluating the rules](#simulating-and-applying-rules) does to every member, when the rules or the user's values for the fields they read have changed. It offers the two options of the re-evaluation:
+
+| Option | Effect at login |
+|--------|-----------------|
+| **Remove the members who joined through a join rule and no longer match any** (`removeUnmatched`) | Such a member is removed. Members who joined any other way are never removed. |
+| **Existing members** (`existingMembers`) | Who is brought in line with the first rule they match, as in [Updating existing members](#updating-existing-members): nobody (`none`), the members who joined through a join rule or at their SSO login (`join-rule`), or every member (`all`), including those added by hand or by an invitation and those whose role was changed by hand. |
+
+With neither option (the default), the rules only make users join.
+
+A member brought in line gets the role of the rule, or the role a new member would join with when it sets none (see [Updating existing members](#updating-existing-members)), and exactly its groups when it sets some: groups added to them by hand are removed at a later login. Members whose role can change the members or the join rules are never updated, but are removed like the others when they joined through a join rule and no longer match, except the organization's last owner. Changing a member's role from the **Members** list marks them as added by an administrator: `join-rule` then neither updates nor removes them, only `all` updates them.
+
+Changing the setting counts as a change of the rules: every member is evaluated again at their next login. Widening `existingMembers` (from `none` to `join-rule`, or to `all`) requires `orgs:members:manage` and `orgs:groups:members:manage` on top of `orgs:join-rules:manage`, as for the re-evaluation, and so does editing, while it is other than `none`, the rules or the default role that rules without a role give, since that moves existing members at their next login. Narrowing it, turning it off and removing the members who no longer match only require `orgs:join-rules:manage`: saving the rules already removes them.
+
+<Warning>
+Role changes made before v27.3.1 were not recorded: with `join-rule`, a member whose role was changed by hand before that version gets the role of the rule they match at their next login. With `all`, every manual change is overridden. Before choosing either, run a [simulation](#simulating-and-applying-rules) with the same `existingMembers` and check the `updates` it reports.
+</Warning>
+
+<Warning>
+With removal on, a member who joined through a join rule is removed as soon as their identity provider stops sending a value a rule reads. Make sure it always sends those claims. In an organization with its own SSO provider, such a member joins again at their next sign-in through it, by [SSO auto-join](#joining-an-organization). With Microsoft Entra ID for example, the `groups` claim is left out of the token for a user in more than 200 groups (the *groups overage*): filter the groups emitted for the application, or use another claim.
+</Warning>
 
 ### Re-evaluation on Rule Changes
 
@@ -188,13 +213,13 @@ When an organization's join rules are updated, the platform re-evaluates all exi
 - New users who now match are **not** retroactively added; they join on their next `/me` call, unless you apply the rules right away (see below)
 - Re-evaluation processes members in batches of 500
 
-On a rule change, only members who joined **through a join rule** are re-evaluated. Members added by an invitation, an invitation code, SSO auto-join or by an administrator are never removed by a rule change. [Re-evaluating the rules](#simulating-and-applying-rules) with `existingMembers: "all"` also evaluates them, only to update their role and groups.
+On a rule change, only members who joined **through a join rule** are re-evaluated. Members added by an invitation, an invitation code, SSO auto-join or by an administrator are never removed by a rule change. [Re-evaluating the rules](#simulating-and-applying-rules) can still update their role and groups: `existingMembers: "join-rule"` covers the members who joined at their SSO login, `"all"` every member.
 
 For a member who joined through a join rule, a rule change has two possible outcomes:
 
 | The member… | Result |
 |-------------|--------|
-| still matches at least one rule | Stays in the organization with the **same role and groups**, even if the rule that now matches first assigns other groups or another role |
+| still matches at least one rule | Stays in the organization with the **same role and groups**, even if the rule that now matches first assigns other groups or another role, unless the organization [re-evaluates its members at login](#re-evaluating-members-at-login) |
 | no longer matches any rule | Is removed from the organization |
 
 <Note>
@@ -224,7 +249,7 @@ curl -X POST "$API_URL/v2/orgs/acme/join-rules/apply" \
 | `joinRules` | Candidate ruleset. When omitted, the organization's current rules are evaluated. |
 | `dryRun` | `true` by default. Set to `false` to apply the rules. |
 | `sampleLimit` | Number of users listed in each sample of the response (default 1000, max 2000). It never limits the processing. |
-| `existingMembers` | Which current members are brought in line with the rules: `none` (default, they are left as they are), `join-rule` (those who joined through a join rule) or `all` (also those added by an administrator, an invitation or SSO auto-join). Other than `none`, it also requires `orgs:members:manage`, plus `orgs:groups:members:manage` when a rule sets groups. See [Updating existing members](#updating-existing-members). |
+| `existingMembers` | Which current members are brought in line with the rules: `none` (default, they are left as they are), `join-rule` (those who joined through a join rule or at their SSO login) or `all` (also those added by an administrator or an invitation). Other than `none`, it also requires `orgs:members:manage`, plus `orgs:groups:members:manage` when a rule sets groups. See [Updating existing members](#updating-existing-members). |
 
 The dry run response reports:
 
@@ -249,7 +274,7 @@ By default, applying the rules never changes the members already in the organiza
 | The matching rule… | Effect on the member |
 |--------------------|----------------------|
 | sets a `role` | The member gets that role |
-| sets no `role` | The member's role is left as it is |
+| sets no `role` | The member gets the role a new member would join with: the organization role their legacy platform role maps to (see [Default role mapping](/self-hosting/operations/migration-v27#default-role-mapping)), otherwise the organization's default role |
 | sets `groups` | The member's groups are replaced by the rule's: they are added to the missing ones and removed from all the others, including groups an administrator added them to |
 | sets no `groups` | The member's groups are left as they are |
 
