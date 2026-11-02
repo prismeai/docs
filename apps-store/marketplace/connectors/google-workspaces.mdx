@@ -623,11 +623,27 @@ The scope names in the table are short forms of `https://www.googleapis.com/auth
 | HTTP code | Meaning |
 |-----------|---------|
 | `400` | Bad request: invalid parameters or malformed body (e.g. bad A1 range, invalid file metadata). |
-| `401` | Unauthorized: the Google access token is missing, expired or revoked. The user must reconnect (OAuth modes). |
-| `403` | Forbidden: insufficient OAuth scope, the target API is not enabled in the Cloud project, or the account lacks access to the resource. |
+| `401` | Unauthorized: Google refused the access token. The connector renews it once and retries; if that fails, the error carries one of the codes below. |
+| `403` | Forbidden: insufficient OAuth scope, the target API is not enabled in the Cloud project, or the account lacks access to the resource (`PERMISSION_DENIED`). A `403` caused by a rate limit is reported as `TEMPORARY`. |
 | `404` | Not found: the file, document, spreadsheet, message or event id does not exist or is not visible to the account. |
 | `429` | Rate limit / quota exceeded: back off and retry. |
 | `500` / `503` | Google service error: transient; retry shortly, no reconnection needed. |
+
+### Error codes
+
+Authentication and permission errors start with a stable code, which is also returned in the `code` field where the response has one. Only `AUTH_EXPIRED` asks the user to reconnect.
+
+| Code | Meaning | What to do |
+|------|---------|------------|
+| `AUTH_EXPIRED` | The user has no stored Google sign-in, or it expired or was revoked. | The user reconnects. |
+| `TEMPORARY` | Google is temporarily unavailable or is rate limiting. | Retry shortly. No reconnection needed. |
+| `OAUTH_CLIENT_MISCONFIGURED` | Google rejected the connector's OAuth client. This affects every user. | An administrator checks the OAuth client ID and secret. Users stay connected, and reconnecting does not help. |
+| `OAUTH_TOKEN_REJECTED` | Google refused to renew the token for another reason, such as scopes. | An administrator checks the OAuth client and its scopes. Users stay connected. |
+| `PERMISSION_DENIED` | The account, scopes or Cloud project do not allow this request. | Check the account's access, the granted scopes and the enabled APIs. |
+
+### Connection status
+
+`connected: true` means the connector holds a credential for this user. It does not prove that Google still accepts it: a revoked sign-in is detected the next time the token is renewed, and is then reported as `AUTH_EXPIRED`. A status response can also include `code` and `reason` when a credential is held but cannot currently be renewed.
 
 ### Common Issues
 
@@ -637,7 +653,9 @@ The scope names in the table are short forms of `https://www.googleapis.com/auth
 
 **"Google is not connected for this user"**: No per-user OAuth token. Open the configuration app (OAuth mode) and click **Connect**, or use the agent's connect flow.
 
-**"Google token refresh failed … must reconnect"**: The stored refresh token was revoked or expired (Google invalidated it). The connection is dropped automatically; the user must reconnect from the config app.
+**"AUTH_EXPIRED: the Google sign-in of this user has expired or was revoked"**: Google invalidated the stored refresh token. The connection is dropped automatically; the user must reconnect from the config app.
+
+**"OAUTH_CLIENT_MISCONFIGURED: Google rejected the OAuth client of the connector"**: The OAuth client ID or secret is wrong, or the client was deleted or disabled in Google Cloud. Fix it in the config app. Users do not need to reconnect.
 
 **"Google OAuth is not configured"**: Neither a tenant OAuth client nor the central platform client is available. Set the OAuth client ID/secret in the config app, or ask the platform maintainer to provision the central OAuth client.
 
