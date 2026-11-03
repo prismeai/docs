@@ -57,6 +57,8 @@ tags:
     description: Execution traces of agent turns (editor debugging, `agent-factory:traces:read`).
   - name: Evaluations
     description: Agent evaluation runs and results.
+  - name: Push
+    description: Mobile device registration for push notifications.
   - name: Admin
     description: |
       GDPR operations called by the AI Insights admin screens. They require
@@ -4864,6 +4866,105 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminError'
+  /v1/push/devices:
+    post:
+      tags: [Push]
+      operationId: registerPushDevice
+      summary: Register the signed-in user's mobile device for push notifications
+      description: |
+        Stores the device's APNs or FCM token and its notification key (RFC 8291),
+        sealed at rest. Registering again with the same `device_id` updates it. A
+        former registration of the same token, whichever the account, is replaced.
+        The app draws a `device_id` at sign-in and forgets it at sign-out; on `409`
+        it draws a new one and retries. Org API keys are refused.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [device_id, platform, token, p256dh, auth]
+              properties:
+                device_id:
+                  type: string
+                  pattern: '^[A-Za-z0-9_-]{16,64}$'
+                platform:
+                  type: string
+                  enum: [ios, android]
+                token:
+                  type: string
+                  description: APNs or FCM token.
+                p256dh:
+                  type: string
+                  description: Uncompressed P-256 public key, base64url.
+                auth:
+                  type: string
+                  description: 16-byte secret, base64url.
+                environment:
+                  type: string
+                  enum: [production, development]
+                  description: APNs environment. Required on iOS, refused on Android.
+                topic:
+                  type: string
+                  description: APNs topic (the app bundle id). iOS only.
+      responses:
+        '204':
+          description: Device registered.
+        '400':
+          description: Invalid registration. `error` names the field (`InvalidToken`, `InvalidKey`, ...).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Not a user credential.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: This `device_id` belongs to another account (`error` is `DeviceIdTaken`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Push notifications are not configured on this instance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [Push]
+      operationId: forgetPushDevice
+      summary: Forget one of the signed-in user's devices
+      description: Called at sign-out. Only the owner of the device can forget it.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: device_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Device forgotten, or it was not registered for this user.
+        '400':
+          description: '`device_id` is missing.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Not a user credential.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 components:
   securitySchemes:
     BearerAuth:
