@@ -280,7 +280,13 @@ Pay attention to cluster health metrics and ensure adequate disk space for index
 
 ### Shard accounting
 
-Elasticsearch limits each node to **1000 shards** by default. A 3-node cluster can therefore hold at most 3000 shards. The events cleanup CronJob keeps this under control; if you approach the limit on a tenant you may need to consolidate older data streams or raise the per-node cap.  
+Elasticsearch and OpenSearch limit each data node to **1000 shards** by default, primaries and replicas included. A 3-node cluster can therefore hold at most 3000 shards. At the limit, the cluster refuses every new index, whichever service asks for it: see [When the cluster reaches the shard limit](#when-the-cluster-reaches-the-shard-limit). The [monitoring thresholds](/self-hosting/production-readiness/monitoring-thresholds) alert you well before.
+
+Three kinds of data create indices, and therefore consume shards (prefixes as in [Index-level patterns](#index-level-patterns)):
+
+- **Events**: one data stream per workspace, `${eventsPrefix}-events-<workspaceId>` on Elasticsearch or `events-${eventsPrefix}-<workspaceId>` on OpenSearch. Each rollover adds a backing index. The [events automated cleanup](#events-automated-cleanup) CronJob frees shards by deleting the data streams of small, inactive workspaces, and a deleted workspace's events are deleted with it (see ILM above).
+- **Knowledge bases**: one index per knowledge base, `${aikPrefix}_vs_<id>`, or `vs_<id>` when no prefix is set. Each one takes **2 shards** (1 primary, 1 replica), whatever its size. This includes the conversation knowledge base an agent creates the first time a file is attached in one of its conversations. These shards are freed only when the knowledge base, its agent or its owner is deleted: no CronJob removes them. A platform with many small knowledge bases reaches the shard limit long before its disk limit.
+- **Crawler and search engine**: the web pages indexed by `prismeai-crawler` for `prismeai-searchengine`, in `${crawlerPrefix}-searchengine-webpages-*`.
 
 In order to troubleshoot what patterns / apps consume the most shards, the **api-gateway** exposes a `/sys/events/*` route that returns the ES/OS `_cat/shards` as JSON. It is reserved to **super admins** (email in `SUPER_ADMIN_EMAILS`), and the gateway forwards to the events service `sys/*` APIs, so you can call it from outside the cluster:
 
@@ -335,7 +341,35 @@ Tenants are auto-detected from index names. When they can't be resolved (e.g. wo
 
 - `patterns`: comma-separated pattern templates (with `%s` as the tenant placeholder) to override the defaults above.
 - `tenants`: comma-separated tenant list to force grouping (like the `TENANTS` variable in the script) when auto-detection isn't enough.
-- `index`: restrict the underlying `_cat/shards` call to a given index/pattern.
+- `index`: restrict the underlying `_cat/shards` call to a given index/pattern. For instance, `index=*vs_*` counts the shards of knowledge bases alone, 2 per knowledge base.
+
+#### When the cluster reaches the shard limit
+
+**Symptom.** Index creation fails with this error (the numbers depend on your cluster):
+
+```text
+Validation Failed: 1: this action would add [2] total shards, but this cluster currently has [3000]/[3000] maximum shards open;
+```
+
+In Prisme.ai, it shows up as follows:
+
+- In Agent Creator, attaching a file to a conversation fails with `Vector store creation failed` when the agent has no conversation knowledge base yet. Agents that already have one are not affected.
+- In Knowledge, creating a knowledge base fails with `INDEX_CREATION_FAILED`. The full error is in the output of the `v1/knowledge_bases` execution, in the [Activity](/products/ai-builder/activity) of the `storage` workspace.
+- New events data streams and their rollovers are refused as well.
+
+Existing knowledge bases keep working: their indices already exist.
+
+**Cause.** The cluster holds as many shards as its data nodes allow.
+
+**Resolution.** You need super admin access to the API and access to the cluster.
+
+1. Find what consumes the shards with `/sys/events/shards?group=true`, then `/sys/events/shards?index=*vs_*` for knowledge bases (see above).
+2. Free shards:
+   - **Events**: check that the cleanup CronJob is enabled (`events.cleanupjob: true`), then run it once by hand as described in [Troubleshooting cleanup jobs](#troubleshooting-cleanup-jobs).
+   - **Knowledge bases**: delete the knowledge bases, and the agents, that are no longer used. Deleting a knowledge base deletes its index and frees its 2 shards.
+3. If the remaining data still needs more shards, add data nodes: each one adds 1000 shards with the default limit. On Amazon OpenSearch Service 2.17 and later, AWS sets the limit to 1000 shards per 16 GB of JVM heap, up to 4000 per node: add nodes or use larger instances.
+
+**Verification.** `/sys/events/shards` reports a `total` below the limit, and attaching a file to an agent that has never received one succeeds.
 
 ### Move an Elasticsearch node without losing redundancy
 
