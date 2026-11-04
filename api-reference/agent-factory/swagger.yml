@@ -445,7 +445,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Forbidden.
+          description: Forbidden — including a `tools[]` entry that reads a knowledge base the caller cannot read or that belongs to another organization (`details.rejected` lists them).
           content:
             application/json:
               schema:
@@ -463,7 +463,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '502':
-          description: Service account provisioning failed (agent record rolled back).
+          description: Service account provisioning failed (agent record rolled back) or `KNOWLEDGE_BASE_CHECK_FAILED` when storage could not be asked whether a knowledge base in `tools[]` is readable (nothing stored; retry).
           content:
             application/json:
               schema:
@@ -564,7 +564,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Forbidden.
+          description: Forbidden — including a `tools[]` entry that reads a knowledge base the caller cannot read or that belongs to another organization (`details.rejected` lists them).
           content:
             application/json:
               schema:
@@ -577,6 +577,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '405':
           description: Method not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: '`KNOWLEDGE_BASE_CHECK_FAILED` — storage could not be asked whether a knowledge base in `tools[]` is readable. Nothing is stored; retry.'
           content:
             application/json:
               schema:
@@ -687,6 +693,10 @@ paths:
         Any `id:` carried by the file's frontmatter is ignored - round-trip
         re-imports always create a new agent unless the caller explicitly
         opts into a patch.
+
+        A knowledge base referenced by a tool is kept only when the caller
+        can read it and it belongs to the agent's organization; otherwise the
+        reference is emptied and reported in `warnings`.
       requestBody:
         required: true
         content:
@@ -742,7 +752,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '502':
-          description: Service account provisioning failed (agent record rolled back).
+          description: Service account provisioning failed (agent record rolled back) or `KNOWLEDGE_BASE_CHECK_FAILED` when storage could not be asked whether a knowledge base in `tools[]` is readable (nothing stored; retry).
           content:
             application/json:
               schema:
@@ -780,6 +790,7 @@ paths:
           schema:
             type: string
             maxLength: 128
+            pattern: '^[a-zA-Z0-9_-]+$'
           description: The file_search knowledge base the cited document belongs to.
         - name: document_id
           in: query
@@ -787,6 +798,7 @@ paths:
           schema:
             type: string
             maxLength: 128
+            pattern: '^[a-zA-Z0-9_-]+$'
           description: The cited document id.
       responses:
         '302':
@@ -2065,7 +2077,9 @@ paths:
       summary: Delete all conversations for the caller on this agent
       description: |
         Cascades a bulk delete: all caller-owned conversations on this
-        agent, their tasks, and their artifact versions / artifacts.
+        agent, their tasks, and their internal `tool_result` artifacts.
+        Canvases are NOT deleted: they are detached (`conversation_id` set
+        to null) and stay listed by `GET /v1/artifacts`.
         Emits `conversations.deleted.all` for cache invalidation.
       parameters:
         - name: agentId
@@ -2138,6 +2152,18 @@ paths:
           schema:
             type: string
           description: 1-indexed page number for the task-message history.
+        - name: message_id
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 128
+          description: |
+            Return the page (of `limit` tasks) holding the task whose history
+            has this message, instead of `page`; with `limit=1`, that task
+            alone. The response's `page` says which page was returned. An
+            unknown message keeps the requested page, with
+            `message_found: false`.
       responses:
         '200':
           description: Conversation + messages.
@@ -2235,7 +2261,11 @@ paths:
     delete:
       tags: [Conversations]
       operationId: deleteConversation
-      summary: Delete a single conversation (cascades to tasks + artifacts)
+      summary: Delete a single conversation (cascades to tasks + tool results)
+      description: |
+        Deletes the conversation, its tasks and its internal `tool_result`
+        artifacts. Its canvases are detached (`conversation_id` set to null)
+        and stay listed by `GET /v1/artifacts`.
       parameters:
         - name: agentId
           in: path
@@ -3024,9 +3054,37 @@ paths:
       operationId: cancelTask
       summary: Cancel a running task (A2A)
       description: |
-        Sets the task `status.state` to `canceled` and stamps a
-        `_completed_at`. Tasks already in `completed` or `canceled`
-        return a 4xx.
+        Stops a running answer (#345). Only the task's owner can cancel it.
+        Sets `status.state` to `canceled` (stamps `_completed_at`, drops a held
+        `pending_approval`); the agent loop re-reads that state before every
+        model call and every tool chunk and stops there, keeping the text already
+        streamed as an interrupted answer. For a root task (its turn was started
+        by a client, not by another workspace) the runtime is also asked to abort
+        the execution processing it (`abort_requested: true`).
+
+        Never changes a finished task: a task already `completed`, `failed`,
+        `rejected`, `blocked` or `canceled` answers 200 with `canceled: false`
+        and its current `status`. Through A2A `tasks/cancel`, a finished task
+        other than `canceled` answers `TaskNotCancelableError` (-32002).
+
+        Deliberate gap with A2A: `tasks/cancel` on a task already `canceled`
+        answers the task (state `canceled`) instead of
+        `TaskNotCancelableError`. A second Stop — a double click, a retry
+        after a network cut — is then a success, not an error to show.
+
+        Body `discard: true` also drops the turn from the conversation (LLM
+        history, transcript, share, task list), including a turn already
+        finished, whose state does not change.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                discard:
+                  type: boolean
+                  description: Drop the turn from the conversation. It stays readable by id and counts in usage.
       parameters:
         - name: agentId
           in: path
@@ -3042,17 +3100,11 @@ paths:
             maxLength: 128
       responses:
         '200':
-          description: Task canceled.
+          description: 'Task canceled by this call (`canceled: true`), or already terminal and left unchanged (`canceled: false`).'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TaskCancelResult'
-        '400':
-          description: Task is already terminal (`completed` or `canceled`).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
         '401':
           description: Authentication required.
           content:
@@ -3198,10 +3250,13 @@ paths:
     get:
       tags: [Artifacts]
       operationId: listArtifacts
-      summary: List artifacts owned by the caller
+      summary: List canvases owned by the caller
       description: |
-        List artifacts the authenticated user owns, optionally filtered
-        by `agent_id`, `conversation_id`, and `artifact_type`.
+        List the canvases the authenticated user owns, optionally filtered
+        by `agent_id`, `conversation_id`, `artifact_type` and a title
+        `search`. Internal `tool_result` artifacts are never listed. A canvas
+        whose conversation was deleted is still listed, with a null
+        `conversation_id`.
       parameters:
         - name: agent_id
           in: query
@@ -3220,21 +3275,37 @@ paths:
           required: false
           schema:
             type: string
-            maxLength: 64
+            maxLength: 256
+          description: One artifact type, or several separated by commas (e.g. `code,slides`). `tool_result` is ignored.
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 200
+          description: Case-insensitive search on the title, matched as literal text.
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [updated, created, title]
+          description: Sort order — most recently edited (content or title; detaching a canvas from a deleted conversation is not an edit), most recently created (default), or title A→Z.
         - name: limit
           in: query
           required: false
           schema:
             type: string
-          description: Page size (default 50).
+          description: Page size (default 50, max 100).
         - name: page
           in: query
           required: false
           schema:
             type: string
+          description: 1-based page number (default 1).
       responses:
         '200':
-          description: Page of artifacts.
+          description: Page of canvases.
           content:
             application/json:
               schema:
@@ -4030,7 +4101,7 @@ paths:
               type: file_search
               name: test_file_search
               description: Test file search tool
-              vector_store_id: vs_test_123
+              vector_store_id: vs_0bd1687755e74937a443cd21632f1641
               catalog_id: template-file-search
       responses:
         '200':
@@ -4052,7 +4123,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Forbidden.
+          description: Forbidden — including a tool that reads a knowledge base the caller cannot read or that belongs to another organization (`details.rejected` lists it).
           content:
             application/json:
               schema:
@@ -4071,6 +4142,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '409':
           description: A tool with the same name already exists on this agent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: '`KNOWLEDGE_BASE_CHECK_FAILED` — storage could not be asked whether a knowledge base the tool reads is readable. Nothing is stored; retry.'
           content:
             application/json:
               schema:
@@ -4728,6 +4805,105 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /v1/push/devices:
+    post:
+      tags: [Push]
+      operationId: registerPushDevice
+      summary: Register the signed-in user's mobile device for push notifications
+      description: |
+        Stores the device's APNs or FCM token and its notification key (RFC 8291),
+        sealed at rest. Registering again with the same `device_id` updates it. A
+        former registration of the same token, whichever the account, is replaced.
+        The app draws a `device_id` at sign-in and forgets it at sign-out; on `409`
+        it draws a new one and retries. Org API keys are refused.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [device_id, platform, token, p256dh, auth]
+              properties:
+                device_id:
+                  type: string
+                  pattern: '^[A-Za-z0-9_-]{16,64}$'
+                platform:
+                  type: string
+                  enum: [ios, android]
+                token:
+                  type: string
+                  description: APNs or FCM token.
+                p256dh:
+                  type: string
+                  description: Uncompressed P-256 public key, base64url.
+                auth:
+                  type: string
+                  description: 16-byte secret, base64url.
+                environment:
+                  type: string
+                  enum: [production, development]
+                  description: APNs environment. Required on iOS, refused on Android.
+                topic:
+                  type: string
+                  description: APNs topic (the app bundle id). iOS only.
+      responses:
+        '204':
+          description: Device registered.
+        '400':
+          description: Invalid registration. `error` names the field (`InvalidToken`, `InvalidKey`, ...).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Not a user credential.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: This `device_id` belongs to another account (`error` is `DeviceIdTaken`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Push notifications are not configured on this instance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [Push]
+      operationId: forgetPushDevice
+      summary: Forget one of the signed-in user's devices
+      description: Called at sign-out. Only the owner of the device can forget it.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: device_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Device forgotten, or it was not registered for this user.
+        '400':
+          description: '`device_id` is missing.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Not a user credential.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/admin/user-deletion:
     post:
       tags: [Admin]
@@ -4866,105 +5042,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminError'
-  /v1/push/devices:
-    post:
-      tags: [Push]
-      operationId: registerPushDevice
-      summary: Register the signed-in user's mobile device for push notifications
-      description: |
-        Stores the device's APNs or FCM token and its notification key (RFC 8291),
-        sealed at rest. Registering again with the same `device_id` updates it. A
-        former registration of the same token, whichever the account, is replaced.
-        The app draws a `device_id` at sign-in and forgets it at sign-out; on `409`
-        it draws a new one and retries. Org API keys are refused.
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [device_id, platform, token, p256dh, auth]
-              properties:
-                device_id:
-                  type: string
-                  pattern: '^[A-Za-z0-9_-]{16,64}$'
-                platform:
-                  type: string
-                  enum: [ios, android]
-                token:
-                  type: string
-                  description: APNs or FCM token.
-                p256dh:
-                  type: string
-                  description: Uncompressed P-256 public key, base64url.
-                auth:
-                  type: string
-                  description: 16-byte secret, base64url.
-                environment:
-                  type: string
-                  enum: [production, development]
-                  description: APNs environment. Required on iOS, refused on Android.
-                topic:
-                  type: string
-                  description: APNs topic (the app bundle id). iOS only.
-      responses:
-        '204':
-          description: Device registered.
-        '400':
-          description: Invalid registration. `error` names the field (`InvalidToken`, `InvalidKey`, ...).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '403':
-          description: Not a user credential.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '409':
-          description: This `device_id` belongs to another account (`error` is `DeviceIdTaken`).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '503':
-          description: Push notifications are not configured on this instance.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-    delete:
-      tags: [Push]
-      operationId: forgetPushDevice
-      summary: Forget one of the signed-in user's devices
-      description: Called at sign-out. Only the owner of the device can forget it.
-      security:
-        - BearerAuth: []
-      parameters:
-        - name: device_id
-          in: query
-          required: true
-          schema:
-            type: string
-      responses:
-        '204':
-          description: Device forgotten, or it was not registered for this user.
-        '400':
-          description: '`device_id` is missing.'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '403':
-          description: Not a user credential.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
 components:
   securitySchemes:
     BearerAuth:
@@ -5080,6 +5157,8 @@ components:
           type: integer
         tasks_archive_deleted:
           type: integer
+        push_devices_deleted:
+          type: integer
         memories_deleted:
           type: integer
         storage_files_deleted:
@@ -5102,6 +5181,7 @@ components:
         access_requests_deleted: 0
         agent_bindings_deleted: 4
         tasks_archive_deleted: 5
+        push_devices_deleted: 1
         memories_deleted: 6
         storage_files_deleted: 2
         storage_vector_stores_deleted: 1
@@ -5125,6 +5205,7 @@ components:
             access_requests: { type: array, items: { type: object, additionalProperties: true } }
             agent_bindings: { type: array, items: { type: object, additionalProperties: true } }
             tasks_archive: { type: array, items: { type: object, additionalProperties: true } }
+            push_devices: { type: array, items: { type: object, additionalProperties: true } }
             agents: { type: array, items: { type: object, additionalProperties: true } }
             memories: { type: array, items: { type: object, additionalProperties: true } }
             files: { type: array, items: { type: object, additionalProperties: true } }
@@ -5150,6 +5231,7 @@ components:
           access_requests: []
           agent_bindings: []
           tasks_archive: []
+          push_devices: []
           agents: []
           memories: []
           files: []
@@ -5163,6 +5245,7 @@ components:
           access_requests: 0
           agent_bindings: 0
           tasks_archive: 0
+          push_devices: 0
           agents: 0
           memories: 0
           files: 0
@@ -5409,6 +5492,9 @@ components:
               type: integer
         canvas_enabled:
           type: boolean
+        conversation_file_tools_enabled:
+          type: boolean
+          description: Opt-in. Exposes the read tools of the Knowledge MCP on the files attached to the current conversation.
         visibility:
           type: string
           enum: [public, private, restricted]
@@ -5563,9 +5649,9 @@ components:
             additionalProperties: true
         max_turns:
           type: integer
-          minimum: 1
+          minimum: 0
           nullable: true
-          description: Persisted only when provided; otherwise the workspace default applies (max_turns has no profile default). 0 and negative values are rejected.
+          description: Persisted only when provided and positive; otherwise the workspace default applies (max_turns has no profile default). 0 means the default, like null or omission. Negative values are rejected.
         token_budget:
           type: integer
           description: Overrides the profile default when provided.
@@ -5645,9 +5731,9 @@ components:
           description: Send null to remove the per-agent limit (the LLM Gateway limit applies).
         max_turns:
           type: integer
-          minimum: 1
+          minimum: 0
           nullable: true
-          description: Send null to reset to the workspace default (max_turns has no profile default). 0 and negative values are rejected.
+          description: Send null or 0 to reset to the workspace default (max_turns has no profile default). Negative values are rejected.
         token_budget:
           type: integer
           nullable: true
@@ -5659,6 +5745,9 @@ components:
           description: Send null or 0 to reset to the workspace default (tool_call_budget has no profile default). Negative values are rejected.
         canvas_enabled:
           type: boolean
+        conversation_file_tools_enabled:
+          type: boolean
+          description: Opt-in. Exposes the read tools of the Knowledge MCP on the files attached to the current conversation.
         visibility:
           type: string
           enum: [public, private, restricted]
@@ -5730,6 +5819,26 @@ components:
               description: |
                 Indicates whether the call created a new agent or patched
                 an existing one (based on `target_agent_id`).
+            warnings:
+              type: array
+              description: |
+                Knowledge bases unlinked during the import because the caller
+                cannot read them or they belong to another organization (an id
+                from another environment included). The tool is kept with its
+                `vector_store_id` (or Knowledge Explorer `server`) emptied.
+              items:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    example: KNOWLEDGE_BASE_UNLINKED
+                  tool:
+                    type: string
+                  knowledge_base_id:
+                    type: string
+                  reason:
+                    type: string
+                    enum: [not_readable, other_organization, invalid_id]
     AgentUnpublishResponse:
       type: object
       properties:
@@ -6234,7 +6343,7 @@ components:
         vector_store_id:
           type: string
           maxLength: 128
-          description: Required for `file_search`.
+          description: Required for `file_search`. A knowledge base the caller can read, in the agent's organization (403 otherwise).
         server:
           type: string
           maxLength: 2048
@@ -6377,6 +6486,13 @@ components:
           items:
             type: object
             additionalProperties: true
+        page:
+          type: integer
+          description: Page returned (the one holding `message_id` when it was found).
+        message_found:
+          type: boolean
+          nullable: true
+          description: Whether a task of this conversation holds `message_id`; null without `message_id`.
     ConversationsBulkDeleteResult:
       type: object
       properties:
@@ -6477,10 +6593,12 @@ components:
               type: string
               description: |
                 BCP-47 code of the user's interface language (`fr`, `fr-FR`,
-                `pt-BR`), used as the default response language only when the
-                message itself does not make the language clear. Also accepted
-                per part; the message level wins. Falls back to the
-                `Accept-Language` header; an unrecognised code is ignored.
+                `pt-BR`), used as the fallback language of the generated
+                conversation title and session summary when the text itself
+                does not make the language clear. It does not steer the
+                agent's reply. Also accepted per part; the message level wins.
+                Falls back to the `Accept-Language` header; an unrecognised
+                code is ignored.
         parts:
           type: array
           items:
@@ -6593,12 +6711,24 @@ components:
             $ref: '#/components/schemas/Task'
     TaskCancelResult:
       type: object
+      required: [id, status, canceled, abort_requested]
       properties:
+        discarded:
+          type: boolean
+          description: Whether the turn is out of the conversation (`discard` was requested).
         id:
           type: string
         status:
           type: string
+          description: Task state after the call (`canceled`, or the terminal state it already had).
+          enum: [canceled, completed, failed, rejected, blocked]
           example: canceled
+        canceled:
+          type: boolean
+          description: True only when this call moved the task to `canceled`.
+        abort_requested:
+          type: boolean
+          description: True when the runtime was asked to abort the execution processing the task (root task with a recorded correlation).
     TaskResolveInput:
       type: object
       required: [approved]
@@ -6690,18 +6820,57 @@ components:
           format: date-time
     ArtifactListResponse:
       type: object
-      description: Paginated list of artifacts (no `total` returned by this endpoint).
+      description: Paginated list of canvases. `total` and `has_more` are computed on the same query as the page.
       properties:
         artifacts:
           type: array
           items:
-            type: object
-            additionalProperties: true
-            description: Artifact record (see `ArtifactDetail`).
+            $ref: '#/components/schemas/ArtifactListItem'
         page:
           type: integer
         limit:
           type: integer
+        total:
+          type: integer
+          description: Number of canvases matching the filters, all pages included.
+        has_more:
+          type: boolean
+    ArtifactListItem:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        artifact_type:
+          type: string
+          description: code, markdown, mermaid, svg, webpage or slides.
+        mime_type:
+          type: string
+        language:
+          type: string
+          nullable: true
+        filename:
+          type: string
+          nullable: true
+        current_version:
+          type: integer
+        total_versions:
+          type: integer
+          nullable: true
+        conversation_id:
+          type: string
+          nullable: true
+          description: Null once the conversation that produced the canvas was deleted.
+        agent_id:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
     ArtifactPatchInput:
       type: object
       description: |
@@ -7121,7 +7290,7 @@ components:
         summary:
           type: object
           additionalProperties: true
-          description: Aggregated KPIs (users, engagement, quality, performance, cost, models, tools).
+          description: 'Aggregated KPIs (users, engagement, quality, performance, cost, models, tools). `tools` = {tool_calls, invalid_tool_names, <tool>: {calls}}; invalid_tool_names sums, over each name a model returned that is not a valid tool name, the completions that returned it (those names are left out of the per-tool list).'
         series:
           type: array
           items:
