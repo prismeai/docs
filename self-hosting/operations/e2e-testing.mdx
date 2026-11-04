@@ -1,0 +1,256 @@
+---
+title: 'Automated end-to-end tests'
+description: 'Run the open-source Prisme.ai E2E suite against your own deployment'
+---
+
+Prisme.ai ships an open-source end-to-end test suite that drives a **real browser against a running instance** — sign-in, chat, agent creation, knowledge bases, Builder, governance — and tells you whether the platform actually works, not just whether it responds.
+
+It is the automated counterpart to the [deployment checklist](/self-hosting/operations/testing): the readiness endpoint answers *"are my services up?"*, this suite answers *"can a user actually do their job?"*.
+
+<Info>
+The suite lives in the [prisme.ai](https://gitlab.com/prisme.ai/prisme.ai) repository under `tests-e2e/`. It is built on [Playwright](https://playwright.dev) with [playwright-bdd](https://vitalets.github.io/playwright-bdd/) — scenarios are written in Gherkin, so they read as plain English.
+
+**Every command below is run from inside `tests-e2e/`**, and `.env.<name>` refers to that directory — not the repository root.
+</Info>
+
+## When to use it
+
+<CardGroup cols={2}>
+  <Card title="After a deployment or upgrade" icon="rocket">
+    Catch a broken login, a misconfigured LLM gateway, or a missing permission before your users do.
+  </Card>
+  <Card title="On every release, in CI" icon="arrows-rotate">
+    Run it as a pipeline stage against a staging environment.
+  </Card>
+  <Card title="To validate a model catalog" icon="brain">
+    Check that each configured provider answers, and interprets files.
+  </Card>
+  <Card title="To reproduce a bug" icon="bug">
+    Write one Gherkin scenario and hand it over as a reproducible artifact.
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+- **Node** v22.x and **npm** 10.x
+- A **Prisme.ai account** on the environment you want to test, with the **admin** or **superadmin** role on the organization — a lesser role hits permission errors mid-suite.
+- Access to Agent Creator, Builder and Insights, depending on which suites you run.
+
+<Tip>
+No local Node or Chromium? The suite also runs in a container — see `docs/DOCKER.md` in the repository. Configuration and custom scenarios are mounted as volumes.
+</Tip>
+
+## Install
+
+<Steps>
+  <Step title="Clone the repository and install">
+    The suite has its own `package.json`, isolated from the platform services.
+
+    ```bash
+    git clone https://gitlab.com/prisme.ai/prisme.ai.git
+    cd prisme.ai/tests-e2e
+    npm install
+    ```
+  </Step>
+  <Step title="Install the browser">
+    Required — Playwright needs its own Chromium build.
+
+    ```bash
+    npm run install:browser
+    ```
+
+    <Note>Re-run this after every Playwright upgrade.</Note>
+  </Step>
+  <Step title="Point it at your environment">
+    Create a `.env.<name>` file (see [Configuration](#configuration)), then make it the active one:
+
+    ```bash
+    echo "my-env" > .active-env
+    ```
+  </Step>
+  <Step title="Run a suite">
+    ```bash
+    npm run bdd:auth
+    ```
+
+    The first run signs in, saves the session, and runs the authentication scenarios. If it goes green, your setup is correct.
+  </Step>
+</Steps>
+
+## Configuration
+
+Each target environment gets its own `.env.<name>` file. Only the admin block is mandatory — everything else unlocks specific suites.
+
+```bash .env.my-env
+# ── Admin account (REQUIRED) — used by almost every suite ────────────────
+PRISME_EMAIL=your.email@example.com
+PRISME_PASSWORD=yourPassword
+PRISME_URL=https://studio.your-domain.com
+
+# ── Member account — for member-dependent scenarios ──────────────────────
+# Used by the basic-user suite and the workspace-sharing scenarios.
+# Scenarios needing it are SKIPPED at runtime when it is absent.
+PRISME_MEMBER_EMAIL=member@example.com
+PRISME_MEMBER_PASSWORD=memberPassword
+
+# ── API key — for the api-* suites ───────────────────────────────────────
+PRISMEAI_API_KEY=iak_yourorg_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+# ── Profile access token — REQUIRED if your platform enforces MFA ────────
+PRISMEAI_BEARER_TOKEN=at:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+<Warning>
+`.env.*` files and everything under `playwright/.auth/` hold real credentials. Both are git-ignored and must never be committed. No email, password or API key belongs in a scenario — read it from `.env.<name>`.
+</Warning>
+
+### Choosing the environment
+
+The active environment is resolved in this order:
+
+1. **Shell variable** — a one-shot override: `PRISME_URL=sandbox npm run bdd:auth`
+2. **`.active-env` file** at the root of `tests-e2e/`
+3. **Fallback** — `studio`
+
+The resolved name loads `.env.<name>` and names the session file (`playwright/.auth/admin-<name>.json`), so several environments coexist without clashing.
+
+```bash
+echo "sandbox" > .active-env                            # change the default
+PRISME_URL=sandbox npm run bdd:auth                     # one-shot override
+PRISME_URL=https://my-env.example.com npm run bdd:auth  # arbitrary URL
+```
+
+## Running the tests
+
+```bash
+npm run bdd            # every scenario
+npm run bdd:auth       # sign-in and session
+npm run bdd:homepage   # home page
+npm run bdd:chat       # chat with an agent
+npm run bdd:builder    # Builder workspaces
+npm run bdd:store      # agent store
+```
+
+Each suite maps to a Gherkin file in `features/` and a tag (`@TC-AUTH`, `@TC-HOME`, …). Run `npm run` with no argument to list them all.
+
+### Debugging a failure
+
+<CardGroup cols={2}>
+  <Card title="Interactive runner" icon="play">
+    ```bash
+    npm run bdd:ui
+    ```
+    Opens Playwright's UI mode: pick a scenario, step through it, travel back in time, and use the selector picker.
+  </Card>
+  <Card title="HTML report" icon="chart-line">
+    ```bash
+    npm run bdd:report
+    ```
+    Opens the report of the last run — screenshots, video, and a full network trace of every API call.
+  </Card>
+</CardGroup>
+
+## Authentication
+
+Authentication is driven entirely by what you put in `.env.<name>`. Precedence is **SSO > profile token > email/password**.
+
+<AccordionGroup>
+  <Accordion title="Email and password (default)" icon="key">
+    Before each run, a `setup` project signs in through the UI and saves the session to `playwright/.auth/admin-<env>.json`. Scenarios then start already authenticated — there is no separate login step to run.
+
+    This is enough on any platform without MFA.
+  </Accordion>
+
+  <Accordion title="Platform with MFA — use a profile access token" icon="shield-halved">
+    When MFA is enforced, an email/password login lands on the two-factor screen and blocks the suites. A **profile access token** (`at:…`) is a non-interactive credential that is **exempt from MFA**:
+
+    ```bash
+    PRISMEAI_BEARER_TOKEN=at:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    ```
+
+    It authenticates the API suites, the fixture provisioning **and** the browser session (injected as a Bearer on the SPA's API calls), so no login form is ever shown. Get it from your profile page and treat it like a password.
+
+    The authentication suite is deliberately excluded from this injection, so it keeps exercising the real login.
+
+    <Note>Under a token, org isolation is skipped automatically — a token is stateless and cannot switch the active org, so suites run on the account's default org.</Note>
+  </Accordion>
+
+  <Accordion title="MFA — TOTP secret (fallback)" icon="clock">
+    Only needed for the flows that must perform a *real* login (the authentication suite). The 6-digit code is derived at run time from your enrolled secret:
+
+    ```bash
+    PRISME_TOTP_SECRET=JBSWY3DPEHPK3PXP
+    ```
+
+    This is the base32 string shown when enrolling MFA ("can't scan the QR code?"). It is fixed — only the derived code rotates. Leaving it unset is safe: the MFA handler is a no-op when no two-factor screen appears.
+  </Accordion>
+
+  <Accordion title="SSO, captcha or magic link" icon="fingerprint">
+    For login flows automation cannot drive (Okta, Azure AD, captcha…), capture a session by hand, once:
+
+    ```bash
+    npm run login -- --sso
+    ```
+
+    A visible browser opens; sign in normally. The session is saved and `PRISME_SSO=1` is written to `.env.<name>`. Every later run reuses that session instead of logging in. When it expires, the setup fails with a clear message — just re-run the command.
+  </Accordion>
+</AccordionGroup>
+
+## Test data is created and destroyed per run
+
+Suites never depend on data that happens to exist on your instance. Any suite that needs an agent **provisions its own through the API** at the start and deletes it at the end:
+
+```
+1. Sign in → save the session                     (once per run)
+2. Per suite:  POST /agents  →  scenarios  →  DELETE /agents/<id>
+3. Nothing left behind
+```
+
+Fixtures are named `agentForTest_<suite>_<runId>`, which keeps parallel runs and CI workers from colliding. The same applies to knowledge bases and workspaces.
+
+<Note>
+By default, suites run on your account's **default organization** and clean up after themselves. For parallel CI jobs sharing one account, opt into an ephemeral organization per run with `TEST_ORG_ISOLATION=1`. It requires a cookie session (SSO or email/password) — it is skipped under a profile token.
+</Note>
+
+## Testing your model catalog
+
+Providers share the same integration path, so the model suite tests **one representative model per provider** — same signal, a fraction of the cost and runtime (roughly 28 models down to 9 providers). For each one it provisions an agent and checks a text answer plus PDF interpretation.
+
+```bash
+npm run bdd:api-models                     # one model per provider (default)
+MODELS_ALL=1 npm run bdd:api-models        # every enabled model
+MODELS_LIMIT=3 npm run bdd:api-models      # smoke test on the first 3
+```
+
+For a durable, shareable report rather than console output:
+
+```bash
+npx tsx scripts/model-report.ts            # → results/model-report.{json,xlsx,html}
+```
+
+## Writing your own scenarios
+
+Scenarios are Gherkin, so a non-developer can read — and often write — them:
+
+```gherkin
+@TC-CHAT-01
+Scenario: The agent answers a simple question
+  Given an ephemeral E2E agent is provisioned via the API for suite "chat"
+  And I am in a new chat of this agent
+  When I ask "What is the capital of France?"
+  Then the agent replies mentioning "Paris"
+```
+
+The layout mirrors that split:
+
+```
+features/          # Gherkin scenarios     (ui-*.feature / api-*.feature)
+tests/steps/       # Step implementations  (ui-*.steps.ts / api-*.steps.ts)
+tests/setup/       # Sign-in and org provisioning
+src/               # Shared helpers (chat, agent creation, API client)
+```
+
+Two conventions keep the suite trustworthy:
+
+- **Never `sleep`.** Wait on a DOM element, never on a fixed delay — fixed waits are how suites become flaky.
+- **Target `data-testid`, not wording.** The platform exposes stable test ids; selectors built on visible text break on the next copy change or in another locale.
