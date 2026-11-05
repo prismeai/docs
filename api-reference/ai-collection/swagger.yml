@@ -5,11 +5,30 @@ info:
   description: |
     Public REST API for the Prisme.ai Collections workspace: named collections
     of structured records with typed schemas, MongoDB-style querying,
-    aggregations, and an MCP (JSON-RPC 2.0) endpoint for AI agents.
+    aggregations, sharing and collection-scoped API keys.
 
-    Records are isolated per owner (user or agent); a collection can be shared
-    with additional agents through its `agent_ids` list. Every write emits an
-    audit event.
+    Collections live inside an organization (tenant boundary): a collection
+    from another organization is always reported as not found. Within the
+    organization, access is granted to the collection owner, to organization
+    admins (role `org_admin`), to the principals listed in its `agent_ids`
+    (role `editor`: read and write records), and
+    through shares (access bindings to a user, a group or the whole
+    organization, see Sharing). A share grants what its role carries:
+    `reader` reads, `editor` also writes records, `admin` also shares; no
+    share deletes the collection. Every write emits an audit event.
+
+    **MCP endpoints.** The same tools are exposed to AI agents and MCP clients
+    over JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`), not modeled as
+    REST operations here:
+    - `POST /ai-collection/mcp`: all tools (`data_discover`,
+      `data_create_collection`, `data_insert`, `data_query`, `data_get`,
+      `data_update`, `data_upsert`, `data_delete`, `data_count`,
+      `data_distinct`, `data_aggregate`, `suggest_schema`). Tool arguments mirror
+      the REST payloads below and take a `collection_id`.
+    - `POST /v1/collections/{collectionId}/mcp`: scoped to a single collection.
+      The `collection_id` is taken from the URL (agents never pass it) and
+      `data_create_collection` / `suggest_schema` are not listed. This is the
+      server URL Agent Factory configures when an agent is bound to a collection.
   contact:
     name: Prisme.ai
     url: https://prisme.ai
@@ -25,7 +44,7 @@ security:
   - OrgApiKeyAuth: []
 tags:
   - name: Collections
-    description: Create, list, read, update, and delete collections (metadata and schema).
+    description: Create, list, read, update, and delete collections (metadata, schema and saved charts).
   - name: Records
     description: Insert, query, read, update, upsert, and delete records in a collection.
   - name: Analytics
@@ -47,8 +66,20 @@ paths:
       operationId: listCollections
       summary: List collections
       description: |
-        Returns the collections owned by the caller within their organization,
-        paginated. Set `with_counts=true` to include an estimated `row_count`
+        Returns the collections the caller can see within their organization,
+        paginated, each with the caller's `role` and its `permissions`.
+        `scope` is `owned` (default, role `owner`) or `all`: every collection
+        of the organization for an organization admin (platform admin, or
+        `manage` on ai-collection-v3 with an unrestricted scope, i.e. the org
+        Owner and Admin roles; a key restricted to some collections never
+        qualifies), role `org_admin` on the collections of other members.
+        A custom role holding `manage` on ai-collection-v3 but no `*` or
+        `ai-collection-v3:*` scope is not an organization admin: add one of
+        these scopes to the role to grant it. Anyone else asking for `all`
+        gets `owned`. `search` matches name or
+        description, case-insensitive. `ids` keeps only the listed collections
+        within that scope.
+        Set `with_counts=true` to include an estimated `row_count`
         per collection (from database statistics, near-free, ideal for
         dashboards; the exact count is available via the count endpoint).
         Rate limit: 100 requests/min per user.
@@ -62,9 +93,33 @@ paths:
           schema:
             type: boolean
           example: true
+        - name: scope
+          in: query
+          required: false
+          description: '`owned` (default) or `all`. `all` lists every collection of the organization for an organization admin, `owned` for anyone else.'
+          schema:
+            type: string
+            maxLength: 50
+          example: all
+        - name: search
+          in: query
+          required: false
+          description: Case-insensitive substring matched against name or description.
+          schema:
+            type: string
+            maxLength: 200
+        - name: ids
+          in: query
+          required: false
+          description: Comma-separated collection ids, at most 100 (400 above). Narrows the scope to these collections, it never widens it.
+          schema:
+            type: string
+            maxLength: 3800
+            pattern: '^[A-Za-z0-9_,-]*$'
+          example: 0b6f5f8e-4f3a-4c1e-9d2a-1c2b3d4e5f60,7a1d2c3b-9e8f-4a5b-8c7d-6e5f4a3b2c1d
       responses:
         '200':
-          description: Collections accessible to the caller (paginated).
+          description: Collections visible to the caller (paginated).
           content:
             application/json:
               schema:
@@ -76,20 +131,33 @@ paths:
                       $ref: '#/components/schemas/Collection'
                   total:
                     type: integer
-                    description: Total number of collections for the caller.
+                    description: Total number of collections in the requested scope.
                   page:
                     type: integer
                   limit:
                     type: integer
+                  has_more:
+                    type: boolean
+        '400':
+          description: 'Invalid query parameter: `limit` or `page` not numeric, `scope` or `search` too long, `ids` malformed or listing more than 100 ids.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
     post:
       tags: [Collections]
       operationId: createCollection
       summary: Create a collection
       description: |
-        Creates a named collection, optionally with a typed schema
-        (`properties`). Collection names are unique per owner.
+        Creates a named collection with a typed schema. At least one column is
+        required in `properties` (use the suggest-schema endpoint to generate
+        one from a description). Collection names are unique within the
+        organization. The caller becomes the owner and gets an `owner` access
+        binding.
         Rate limit: 100 requests/min per user.
       requestBody:
         required: true
@@ -97,13 +165,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [name]
+              required: [name, properties]
               properties:
                 name:
                   type: string
                   maxLength: 64
-                  pattern: '^[a-zA-Z0-9_-]+$'
-                  description: Collection name (alphanumeric, `-`, `_`). Unique per owner.
+                  pattern: '^[a-zA-Z0-9 _-]+$'
+                  description: Collection name (letters, digits, spaces, `-`, `_`; truncated to 64 characters). Unique within the organization.
                   example: products
                 description:
                   type: string
@@ -124,7 +192,7 @@ paths:
                   items:
                     $ref: '#/components/schemas/IndexDefinition'
       responses:
-        '200':
+        '201':
           description: Collection created.
           content:
             application/json:
@@ -136,31 +204,51 @@ paths:
                     format: uuid
                   name:
                     type: string
+                  orgSlug:
+                    type: string
                   owner_id:
                     type: string
                   owner_type:
                     type: string
-                    enum: [user, agent]
+                    enum: [user]
+                  schema_applied:
+                    type: boolean
                   status:
                     type: string
                     example: ready
-                  schema_applied:
-                    type: boolean
         '400':
-          $ref: '#/components/responses/BadRequest'
-        '409':
-          description: A collection with this name already exists for this owner.
+          description: 'Invalid arguments: missing or invalid name, no column in `properties`, or a collection with this name already exists in the organization.'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-  /v1/collections/{collection_id}:
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/collections/{collectionId}:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     get:
       tags: [Collections]
       operationId: getCollection
       summary: Get collection metadata
+      description: |
+        Returns the collection metadata, including its schema, indexes and
+        saved charts, with the caller's `role` and `permissions`. The owner,
+        an organization admin (role `org_admin`, who may also update, share and
+        delete it), the principals in `agent_ids` and any share may read it. A
+        caller who is neither the owner nor an organization admin gets no
+        `owner_id` nor `owner_type`, and gets `agent_ids` only with the `share`
+        permission.
+        `PATCH` and `DELETE` emit `audit.collection.updated` /
+        `audit.collection.deleted` with the caller's `access_reason`.
+        Rate limit: 100 requests/min per user.
       responses:
         '200':
           description: Collection metadata.
@@ -168,6 +256,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Collection'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
     patch:
@@ -175,9 +265,12 @@ paths:
       operationId: updateCollection
       summary: Update collection metadata
       description: |
-        Updates the description, settings, or the `agent_ids` sharing list.
-        To evolve the schema after creation, use the schema and indexes
-        endpoints instead.
+        Updates the name, description, settings, or the `agent_ids` list. Only
+        the provided fields are changed. Needs the `write` permission, and
+        `share` when `agent_ids` is given, since that list grants access; an
+        empty list clears it. To
+        evolve the schema after creation, use the schema and indexes endpoints
+        instead.
       requestBody:
         required: true
         content:
@@ -185,16 +278,18 @@ paths:
             schema:
               type: object
               properties:
+                name:
+                  type: string
                 description:
                   type: string
                 settings:
                   $ref: '#/components/schemas/CollectionSettings'
                 agent_ids:
                   type: array
-                  description: Agents granted access to this collection.
+                  description: Principals granted the editor role on this collection (replaces the list, `[]` clears it).
                   items:
                     type: string
-                  example: [agent_123, agent_456]
+                  example: [agent-abc, agent-def]
       responses:
         '200':
           description: Updated collection metadata.
@@ -202,13 +297,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Collection'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
     delete:
       tags: [Collections]
       operationId: deleteCollection
       summary: Delete a collection
-      description: Permanently deletes the collection and **all its records**.
+      description: |
+        Permanently deletes the collection, **all its records** and its access
+        bindings. Not open to a share: the `delete` permission belongs to the
+        owner role.
       responses:
         '200':
           description: Collection deleted.
@@ -219,18 +319,29 @@ paths:
                 properties:
                   deleted:
                     type: boolean
+                  collection_id:
+                    type: string
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-  /v1/collections/{collection_id}/data:
+  /v1/collections/{collectionId}/data:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     get:
       tags: [Records]
       operationId: queryRecords
       summary: Query records
       description: |
         Returns records matching a MongoDB-style filter, with sorting,
-        pagination, and field projection. Operators executing code or
+        pagination, and field selection. Operators executing code or
         cross-referencing data (`$where`, `$function`, `$expr`, `$lookup`,
         `$merge`, `$accumulator`, `$out`) are rejected.
 
@@ -253,16 +364,16 @@ paths:
           description: JSON-encoded sort specification.
           schema:
             type: string
-          example: '{"created_at":-1}'
+          example: '{"createdAt":-1}'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Page'
         - name: fields
           in: query
           required: false
-          description: JSON-encoded field projection.
+          description: Comma-separated list of fields to return.
           schema:
             type: string
-          example: '{"name":1,"email":1}'
+          example: name,email
       responses:
         '200':
           description: Matching records.
@@ -280,14 +391,16 @@ paths:
                       $ref: '#/components/schemas/Record'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '404':
-          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
     post:
       tags: [Records]
       operationId: insertRecords
       summary: Insert records
       description: |
-        Inserts one record or a batch of up to 1,000 records.
+        Inserts one record or a batch of up to 1,000 records. Each record is
+        stamped with the caller's `user_id` and, when a TTL applies, an
+        `expires_at` timestamp.
         Rate limit: 20 requests/min per user.
       requestBody:
         required: true
@@ -310,7 +423,7 @@ paths:
                   minimum: 0
                   description: Auto-expire the records after N days (0 = never).
       responses:
-        '200':
+        '201':
           description: Records inserted.
           content:
             application/json:
@@ -327,13 +440,21 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '429':
           $ref: '#/components/responses/RateLimited'
-  /v1/collections/{collection_id}/data/count:
+  /v1/collections/{collectionId}/data/count:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     get:
       tags: [Analytics]
       operationId: countRecords
       summary: Count records
+      description: 'Exact count of the matching records. Rate limit: 100 requests/min per user.'
       parameters:
         - name: filter
           in: query
@@ -351,16 +472,23 @@ paths:
                 properties:
                   count:
                     type: integer
-        '404':
-          $ref: '#/components/responses/NotFound'
-  /v1/collections/{collection_id}/data/distinct:
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /v1/collections/{collectionId}/data/distinct:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     get:
       tags: [Analytics]
       operationId: distinctValues
       summary: Get distinct values of a field
-      description: Returns up to 1,000 unique values for a field.
+      description: 'Returns up to 1,000 unique values for a field. Rate limit: 100 requests/min per user.'
       parameters:
         - name: field
           in: query
@@ -374,6 +502,12 @@ paths:
           description: JSON-encoded MongoDB-style filter.
           schema:
             type: string
+        - name: count
+          in: query
+          required: false
+          description: Set to `true` to include the number of occurrences of each distinct value.
+          schema:
+            type: boolean
       responses:
         '200':
           description: Distinct values.
@@ -386,14 +520,22 @@ paths:
                     type: string
                   count:
                     type: integer
+                    description: Number of distinct values returned.
                   values:
                     type: array
                     items: {}
-        '404':
-          $ref: '#/components/responses/NotFound'
-  /v1/collections/{collection_id}/data/aggregate:
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /v1/collections/{collectionId}/data/aggregate:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     post:
       tags: [Analytics]
       operationId: aggregateRecords
@@ -401,6 +543,7 @@ paths:
       description: |
         Computes sums, averages, and counts over matching records, with
         optional grouping. Maximum 10 aggregation steps per call.
+        Rate limit: 100 requests/min per user.
       requestBody:
         required: true
         content:
@@ -421,16 +564,17 @@ paths:
                   maxItems: 10
                   items:
                     type: object
-                    required: [type, output_field]
+                    required: [type]
                     properties:
                       type:
                         type: string
                         enum: [sum, avg, count]
                       input_field:
                         type: string
-                        description: Numeric field to aggregate (unused for `count`).
+                        description: Numeric field to aggregate (optional for `count`).
                       output_field:
                         type: string
+                        description: Name of the result field (defaults to the step `type`).
             example:
               filter: { status: completed }
               group_by: category
@@ -452,9 +596,16 @@ paths:
                       additionalProperties: true
         '400':
           $ref: '#/components/responses/BadRequest'
-  /v1/collections/{collection_id}/data/upsert:
+  /v1/collections/{collectionId}/data/upsert:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     post:
       tags: [Records]
       operationId: upsertRecord
@@ -475,13 +626,11 @@ paths:
                   $ref: '#/components/schemas/RecordInput'
                 match_fields:
                   type: array
+                  minItems: 1
                   items:
                     type: string
                   description: Fields identifying the record to update if it exists.
                   example: [email]
-                ttl_days:
-                  type: integer
-                  minimum: 0
       responses:
         '200':
           description: Upsert result.
@@ -498,14 +647,23 @@ paths:
                     additionalProperties: true
         '400':
           $ref: '#/components/responses/BadRequest'
-  /v1/collections/{collection_id}/data/{record_id}:
+  /v1/collections/{collectionId}/data/{recordId}:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
-      - name: record_id
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
+      - name: recordId
         in: path
         required: true
         schema:
           type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
         description: Record identifier (`_id`).
     get:
       tags: [Records]
@@ -513,25 +671,27 @@ paths:
       summary: Get a record
       responses:
         '200':
-          description: The record, if found.
+          description: The record.
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  found:
-                    type: boolean
-                  record:
-                    $ref: '#/components/schemas/Record'
+                $ref: '#/components/schemas/Record'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
-          $ref: '#/components/responses/NotFound'
+          description: Record not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     patch:
       tags: [Records]
       operationId: updateRecord
       summary: Update a record
       description: |
         Updates the record's fields. System fields (`_id`, `created_at`,
-        ownership metadata) are protected and stripped from the payload.
+        `createdAt`, ownership metadata) are protected and stripped from the
+        payload.
       requestBody:
         required: true
         content:
@@ -550,16 +710,13 @@ paths:
                     type: integer
                   matched_count:
                     type: integer
-        '404':
-          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
     delete:
       tags: [Records]
       operationId: deleteRecord
       summary: Delete a record
-      description: |
-        Deletes a single record. Bulk deletion (multiple records in one call)
-        is only available when explicitly enabled in the platform
-        configuration.
+      description: Deletes a single record.
       responses:
         '200':
           description: Deletion result.
@@ -570,23 +727,32 @@ paths:
                 properties:
                   deleted_count:
                     type: integer
-        '404':
-          $ref: '#/components/responses/NotFound'
-  /v1/collections/{collection_id}/data/bulk:
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /v1/collections/{collectionId}/data/bulk:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     post:
       tags: [Records]
       operationId: bulkInsertRecords
       summary: Bulk-insert records (large imports)
       description: |
         Batch-inserts up to 5,000 records in a single call, built for large CSV
-        imports (the client streams the file and posts batches). A batch is a
-        single database flush and is all-or-nothing: if one record violates a
-        column type or constraint the whole batch is rejected with `422` and no
-        per-row error list, so validate and coerce types client-side before
-        posting. Provide `upsert_key` (a column with a unique constraint) for an
-        idempotent re-import that updates instead of duplicating.
+        imports (the client streams the file and posts batches). Records are
+        stored as sent: unlike the insert endpoint, no per-record `user_id` or
+        TTL is added. A batch is a single database flush and is all-or-nothing:
+        if one record violates a column type or constraint the whole batch is
+        rejected with `422` and no per-row error list, so validate and coerce
+        types client-side before posting. Provide `upsert_key` (a column with a
+        unique constraint) for an idempotent re-import that updates instead of
+        duplicating.
         Rate limit: 120 requests/min per user.
       requestBody:
         required: true
@@ -598,6 +764,7 @@ paths:
               properties:
                 records:
                   type: array
+                  minItems: 1
                   maxItems: 5000
                   items:
                     $ref: '#/components/schemas/RecordInput'
@@ -620,31 +787,47 @@ paths:
                     enum: [append, upsert]
                   collection_id:
                     type: string
+                  result:
+                    type: object
+                    additionalProperties: true
+                    description: Raw engine result.
         '400':
-          description: 'Validation error (empty batch, or more than 5,000 records).'
+          description: 'Validation error (`VALIDATION_ERROR` for an empty batch, `BATCH_TOO_LARGE` above 5,000 records).'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '422':
-          description: Batch rejected (all-or-nothing) due to a type or constraint violation.
+          description: Batch rejected (all-or-nothing) due to a type or constraint violation (`BATCH_INSERT_FAILED`).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/RateLimited'
-  /v1/collections/{collection_id}/schema:
+  /v1/collections/{collectionId}/schema:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     patch:
       tags: [Schema]
       operationId: updateSchema
       summary: Add or merge columns
       description: |
-        Adds new typed columns to an existing collection by merging the provided
-        `properties` into the current schema. Existing indexes and unique
-        constraints are preserved.
+        Adds or updates typed columns by merging the provided `properties` into
+        the current schema. Existing indexes and unique constraints are
+        preserved. New columns must be nullable (the table may already hold
+        rows); changing an existing column's type is a data migration and may
+        fail on existing data.
+        Rate limit: 20 requests/min per user.
       requestBody:
         required: true
         content:
@@ -662,12 +845,27 @@ paths:
             application/json:
               schema:
                 type: object
-                additionalProperties: true
+                properties:
+                  updated:
+                    type: boolean
+                  collection_id:
+                    type: string
+                  schema:
+                    $ref: '#/components/schemas/SchemaProperties'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-  /v1/collections/{collection_id}/indexes:
+  /v1/collections/{collectionId}/indexes:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     post:
       tags: [Schema]
       operationId: applyIndexes
@@ -676,7 +874,9 @@ paths:
         Applies indexes and unique constraints to an existing collection. Provide
         the full desired set; the constraints are persisted so a later schema
         change re-applies them. A unique constraint is required to use a column as
-        an upsert key in bulk import.
+        an upsert key in bulk import. Returns `400 NO_SCHEMA` if the collection
+        has no typed columns.
+        Rate limit: 20 requests/min per user.
       requestBody:
         required: true
         content:
@@ -716,14 +916,21 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-  /v1/collections/{collection_id}/charts:
+  /v1/collections/{collectionId}/charts:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     get:
       tags: [Collections]
       operationId: getCharts
       summary: Get saved charts
-      description: Returns the collection's saved chart specs (shared at the collection level).
+      description: 'Returns the collection saved chart specs (shared at the collection level). Rate limit: 60 requests/min per user.'
       responses:
         '200':
           description: Saved charts.
@@ -775,10 +982,23 @@ paths:
                     items:
                       $ref: '#/components/schemas/ChartSpec'
         '400':
-          $ref: '#/components/responses/BadRequest'
-  /v1/collections/{collection_id}/ask:
+          description: Invalid body, or more than 50 charts (`TOO_MANY_CHARTS`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/collections/{collectionId}/ask:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     post:
       tags: [AI]
       operationId: askCollection
@@ -813,14 +1033,33 @@ paths:
                     type: string
                   plan:
                     type: object
+                    description: The generated plan (`mode` is `query` or `aggregate`).
                     additionalProperties: true
                   data:
                     type: object
                     additionalProperties: true
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: Missing question, no default completion model configured for the organization (`NO_DEFAULT_MODEL`), or the plan failed to execute (`EXECUTION_ERROR`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
+        '422':
+          description: The model could not produce a usable plan for this question.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          description: The LLM call failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/suggest-schema:
     post:
       tags: [AI]
@@ -830,6 +1069,7 @@ paths:
         Suggests a typed `properties` schema from a plain-language description of
         the data to store, using the org default LLM. Feed the result to the
         collection create endpoint.
+        Rate limit: 20 requests/min per user.
       requestBody:
         required: true
         content:
@@ -841,6 +1081,10 @@ paths:
                 description:
                   type: string
                   example: A CRM of companies with name, industry, website and annual revenue in EUR
+                name:
+                  type: string
+                  description: Optional collection name, echoed back.
+                  example: companies
       responses:
         '200':
           description: Suggested schema.
@@ -849,25 +1093,41 @@ paths:
               schema:
                 type: object
                 properties:
-                  data:
-                    type: object
-                    properties:
-                      name:
-                        type: string
-                      properties:
-                        $ref: '#/components/schemas/SchemaProperties'
-                      model:
-                        type: string
+                  name:
+                    type: string
+                  properties:
+                    $ref: '#/components/schemas/SchemaProperties'
+                  model:
+                    type: string
+                    description: Model used to generate the suggestion.
         '400':
           $ref: '#/components/responses/BadRequest'
-  /v1/collections/{collection_id}/access:
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          description: The LLM call failed or returned an unusable schema (`SUGGEST_ERROR`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/collections/{collectionId}/access:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     get:
       tags: [Sharing]
       operationId: listAccess
       summary: List access bindings
-      description: Lists who the collection is shared with (owner, users, groups, org).
+      description: |
+        Lists who the collection is shared with (owner, users, groups, org).
+        Requires the `share` permission on the collection.
+        Rate limit: 100 requests/min per user.
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Page'
@@ -888,6 +1148,10 @@ paths:
                       $ref: '#/components/schemas/AccessBinding'
                   total:
                     type: integer
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
         '404':
           $ref: '#/components/responses/NotFound'
     post:
@@ -897,7 +1161,8 @@ paths:
       description: |
         Grants a role to a principal within the same organization. The principal
         must be a member of the caller's org (users and groups are verified via
-        governance). Cross-org principals are rejected.
+        governance). Cross-org principals are rejected, and the owner cannot be
+        re-shared.
       requestBody:
         required: true
         content:
@@ -911,7 +1176,9 @@ paths:
                   enum: [user, group, org]
                 principal_id:
                   type: string
+                  maxLength: 256
                   description: 'For `user`: a member user id. For `group`: `orgSlug:group`. For `org`: the org slug.'
+                  example: user-123
                 role:
                   type: string
                   enum: [reader, editor, admin]
@@ -926,20 +1193,34 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-  /v1/collections/{collection_id}/access/{principal_type}/{principal_id}:
+        '409':
+          description: A binding already exists for this principal (`ALREADY_EXISTS`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/collections/{collectionId}/access/{principalType}/{principalId}:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
-      - name: principal_type
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
+      - name: principalType
         in: path
         required: true
         schema:
           type: string
           enum: [user, group, org]
-      - name: principal_id
+      - name: principalId
         in: path
         required: true
         schema:
           type: string
+          maxLength: 256
     get:
       tags: [Sharing]
       operationId: getAccessBinding
@@ -952,7 +1233,11 @@ paths:
               schema:
                 $ref: '#/components/schemas/AccessBinding'
         '404':
-          $ref: '#/components/responses/NotFound'
+          description: Collection or binding not found (`BINDING_NOT_FOUND`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     patch:
       tags: [Sharing]
       operationId: updateAccessBinding
@@ -975,6 +1260,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AccessBinding'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
     delete:
@@ -991,11 +1278,24 @@ paths:
                 properties:
                   deleted:
                     type: boolean
+        '400':
+          description: The binding could not be deleted (`DELETE_FAILED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
-  /v1/collections/{collection_id}/api-keys:
+  /v1/collections/{collectionId}/api-keys:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
+      - name: collectionId
+        in: path
+        required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
     get:
       tags: [API Keys]
       operationId: listApiKeys
@@ -1004,6 +1304,16 @@ paths:
         Lists the API keys scoped to this collection. Raw keys are never returned.
         Requires `ai-collection-v3:collections:share` and the
         `ai-collection-v3:apikeys:read` org permission (403 otherwise).
+        Rate limit: 100 requests/min per user.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+          description: Page size.
+        - $ref: '#/components/parameters/Page'
       responses:
         '200':
           description: API keys.
@@ -1042,7 +1352,9 @@ paths:
       description: |
         Mints an org API key scoped to this collection. The raw key is returned
         exactly once, in the `secret` field: store it now, it cannot be retrieved
-        again. Requires `ai-collection-v3:collections:share` and the
+        again. When `permissions` is omitted, the workspace default permissions
+        apply; at least one permission is required. Requires
+        `ai-collection-v3:collections:share` and the
         `ai-collection-v3:apikeys:create` org permission (403 otherwise; a key
         scoped to a collection is refused unless it also carries the
         `ai-collection-v3:collections:*` and `ai-collection-v3:apikeys:*`
@@ -1057,14 +1369,21 @@ paths:
               properties:
                 name:
                   type: string
+                  maxLength: 128
                 slug:
                   type: string
-                  description: Unique identifier for the key within the org.
+                  maxLength: 96
+                  description: Unique identifier for the key within the org. Also used as the key `id`.
                 permissions:
                   type: array
                   items:
                     type: string
+                    maxLength: 96
                   example: [collections:read]
+                expiresAt:
+                  type: string
+                  format: date-time
+                  description: Optional expiration date.
       responses:
         '201':
           description: 'API key created. `secret` is shown only once.'
@@ -1086,12 +1405,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-  /v1/collections/{collection_id}/api-keys/{key_id}:
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/collections/{collectionId}/api-keys/{keyId}:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
-      - name: key_id
+      - name: collectionId
         in: path
         required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
+      - name: keyId
+        in: path
+        required: true
+        description: API key identifier (its `id`, i.e. the slug given at creation).
         schema:
           type: string
     get:
@@ -1149,12 +1478,20 @@ paths:
                 $ref: '#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
-  /v1/collections/{collection_id}/api-keys/{key_id}/rotate:
+  /v1/collections/{collectionId}/api-keys/{keyId}/rotate:
     parameters:
-      - $ref: '#/components/parameters/CollectionId'
-      - name: key_id
+      - name: collectionId
         in: path
         required: true
+        description: Collection identifier (`collection_id` returned at creation, `coll_id` on the collection object).
+        schema:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]+$'
+      - name: keyId
+        in: path
+        required: true
+        description: API key identifier (its `id`, i.e. the slug given at creation).
         schema:
           type: string
     post:
@@ -1200,7 +1537,7 @@ paths:
         Tool arguments mirror the REST payloads documented above.
 
         A per-collection scoped endpoint is also available at
-        `/v1/collections/{collection_id}/mcp`: it binds an agent to a single
+        `/v1/collections/{collectionId}/mcp`: it binds an agent to a single
         collection (no `collection_id` argument needed on each call).
         Rate limit: 100 requests/min per user.
       requestBody:
@@ -1261,6 +1598,7 @@ paths:
                         type: integer
                       message:
                         type: string
+
 components:
   securitySchemes:
     BearerAuth:
@@ -1274,14 +1612,6 @@ components:
       name: x-prismeai-api-key
       description: Organization-scoped API key.
   parameters:
-    CollectionId:
-      name: collection_id
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
-      description: Collection identifier returned at creation.
     Limit:
       name: limit
       in: query
@@ -1300,10 +1630,10 @@ components:
         type: integer
         minimum: 1
         default: 1
-      description: Page number.
+      description: Page number (1-based).
   responses:
     BadRequest:
-      description: Invalid arguments (bad filter operator, batch too large, name invalid…).
+      description: Invalid arguments (bad filter operator, batch too large, missing field...), or the collection does not exist or is not accessible.
       content:
         application/json:
           schema:
@@ -1314,14 +1644,20 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: The caller is neither the owner of the collection nor listed in its `agent_ids`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
     NotFound:
-      description: Collection or record not found, or the caller has no access to it.
+      description: Collection (or sub-resource) not found, or it belongs to another organization.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     RateLimited:
-      description: Rate limit exceeded.
+      description: Rate limit exceeded (`RATE_LIMITED`).
       content:
         application/json:
           schema:
@@ -1330,28 +1666,32 @@ components:
     Collection:
       type: object
       properties:
-        collection_id:
+        _id:
+          type: string
+          description: Internal storage id.
+        coll_id:
           type: string
           format: uuid
+          description: Collection identifier, used in every `/v1/collections/{collectionId}` path.
         name:
           type: string
           example: products
         description:
           type: string
-        owner_id:
-          type: string
-          description: User ID or agent ID owning the collection.
-        owner_type:
-          type: string
-          enum: [user, agent]
-        agent_ids:
-          type: array
-          description: Agents granted access (sharing list).
-          items:
-            type: string
         orgSlug:
           type: string
           description: Organization the collection belongs to (tenant boundary).
+        owner_id:
+          type: string
+          description: User ID owning the collection.
+        owner_type:
+          type: string
+          enum: [user]
+        agent_ids:
+          type: array
+          description: Principals granted record access in addition to the owner.
+          items:
+            type: string
         settings:
           $ref: '#/components/schemas/CollectionSettings'
         schema:
@@ -1370,30 +1710,50 @@ components:
             $ref: '#/components/schemas/ChartSpec'
         row_count:
           type: integer
-          description: 'On list with `with_counts=true`, an estimated count; null otherwise.'
+          nullable: true
+          description: 'Only on list with `with_counts=true`: an estimated count (null when the table does not exist yet).'
+        role:
+          type: string
+          enum: [owner, org_admin, admin, editor, reader]
+          description: 'The caller''s role on the collection (list, and GET/PATCH of one collection): `owner`; `org_admin` for an organization admin; `editor` through agent_ids. `admin`, `editor` and `reader` are also the roles of a share.'
+        permissions:
+          type: array
+          items:
+            type: string
+            enum: [read, write, share, delete]
+          description: Permissions carried by the role, for display (which actions to offer). The server checks access on each call; they are not a guarantee by themselves. An organization admin holds all four, like the owner, unlike the `admin` share role (no delete).
         status:
           type: string
           example: ready
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
     CollectionSettings:
       type: object
+      description: Free-form settings stored with the collection.
       properties:
         ttl_days:
           type: integer
           minimum: 0
-          description: Default record expiration in days (0 = never).
+          description: Record expiration in days (0 = never).
         max_records:
           type: integer
-          description: Collection size limit (default 10,000).
+          description: Collection size limit.
+      additionalProperties: true
     SchemaProperties:
       type: object
-      description: 'Column definitions: field name → type descriptor.'
+      description: 'Column definitions: field name -> type descriptor.'
       additionalProperties:
         type: object
         required: [type]
         properties:
           type:
             type: string
-            enum: [text, integer, double, boolean, date, datetime, json, array]
+            description: 'Column type: `text`, `integer`, `double`, `boolean`, `date`, `datetime`, `json` or `array` (`float`, `decimal` and `number` are also accepted).'
+            example: text
           nullable:
             type: boolean
       example:
@@ -1406,8 +1766,8 @@ components:
     RecordInput:
       type: object
       description: |
-        Record fields matching the collection schema. Unknown fields are
-        accepted (flexible schema); system fields are ignored.
+        Record fields matching the collection schema. System fields are
+        ignored on update.
       additionalProperties: true
       example:
         product_name: Laptop Pro 16
@@ -1420,10 +1780,16 @@ components:
       properties:
         _id:
           type: string
-        created_at:
+        user_id:
+          type: string
+          description: User who inserted the record (not set by bulk import).
+        expires_at:
+          type: integer
+          description: Expiration timestamp in milliseconds, when a TTL applies.
+        createdAt:
           type: string
           format: date-time
-        updated_at:
+        updatedAt:
           type: string
           format: date-time
       additionalProperties: true
@@ -1441,7 +1807,8 @@ components:
       type: object
       description: |
         A saved chart specification, stored and returned verbatim (opaque to the
-        API). Executed client-side or via the aggregate endpoint.
+        API). The fields below are the ones used by the Prisme.ai Collections
+        app; charts are computed with the aggregate endpoint.
       properties:
         id:
           type: string
@@ -1464,7 +1831,7 @@ components:
       properties:
         object:
           type: string
-          example: collection.access
+          example: collection.access_binding
         collection_id:
           type: string
         principal_type:
@@ -1477,12 +1844,28 @@ components:
           enum: [owner, reader, editor, admin]
         email:
           type: string
+          nullable: true
+        org_slug:
+          type: string
+          nullable: true
+        granted_by:
+          type: string
+          nullable: true
+        created_at:
+          type: integer
+          nullable: true
+          description: Unix seconds.
+        updated_at:
+          type: integer
+          nullable: true
+          description: Unix seconds.
     ApiKey:
       type: object
       description: API key metadata. The raw key is never included here.
       properties:
         id:
           type: string
+          description: Key identifier (the slug).
         object:
           type: string
           example: collection.api_key
@@ -1501,6 +1884,15 @@ components:
             type: string
         expires_at:
           type: integer
+          nullable: true
+          description: Unix seconds.
+        created_at:
+          type: integer
+          nullable: true
+          description: Unix seconds.
+        updated_at:
+          type: integer
+          nullable: true
           description: Unix seconds.
     ApiKeyWithSecret:
       allOf:
@@ -1515,6 +1907,6 @@ components:
       properties:
         error:
           type: string
-          example: InvalidArguments
+          example: VALIDATION_ERROR
         message:
           type: string
