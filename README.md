@@ -30,6 +30,20 @@ npm run swagger:transform
 
 Install our Github App to auto propagate changes from your repo to your deployment. Changes will be deployed to production automatically after pushing to the default branch. Find the link to install on your dashboard. 
 
+### Deploying from GitLab
+
+The GitLab copy of this repository ([prisme.ai/docs](https://gitlab.com/prisme.ai/docs)) runs `.gitlab-ci.yml`:
+
+- **`validate`** and **`broken-links`** run `mint validate` and `mint broken-links` on every merge request and on `main`. They do not block yet, because `main` still has errors; make them blocking (`allow_failure: false`) once `main` passes.
+- **`deploy`** runs on `main` and calls the Mintlify API (`.gitlab/ci/mintlify-deploy.mjs`). It waits for the build and fails the pipeline if Mintlify fails.
+
+To turn on deployment from GitLab:
+
+1. In the Mintlify dashboard, **Git Settings**: connect GitLab with the project ID and a project access token (role Maintainer, scopes `api` and `read_api`), branch `main`. Mintlify builds from this source, so do this first: until then the API redeploys the GitHub repository.
+2. In GitLab, **Settings > CI/CD > Variables**: add `MINTLIFY_API_KEY` (admin API key, masked and protected) and `MINTLIFY_PROJECT_ID` (both from the dashboard's **API keys** page). The `deploy` job only runs when both are set.
+3. In GitLab, **Settings > Webhooks**: add `https://leaves.mintlify.com/gitlab-webhook` with the dashboard's webhook token as **Secret token**, and tick **Merge request events** only, for preview deployments. Leave **Push events** off: the `deploy` job already deploys `main`, and the webhook would deploy it a second time, outside the pipeline.
+4. Uninstall the Mintlify GitHub App from the GitHub repository.
+
 #### Troubleshooting
 
 - Mintlify dev isn't running - Run `mintlify install` it'll re-install dependencies.
