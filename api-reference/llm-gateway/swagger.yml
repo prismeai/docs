@@ -76,6 +76,14 @@ paths:
         `failover: { from_model, to_model }` on the response body, or on the
         first forwarded chunk when streaming.
 
+        **Forced tool choice downgrade.** A model known to refuse forced tool
+        use (catalog flag `provider_config.supports_forced_tool_choice: false`,
+        or a refusal from the provider, retried once on the same model) is sent
+        `tool_choice: auto` plus a system message telling it to call the
+        requested tool (one of the allowed ones, or any tool for `required`). The
+        decision is reported as `tool_choice_downgrade` on the response body,
+        or on the first forwarded chunk when streaming.
+
         **Thinking blocks.** Anthropic thinking blocks are never streamed. They
         are returned on the assistant message as `reasoning_details`, tagged
         with `reasoning_model` (the model that answered). Send both back
@@ -1642,8 +1650,21 @@ components:
             additionalProperties: true
         tool_choice:
           description: |
-            Tool selection hint: `"auto"`, `"none"`, `"required"`, or
-            `{ type: "function", function: { name } }`.
+            Tool selection hint: `"auto"`, `"none"`, `"required"`,
+            `{ type: "function", function: { name } }`, or
+            `{ type: "allowed_tools", allowed_tools: { mode: "required" | "auto", tools: [{ type: "function", function: { name } }] } }`
+            to restrict the call to a subset of `tools` while sending them all
+            (the prompt cache stays intact). The subset is enforced by OpenAI's
+            own API, and by Gemini models on Vertex AI with `mode: "required"`.
+            OpenAI Chat Completions receives the value as sent; the Responses
+            API gets it in its own shape (entries without a name dropped, none
+            named gives `"auto"`). Other providers, Azure OpenAI included, get
+            the closest shape: one allowed tool is forced by name, several
+            force a call to any declared tool, so steer the model to the subset
+            with a system message. For them, entries without `function.name`
+            are ignored and naming no tool is `"auto"`. With `mode: "auto"` the
+            model may also answer without calling a tool: nothing is forced and
+            no downgrade applies.
         response_format:
           description: |
             OpenAI-style structured output hint
@@ -1806,6 +1827,8 @@ components:
               additionalProperties: true
         failover:
           $ref: '#/components/schemas/FailoverInfo'
+        tool_choice_downgrade:
+          $ref: '#/components/schemas/ToolChoiceDowngrade'
 
     ChatCompletionChunk:
       type: object
@@ -1850,6 +1873,10 @@ components:
           allOf:
             - $ref: '#/components/schemas/FailoverInfo'
           description: Present on the first forwarded chunk when the gateway switched model.
+        tool_choice_downgrade:
+          allOf:
+            - $ref: '#/components/schemas/ToolChoiceDowngrade'
+          description: Present on the first forwarded chunk when the forced `tool_choice` was downgraded.
         error:
           type: object
           description: |
@@ -1889,6 +1916,37 @@ components:
         to_model:
           type: string
           description: Model that actually answered.
+
+    ToolChoiceDowngrade:
+      type: object
+      description: |
+        Reported when the forced `tool_choice` was replaced by `auto` plus a
+        system message for the model that answered. Absent otherwise.
+      properties:
+        reason:
+          type: string
+          enum: [capability, provider_error]
+          description: |
+            `capability`: the model's catalog entry refuses forced tool use.
+            `provider_error`: the provider refused the forced call, and the
+            same model was retried downgraded.
+        tool:
+          type: string
+          description: The tool to call when exactly one was named, else empty.
+        tools:
+          type: array
+          items:
+            type: string
+          description: |
+            Every tool named by the forced `tool_choice` (the `allowed_tools`
+            subset, or the single tool). Empty for "call any tool".
+        message:
+          type: object
+          description: |
+            The system message appended to the request (`role`, `content`),
+            for information. It applies to that call only: do not store it in
+            a conversation history.
+          additionalProperties: true
 
     EmbeddingRequest:
       type: object
