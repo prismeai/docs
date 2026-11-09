@@ -2546,8 +2546,8 @@ paths:
         Parts are discriminated by field presence: `TextPart` (`text`),
         `FilePart` (`url` or `raw`), `DataPart` (`data`).
 
-        An always-on rate-limit floor (200/h per user) applies, plus any
-        agent-configured limit. The HITL approval flow is supported and
+        An agent-configured rate limit applies when set (off by default);
+        LLM usage is bounded by llm-gateway's governance quotas. The HITL approval flow is supported and
         will park the task in `input-required` until resolved through
         `/v1/agents/{agentId}/tasks/{taskId}/resolve`.
 
@@ -2564,7 +2564,9 @@ paths:
         MESSAGE_IN_PROGRESS` and names the conversation it is writing to.
         The body of a replay is not compared with the first one: a different
         message under the same key still gets the first answer. Replays count
-        against the rate limits. The body's `message_id` plays no part in this. **Not supported on
+        against the rate limits. An LLM `429` (quota or provider rate limit) is
+        not stored: it frees the key, so a retry with the same key after
+        `Retry-After` runs the message again. The body's `message_id` plays no part in this. **Not supported on
         `messages/stream`**: a streamed send is always executed.
       parameters:
         - name: agentId
@@ -2642,11 +2644,59 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '429':
-          description: Rate limit exceeded (200/h floor or agent-configured).
+          description: |
+            Rate limit exceeded. Two cases, both with `error: RATE_LIMITED` and
+            `details.retryAfter` (seconds to wait before retrying):
+            - the agent-configured limit (`config.rateLimits`, off by default) - plain `Error` body;
+            - the agent's LLM call was refused with a 429 by llm-gateway: a quota
+              (`RPM_EXCEEDED`, `TPM_EXCEEDED`, `MONTHLY_TOKENS_EXCEEDED`,
+              `MONTHLY_COST_EXCEEDED`) or every provider model rate limited
+              (`RATE_LIMITED`). The body also carries the failed `task`
+              (`status.state: failed`), `details.code` names the refusal and
+              `details.scope` the quota scope. `retryAfter` defaults to 60 when the
+              gateway gave none, and is also sent as a `Retry-After` header (whole
+              seconds, rounded up). `message` stays generic (`LLM rate limit
+              exceeded`), while the failed `task` carries the gateway's own refusal
+              as its agent message: its text and part `metadata.details` include
+              the quota figures (metric, limit, remaining). This is deliberate: the
+              caller only ever sees its own task.
+
+            Retrying after an LLM refusal is not idempotent. Like any message
+            without `taskId`, the retry (same `contextId`) opens a new task in the
+            conversation; the refused task stays there with `status.state: failed`
+            and its user message. When the refusal came before the agent's first
+            LLM answer (no tool run, the usual quota case), the refused task is left
+            out of the history the model receives, so the retried message reaches
+            it once. When it came later in the agent loop, the refused task is
+            replayed with its user message and the tool calls already made: the
+            model sees the message twice along with those tool results, and may
+            still call the same tools again. A send carrying
+            `message.metadata.clientMessageId` is no exception: the refusal is
+            not stored against the key, so the retry with the same key runs the
+            agent (a new task, no `task.replayed`).
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying (LLM refusal case).
+              schema:
+                type: integer
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                anyOf:
+                  - $ref: '#/components/schemas/Error'
+                  - $ref: '#/components/schemas/MessageSendQuotaError'
+              example:
+                error: RATE_LIMITED
+                message: LLM rate limit exceeded
+                details:
+                  retryAfter: 10.617
+                  code: TPM_EXCEEDED
+                  scope: user
+                task:
+                  id: task_xxx
+                  contextId: ctx_xxx
+                  status:
+                    state: failed
   /v1/agents/{agentId}/messages/stream:
     post:
       tags: [Messages]
@@ -3858,6 +3908,24 @@ paths:
                 $ref: '#/components/schemas/JsonRpcResponse'
         '400':
           description: Invalid JSON-RPC envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JsonRpcErrorEnvelope'
+        '429':
+          description: |
+            `tasks/send` only: `messages/send` answered 429 (rate limit, or the
+            agent's LLM call refused by llm-gateway - see `POST
+            /v1/agents/{agentId}/messages/send`). JSON-RPC error envelope with
+            `error.code: -32000`, a readable `error.message`, and `error.data`
+            carrying `code: RATE_LIMITED`, `details` (`retryAfter`, plus `code` /
+            `scope` for an LLM refusal) and, for an LLM refusal, the failed `task`.
+            `error.message` is the generic one of `messages/send`, but
+            `error.data.task` holds the gateway's full refusal text and details
+            (quota metric, limit, remaining) in its agent message: accepted, since
+            it is the caller's own task.
+            The `Retry-After` header is set for an LLM refusal. Other `messages/send`
+            errors (403, 404, 409) keep their HTTP status the same way.
           content:
             application/json:
               schema:
@@ -6460,6 +6528,9 @@ components:
                 send. A replay still counts against the rate limits like any
                 other call (it is checked before the key is looked up), and
                 one that is over the limit gets `429`, not the stored answer.
+                An LLM `429` (the agent's own model refused by a quota or a
+                provider rate limit) is not stored either: the key is freed,
+                and retrying it after `Retry-After` runs the message again.
 
                 Honoured only for a caller authenticated as a user. An org API
                 key with no user behind it resolves to a single shared
@@ -6501,6 +6572,33 @@ components:
           additionalProperties: true
         status:
           type: string
+    MessageSendQuotaError:
+      description: |
+        429 body of `messages/send` when the agent's LLM call was refused with a
+        429 by llm-gateway (quota or provider rate limit): the `Error` fields plus
+        the failed task.
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          properties:
+            details:
+              type: object
+              additionalProperties: true
+              properties:
+                retryAfter:
+                  type: number
+                  description: Seconds to wait before retrying.
+                code:
+                  type: string
+                  enum: [RPM_EXCEEDED, TPM_EXCEEDED, MONTHLY_TOKENS_EXCEEDED, MONTHLY_COST_EXCEEDED, RATE_LIMITED]
+                  description: Quota code, or `RATE_LIMITED` when every provider model was rate limited.
+                scope:
+                  type: string
+                  description: Quota scope that refused the call (e.g. user, agent, org). Absent for a provider rate limit.
+            task:
+              type: object
+              additionalProperties: true
+              description: The failed task, same shape as `MessageSendResponse.task` (`status.state` is `failed`). Its agent message is the gateway's refusal, quota figures (limit, remaining) included, unlike the generic `message`.
     MessageSendResponse:
       type: object
       properties:
@@ -7320,6 +7418,12 @@ components:
               example: -32000
             message:
               type: string
+            data:
+              type: object
+              additionalProperties: true
+              description: |
+                Set when a routed endpoint failed: `code` (error code), and when
+                present `details` and the failed `task` (e.g. `tasks/send` 429).
         id:
           type: string
           nullable: true
