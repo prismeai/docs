@@ -363,7 +363,8 @@ openid email
     | `driveUpdate` | Update file metadata or move it across folders with `addParents` / `removeParents`. | The updated File resource. |
     | `driveDelete` | Permanently delete a file by `fileId`. | Empty (HTTP 204). |
     | `driveCopy` | Duplicate a file by `fileId`; override metadata via `body`. | The new (copied) File resource `{ id, name, … }`. |
-    | `driveExport` | Export a Google-native file (Doc/Sheet/Slide) to a `mimeType` (e.g. `application/pdf`). | The exported file bytes in the requested format. |
+    | `driveGetContent` | Download one file's content by `fileId`; optional `maxBytes`. Google Docs, Slides and Drawings come back as PDF, Sheets as XLSX. | `{ fileId, name, mimeType, sourceMimeType, size, base64, webUrl }` |
+    | `driveExport` | Export a Google-native file (Doc/Sheet/Slide) to a `mimeType` (e.g. `text/plain`, `text/csv`). | The exported content, read as text: use a text format here, and `driveGetContent` for a PDF or another binary file. |
     | `drivePermissionsList` | List the sharing permissions on a file. | `{ permissions: [{ id, type, role, emailAddress }] }` |
     | `drivePermissionsCreate` | Share a file: `body` = `{ role, type, emailAddress }`. | The created Permission `{ id, type, role }`. |
     | `drivePermissionsDelete` | Revoke a permission by `permissionId`. | Empty (HTTP 204). |
@@ -395,6 +396,7 @@ openid email
     | `gmailGetProfile` | Resolve the connected account ("me" / "my email") in one call. | `{ emailAddress, messagesTotal, threadsTotal, historyId }` |
     | `gmailMessagesList` | List/search message ids; filter with `q` (Gmail search syntax) and `labelIds`. | `{ messages: [{ id, threadId }], nextPageToken, resultSizeEstimate }` |
     | `gmailMessagesGet` | Fetch one message by `id`; `format` controls verbosity (`minimal`/`full`/`metadata`/`raw`). | A Message resource `{ id, threadId, labelIds, snippet, payload, … }`. |
+    | `gmailAttachmentGetContent` | Download one attachment by `messageId` + `partId` (the MIME part id); optional `maxBytes`. | `{ messageId, partId, name, mimeType, size, base64 }` |
     | `gmailMessagesSend` | Send an email; `body` = `{ to, subject, text\|html, cc, bcc, … }` as plain strings (server builds the MIME). | The sent Message `{ id, threadId, labelIds }`. |
     | `gmailMessagesModify` | Add/remove labels on a message; `body` = `{ addLabelIds, removeLabelIds }`. | The updated Message `{ id, threadId, labelIds }`. |
     | `gmailMessagesTrash` | Move a message to Trash by `id`. | The trashed Message `{ id, threadId, labelIds }`. |
@@ -418,6 +420,20 @@ openid email
       `Returns` shows the shape of the operation output (the underlying Google API resource). `calendarId` defaults to `primary` when omitted. Gmail send/draft bodies take plain strings (`to`, `subject`, `text`/`html`, optional `cc`, `bcc`, `replyTo`, `inReplyTo`, `threadId`); the server builds and base64-encodes the MIME message itself.
     </Note>
 
+    ### File content
+
+    `driveGetContent` and `gmailAttachmentGetContent` return file bytes as standard base64, so a binary file (PDF, DOCX, image) comes back intact. Both are App-mode instructions only; they do not go through the MCP endpoint.
+
+    | Topic | Behavior |
+    |---|---|
+    | Output | `driveGetContent`: `{ fileId, name, mimeType, sourceMimeType, size, base64, webUrl }`. `gmailAttachmentGetContent`: `{ messageId, partId, name, mimeType, size, base64 }`. |
+    | Google-native files | `driveGetContent` exports Google Docs, Slides and Drawings as PDF and Sheets as XLSX; `name` gets the matching extension and `sourceMimeType` keeps the Google type. Forms, Sites, shortcuts and folders have no file content. |
+    | Gmail attachments | Address the attachment by its MIME `partId` (`payload.parts[].partId` of `gmailMessagesGet` with `format: full`, for example `1` or `0.2`), not by Gmail's `attachmentId`, which changes on every read. |
+    | Activity feed | The output is redacted: the base64 body never appears in the workspace activity feed. |
+    | Size limit | 4 MB (4,194,304 bytes) by default, which is also the maximum. Pass `maxBytes` to lower it; a larger value is capped at 4 MB. |
+    | When the size is checked | Before the download for Drive binaries and Gmail attachments, from their declared size; the downloaded body must then match that size exactly. After the export for Google-native files: Drive declares no size for them, so the exported file is measured. |
+    | Errors | `{ error, reason? }`. `reason` is `invalid_id` for a missing or malformed `fileId`, `messageId` or `partId`, `too_large` above the limit, or `read_failed` when the body does not match the declared size. |
+
     ## DSUL Examples
 
     **List the 10 most recently modified Drive files:**
@@ -429,6 +445,15 @@ openid email
         pageSize: 10
         fields: "files(id,name,mimeType,modifiedTime)"
       output: files
+    ```
+
+    **Download a Google Doc as PDF:**
+
+    ```yaml
+    - Google Workspaces.driveGetContent:
+        fileId: '{{documentId}}'
+      output: file
+    # file.name ends in .pdf; file.base64 holds the PDF, or file.error and file.reason explain the refusal
     ```
 
     **Create a spreadsheet, then write a header row:**

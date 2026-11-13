@@ -443,8 +443,8 @@ profile
     | `rebindReport` | Rebind a report to another dataset (`datasetId`). | Empty (HTTP 200). |
     | `getReportPages` / `getReportPage` | List a report's pages / get one by `pageName`. | `{ value: [{ name, displayName, order }] }` / a Page resource. |
     | `exportReport` | Start an async export to `format` (PDF/PPTX/PNG). | `{ id, status }` (poll for completion). |
-    | `getReportExportStatus` | Poll an export by `exportId`. | `{ id, status, percentComplete, resourceLocation }` |
-    | `getReportExportFile` | Download the finished export by `exportId`. | The exported file bytes. |
+    | `getReportExportStatus` | Poll an export by `exportId` until `status` is `Succeeded` (or `Failed`). | `{ id, status, percentComplete, reportName, resourceFileExtension, resourceLocation }` |
+    | `getReportExportFile` | Download the finished export by `exportId` (optional `maxBytes`). Refuses an export whose status is not `Succeeded` yet. | `{ name, mimeType, size, base64, reportName, fileExtension }`; see *Export files* below. |
     | `updateReportContent` | Overwrite a report's content from a source report. | Empty (HTTP 200). |
     | `generateReportToken` | Generate an embed token; `accessLevel`, optional `identities` for RLS. | `{ token, tokenId, expiration }` |
 
@@ -514,6 +514,18 @@ profile
       `Returns` shows the shape of the operation output (the underlying Power BI API resource). `groupId` is the workspace id and is optional on data operations; omit it to target "My workspace". All `admin*` instructions require the connected user to be a Fabric / Power BI administrator.
     </Note>
 
+    ### Export files
+
+    An export runs in three steps: `exportReport` starts it and returns its `id`, `getReportExportStatus` reports its progress, and `getReportExportFile` downloads the file once `status` is `Succeeded`. `getReportExportFile` reads the export status itself first and answers an error with `exportStatus` (for example `Running`) instead of downloading an unfinished export.
+
+    | Topic | Behavior |
+    |---|---|
+    | Output | `{ name, mimeType, size, base64, reportName, fileExtension }`: the exported PDF, PPTX or PNG as standard base64 and its size in bytes. `name` and `mimeType` come from the export's `reportName` and `resourceFileExtension`. This applies to the instruction only; the `reports` MCP tool is unchanged. |
+    | Activity feed | The output is redacted: the base64 body never appears in the workspace activity feed. |
+    | Size limit | 4 MB (4,194,304 bytes) by default, which is also the maximum. Pass `maxBytes` to lower it; a larger value is capped at 4 MB. |
+    | When the size is checked | After the download: Power BI does not declare the file size, so the file is downloaded first, then refused when it is empty or above the limit. |
+    | Errors | `{ error, reason?, status?, exportStatus? }`. `reason` is `too_large` above the limit or `read_failed` when the download fails; `status` is the HTTP status of a failed Power BI call; `exportStatus` is the export state when it is not `Succeeded` yet. |
+
     ## DSUL Examples
 
     **List datasets in a workspace, then run a DAX query:**
@@ -543,7 +555,7 @@ profile
       output: history
     ```
 
-    **Export a report to PDF (async: start, poll, download):**
+    **Export a report to PDF (async: start, poll until `Succeeded`, download):**
 
     ```yaml
     - Power BI.exportReport:
@@ -551,17 +563,30 @@ profile
         reportId: '{{reportId}}'
         format: PDF
       output: export
-    - Power BI.getReportExportStatus:
-        groupId: '{{workspaceId}}'
-        reportId: '{{reportId}}'
-        exportId: '{{export.id}}'
-      output: status
-    - Power BI.getReportExportFile:
-        groupId: '{{workspaceId}}'
-        reportId: '{{reportId}}'
-        exportId: '{{export.id}}'
-      output: file
+    - repeat:
+        until: 20
+        do:
+          - wait:
+              timeout: 5
+          - Power BI.getReportExportStatus:
+              groupId: '{{workspaceId}}'
+              reportId: '{{reportId}}'
+              exportId: '{{export.id}}'
+            output: status
+          - conditions:
+              '{{status.status}} == "Succeeded" || {{status.status}} == "Failed"':
+                - break:
+                    scope: repeat
+    - conditions:
+        '{{status.status}} == "Succeeded"':
+          - Power BI.getReportExportFile:
+              groupId: '{{workspaceId}}'
+              reportId: '{{reportId}}'
+              exportId: '{{export.id}}'
+            output: file
     ```
+
+    On success, `file.name`, `file.mimeType` and `file.base64` hold the PDF. Large reports can take minutes to export: raise `until` or `timeout` accordingly.
 
     **Discover a model's structure with DAX (works on import/DirectQuery models):**
 

@@ -318,7 +318,8 @@ This connector is used by four different roles. Jump to the section that matches
     | Instruction | Description | Returns |
     |-------------|-------------|---------|
     | `listFiles` | List a directory by `path` (default `/`); `depth` = `1` for immediate children (default) or `0` for path info only. | `{ files: [{ name, path, isDirectory, size, lastModified, contentType }] }` |
-    | `getFile` | Download file content by `path`. | `{ path, content, size, contentType }` |
+    | `getFile` | Download a text file's content by `path`. The body is read as text, which corrupts a binary file: use `getFileContent` for PDF, DOCX or images. | `{ path, content, size, contentType }` |
+    | `getFileContent` | Download a file's bytes by `path`; optional `maxBytes`. Byte-safe for binary files. | `{ name, mimeType, size, base64, path }` |
     | `getFileProperties` | Fetch metadata of a file or directory by `path` without its content. | `{ path, isDirectory, size, lastModified, contentType, etag }` |
     | `uploadFile` | Create or overwrite a file at `path` with `content`; optional `contentType` (default `text/plain`). | `{ path, size }` |
     | `deleteFile` | Delete a file or directory by `path` (directories are deleted recursively). | Empty (HTTP 204) |
@@ -331,6 +332,18 @@ This connector is used by four different roles. Jump to the section that matches
     <Note>
       `Returns` shows the shape of the operation output. `depth` accepts `0` (path info only) or `1` (immediate children, default). `deleteFile` deletes directories recursively.
     </Note>
+
+    ### File content
+
+    `getFileContent` returns a file's bytes as standard base64, so a binary file (PDF, DOCX, image) comes back intact. It addresses the file like `getFile`; `.` and `..` segments are refused, and when the configuration sets `allowedPath`, the path must be within it.
+
+    | Topic | Behavior |
+    |---|---|
+    | Output | `{ name, mimeType, size, base64, path }`. |
+    | Activity feed | The output is redacted: the base64 body never appears in the workspace activity feed. |
+    | Size limit | 4 MB (4,194,304 bytes) by default, which is also the maximum. Pass `maxBytes` to lower it; a larger value is capped at 4 MB. |
+    | When the size is checked | Before the download: the connector reads the file's properties first (`PROPFIND`) and refuses a folder, a file whose size the server does not report, or a file above the limit, without downloading it. The downloaded body must then match the declared size exactly. |
+    | Errors | `{ error, reason? }`. `reason` is `too_large` above the limit or `read_failed` when the body cannot be downloaded or does not match the declared size. A refused path, a folder or a missing size returns `{ error }` only. |
 
     ## DSUL Examples
 
@@ -354,6 +367,15 @@ This connector is used by four different roles. Jump to the section that matches
         payload:
           size: '{{report.size}}'
           excerpt: '{% slice({{report.content}}, 0, 500) %}'
+    ```
+
+    ### Download a PDF
+
+    ```yaml
+    - WebDAV.getFileContent:
+        path: '/Reports/2026/q1-results.pdf'
+        output: pdf
+    # pdf.mimeType and pdf.base64 hold the file, or pdf.error explains the refusal
     ```
 
     ### Upload a generated markdown file
